@@ -17,29 +17,8 @@ name: Linux Build using GCC
 on:
   push:
     branches:
-      - "main"
-    paths:
-      - "velox/**"
-      - "!velox/docs/**"
-      - "CMakeLists.txt"
-      - "CMake/**"
-      - "third_party/**"
-      - "scripts/setup-ubuntu.sh"
-      - "scripts/setup-helper-functions.sh"
-      - ".github/workflows/linux-build.yml"
-      - ".github/workflows/linux-build-base.yml"
-
-  pull_request:
-    paths:
-      - "velox/**"
-      - "!velox/docs/**"
-      - "CMakeLists.txt"
-      - "CMake/**"
-      - "third_party/**"
-      - "scripts/setup-ubuntu.sh"
-      - "scripts/setup-helper-functions.sh"
-      - ".github/workflows/linux-build.yml"
-      - ".github/workflows/linux-build-base.yml"
+      - "velox-cudf"
+      - "pull-request/[0-9]+"
 
 permissions:
   contents: read
@@ -49,6 +28,143 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  linux-gcc:
-    name: Build with GCC
-    uses: ./.github/workflows/linux-build-base.yml
+  adapters:
+    name: Linux release with adapters
+    runs-on: linux-amd64-cpu16
+    container: ghcr.io/facebookincubator/velox-dev:adapters
+    defaults:
+      run:
+        shell: bash
+    env:
+      CCACHE_DIR: "${{ github.workspace }}/.ccache"
+      VELOX_DEPENDENCY_SOURCE: SYSTEM
+      GTest_SOURCE: BUNDLED
+      simdjson_SOURCE: BUNDLED
+      xsimd_SOURCE: BUNDLED
+      Arrow_SOURCE: BUNDLED
+      Thrift_SOURCE: BUNDLED
+      cudf_SOURCE:  BUNDLED
+      CUDA_VERSION: "12.4"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fix git permissions
+        # Usually actions/checkout does this but as we run in a container
+        # it doesn't work
+        run: git config --global --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Install Dependencies
+        run: |
+          # Allows to install arbitrary cuda-version whithout needing to update
+          # docker container before. It simplifies testing new/different versions
+          if ! yum list installed cuda-nvcc-$(echo ${CUDA_VERSION} | tr '.' '-') 1>/dev/null; then
+            source scripts/setup-centos9.sh
+            install_cuda ${CUDA_VERSION}
+          fi
+
+      - uses: assignUser/stash/restore@v1
+        with:
+          token: '${{ secrets.ARTIFACT_CACHE_TOKEN }}'
+          path: '${{ env.CCACHE_DIR }}'
+          key: ccache-linux-adapters
+
+      - name: "Zero Ccache Statistics"
+        run: |
+          ccache -sz
+
+      - name: Make Release Build
+        env:
+          MAKEFLAGS: 'TREAT_WARNINGS_AS_ERRORS=0 NUM_THREADS=16 MAX_HIGH_MEM_JOBS=4'
+          CUDA_ARCHITECTURES: 70
+          CUDA_COMPILER: /usr/local/cuda-${CUDA_VERSION}/bin/nvcc
+          # Set compiler to GCC 12
+          CUDA_FLAGS: "-ccbin /opt/rh/gcc-toolset-12/root/usr/bin"
+        run: |
+          EXTRA_CMAKE_FLAGS=(
+            "-DVELOX_ENABLE_BENCHMARKS=ON"
+            "-DVELOX_ENABLE_ARROW=ON"
+            "-DVELOX_ENABLE_PARQUET=ON"
+            "-DVELOX_ENABLE_HDFS=ON"
+            "-DVELOX_ENABLE_S3=ON"
+            "-DVELOX_ENABLE_GCS=ON"
+            "-DVELOX_ENABLE_ABFS=ON"
+            "-DVELOX_ENABLE_REMOTE_FUNCTIONS=ON"
+            "-DVELOX_ENABLE_GPU=ON"
+            "-DVELOX_ENABLE_CUDF=ON"
+            "-DVELOX_MONO_LIBRARY=ON"
+          )
+          make release EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS[*]}"
+
+      - name: Ccache after
+        run: ccache -s
+
+      - uses: assignUser/stash/save@v1
+        with:
+          path: '${{ env.CCACHE_DIR }}'
+          key: ccache-linux-adapters
+
+      - name: Run Tests
+        # Some of the adapters dependencies are in the 'adapters' conda env
+        shell: mamba run --no-capture-output -n adapters /usr/bin/bash -e {0}
+        env:
+          LIBHDFS3_CONF: "${{ github.workspace }}/scripts/hdfs-client.xml"
+        working-directory: _build/release
+        run: |
+          export CLASSPATH=`/usr/local/hadoop/bin/hdfs classpath --glob`
+          ctest -j 8 --label-exclude cuda_driver --output-on-failure --no-tests=error -E "velox_exec_test|velox_hdfs_file_test|velox_s3"
+
+# ubuntu-debug:
+#   runs-on: linux-amd64-cpu16
+#   name: "Ubuntu debug with resolve_dependency"
+#   env:
+#     CCACHE_DIR: "${{ github.workspace }}/.ccache"
+#   defaults:
+#     run:
+#       shell: bash
+#       working-directory: velox
+#   steps:
+
+#     - name: Get Ccache Stash
+#       uses: assignUser/stash/restore@v1
+#       with:
+#         token: '${{ secrets.ARTIFACT_CACHE_TOKEN }}'
+#         path: '${{ env.CCACHE_DIR }}'
+#         key: ccache-ubuntu-debug-default
+
+#     - name: Ensure Stash Dirs Exists
+#       working-directory: ${{ github.workspace }}
+#       run: |
+#         mkdir -p '${{ env.CCACHE_DIR }}'
+
+#     - uses: actions/checkout@v4
+#       with:
+#         path: velox
+
+#     - name: Install Dependencies
+#       run: |
+#         source scripts/setup-ubuntu.sh && install_apt_deps
+
+#     - name: Clear CCache Statistics
+#       run: |
+#         ccache -sz
+
+#     - name: Make Debug Build
+#       env:
+#         VELOX_DEPENDENCY_SOURCE: BUNDLED
+#         MAKEFLAGS: "TREAT_WARNINGS_AS_ERRORS=0 NUM_THREADS=16 MAX_HIGH_MEM_JOBS=4"
+#         EXTRA_CMAKE_FLAGS: "-DVELOX_ENABLE_ARROW=ON -DVELOX_ENABLE_PARQUET=ON"
+#       run: |
+#         make debug
+
+#     - name: CCache after
+#       run: |
+#         ccache -vs
+
+#     - uses: assignUser/stash/save@v1
+#       with:
+#         path: '${{ env.CCACHE_DIR }}'
+#         key: ccache-ubuntu-debug-default
+
+#     - name: Run Tests
+#       run: |
+#         cd _build/debug && ctest -j 8 --output-on-failure --no-tests=error -E "velox_exec_test"

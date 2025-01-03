@@ -375,6 +375,8 @@ if(ENABLE_ALL_WARNINGS)
        -Wno-unused-parameter \
        -Wno-sign-compare \
        -Wno-ignored-qualifiers \
+       -Wno-missing-field-initializers \
+       -Wno-deprecated-copy \
        ${KNOWN_COMPILER_SPECIFIC_WARNINGS}")
 
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra ${KNOWN_WARNINGS}")
@@ -382,7 +384,7 @@ endif()
 
 message("FINAL CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}")
 
-if(${VELOX_ENABLE_GPU})
+if(VELOX_ENABLE_GPU)
   enable_language(CUDA)
   # Determine CUDA_ARCHITECTURES automatically.
   cmake_policy(SET CMP0104 NEW)
@@ -394,6 +396,11 @@ if(${VELOX_ENABLE_GPU})
     add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-G>")
   endif()
   find_package(CUDAToolkit REQUIRED)
+  if(VELOX_ENABLE_CUDF)
+    set(VELOX_ENABLE_ARROW ON)
+    velox_set_source(cudf)
+    velox_resolve_dependency(cudf)
+  endif()
 endif()
 
 # Set after the test of the CUDA compiler. Otherwise, the test fails with
@@ -465,8 +472,10 @@ else()
 endif()
 velox_resolve_dependency(glog)
 
-velox_set_source(fmt)
-velox_resolve_dependency(fmt 9.0.0)
+if(NOT TARGET fmt::fmt)
+  set_source(fmt)
+  resolve_dependency(fmt 9.0.0)
+endif()
 
 if(${VELOX_BUILD_MINIMAL_WITH_DWIO} OR ${VELOX_ENABLE_HIVE_CONNECTOR})
   # DWIO needs all sorts of stream compression libraries.

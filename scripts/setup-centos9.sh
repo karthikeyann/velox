@@ -43,7 +43,7 @@ DEPENDENCY_DIR=${DEPENDENCY_DIR:-$(pwd)/deps-download}
 FB_OS_VERSION="v2024.07.01.00"
 FMT_VERSION="10.1.1"
 BOOST_VERSION="boost-1.84.0"
-ARROW_VERSION="15.0.0"
+ARROW_VERSION="16.1.0"
 STEMMER_VERSION="2.2.0"
 DUCKDB_VERSION="v0.8.1"
 
@@ -219,10 +219,11 @@ function install_arrow {
 }
 
 function install_cuda {
+  dnf install -y patch
   # See https://developer.nvidia.com/cuda-downloads
   dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
   local dashed="$(echo $1 | tr '.' '-')"
-  dnf install -y cuda-nvcc-$dashed cuda-cudart-devel-$dashed cuda-nvrtc-devel-$dashed cuda-driver-devel-$dashed 
+  dnf install -y cuda-nvcc-$dashed cuda-cudart-devel-$dashed cuda-nvrtc-devel-$dashed cuda-driver-devel-$dashed
 }
 
 function install_velox_deps {

@@ -74,7 +74,7 @@ function install_gcc11_if_needed {
 FB_OS_VERSION="v2024.07.01.00"
 FMT_VERSION="10.1.1"
 BOOST_VERSION="boost-1.84.0"
-ARROW_VERSION="15.0.0"
+ARROW_VERSION="16.1.0"
 STEMMER_VERSION="2.2.0"
 DUCKDB_VERSION="v0.8.1"
 
@@ -125,6 +125,7 @@ function install_velox_deps_from_apt {
     libre2-dev \
     libsnappy-dev \
     libsodium-dev \
+    libthrift-dev \
     liblzo2-dev \
     libelf-dev \
     libdwarf-dev \

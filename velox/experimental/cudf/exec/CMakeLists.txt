@@ -12,34 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_library(velox_tpch_benchmark_lib TpchBenchmark.cpp)
-
-target_link_libraries(
-  velox_tpch_benchmark_lib
-  velox_query_benchmark
-  velox_aggregates
+add_library(
   velox_cudf_exec
-  velox_exec
-  velox_exec_test_lib
-  velox_dwio_common
-  velox_dwio_common_exception
-  velox_dwio_parquet_reader
-  velox_dwio_common_test_utils
-  velox_hive_connector
-  velox_exception
-  velox_memory
-  velox_process
-  velox_serialization
-  velox_encode
-  velox_type
-  velox_type_fbhive
-  velox_caching
-  velox_vector_test_lib
-  Folly::follybenchmark
-  Folly::folly
-  fmt::fmt)
+  CudfConversion.cpp
+  CudfHashJoin.cpp
+  CudfOrderBy.cpp
+  ToCudf.cpp
+  Utilities.cpp
+  VeloxCudfInterop.cpp)
 
-add_executable(velox_tpch_benchmark TpchBenchmarkMain.cpp)
+set_target_properties(
+  velox_cudf_exec
+  PROPERTIES CUDA_ARCHITECTURES native)
 
 target_link_libraries(
-  velox_tpch_benchmark velox_tpch_benchmark_lib)
+  velox_cudf_exec
+  cudf::cudf
+  velox_exception
+  velox_common_base
+  velox_exec)

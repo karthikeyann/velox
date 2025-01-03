@@ -11,16 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-list(APPEND CMAKE_PREFIX_PATH "${CUDAToolkit_LIBRARY_DIR}/cmake")
-find_package(Thrust REQUIRED)
-find_package(CUB REQUIRED)
+ARG base=nvidia/cuda:12.2.2-devel-ubuntu22.04
+# Set a default timezone, can be overriden via ARG
+ARG tz="Europe/Madrid"
 
-add_executable(velox_gpu_hash_table_test HashTableTest.cu)
-target_link_libraries(
-  velox_gpu_hash_table_test
-  Folly::folly
-  gflags::gflags
-  glog::glog
-  CUB::CUB
-  Thrust::Thrust
-  CUDA::cudart)
+FROM ${base}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt update && \
+      apt install -y sudo \
+            lsb-release \
+            pip \
+            python3 \
+            python3-six
+
+
+ADD scripts /velox/scripts/
+
+# TZ and DEBIAN_FRONTEND="noninteractive"
+# are required to avoid tzdata installation
+# to prompt for region selection.
+ARG DEBIAN_FRONTEND="noninteractive"
+ENV TZ=${tz}
+RUN /velox/scripts/setup-ubuntu.sh
+
+WORKDIR /velox
