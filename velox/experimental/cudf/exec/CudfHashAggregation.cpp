@@ -439,6 +439,8 @@ auto toAggregators(
         VELOX_NYI("Constants and lambdas not yet supported");
       }
     }
+    std::cout << "aggInputs: " << aggInputs.size() << std::endl;
+    std::cout << "aggKind: " << aggregate.call->name() << std::endl;
     // The loop on aggregate.call->inputs() is taken from
     // AggregateInfo.cpp::toAggregateInfo(). It seems to suggest that there can
     // be multiple inputs to an aggregate.
