@@ -223,7 +223,7 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         // We don't know how to handle kIntermediate step for mean
         VELOX_NYI("Unsupported aggregation step for mean");
     }
-    std::cout << "values type: " << int(request.values.type().id())
+    std::cout << "values type: " << int(tbl.column(inputIndex).type().id())
               << " aggregation name: " << "mean" << std::endl;
   }
 
