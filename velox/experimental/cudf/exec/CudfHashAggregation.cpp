@@ -202,6 +202,7 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       }
       case core::AggregationNode::Step::kIntermediate:
       case core::AggregationNode::Step::kFinal: {
+        std::cout << "kFinal -> struct type ";
         // In intermediate and final aggregation, the previously computed sum
         // and count are in the child columns of the input column.
         auto& request = requests.emplace_back();
