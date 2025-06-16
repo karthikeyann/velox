@@ -59,6 +59,8 @@ using namespace facebook::velox;
       request.values = tbl.column(inputIndex);                                \
       request.aggregations.push_back(                                         \
           cudf::make_##name##_aggregation<cudf::groupby_aggregation>());      \
+      std::cout << "values type: " << int(request.values.type().id())         \
+                << " aggregation name: " << #name << std::endl;               \
     }                                                                         \
                                                                               \
     std::unique_ptr<cudf::column> makeOutputColumn(                           \
@@ -113,6 +115,9 @@ struct CountAggregator : cudf_velox::CudfHashAggregation::Aggregator {
               constant == nullptr ? cudf::null_policy::EXCLUDE
                                   : cudf::null_policy::INCLUDE)
         : cudf::make_sum_aggregation<cudf::groupby_aggregation>();
+    // print values type and aggregation  name
+    std::cout << "values type: " << int(request.values.type().id())
+              << " aggregation name: " << "sum" << std::endl;
     request.aggregations.push_back(std::move(aggRequest));
   }
 
@@ -218,6 +223,8 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         // We don't know how to handle kIntermediate step for mean
         VELOX_NYI("Unsupported aggregation step for mean");
     }
+    std::cout << "values type: " << int(request.values.type().id())
+              << " aggregation name: " << "mean" << std::endl;
   }
 
   std::unique_ptr<cudf::column> makeOutputColumn(
