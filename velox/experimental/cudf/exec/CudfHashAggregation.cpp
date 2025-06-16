@@ -187,6 +187,8 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         request.values = tbl.column(inputIndex);
         request.aggregations.push_back(
             cudf::make_mean_aggregation<cudf::groupby_aggregation>());
+        std::cout << "values type: " << int(request.values.type().id())
+                  << " aggregation name: " << "mean (single)" << std::endl;
         break;
       }
       case core::AggregationNode::Step::kPartial: {
@@ -198,6 +200,8 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         request.aggregations.push_back(
             cudf::make_count_aggregation<cudf::groupby_aggregation>(
                 cudf::null_policy::EXCLUDE));
+        std::cout << "values type: " << int(request.values.type().id())
+                  << " aggregation name: " << "sum, count (partial)" << std::endl;
         break;
       }
       case core::AggregationNode::Step::kIntermediate:
@@ -218,14 +222,14 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         // need to sum them up again.
         request2.aggregations.push_back(
             cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+        std::cout << "values type: " << int(tbl.column(inputIndex).child(0).type().id()) << ", " << int(tbl.column(inputIndex).child(1).type().id())
+                  << " aggregation name: " << "mean (intermediate/final)" << std::endl;
         break;
       }
       default:
         // We don't know how to handle kIntermediate step for mean
         VELOX_NYI("Unsupported aggregation step for mean");
     }
-    std::cout << "values type: " << int(tbl.column(inputIndex).type().id())
-              << " aggregation name: " << "mean" << std::endl;
   }
 
   std::unique_ptr<cudf::column> makeOutputColumn(
