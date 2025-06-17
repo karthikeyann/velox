@@ -34,6 +34,10 @@ namespace {
 
 using namespace facebook::velox;
 
+bool isFloatingPointType(const TypePtr& type) {
+  return type->kind() != TypeKind::REAL && type->kind() != TypeKind::DOUBLE;
+}
+
 #define DEFINE_SIMPLE_AGGREGATOR(Name, name, KIND)                            \
   struct Name##Aggregator : cudf_velox::CudfHashAggregation::Aggregator {     \
     Name##Aggregator(                                                         \
@@ -69,7 +73,7 @@ using namespace facebook::velox;
       auto col = std::move(results[output_idx].results[0]);                   \
       const auto cudfType =                                                   \
           cudf::data_type(cudf_velox::veloxToCudfTypeId(resultType));         \
-      if (col->type() != cudfType) {                                          \
+      if (col->type() != cudfType && !isFloatingPointType(resultType)) {      \
         col = cudf::cast(*col, cudfType, stream);                             \
       }                                                                       \
       return col;                                                             \
@@ -491,15 +495,15 @@ auto toAggregators(
   auto const step = aggregationNode.step();
   bool const isGlobal = aggregationNode.groupingKeys().empty();
   auto const& inputRowSchema = aggregationNode.sources()[0]->outputType();
+  const auto numKeys = aggregationNode.groupingKeys().size();
+  const auto outputType = aggregationNode.outputType();
 
   std::vector<std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator>>
       aggregators;
   for (auto const& aggregate : aggregationNode.aggregates()) {
     std::vector<column_index_t> aggInputs;
     std::vector<VectorPtr> aggConstants;
-    std::vector<TypePtr> argumentTypes;
     for (auto const& arg : aggregate.call->inputs()) {
-      argumentTypes.push_back(arg->type());
       if (auto const field =
               dynamic_cast<core::FieldAccessTypedExpr const*>(arg.get())) {
         aggInputs.push_back(inputRowSchema->getChildIdx(field->name()));
@@ -529,8 +533,10 @@ auto toAggregators(
     auto const companionStep = getCompanionStep(kind, step);
     const auto originalName = getOriginalName(kind);
     const auto resultType = exec::isPartialOutput(companionStep)
-        ? exec::Aggregate::intermediateType(originalName, argumentTypes)
-        : exec::Aggregate::finalType(originalName, argumentTypes);
+        ? exec::Aggregate::intermediateType(
+              originalName, aggregate.rawInputTypes)
+        : outputType->childAt(numKeys + i);
+
     aggregators.push_back(createAggregator(
         companionStep, kind, inputIndex, constant, isGlobal, resultType));
   }
@@ -553,15 +559,17 @@ auto toIntermediateAggregators(
     auto const inputIndex = aggregationNode.groupingKeys().size() + i;
     auto const kind = aggregate.call->name();
     auto const constant = nullptr;
-    std::vector<TypePtr> argumentTypes;
-    for (auto const& arg : aggregate.call->inputs()) {
-      argumentTypes.push_back(arg->type());
-    }
     const auto originalName = getOriginalName(kind);
-    const auto resultType =
-        exec::Aggregate::finalType(originalName, argumentTypes);
-    aggregators.push_back(createAggregator(
-        step, kind, inputIndex, constant, isGlobal, resultType));
+    auto const companionStep = getCompanionStep(kind, step);
+    if (exec::isPartialOutput(companionStep)) {
+      const auto resultType = exec::Aggregate::intermediateType(
+          originalName, aggregate.rawInputTypes);
+      aggregators.push_back(createAggregator(
+          step, kind, inputIndex, constant, isGlobal, resultType));
+    } else {
+      // Final step aggregator will not use the intermediate aggregator.
+      aggregators.push_back(nullptr);
+    }
   }
   return aggregators;
 }
