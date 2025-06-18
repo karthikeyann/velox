@@ -33,7 +33,7 @@
 #.github/ @assignUser @majetideepak
 
 # Breeze
-#velox/experimental/breeze @dreveman
+# velox/experimental/breeze @dreveman
 
 # cuDF
 velox/experimental/cudf @bdice @karthikeyann @devavret
