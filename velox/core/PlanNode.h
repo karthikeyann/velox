@@ -2758,7 +2758,8 @@ class PartitionedOutputNode : public PlanNode {
       PartitionFunctionSpecPtr partitionFunctionSpec,
       RowTypePtr outputType,
       std::string serdeKind,
-      PlanNodePtr source);
+      PlanNodePtr source,
+      bool rootFragment = false);
 
 #ifdef VELOX_ENABLE_BACKWARD_COMPATIBILITY
   PartitionedOutputNode(
@@ -2830,7 +2831,8 @@ class PartitionedOutputNode : public PlanNode {
       const PlanNodeId& id,
       RowTypePtr outputType,
       std::string serdeKind,
-      PlanNodePtr source);
+      PlanNodePtr source,
+      bool rootFragment = false);
 
 #ifdef VELOX_ENABLE_BACKWARD_COMPATIBILITY
   static std::shared_ptr<PartitionedOutputNode> single(
@@ -2966,6 +2968,10 @@ class PartitionedOutputNode : public PlanNode {
     return outputType_;
   }
 
+  const bool isRootFragment() const {
+    return rootFragment_;
+  }
+
   const std::vector<PlanNodePtr>& sources() const override {
     return sources_;
   }
@@ -3041,6 +3047,7 @@ class PartitionedOutputNode : public PlanNode {
   const PartitionFunctionSpecPtr partitionFunctionSpec_;
   const std::string serdeKind_;
   const RowTypePtr outputType_;
+  const bool rootFragment_;
 };
 
 using PartitionedOutputNodePtr = std::shared_ptr<const PartitionedOutputNode>;
