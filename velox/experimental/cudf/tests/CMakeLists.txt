@@ -112,8 +112,6 @@ add_test(
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-set_tests_properties(velox_cudf_hash_join_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
-set_tests_properties(velox_cudf_order_by_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(velox_cudf_aggregation_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(velox_cudf_assign_unique_id_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(velox_cudf_config_test PROPERTIES LABELS cuda_driver TIMEOUT 300)
