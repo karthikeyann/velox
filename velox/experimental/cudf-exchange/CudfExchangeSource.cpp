@@ -222,13 +222,12 @@ std::shared_ptr<CudfExchangeSource> CudfExchangeSource::getSelfPtr() {
   return ptr;
 }
 
-void CudfExchangeSource::enqueue(
-    std::unique_ptr<cudf::packed_columns> columns) {
+void CudfExchangeSource::enqueue(PackedTableWithStreamPtr data) {
   std::vector<velox::ContinuePromise> queuePromises;
   {
     std::lock_guard<std::mutex> l(queue_->mutex());
 
-    queue_->enqueueLocked(std::move(columns), queuePromises);
+    queue_->enqueueLocked(std::move(data), queuePromises);
   }
   // wake up consumers of the CudfExchangeQueue
   for (auto& promise : queuePromises) {
@@ -470,10 +469,20 @@ void CudfExchangeSource::onData(
     metrics_.numPackedColumns_.addValue(1);
     metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
 
-    std::unique_ptr<cudf::packed_columns> columns =
-        std::make_unique<cudf::packed_columns>(
-            std::move(ptr->metadata.cudfMetadata), std::move(ptr->dataBuf));
-    enqueue(std::move(columns));
+    // Create packed_columns from the received metadata and data buffer
+    cudf::packed_columns packedCols(
+        std::move(ptr->metadata.cudfMetadata), std::move(ptr->dataBuf));
+
+    // Unpack to get the table_view and create a packed_table
+    cudf::table_view tableView = cudf::unpack(packedCols);
+    auto packedTable = std::make_unique<cudf::packed_table>(
+        cudf::packed_table{tableView, std::move(packedCols)});
+
+    // Bundle the packed_table with the stream that was used for allocation
+    auto data = std::make_unique<PackedTableWithStream>(
+        std::move(packedTable), ptr->stream);
+
+    enqueue(std::move(data));
     setStateIf(ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
   }
   communicator_->addToWorkQueue(getSelfPtr());
@@ -606,11 +615,26 @@ void CudfExchangeSource::onIntraNodeData(
   metrics_.numPackedColumns_.addValue(1);
   metrics_.totalBytes_.addValue(data->gpu_data->size());
 
-  // Convert shared_ptr to unique_ptr for enqueue
-  auto uniqueData = std::make_unique<cudf::packed_columns>(
+  // Convert packed_columns to PackedTableWithStream for the queue.
+  // Create packed_columns from the shared data.
+  cudf::packed_columns packedCols(
       std::move(data->metadata), std::move(data->gpu_data));
 
-  enqueue(std::move(uniqueData));
+  // Unpack to get the table_view and create a packed_table
+  cudf::table_view tableView = cudf::unpack(packedCols);
+  auto packedTable = std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedCols)});
+
+  // Get a stream from the global stream pool for the PackedTableWithStream.
+  // For intra-node transfer, the data was allocated on the server side.
+  auto stream =
+      facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+
+  // Bundle the packed_table with the stream
+  auto tableWithStream = std::make_unique<PackedTableWithStream>(
+      std::move(packedTable), stream);
+
+  enqueue(std::move(tableWithStream));
 
   this->sequenceNumber_++;
   setStateIf(ReceiverState::WaitingForIntraNodeData, ReceiverState::ReadyToReceive);

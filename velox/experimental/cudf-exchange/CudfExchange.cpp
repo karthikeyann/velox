@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/cudf-exchange/CudfExchange.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
 
 using namespace facebook::velox::exec;
 using namespace facebook::velox::core;
@@ -97,7 +98,7 @@ bool CudfExchange::getSplits(ContinueFuture* future) {
 
 BlockingReason CudfExchange::isBlocked(ContinueFuture* future) {
   // check whether there is data or whether this is at the end.
-  if (currentColumns_ != nullptr || atEnd_) {
+  if (currentData_ != nullptr || atEnd_) {
     return BlockingReason::kNotBlocked;
   }
 
@@ -106,11 +107,11 @@ BlockingReason CudfExchange::isBlocked(ContinueFuture* future) {
     getSplits(&splitFuture_);
   }
 
-  // No data! Ask the client for the next packed_columns.
-  VELOX_CHECK_NULL(currentColumns_);
+  // No data! Ask the client for the next packed table.
+  VELOX_CHECK_NULL(currentData_);
   ContinueFuture dataFuture;
-  currentColumns_ = exchangeClient_->next(driverId_, &atEnd_, &dataFuture);
-  if (currentColumns_ != nullptr || atEnd_) {
+  currentData_ = exchangeClient_->next(driverId_, &atEnd_, &dataFuture);
+  if (currentData_ != nullptr || atEnd_) {
     if (atEnd_ && noMoreSplits_) {
       const auto numSplits = stats_.rlock()->numSplits;
       operatorCtx_->task()->multipleSplitsFinished(false, numSplits, 0);
@@ -136,32 +137,32 @@ BlockingReason CudfExchange::isBlocked(ContinueFuture* future) {
 }
 
 bool CudfExchange::isFinished() {
-  return atEnd_ && currentColumns_ == nullptr;
+  return atEnd_ && currentData_ == nullptr;
 }
 
 RowVectorPtr CudfExchange::getOutput() {
   VLOG(3) << "@" << taskId() << " CudfExchange::getOutput() has data: "
-          << (currentColumns_ != nullptr);
-  if (currentColumns_ == nullptr) {
+          << (currentData_ != nullptr);
+  if (currentData_ == nullptr) {
     return nullptr;
   }
-  // Convert the cudf::packed_columns into a RowVectorPtr.
-  cudf::table_view tblView = cudf::unpack(*currentColumns_);
-  // create a new table from the table view and convert that into
-  // a CudfVector.
-  auto stream =
-      facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
-  auto mr = cudf::get_current_device_resource_ref();
-  std::unique_ptr<cudf::table> tbl =
-      std::make_unique<cudf::table>(tblView, stream, mr);
-  auto numRows = tbl->num_rows();
-  // outputType_ is declared in the Operator base class.
-  auto result = std::make_shared<cudf_velox::CudfVector>(
-      pool(), outputType_, numRows, std::move(tbl), stream);
 
-  recordInputStats(currentColumns_->gpu_data->size(), result);
-  // free the memory owned by packed_columns and set it to nullptr;
-  currentColumns_.reset();
+  // Get the packed_table and stream from the PackedTableWithStream
+  auto numRows = currentData_->packedTable->table.num_rows();
+  auto gpuDataSize = currentData_->gpuDataSize();
+
+  // Use the stream that was allocated in CudfExchangeSource::onMetadata
+  // and the packed_table constructor of CudfVector to avoid copying data.
+  auto result = std::make_shared<cudf_velox::CudfVector>(
+      pool(),
+      outputType_,
+      numRows,
+      std::move(currentData_->packedTable),
+      currentData_->stream);
+
+  recordInputStats(gpuDataSize, result);
+  // free the memory owned by PackedTableWithStream and set it to nullptr;
+  currentData_.reset();
 
   return result;
 }
@@ -178,8 +179,8 @@ void CudfExchange::recordInputStats(
 
 void CudfExchange::close() {
   SourceOperator::close();
-  if (currentColumns_ != nullptr) {
-    currentColumns_.reset();
+  if (currentData_ != nullptr) {
+    currentData_.reset();
   }
   if (exchangeClient_) {
     recordExchangeClientStats();
