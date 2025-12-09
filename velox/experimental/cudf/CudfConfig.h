@@ -26,6 +26,8 @@ struct CudfConfig {
   static constexpr const char* kCudfEnabled{"cudf.enabled"};
   static constexpr const char* kCudfDebugEnabled{"cudf.debug_enabled"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
+  static constexpr const char* kCudfTemporaryMemoryResource{
+      "cudf.temporary_memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
       "cudf.function_name_prefix"};
@@ -56,6 +58,12 @@ struct CudfConfig {
   /// Memory resource for cuDF.
   /// Possible values are (cuda, pool, async, arena, managed, managed_pool).
   std::string memoryResource{"async"};
+
+  /// Memory resource for cuDF temporary memory.
+  /// Possible values are (none, cuda, pool, async, arena, managed,
+  /// managed_pool).
+  std::string temporaryMemoryResource{
+      "none"}; // none means same as memoryResource
 
   /// The initial percent of GPU memory to allocate for pool or arena memory
   /// resources.

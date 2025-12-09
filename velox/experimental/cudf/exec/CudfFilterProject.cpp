@@ -244,8 +244,8 @@ void CudfFilterProject::filter(
     std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
     rmm::cuda_stream_view stream) {
   // Evaluate the Filter
-  auto filterColumn = filterEvaluator_->eval(
-      inputTableColumns, stream, cudf::get_current_device_resource_ref(), true);
+  auto filterColumn =
+      filterEvaluator_->eval(inputTableColumns, stream, *mr_, true);
   auto filterColumnView = asView(filterColumn);
   bool shouldApplyFilter = [&]() {
     if (filterColumnView.has_nulls()) {
@@ -257,7 +257,7 @@ void CudfFilterProject::filter(
         *cudf::make_all_aggregation<cudf::reduce_aggregation>(),
         cudf::data_type(cudf::type_id::BOOL8),
         stream,
-        cudf::get_current_device_resource_ref());
+        *mr_);
     using ScalarType = cudf::scalar_type_t<bool>;
     auto result = static_cast<ScalarType*>(isAllTrue.get());
     // If filter is not all true, apply the filter
@@ -277,11 +277,8 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     rmm::cuda_stream_view stream) {
   std::vector<ColumnOrView> columns;
   for (auto& projectEvaluator : projectEvaluators_) {
-    columns.push_back(projectEvaluator->eval(
-        inputTableColumns,
-        stream,
-        cudf::get_current_device_resource_ref(),
-        true));
+    columns.push_back(
+        projectEvaluator->eval(inputTableColumns, stream, *mr_, true));
   }
 
   // Rearrange columns to match outputType_
@@ -297,8 +294,7 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
       // Materialize the column_view into an owned column
       auto view = std::get<cudf::column_view>(columnOrView);
       outputColumns[resultProjections_[i].outputChannel] =
-          std::make_unique<cudf::column>(
-              view, stream, cudf::get_current_device_resource_ref());
+          std::make_unique<cudf::column>(view, stream, *mr_);
     }
   }
 
@@ -319,9 +315,7 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     } else {
       // Otherwise, copy the column and decrement the count
       outputColumns[identity.outputChannel] = std::make_unique<cudf::column>(
-          *inputTableColumns[identity.inputChannel],
-          stream,
-          cudf::get_current_device_resource_ref());
+          *inputTableColumns[identity.inputChannel], stream, *mr_);
     }
     VELOX_CHECK_GT(inputChannelCount[identity.inputChannel], 0);
     inputChannelCount[identity.inputChannel]--;

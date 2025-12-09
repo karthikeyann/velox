@@ -418,6 +418,7 @@ bool CompileState::compile(bool allowCpuFallback) {
 }
 
 std::shared_ptr<rmm::mr::device_memory_resource> mr_;
+std::shared_ptr<rmm::mr::device_memory_resource> temp_mr_;
 
 struct CudfDriverAdapter {
   CudfDriverAdapter(bool allowCpuFallback)
@@ -458,8 +459,18 @@ void registerCudf() {
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
   auto mr = cudf_velox::createMemoryResource(
       mrMode, CudfConfig::getInstance().memoryPercent);
-  cudf::set_current_device_resource(mr.get());
   mr_ = mr;
+  const std::string& temporaryMrMode =
+      CudfConfig::getInstance().temporaryMemoryResource;
+  if (temporaryMrMode == "none") {
+    rmm::mr::set_current_device_resource(mr.get());
+    temp_mr_ = mr;
+  } else {
+    auto temporaryMr = cudf_velox::createMemoryResource(
+        temporaryMrMode, CudfConfig::getInstance().memoryPercent);
+    rmm::mr::set_current_device_resource(temporaryMr.get());
+    temp_mr_ = temporaryMr;
+  }
 
   exec::Operator::registerOperator(
       std::make_unique<CudfHashJoinBridgeTranslator>());
@@ -476,6 +487,7 @@ void registerCudf() {
 
 void unregisterCudf() {
   mr_ = nullptr;
+  temp_mr_ = nullptr;
   exec::DriverFactory::adapters.erase(
       std::remove_if(
           exec::DriverFactory::adapters.begin(),
@@ -503,6 +515,9 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfMemoryResource) != config.end()) {
     memoryResource = config[kCudfMemoryResource];
+  }
+  if (config.find(kCudfTemporaryMemoryResource) != config.end()) {
+    temporaryMemoryResource = config[kCudfTemporaryMemoryResource];
   }
   if (config.find(kCudfMemoryPercent) != config.end()) {
     memoryPercent = folly::to<int32_t>(config[kCudfMemoryPercent]);

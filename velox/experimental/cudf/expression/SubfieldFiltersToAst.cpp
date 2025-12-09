@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
 
@@ -334,7 +335,7 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
   using Operation = cudf::ast::operation;
 
   auto stream = cudf::get_default_stream();
-  auto mr = cudf::get_current_device_resource_ref();
+  rmm::device_async_resource_ref mr = *mr_;
 
   switch (filter.kind()) {
     case common::FilterKind::kBigintRange: {

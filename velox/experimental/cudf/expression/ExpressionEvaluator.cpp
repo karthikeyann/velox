@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
@@ -117,7 +118,7 @@ class SplitFunction : public CudfFunction {
     using velox::exec::ConstantExpr;
 
     auto stream = cudf::get_default_stream();
-    auto mr = cudf::get_current_device_resource_ref();
+    rmm::device_async_resource_ref mr = *mr_;
 
     auto delimiterExpr =
         std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
@@ -388,7 +389,7 @@ class SubstrFunction : public CudfFunction {
     VELOX_CHECK_LE(expr->inputs().size(), 3, "substr expects at most 3 inputs");
 
     auto stream = cudf::get_default_stream();
-    auto mr = cudf::get_current_device_resource_ref();
+    rmm::device_async_resource_ref mr = *mr_;
 
     auto startExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
     VELOX_CHECK_NOT_NULL(startExpr, "substr start must be a constant");

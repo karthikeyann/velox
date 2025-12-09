@@ -261,8 +261,8 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     const auto originalNumColumns = cudfTableColumns.size();
     // Filter may need addtional computed columns which are added to
     // cudfTableColumns
-    auto filterResult = cudfExpressionEvaluator_->eval(
-        cudfTableColumns, stream_, cudf::get_current_device_resource_ref());
+    auto filterResult =
+        cudfExpressionEvaluator_->eval(cudfTableColumns, stream_, *mr_);
     // discard computed columns
     std::vector<std::unique_ptr<cudf::column>> originalColumns;
     originalColumns.reserve(originalNumColumns);
@@ -274,10 +274,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
         std::make_unique<cudf::table>(std::move(originalColumns));
     // Keep only rows where the filter is true
     cudfTable = cudf::apply_boolean_mask(
-        *originalTable,
-        asView(filterResult),
-        stream_,
-        cudf::get_current_device_resource_ref());
+        *originalTable, asView(filterResult), stream_, *mr_);
   }
   totalRemainingFilterTime_.fetch_add(
       filterTimeUs * 1000, std::memory_order_relaxed);
@@ -508,7 +505,7 @@ CudfHiveDataSource::createSplitReader() {
       cudfHiveConfig_->maxPassReadLimit(),
       readerOptions,
       stream_,
-      cudf::get_current_device_resource_ref());
+      *mr_);
 }
 
 void CudfHiveDataSource::resetSplit() {

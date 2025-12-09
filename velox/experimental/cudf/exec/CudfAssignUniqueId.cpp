@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/exec/CudfAssignUniqueId.h"
+#include "velox/experimental/cudf/exec/ToCudf.h"
 
 #include <cudf/lists/filling.hpp>
 
@@ -66,8 +67,7 @@ RowVectorPtr CudfAssignUniqueId::getOutput() {
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK(cudfVector, "Input must be a CudfVector");
   auto stream = cudfVector->stream();
-  auto uniqueIdColumn = generateIdColumn(
-      input_->size(), stream, cudf::get_current_device_resource_ref());
+  auto uniqueIdColumn = generateIdColumn(input_->size(), stream, *mr_);
   auto size = cudfVector->size();
   auto columns = cudfVector->release()->release();
   columns.push_back(std::move(uniqueIdColumn));

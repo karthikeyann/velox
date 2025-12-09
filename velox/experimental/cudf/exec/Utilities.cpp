@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
@@ -137,8 +138,7 @@ std::unique_ptr<cudf::table> concatenateTables(
       tables.end(),
       std::back_inserter(tableViews),
       [&](const auto& tbl) { return tbl->view(); });
-  return cudf::concatenate(
-      tableViews, stream, cudf::get_current_device_resource_ref());
+  return cudf::concatenate(tableViews, stream, *mr_);
 }
 
 std::unique_ptr<cudf::table> makeEmptyTable(TypePtr const& inputType) {
@@ -191,8 +191,7 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
     return tables[0]->release();
   }
 
-  auto output = cudf::concatenate(
-      tableViews, stream, cudf::get_current_device_resource_ref());
+  auto output = cudf::concatenate(tableViews, stream, *mr_);
   stream.synchronize();
   return output;
 }
@@ -242,7 +241,7 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
               std::vector<cudf::table_view>(
                   tableViews.begin() + startpos, tableViews.begin() + i),
               stream,
-              cudf::get_current_device_resource_ref()));
+              *mr_));
       startpos = i;
       runningRows = 0;
     }
@@ -255,7 +254,7 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
             std::vector<cudf::table_view>(
                 tableViews.begin() + startpos, tableViews.end()),
             stream,
-            cudf::get_current_device_resource_ref()));
+            *mr_));
   }
   stream.synchronize();
   return outputTables;

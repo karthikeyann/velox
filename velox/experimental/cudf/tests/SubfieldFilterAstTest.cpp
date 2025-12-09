@@ -64,7 +64,7 @@ class SubfieldFilterAstTest : public OperatorTestBase {
       const RowVectorPtr& vector,
       const cudf::ast::expression& expr) {
     auto stream = cudf::get_default_stream();
-    auto mr = cudf::get_current_device_resource_ref();
+    rmm::device_async_resource_ref mr = *mr_;
 
     {
       auto cudfTable =
@@ -528,7 +528,7 @@ TEST_F(SubfieldFilterAstTest, MultipleSubfieldFilters) {
   // Create input vector and evaluate using cuDF.
   auto vec = makeTestVector(rowType, 200);
   auto stream = cudf::get_default_stream();
-  auto mr = cudf::get_current_device_resource_ref();
+  rmm::device_async_resource_ref mr = *mr_;
 
   auto cudfTable =
       cudf_velox::with_arrow::toCudfTable(vec, pool_.get(), stream);

@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include "velox/experimental/cudf/exec/ToCudf.h"
+
 #include "velox/expression/ConstantExpr.h"
 #include "velox/type/Type.h"
 #include "velox/vector/BaseVector.h"
@@ -77,7 +79,7 @@ std::unique_ptr<cudf::scalar> makeScalarFromValue(
     bool isNull,
     std::optional<cudf::type_id> toType = std::nullopt) {
   auto stream = cudf::get_default_stream();
-  auto mr = cudf::get_current_device_resource_ref();
+  rmm::device_async_resource_ref mr = *mr_;
 
   if constexpr (cudf::is_fixed_width<T>()) {
     if (type->isDecimal()) {
