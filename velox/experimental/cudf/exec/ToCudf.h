@@ -61,7 +61,8 @@ struct TaskPipelineKey {
 };
 
 // Map to store ExchangeClientFacade instances by task and pipeline.
-// Declared in ToCudf.cpp to ensure a single instance across all translation units.
+// Declared in ToCudf.cpp to ensure a single instance across all translation
+// units.
 using ExchangeClientFacadeMap = std::unordered_map<
     TaskPipelineKey,
     std::shared_ptr<cudf_exchange::ExchangeClientFacade>,
