@@ -568,7 +568,9 @@ bool CompileState::compile(bool allowCpuFallback) {
       LOG(WARNING)
           << "Replacement with cuDF operator failed. Falling back to CPU execution for operator:"
           << oper->toString();
-      if (CudfConfig::getInstance().debugEnabled) {
+      // DNB: There's no plan node for the CallbackSink operator
+      // that reports "N/A" as the planNodeId.
+      if (CudfConfig::getInstance().debugEnabled && oper->planNodeId() != "N/A") {
         // print input types, output types
         auto planNode = getPlanNode(oper->planNodeId());
         LOG(INFO) << "Output type: " << planNode->outputType()->toString();
