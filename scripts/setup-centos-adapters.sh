@@ -25,6 +25,8 @@
 #     Use "n" to never wipe directories.
 # * VELOX_CUDA_VERSION="12.8": Which version of CUDA to install, will pick up
 #   CUDA_VERSION from the env
+# * VELOX_UCX_VERSION="1.19.0": Which version of ucx to install, will pick up
+#   UCX_VERSION from the env
 
 set -efx -o pipefail
 
@@ -39,27 +41,30 @@ function install_ucx {
   local NEEDS_AUTOGEN=false
 
   if [ "${VELOX_UCX_VERSION}" == "master" ]; then
-      echo "UCX version is 'master', performing git checkout..."
-      github_checkout "${UCX_REPO_NAME}" "${VELOX_UCX_VERSION}"
-      NEEDS_AUTOGEN=true
+    github_checkout "${UCX_REPO_NAME}" "${VELOX_UCX_VERSION}"
+    NEEDS_AUTOGEN=true
   else
-      echo "UCX version is '${VELOX_UCX_VERSION}', performing wget and untar..."
-      wget_and_untar https://github.com/openucx/ucx/releases/download/v"${VELOX_UCX_VERSION}"/ucx-"${VELOX_UCX_VERSION}".tar.gz ucx
+    wget_and_untar https://github.com/openucx/ucx/releases/download/v"${VELOX_UCX_VERSION}"/ucx-"${VELOX_UCX_VERSION}".tar.gz ucx
   fi
 
   (
     cd "${DEPENDENCY_DIR}"/ucx || exit
     if [ "${NEEDS_AUTOGEN}" = true ]; then
-      echo "Running autogen.sh for master branch..."
       ./autogen.sh
     fi
 
+    local CUDA_FLAG=""
+    if [ -d "/usr/local/cuda" ]; then
+      CUDA_FLAG="--with-cuda=/usr/local/cuda"
+    fi
+
     mkdir build-linux && cd build-linux
+
     ../contrib/configure-release --prefix="${INSTALL_PREFIX}" --with-sysroot --enable-cma \
-        --enable-mt --with-gnu-ld --with-rdmacm --with-verbs \
-        --with-cuda="/usr/local/cuda"
+      --enable-mt --with-gnu-ld --with-rdmacm --with-verbs \
+      --without-go --without-java ${CUDA_FLAG}
     make "-j${NPROC}"
-    ${SUDO} make install
+    make install
   )
 }
 
@@ -91,8 +96,7 @@ function install_cuda {
     libcufile-devel-"$dashed" \
     libnvjitlink-devel-"$dashed" \
     cuda-nvml-devel-"$dashed" \
-    libnvjitlink-devel-"$dashed"
-  dnf_install numactl-devel
+    numactl-devel
 }
 
 function install_adapters_deps_from_dnf {
