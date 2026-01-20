@@ -570,7 +570,8 @@ bool CompileState::compile(bool allowCpuFallback) {
           << oper->toString();
       // DNB: There's no plan node for the CallbackSink operator
       // that reports "N/A" as the planNodeId.
-      if (CudfConfig::getInstance().debugEnabled && oper->planNodeId() != "N/A") {
+      if (CudfConfig::getInstance().debugEnabled &&
+          oper->planNodeId() != "N/A") {
         // print input types, output types
         auto planNode = getPlanNode(oper->planNodeId());
         LOG(INFO) << "Output type: " << planNode->outputType()->toString();
@@ -729,7 +730,6 @@ void CudfConfig::initialize(
   if (config.find(kUcxxBlockingPolling) != config.end()) {
     ucxxBlockingPolling = folly::to<bool>(config[kUcxxBlockingPolling]);
   }
-
 }
 
 } // namespace facebook::velox::cudf_velox
