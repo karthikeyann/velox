@@ -151,6 +151,13 @@ bool CompileState::compile(bool allowCpuFallback) {
       auto projectPlanNode = std::dynamic_pointer_cast<const core::ProjectNode>(
           getPlanNode(filterProjectOp->planNodeId()));
       auto filterNode = filterProjectOp->filterNode();
+      bool canBeEvaluated = true;
+      if (projectPlanNode) {
+        if (projectPlanNode->sources()[0]->outputType()->size() == 0 ||
+            projectPlanNode->outputType()->size() == 0) {
+          return false;
+        }
+      }
 
       // Check filter separately.
       if (filterNode) {
@@ -181,6 +188,12 @@ bool CompileState::compile(bool allowCpuFallback) {
         std::dynamic_pointer_cast<const core::AggregationNode>(
             getPlanNode(op->planNodeId()));
     if (!aggregationPlanNode) {
+      return false;
+    }
+
+    if (aggregationPlanNode->sources()[0]->outputType()->size() == 0) {
+      // We cannot hande RowVectors with a length but no data.
+      // This is the case with count(*) global (without groupby)
       return false;
     }
 
@@ -570,7 +583,8 @@ bool CompileState::compile(bool allowCpuFallback) {
           << oper->toString();
       // DNB: There's no plan node for the CallbackSink operator
       // that reports "N/A" as the planNodeId.
-      if (CudfConfig::getInstance().debugEnabled && oper->planNodeId() != "N/A") {
+      if (CudfConfig::getInstance().debugEnabled &&
+          oper->planNodeId() != "N/A") {
         // print input types, output types
         auto planNode = getPlanNode(oper->planNodeId());
         LOG(INFO) << "Output type: " << planNode->outputType()->toString();
@@ -729,7 +743,6 @@ void CudfConfig::initialize(
   if (config.find(kUcxxBlockingPolling) != config.end()) {
     ucxxBlockingPolling = folly::to<bool>(config[kUcxxBlockingPolling]);
   }
-
 }
 
 } // namespace facebook::velox::cudf_velox
