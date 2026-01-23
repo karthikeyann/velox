@@ -295,7 +295,7 @@ jobs:
           export LD_LIBRARY_PATH=$DEPS_PATH/cudf-build:$DEPS_PATH/rmm-build:$LD_LIBRARY_PATH
           export LD_LIBRARY_PATH=$DEPS_PATH/kvikio-build:$DEPS_PATH/curl-build:$LD_LIBRARY_PATH
           export LD_LIBRARY_PATH=$DEPS_PATH/rapids_logger-build:$DEPS_PATH/nvcomp_proprietary_binary-src/lib64:$LD_LIBRARY_PATH
-          ctest --output-on-failure
+          /usr/local/bin/ctest --output-on-failure
 
   ubuntu-debug:
     runs-on: 8-core-ubuntu-22.04
