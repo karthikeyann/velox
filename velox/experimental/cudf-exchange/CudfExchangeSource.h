@@ -31,9 +31,9 @@
 
 #include <rmm/cuda_stream_pool.hpp>
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/mr/device/cuda_memory_resource.hpp>
-#include <rmm/mr/device/device_memory_resource.hpp>
-#include <rmm/mr/device/pool_memory_resource.hpp>
+#include <rmm/mr/cuda_memory_resource.hpp>
+#include <rmm/mr/device_memory_resource.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
 
 using namespace facebook::velox::exec;
 namespace facebook::velox::cudf_exchange {
@@ -87,7 +87,7 @@ class CudfExchangeSource
 
   // Returns runtime statistics. ExchangeSource is expected to report
   // background CPU time by including a runtime metric named
-  // ExchangeClient::kBackgroundCpuTimeMs.
+  // Operator::kBackgroundCpuTimeNanos.
   folly::F14FastMap<std::string, int64_t> stats() const;
 
   /// Returns runtime statistics. ExchangeSource is expected to report
