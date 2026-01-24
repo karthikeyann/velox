@@ -33,7 +33,6 @@
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 #include "velox/exec/tests/utils/VectorTestUtil.h"
-#include "velox/vector/VectorPrinter.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 
 #include <fmt/format.h>
@@ -1924,7 +1923,7 @@ TEST_P(MultiThreadedHashJoinTest, leftJoinWithFilter) {
     auto testBuildVectors = buildVectors;
     HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
         .injectSpill(false)
-        .numDrivers(numDrivers_)
+        .numDrivers(numDrivers_, false, false)
         .probeKeys({"c0"})
         .probeVectors(std::move(testProbeVectors))
         .buildKeys({"u_c0"})
@@ -1944,7 +1943,7 @@ TEST_P(MultiThreadedHashJoinTest, leftJoinWithFilter) {
     auto testBuildVectors = buildVectors;
     HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
         .injectSpill(false)
-        .numDrivers(numDrivers_)
+        .numDrivers(numDrivers_, false, false)
         .probeKeys({"c0"})
         .probeVectors(std::move(testProbeVectors))
         .buildKeys({"u_c0"})
@@ -1998,7 +1997,7 @@ TEST_P(MultiThreadedHashJoinTest, leftJoinWithNullableFilter) {
   HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
       .injectSpill(false)
       .checkSpillStats(false)
-      .numDrivers(numDrivers_)
+      .numDrivers(numDrivers_, false, false)
       .probeKeys({"c0"})
       .probeVectors(std::move(probeVectors))
       .buildKeys({"u_c0"})
@@ -6485,7 +6484,7 @@ TEST_F(HashJoinTest, leftJoinWithMissAtEndOfBatchMultipleBuildMatches) {
   test("t_k2 != 4 and t_k2 != 8");
 }
 
-TEST_F(HashJoinTest, DISABLED_leftJoinPreserveProbeOrder) {
+TEST_F(HashJoinTest, leftJoinPreserveProbeOrder) {
   const std::vector<RowVectorPtr> probeVectors = {
       makeRowVector(
           {"k1", "v1"},
