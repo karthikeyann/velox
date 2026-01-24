@@ -86,8 +86,8 @@ void CudfTpchBenchmark::initialize() {
         std::move(cudfHiveConfigurationValues));
 
     // Create cudfHive connector with config...
-    cudf_velox::connector::hive::CudfHiveConnectorFactory cudfHiveFactory;
-    auto cudfHiveConnector = cudfHiveFactory.newConnector(
+    cudf_velox::connector::hive::CudfHiveConnectorFactory CudfHiveFactory;
+    auto cudfHiveConnector = CudfHiveFactory.newConnector(
         facebook::velox::exec::test::kHiveConnectorId,
         cudfHiveProperties,
         ioExecutor_.get());

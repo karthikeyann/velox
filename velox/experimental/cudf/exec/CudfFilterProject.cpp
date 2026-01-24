@@ -38,8 +38,7 @@ namespace {
 void debugPrintTree(
     const std::shared_ptr<velox::exec::Expr>& expr,
     int indent = 0) {
-  std::cout << std::string(indent, ' ') << expr->name() << "("
-            << expr->type()->toString() << ")" << std::endl;
+  std::cout << std::string(indent, ' ') << expr->name() << std::endl;
   for (auto& input : expr->inputs()) {
     debugPrintTree(input, indent + 2);
   }
@@ -107,7 +106,10 @@ bool canBeEvaluatedByCudf(
   }
 
   auto precompilePool = memory::memoryManager()->addLeafPool(
-      "cudf-expr-precompile" + queryCtx->queryId(), /*threadSafe*/ false);
+      // Complains that LeafPool already exists
+      //"cudf-expr-precompile", /*threadSafe*/ false);
+      "",
+      /*threadSafe*/ false);
   core::ExecCtx precompileCtx(precompilePool.get(), queryCtx);
 
   bool lazyDereference = false;
