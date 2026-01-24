@@ -535,7 +535,7 @@ bool CompileState::compile(bool allowCpuFallback) {
       LOG(INFO) << "Operator: ID " << oper->operatorId() << ": "
                 << oper->toString().c_str()
                 << ", keepOperator = " << keepOperator
-                << ", replaceOp.size() = " << replaceOp.size() << "\n";
+                << ", replaceOp.size() = " << replaceOp.size() << ", ";
     }
     auto isGpuReplaceableOperator = [](const exec::Operator* op) {
       return isAnyOf<
@@ -569,8 +569,7 @@ bool CompileState::compile(bool allowCpuFallback) {
       LOG(INFO) << "isGpuReplaceableOperator = "
                 << isGpuReplaceableOperator(oper)
                 << ", isGpuAgnosticOperator = " << isGpuAgnosticOperator(oper)
-                << std::endl;
-      LOG(INFO) << "GPU operator condition = " << condition << std::endl;
+                << ", GPU operator condition = " << condition << std::endl;
     }
     if (!allowCpuFallback) {
       VELOX_CHECK(
@@ -581,6 +580,8 @@ bool CompileState::compile(bool allowCpuFallback) {
       LOG(WARNING)
           << "Replacement with cuDF operator failed. Falling back to CPU execution for operator:"
           << oper->toString();
+      LOG(WARNING) << "Replacement Failed PlanNode: "
+                   << planNode->toString(true, false) << std::endl;
       // DNB: There's no plan node for the CallbackSink operator
       // that reports "N/A" as the planNodeId.
       if (CudfConfig::getInstance().debugEnabled &&
