@@ -1167,10 +1167,10 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   // cudfInput is staying alive until the table view is no longer needed.
   auto leftTableView = cudfInput->getTableView();
   if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(1) << "Probe table number of columns: "
-              << leftTableView.num_columns() << std::endl;
+    VLOG(1) << "Probe table number of columns: " << leftTableView.num_columns()
+            << std::endl;
     VLOG(1) << "Probe table number of rows: " << leftTableView.num_rows()
-              << std::endl;
+            << std::endl;
   }
 
   auto& rightTables = hashObject_.value().first;
