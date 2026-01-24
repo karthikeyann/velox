@@ -26,7 +26,6 @@
 #include "velox/expression/ConstantExpr.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/ExprCompiler.h"
-#include "velox/expression/ExprOptimizer.h"
 #include "velox/expression/FieldReference.h"
 #include "velox/expression/LambdaExpr.h"
 #include "velox/expression/PeeledEncoding.h"
@@ -696,16 +695,35 @@ std::string onTopLevelException(VeloxException::Type exceptionType, void* arg) {
   if (strlen(basePath) == 0 && exceptionType == VeloxException::Type::kSystem) {
     basePath = FLAGS_velox_save_input_on_expression_system_failure_path.c_str();
   }
+
+  const auto& owner = context->expr()->vectorFunctionMetadata().owner;
   if (strlen(basePath) == 0) {
-    return fmt::format("Top-level Expression: {}", context->expr()->toString());
+    if (owner.empty()) {
+      return fmt::format(
+          "Top-level Expression: {}", context->expr()->toString());
+    }
+    return fmt::format(
+        "Owner: {}. Top-level Expression: {}",
+        owner,
+        context->expr()->toString());
   }
 
   // Save input vector to a file.
   context->persistDataAndSql(basePath);
 
+  if (owner.empty()) {
+    return fmt::format(
+        "Top-level Expression: {}. Input data: {}. SQL expression: {}."
+        " All SQL expressions: {}. ",
+        context->expr()->toString(),
+        context->dataPath(),
+        context->sqlPath(),
+        context->allExprSqlPath());
+  }
   return fmt::format(
-      "Top-level Expression: {}. Input data: {}. SQL expression: {}."
+      "Owner: {}. Top-level Expression: {}. Input data: {}. SQL expression: {}."
       " All SQL expressions: {}. ",
+      owner,
       context->expr()->toString(),
       context->dataPath(),
       context->sqlPath(),
@@ -716,7 +734,12 @@ std::string onTopLevelException(VeloxException::Type exceptionType, void* arg) {
 /// sub-expression. Returns the output of Expr::toString() for the
 /// sub-expression.
 std::string onException(VeloxException::Type /*exceptionType*/, void* arg) {
-  return static_cast<Expr*>(arg)->toString();
+  auto* expr = static_cast<Expr*>(arg);
+  const auto& owner = expr->vectorFunctionMetadata().owner;
+  if (owner.empty()) {
+    return static_cast<Expr*>(arg)->toString();
+  }
+  return fmt::format("Owner: {}. Expression: {}", owner, expr->toString());
 }
 } // namespace
 
@@ -1771,8 +1794,8 @@ common::Subfield extractSubfield(
         break;
       case TypeKind::VARCHAR:
         path.push_back(
-            std::make_unique<common::Subfield::StringSubscript>(
-                index->value()->as<ConstantVector<StringView>>()->value()));
+            std::make_unique<common::Subfield::StringSubscript>(std::string(
+                index->value()->as<ConstantVector<StringView>>()->value())));
         break;
       default:
         return {};
@@ -1847,20 +1870,10 @@ void validateLazyDereference(const std::vector<std::shared_ptr<Expr>>& exprs) {
 ExprSet::ExprSet(
     const std::vector<core::TypedExprPtr>& sources,
     core::ExecCtx* execCtx,
-    bool optimize,
+    bool enableConstantFolding,
     bool lazyDereference)
     : execCtx_(execCtx), lazyDereference_(lazyDereference) {
-  if (optimize) {
-    std::vector<core::TypedExprPtr> optimizedExprs;
-    for (const auto& source : sources) {
-      optimizedExprs.push_back(
-          expression::optimize(source, execCtx->queryCtx(), execCtx->pool()));
-    }
-    exprs_ = compileExpressions(optimizedExprs, execCtx, this);
-  } else {
-    exprs_ = compileExpressions(sources, execCtx, this);
-  }
-
+  exprs_ = compileExpressions(sources, execCtx, this, enableConstantFolding);
   if (lazyDereference_) {
     validateLazyDereference(exprs_);
   }
@@ -2145,9 +2158,10 @@ VectorPtr tryEvaluateConstantExpressionInternal(
     memory::MemoryPool* pool,
     core::ExecCtx* execCtx,
     bool suppressEvaluationFailures) {
-  // Disable expression optimization to avoid an infinite loop between
-  // ExprOptimizer and ExprSet.
-  velox::exec::ExprSet exprSet({expr}, execCtx, /*optimize*/ false);
+  // Disable constant folding to avoid an infinite loop between ExprOptimizer
+  // and ExprCompiler.
+  velox::exec::ExprSet exprSet(
+      {expr}, execCtx, /*enableConstantFolding*/ false);
 
   // The construction of ExprSet involves compiling and constant folding the
   // expression. If constant folding succeeded, then we get a ConstantExpr.

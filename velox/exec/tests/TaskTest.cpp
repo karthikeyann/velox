@@ -256,7 +256,8 @@ class ExternalBlocker {
  public:
   folly::SemiFuture<folly::Unit> continueFuture() {
     if (isBlocked_) {
-      auto [promise, future] = makeVeloxContinuePromiseContract();
+      auto [promise, future] =
+          makeVeloxContinuePromiseContract("ExternalBlocker::continueFuture");
       continuePromise_ = std::move(promise);
       return std::move(future);
     }
@@ -3007,7 +3008,7 @@ class TestBarrierOperator : public exec::Operator {
       return nullptr;
     }
     auto output = inputs_.front();
-    inputs_.erase(inputs_.begin());
+    inputs_.erase(inputs_.cbegin());
     return output;
   }
 

@@ -109,9 +109,9 @@ class ExchangeClientTest
     return pageSize;
   }
 
-  std::vector<std::unique_ptr<SerializedPage>>
+  std::vector<std::unique_ptr<SerializedPageBase>>
   fetchPages(int consumerId, ExchangeClient& client, int32_t numPages) {
-    std::vector<std::unique_ptr<SerializedPage>> allPages;
+    std::vector<std::unique_ptr<SerializedPageBase>> allPages;
     for (auto i = 0; i < numPages; ++i) {
       bool atEnd{false};
       ContinueFuture future;
@@ -139,7 +139,7 @@ class ExchangeClientTest
 
   static void enqueue(
       ExchangeQueue& queue,
-      std::unique_ptr<SerializedPage> page) {
+      std::unique_ptr<SerializedPageBase> page) {
     std::vector<ContinuePromise> promises;
     {
       std::lock_guard<std::mutex> l(queue.mutex());
@@ -150,10 +150,10 @@ class ExchangeClientTest
     }
   }
 
-  static std::unique_ptr<SerializedPage> makePage(uint64_t size) {
+  static std::unique_ptr<SerializedPageBase> makePage(uint64_t size) {
     auto ioBuf = folly::IOBuf::create(size);
     ioBuf->append(size);
-    return std::make_unique<SerializedPage>(std::move(ioBuf), nullptr, 1);
+    return std::make_unique<PrestoSerializedPage>(std::move(ioBuf), nullptr, 1);
   }
 
   folly::Executor* executor() const {
@@ -1064,6 +1064,83 @@ TEST_P(ExchangeClientTest, skipRequestDataSizeNotTriggeredWithMultipleSources) {
   }
 
   client->close();
+}
+
+// Test that lazyFetching=true defers data fetching until next() is called.
+// When lazyFetching=false (default), fetching starts immediately when remote
+// tasks are added via pickSourcesToRequestLocked(). When lazyFetching=true,
+// pickSourcesToRequestLocked() is not called in addRemoteTaskId(), deferring
+// the fetch until next() is called. This is useful for cached hash table
+// scenarios where waiter tasks may not need the data if the table is already
+// cached.
+TEST_P(ExchangeClientTest, lazyFetching) {
+  auto data = makeRowVector({makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
+
+  // Test with lazyFetching=false (default behavior).
+  // Verify that fetching starts and we can retrieve pages normally.
+  {
+    auto taskId = "local://eager-fetching-test";
+    auto task = makeTask(taskId);
+
+    bufferManager_->initializeTask(
+        task, core::PartitionedOutputNode::Kind::kPartitioned, 100, 16);
+
+    auto client = std::make_shared<ExchangeClient>(
+        "t",
+        17,
+        ExchangeClient::kDefaultMaxQueuedBytes,
+        1,
+        kDefaultMinExchangeOutputBatchBytes,
+        pool(),
+        executor(),
+        10, // requestDataSizesMaxWaitSec
+        false, // skipRequestDataSizeWithSingleSource
+        false); // lazyFetching=false (default)
+
+    client->addRemoteTaskId(taskId);
+    enqueue(taskId, 17, data);
+
+    auto pages = fetchPages(1, *client, 1);
+    ASSERT_EQ(1, pages.size());
+
+    task->requestCancel();
+    bufferManager_->removeTask(taskId);
+    client->close();
+  }
+
+  // Test with lazyFetching=true.
+  // Verify that we can still retrieve pages (fetch is triggered by next()).
+  {
+    auto taskId = "local://lazy-fetching-test";
+    auto task = makeTask(taskId);
+
+    bufferManager_->initializeTask(
+        task, core::PartitionedOutputNode::Kind::kPartitioned, 100, 16);
+
+    auto client = std::make_shared<ExchangeClient>(
+        "t",
+        17,
+        ExchangeClient::kDefaultMaxQueuedBytes,
+        1,
+        kDefaultMinExchangeOutputBatchBytes,
+        pool(),
+        executor(),
+        10, // requestDataSizesMaxWaitSec
+        false, // skipRequestDataSizeWithSingleSource
+        true); // lazyFetching=true
+
+    client->addRemoteTaskId(taskId);
+    enqueue(taskId, 17, data);
+
+    // Even with lazy fetching, we should be able to retrieve pages
+    // since next() triggers the fetch.
+    auto pages = fetchPages(1, *client, 1);
+    ASSERT_EQ(1, pages.size());
+
+    task->requestCancel();
+    bufferManager_->removeTask(taskId);
+    client->close();
+  }
 }
 
 // Test the new hasNoMoreSources() API

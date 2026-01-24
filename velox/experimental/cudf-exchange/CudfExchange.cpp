@@ -55,7 +55,8 @@ void CudfExchange::addRemoteTaskIds(std::vector<std::string>& remoteTaskIds) {
   std::shuffle(std::begin(remoteTaskIds), std::end(remoteTaskIds), rng_);
   for (const std::string& remoteTaskId : remoteTaskIds) {
     exchangeClient_->addRemoteTaskId(remoteTaskId);
-    VLOG(3) << "@" << taskId() << " CudfExchange::addRemoteTasksIds: " << remoteTaskId;
+    VLOG(3) << "@" << taskId()
+            << " CudfExchange::addRemoteTasksIds: " << remoteTaskId;
   }
   stats_.wlock()->numSplits += remoteTaskIds.size();
 }
@@ -201,14 +202,12 @@ void CudfExchange::recordExchangeClientStats() {
     lockedStats->runtimeStats.insert({name, value});
   }
 
-  auto backgroundCpuTimeMs =
-      exchangeClientStats.find(ExchangeClient::kBackgroundCpuTimeMs);
-  if (backgroundCpuTimeMs != exchangeClientStats.end()) {
+  const auto iter = exchangeClientStats.find(Operator::kBackgroundCpuTimeNanos);
+  if (iter != exchangeClientStats.end()) {
     const CpuWallTiming backgroundTiming{
-        static_cast<uint64_t>(backgroundCpuTimeMs->second.count),
+        static_cast<uint64_t>(iter->second.count),
         0,
-        static_cast<uint64_t>(backgroundCpuTimeMs->second.sum) *
-            Timestamp::kNanosecondsInMillisecond};
+        static_cast<uint64_t>(iter->second.sum)};
     lockedStats->backgroundTiming.clear();
     lockedStats->backgroundTiming.add(backgroundTiming);
   }

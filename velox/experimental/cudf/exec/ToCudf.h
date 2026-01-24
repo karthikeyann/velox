@@ -21,7 +21,7 @@
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 
-#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device_memory_resource.hpp>
 
 #include <gflags/gflags.h>
 
