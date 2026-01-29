@@ -83,7 +83,15 @@ CudfFromVelox::CudfFromVelox(
       NvtxHelper(
           nvtx3::rgb{255, 140, 0}, // Orange
           operatorId,
-          fmt::format("[{}]", planNodeId)) {}
+          fmt::format("[{}]", planNodeId)) {
+  // Setup identity projections for all columns since this operator passes
+  // all columns through unchanged. This is needed for dynamic filter pushdown.
+  const auto numColumns = outputType->size();
+  identityProjections_.reserve(numColumns);
+  for (column_index_t i = 0; i < numColumns; ++i) {
+    identityProjections_.emplace_back(i, i);
+  }
+}
 
 void CudfFromVelox::addInput(RowVectorPtr input) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
@@ -175,7 +183,15 @@ CudfToVelox::CudfToVelox(
       NvtxHelper(
           nvtx3::rgb{148, 0, 211}, // Purple
           operatorId,
-          fmt::format("[{}]", planNodeId)) {}
+          fmt::format("[{}]", planNodeId)) {
+  // Setup identity projections for all columns since this operator passes
+  // all columns through unchanged. This is needed for dynamic filter pushdown.
+  const auto numColumns = outputType->size();
+  identityProjections_.reserve(numColumns);
+  for (column_index_t i = 0; i < numColumns; ++i) {
+    identityProjections_.emplace_back(i, i);
+  }
+}
 
 bool CudfToVelox::isPassthroughMode() const {
   return operatorCtx_->driverCtx()->queryConfig().get<bool>(
