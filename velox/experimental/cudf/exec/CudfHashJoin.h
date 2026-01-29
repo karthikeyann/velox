@@ -31,6 +31,8 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <folly/container/F14Set.h>
+
 #include <memory>
 
 namespace facebook::velox::cudf_velox {
@@ -210,6 +212,18 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   // For Right joins, only one driver collects the unmatched rows mask and
   // emits. This value is set true only for that driver. See noMoreInput
   bool isLastDriver_{false};
+
+  /// Tracks which key channels have already produced dynamic filters.
+  /// Used to avoid producing duplicate filters across peer operators.
+  folly::F14FastSet<column_index_t> dynamicFiltersProducedOnChannels_;
+
+  /// Finds all peer CudfHashJoinProbe operators in the same pipeline.
+  /// Used to coordinate dynamic filter production across parallel operators.
+  std::vector<CudfHashJoinProbe*> findPeerOperators();
+
+  /// Generates BigIntRange filters from build-side key columns and pushes
+  /// them upstream to TableScan via Driver::pushdownFilters().
+  void pushdownDynamicFilters();
 
   static constexpr auto oobPolicy = cudf::out_of_bounds_policy::NULLIFY;
   /**

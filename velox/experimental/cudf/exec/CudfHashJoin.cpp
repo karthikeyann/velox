@@ -23,7 +23,9 @@
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/core/PlanNode.h"
+#include "velox/exec/Driver.h"
 #include "velox/exec/Task.h" // NOLINT(misc-unused-headers)
+#include "velox/type/Filter.h"
 #include "velox/type/TypeUtil.h"
 
 #include <cudf/aggregation.hpp>
@@ -1096,6 +1098,139 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
   return cudfOutputs;
 }
 
+std::vector<CudfHashJoinProbe*> CudfHashJoinProbe::findPeerOperators() {
+  auto task = operatorCtx_->task();
+  const std::vector<exec::Operator*> operators =
+      task->findPeerOperators(operatorCtx_->driverCtx()->pipelineId, this);
+  std::vector<CudfHashJoinProbe*> probeOps;
+  probeOps.reserve(operators.size());
+  for (auto* op : operators) {
+    auto* probeOp = dynamic_cast<CudfHashJoinProbe*>(op);
+    probeOps.push_back(probeOp);
+  }
+  return probeOps;
+}
+
+void CudfHashJoinProbe::pushdownDynamicFilters() {
+  const bool debugEnabled = CudfConfig::getInstance().debugEnabled;
+  VLOG_IF(2, debugEnabled) << "CudfHashJoinProbe::pushdownDynamicFilters for "
+                           << planNodeId();
+
+  auto* driver = operatorCtx_->driverCtx()->driver;
+
+  // Get the build tables to extract min/max from key columns
+  auto& rightTables = hashObject_.value().first;
+  if (rightTables.empty() || rightTables[0]->num_rows() == 0) {
+    VLOG_IF(2, debugEnabled) << "  Build table empty, skipping dynamic filters";
+    return;
+  }
+
+  auto stream = cudfGlobalStreamPool().get_stream();
+
+  // Convert leftKeyIndices_ (cudf::size_type/int) to column_index_t (uint32_t)
+  // for compatibility with Driver::pushdownFilters()
+  std::vector<column_index_t> keyChannels;
+  keyChannels.reserve(leftKeyIndices_.size());
+  for (size_t i = 0; i < leftKeyIndices_.size(); ++i) {
+    keyChannels.push_back(static_cast<column_index_t>(leftKeyIndices_[i]));
+  }
+
+  auto numFilters = driver->pushdownFilters(
+      this,
+      keyChannels,
+      [&](column_index_t sourceChannel,
+          std::shared_ptr<common::Filter>& filter) {
+        // Skip if filter already produced for this channel
+        if (dynamicFiltersProducedOnChannels_.contains(sourceChannel)) {
+          return true;
+        }
+
+        // Get the build table key column index
+        auto keyIndex = rightKeyIndices_[sourceChannel];
+
+        // Get the type of the key column
+        auto keyColType = rightTables[0]->view().column(keyIndex).type();
+
+        // Only support BIGINT (INT64) for now, matching CPU HashProbe behavior
+        if (keyColType.id() != cudf::type_id::INT64) {
+          VLOG_IF(2, debugEnabled)
+              << "  Skipping dynamic filter for channel " << sourceChannel
+              << ": not INT64 (type=" << static_cast<int>(keyColType.id())
+              << ")";
+          return false;
+        }
+
+        // Extract min/max across all build table batches
+        int64_t globalMin = std::numeric_limits<int64_t>::max();
+        int64_t globalMax = std::numeric_limits<int64_t>::min();
+
+        for (const auto& table : rightTables) {
+          auto keyCol = table->view().column(keyIndex);
+          if (keyCol.size() == 0) {
+            continue;
+          }
+
+          // Compute min
+          auto minScalar = cudf::reduce(
+              keyCol,
+              *cudf::make_min_aggregation<cudf::reduce_aggregation>(),
+              keyCol.type(),
+              stream,
+              cudf::get_current_device_resource_ref());
+
+          // Compute max
+          auto maxScalar = cudf::reduce(
+              keyCol,
+              *cudf::make_max_aggregation<cudf::reduce_aggregation>(),
+              keyCol.type(),
+              stream,
+              cudf::get_current_device_resource_ref());
+
+          // Synchronize to ensure reduction is complete before reading values
+          stream.synchronize();
+
+          // Extract values from scalars
+          if (minScalar->is_valid() && maxScalar->is_valid()) {
+            auto* minNumeric =
+                static_cast<cudf::numeric_scalar<int64_t>*>(minScalar.get());
+            auto* maxNumeric =
+                static_cast<cudf::numeric_scalar<int64_t>*>(maxScalar.get());
+
+            globalMin = std::min(globalMin, minNumeric->value(stream));
+            globalMax = std::max(globalMax, maxNumeric->value(stream));
+          }
+        }
+
+        // If we found valid min/max values, create the filter
+        if (globalMin <= globalMax) {
+          filter = std::make_unique<common::BigintRange>(
+              globalMin, globalMax, /*nullAllowed=*/false);
+
+          // Important: Log filter creation at INFO level
+          if (debugEnabled) {
+            LOG(INFO) << "CudfHashJoinProbe " << planNodeId()
+                      << ": Created dynamic filter BigintRange[" << globalMin
+                      << ", " << globalMax << "] for channel " << sourceChannel;
+          }
+
+          // Track that we've produced this filter
+          dynamicFiltersProducedOnChannels_.insert(sourceChannel);
+
+          // Also mark peer operators to avoid duplicate filter production
+          for (auto* peer : findPeerOperators()) {
+            peer->dynamicFiltersProducedOnChannels_.insert(sourceChannel);
+          }
+          return true;
+        }
+
+        return false;
+      });
+
+  if (numFilters > 0) {
+    addRuntimeStat("dynamicFiltersProduced", RuntimeCounter(numFilters));
+  }
+}
+
 RowVectorPtr CudfHashJoinProbe::getOutput() {
   if (CudfConfig::getInstance().debugEnabled) {
     LOG(INFO) << "Calling CudfHashJoinProbe::getOutput" << std::endl;
@@ -1314,6 +1449,16 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
         skipInput_ = true;
       }
     }
+  } else if (
+      (joinNode_->isInnerJoin() || joinNode_->isLeftSemiFilterJoin() ||
+       joinNode_->isRightSemiFilterJoin() || joinNode_->isRightJoin()) &&
+      operatorCtx_->driverCtx()
+          ->queryConfig()
+          .hashProbeDynamicFilterPushdownEnabled()) {
+    // Push down dynamic filters based on build-side key ranges.
+    // This is done when the build table is non-empty and the query config
+    // enables dynamic filter pushdown for hash probe.
+    pushdownDynamicFilters();
   }
   if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) &&
       future_.valid()) {
