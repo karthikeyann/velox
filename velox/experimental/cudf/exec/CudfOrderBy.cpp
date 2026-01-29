@@ -37,6 +37,14 @@ CudfOrderBy::CudfOrderBy(
           operatorId,
           fmt::format("[{}]", orderByNode->id())),
       orderByNode_(orderByNode) {
+  // Setup identity projections for all columns (OrderBy passes all columns
+  // through). This is used for dynamic filter pushdown.
+  const auto numColumns = orderByNode->outputType()->size();
+  identityProjections_.reserve(numColumns);
+  for (column_index_t i = 0; i < numColumns; ++i) {
+    identityProjections_.emplace_back(i, i);
+  }
+
   sortKeys_.reserve(orderByNode->sortingKeys().size());
   columnOrder_.reserve(orderByNode->sortingKeys().size());
   nullOrder_.reserve(orderByNode->sortingKeys().size());

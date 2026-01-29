@@ -643,8 +643,11 @@ void CudfHashAggregation::initialize() {
   // output types reported by aggregation functions. We can't do that in cudf
   // groupby.
 
-  // TODO: Set identity projections used by HashProbe to pushdown dynamic
-  // filters to table scan.
+  // Set identity projections for grouping keys. This is used by HashProbe
+  // to pushdown dynamic filters to table scan.
+  for (auto i = 0; i < groupingKeyInputChannels_.size(); ++i) {
+    identityProjections_.emplace_back(groupingKeyInputChannels_[i], i);
+  }
 
   // TODO: Add support for grouping sets and group ids.
 

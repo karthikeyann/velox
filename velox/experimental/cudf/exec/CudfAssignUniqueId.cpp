@@ -44,6 +44,18 @@ CudfAssignUniqueId::CudfAssignUniqueId(
       "Unique 24-bit ID specified for CudfAssignUniqueId exceeds the limit");
   uniqueValueMask_ = static_cast<int64_t>(uniqueTaskId) << 40;
 
+  // Setup identity projections for all input columns (output columns except the
+  // last which is the unique ID column).
+  const auto numColumns = planNode->outputType()->size();
+  identityProjections_.reserve(numColumns - 1);
+  for (column_index_t i = 0; i < numColumns - 1; ++i) {
+    identityProjections_.emplace_back(i, i);
+  }
+
+  // The unique ID result goes to the last output column.
+  resultProjections_.emplace_back(0, numColumns - 1);
+  results_.resize(1);
+
   rowIdCounter_ = 0;
   maxRowIdCounterValue_ = 0;
 }

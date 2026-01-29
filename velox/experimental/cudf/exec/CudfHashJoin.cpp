@@ -384,6 +384,19 @@ CudfHashJoinProbe::CudfHashJoinProbe(
     }
   }
 
+  // Setup identity projections for probe columns that appear in the output.
+  // This is used by dynamic filter pushdown to table scan.
+  // Only set for non-right and non-full joins (consistent with CPU HashProbe).
+  if (!joinNode_->isRightJoin() && !joinNode_->isFullJoin()) {
+    for (auto i = 0; i < probeType->size(); ++i) {
+      auto& name = probeType->nameOf(i);
+      auto outIndex = outputType->getChildIdxIfExists(name);
+      if (outIndex.has_value()) {
+        identityProjections_.emplace_back(i, *outIndex);
+      }
+    }
+  }
+
   // Setup filter in case it exists
   if (joinNode_->filter()) {
     // simplify expression

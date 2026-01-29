@@ -107,6 +107,14 @@ CudfLocalPartition::CudfLocalPartition(
       numPartitions_ == 1 || partitionKeyIndices_.size() > 0 ||
       partitionFunctionType_ == PartitionFunctionType::kRoundRobin);
 
+  // Setup identity projections for all columns (LocalPartition passes all
+  // columns through). This is used for dynamic filter pushdown.
+  const auto numColumns = planNode->outputType()->size();
+  identityProjections_.reserve(numColumns);
+  for (column_index_t i = 0; i < numColumns; ++i) {
+    identityProjections_.emplace_back(i, i);
+  }
+
   // Since we're replacing the LocalPartition with CudfLocalPartition, the
   // number of producers is already set. Adding producer only adds to a counter
   // which we don't have to do again.

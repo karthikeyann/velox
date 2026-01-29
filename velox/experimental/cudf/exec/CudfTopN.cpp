@@ -43,6 +43,14 @@ CudfTopN::CudfTopN(
       CudfQueryConfig::kCudfTopNBatchSize, kBatchSize_);
   const auto numColumns{outputType_->children().size()};
   const auto numSortingKeys{topNNode->sortingKeys().size()};
+
+  // Setup identity projections for all columns (TopN passes all columns
+  // through). This is used for dynamic filter pushdown.
+  identityProjections_.reserve(numColumns);
+  for (column_index_t i = 0; i < numColumns; ++i) {
+    identityProjections_.emplace_back(i, i);
+  }
+
   std::vector<bool> isSortingKey(numColumns);
   sortKeys_.reserve(numSortingKeys);
   columnOrder_.reserve(numSortingKeys);
