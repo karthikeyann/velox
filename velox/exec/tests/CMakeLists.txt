@@ -63,6 +63,7 @@ set(
   MixedUnionWithTableScanTest.cpp
   MemoryReclaimerTest.cpp
   EnforceDistinctTest.cpp
+  TpcdsPlanFromJsonTest.cpp
   TraceUtilTest.cpp
   HashPartitionFunctionTest.cpp
   SpatialIndexTest.cpp
