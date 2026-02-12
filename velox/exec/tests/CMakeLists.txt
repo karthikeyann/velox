@@ -64,6 +64,7 @@ set(
   MemoryReclaimerTest.cpp
   EnforceDistinctTest.cpp
   TpcdsPlanFromJsonTest.cpp
+  VeloxPlanLoaderTest.cpp
   TraceUtilTest.cpp
   HashPartitionFunctionTest.cpp
   SpatialIndexTest.cpp
