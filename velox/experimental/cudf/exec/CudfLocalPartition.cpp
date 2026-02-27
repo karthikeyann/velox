@@ -210,9 +210,10 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
             stream);
       } else if (
           partitionFunctionType_ == PartitionFunctionType::kRoundRobinRow) {
-        return cudf::round_robin_partition(
+        auto result = cudf::round_robin_partition(
             tableView, numPartitions_, counter_, stream);
         counter_ = (counter_ + cudfVector->size()) % numPartitions_;
+        return result;
       }
       VELOX_FAIL("Unsupported partition function");
     }();
@@ -251,6 +252,11 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
           stream);
       enqueuePartition(i, partitionCudfVector);
     }
+    // Ensure all async GPU work (hash_partition, split, table copies) is
+    // complete before returning. Without this, the consumer on a different
+    // driver thread may read the partitioned data on a different CUDA stream
+    // before the GPU work on this stream finishes — a cross-stream race.
+    stream.synchronize();
   } else {
     // Single partition case.
     ContinueFuture future;
