@@ -1131,6 +1131,11 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftSemiFilterJoin(
     auto rightTableView = rightTables[i]->view();
     std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftJoinIndices;
 
+    if (buildStream_.has_value()) {
+      // Make probe stream wait for build data to be ready on buildStream_.
+      cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+    }
+
     if (joinNode_->filter()) {
       leftJoinIndices = cudf::mixed_left_semi_join(
           leftTableView.select(leftKeyIndices_),
@@ -1182,6 +1187,11 @@ CudfHashJoinProbe::rightSemiFilterJoin(
       1,
       "Multiple right tables not yet supported for rightSemiFilterJoin");
 
+  if (buildStream_.has_value()) {
+    // Make probe stream wait for build data to be ready on buildStream_.
+    cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+  }
+
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> rightJoinIndices;
   if (joinNode_->filter()) {
     rightJoinIndices = cudf::mixed_left_semi_join(
@@ -1231,6 +1241,11 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
       "Multiple right tables not yet supported for antiJoin");
 
   auto rightTableView = rightTables[0]->view();
+
+  if (buildStream_.has_value()) {
+    // Make probe stream wait for build data to be ready on buildStream_.
+    cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+  }
 
   // For the special case where we need to drop nulls, we create a local table.
   // Otherwise, we use the input view directly.
