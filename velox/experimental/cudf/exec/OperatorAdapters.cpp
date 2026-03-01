@@ -31,6 +31,7 @@
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+#include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 
 #include "velox/exec/AssignUniqueId.h"
 #include "velox/exec/CallbackSink.h"
@@ -256,6 +257,11 @@ class AggregationAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<const core::AggregationNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
+    if (CudfConfig::getInstance().concatOptimizationEnabled) {
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(
+              operatorId, ctx, aggregationPlanNode));
+    }
     result.push_back(
         std::make_unique<CudfHashAggregation>(
             operatorId, ctx, aggregationPlanNode));

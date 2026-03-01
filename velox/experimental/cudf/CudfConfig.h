@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -47,6 +48,12 @@ struct CudfConfig {
   static constexpr const char* kUcxxBlockingPolling{"ucxx.blocking_polling"};
   static constexpr const char* kCudfExchangeLogLevel{
       "cudf.exchange_log_level"};
+  static constexpr const char* kCudfBatchSizeMinThreshold{
+      "cudf.batch_size_min_threshold"};
+  static constexpr const char* kCudfBatchSizeMaxThreshold{
+      "cudf.batch_size_max_threshold"};
+  static constexpr const char* kCudfConcatOptimizationEnabled{
+      "cudf.concat_optimization_enabled"};
 
   /// Singleton CudfConfig instance.
   /// Clients must set the configs below before invoking registerCudf().
@@ -115,6 +122,23 @@ struct CudfConfig {
   /// VLOG level for cudf-exchange source files (0 = silent, 1-3 = increasing
   /// verbosity). Applied via google::SetVLOGLevel when Communicator starts.
   int32_t exchangeLogLevel{0};
+
+  /// Whether to insert CudfBatchConcat operators before supported Cudf
+  /// operators.
+  /// This can improve performance by reducing the number of cuda kernel
+  /// launches on addInput of certain operators by collecting a minimum number
+  /// of rows before concatenating and passing on to the next operator.
+  /// This batch size is determined by batchSizeMinThreshold and
+  /// batchSizeMaxThreshold
+  bool concatOptimizationEnabled{false};
+
+  /// Minimum rows to accumulate before GPU-side concatenation in
+  /// `CudfBatchConcat` (default 100k).
+  int32_t batchSizeMinThreshold{100000};
+
+  /// Maximum rows allowed in a concatenated batch (user configurable).
+  /// When not set, cuDF's own `size_type::max()` is used.
+  std::optional<int32_t> batchSizeMaxThreshold;
 };
 
 } // namespace facebook::velox::cudf_velox
