@@ -18,6 +18,8 @@
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
+#include "velox/common/base/RuntimeMetrics.h"
+
 #include <cudf/detail/copy.hpp>
 #include <cudf/detail/gather.hpp>
 #include <cudf/merge.hpp>
@@ -196,5 +198,10 @@ void CudfTopN::noMoreInput() {
 
 bool CudfTopN::isFinished() {
   return finished_;
+}
+
+void CudfTopN::close() {
+  RuntimeStatWriterScopeGuard statsGuard(this);
+  Operator::close();
 }
 } // namespace facebook::velox::cudf_velox

@@ -22,6 +22,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
 #include "velox/exec/HashAggregation.h"
@@ -878,6 +879,7 @@ CudfHashAggregation::CudfHashAggregation(
           driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
 
 void CudfHashAggregation::initialize() {
+  RuntimeStatWriterScopeGuard statsGuard(this);
   Operator::initialize();
 
   inputType_ = aggregationNode_->sources()[0]->outputType();
@@ -1248,6 +1250,11 @@ void CudfHashAggregation::noMoreInput() {
 
 bool CudfHashAggregation::isFinished() {
   return finished_;
+}
+
+void CudfHashAggregation::close() {
+  RuntimeStatWriterScopeGuard statsGuard(this);
+  Operator::close();
 }
 
 // Step-aware aggregation registry implementation

@@ -109,6 +109,8 @@ class CudfHashJoinBuild : public exec::Operator, public NvtxHelper {
 
   bool isFinished() override;
 
+  void close() override;
+
  private:
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   std::vector<CudfVectorPtr> inputs_;

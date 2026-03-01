@@ -19,6 +19,8 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "velox/common/base/RuntimeMetrics.h"
+
 #include <cudf/copying.hpp>
 
 namespace facebook::velox::cudf_velox {

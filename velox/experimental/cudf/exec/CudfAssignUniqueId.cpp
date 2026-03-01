@@ -17,6 +17,8 @@
 #include "velox/experimental/cudf/exec/CudfAssignUniqueId.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
+#include "velox/common/base/RuntimeMetrics.h"
+
 #include <cudf/lists/filling.hpp>
 
 #include <utility>
@@ -157,5 +159,10 @@ void CudfAssignUniqueId::requestRowIds() {
   rowIdCounter_ = rowIdPool_->fetch_add(kRowIdsPerRequest);
   maxRowIdCounterValue_ =
       std::min(rowIdCounter_ + kRowIdsPerRequest, kMaxRowId);
+}
+
+void CudfAssignUniqueId::close() {
+  RuntimeStatWriterScopeGuard statsGuard(this);
+  Operator::close();
 }
 } // namespace facebook::velox::cudf_velox

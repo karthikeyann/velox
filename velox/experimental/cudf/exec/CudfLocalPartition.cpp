@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/HashPartitionFunction.h"
 #include "velox/exec/RoundRobinPartitionFunction.h"
@@ -297,6 +298,11 @@ bool CudfLocalPartition::isFinished() {
   flushVectorPool();
 
   return true;
+}
+
+void CudfLocalPartition::close() {
+  RuntimeStatWriterScopeGuard statsGuard(this);
+  Operator::close();
 }
 
 } // namespace facebook::velox::cudf_velox

@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/FieldReference.h"
@@ -158,6 +159,7 @@ CudfFilterProject::CudfFilterProject(
 }
 
 void CudfFilterProject::initialize() {
+  RuntimeStatWriterScopeGuard statsGuard(this);
   Operator::initialize();
 
   std::vector<core::TypedExprPtr> allExprs;

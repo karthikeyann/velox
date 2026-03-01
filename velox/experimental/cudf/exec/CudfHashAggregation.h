@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -91,6 +92,8 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   }
 
   bool isFinished() override;
+
+  void close() override;
 
  private:
   // Setups the projections for accessing grouping keys stored in grouping

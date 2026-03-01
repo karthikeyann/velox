@@ -22,6 +22,7 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 #include "velox/vector/ComplexVector.h"
@@ -172,6 +173,7 @@ RowVectorPtr CudfFromVelox::getOutput() {
 }
 
 void CudfFromVelox::close() {
+  RuntimeStatWriterScopeGuard statsGuard(this);
   // TODO(kn): Remove default stream after redesign of CudfFromVelox
   cudf::get_default_stream(cudf::allow_default_stream).synchronize();
   exec::Operator::close();
@@ -342,6 +344,7 @@ RowVectorPtr CudfToVelox::getOutput() {
 }
 
 void CudfToVelox::close() {
+  RuntimeStatWriterScopeGuard statsGuard(this);
   exec::Operator::close();
   inputs_.clear();
 }

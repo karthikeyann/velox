@@ -20,6 +20,8 @@
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
+#include "velox/common/base/RuntimeMetrics.h"
+
 #include <cudf/sorting.hpp>
 
 namespace facebook::velox::cudf_velox {
@@ -116,6 +118,7 @@ RowVectorPtr CudfOrderBy::getOutput() {
 }
 
 void CudfOrderBy::close() {
+  RuntimeStatWriterScopeGuard statsGuard(this);
   exec::Operator::close();
   // Release stored inputs
   // Release cudf memory resources

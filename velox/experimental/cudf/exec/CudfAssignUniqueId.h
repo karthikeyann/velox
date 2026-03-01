@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -58,6 +59,8 @@ class CudfAssignUniqueId : public exec::Operator, public NvtxHelper {
   }
 
   bool isFinished() override;
+
+  void close() override;
 
  private:
   std::unique_ptr<cudf::column> generateIdColumn(

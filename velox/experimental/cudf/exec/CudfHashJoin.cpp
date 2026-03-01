@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Task.h" // NOLINT(misc-unused-headers)
 #include "velox/type/TypeUtil.h"
@@ -78,6 +79,7 @@ cudf::table_view createExtendedTableView(
 } // namespace
 
 void CudfHashJoinProbe::close() {
+  RuntimeStatWriterScopeGuard statsGuard(this);
   Operator::close();
   filterEvaluator_.reset();
   scalars_.clear();
@@ -350,6 +352,11 @@ exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
 
 bool CudfHashJoinBuild::isFinished() {
   return !future_.valid() && noMoreInput_;
+}
+
+void CudfHashJoinBuild::close() {
+  RuntimeStatWriterScopeGuard statsGuard(this);
+  Operator::close();
 }
 
 CudfHashJoinProbe::CudfHashJoinProbe(
