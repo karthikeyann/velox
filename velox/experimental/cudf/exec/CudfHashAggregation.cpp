@@ -912,6 +912,10 @@ void CudfHashAggregation::computeIntermediateGroupbyPartial(CudfVectorPtr tbl) {
       aggregators_,
       inputTableStream);
 
+  if (!groupbyOnInput) {
+    return; // Input batch produced 0 result rows; nothing to merge.
+  }
+
   // If we already have partial output, concatenate the new results with it.
   if (partialOutput_) {
     // Create a vector of tables to concatenate
