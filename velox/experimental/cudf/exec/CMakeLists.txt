@@ -22,9 +22,11 @@ add_library(
   CudfLimit.cpp
   CudfLocalPartition.cpp
   CudfOrderBy.cpp
+  CudfBatchConcat.cpp
   CudfTopN.cpp
   CudfTopNRowNumber.cpp
   DebugUtil.cpp
+  GpuResources.cpp
   OperatorAdapters.cpp
   ToCudf.cpp
   Utilities.cpp

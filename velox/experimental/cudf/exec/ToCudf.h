@@ -86,8 +86,6 @@ class CompileState {
   exec::Driver& driver_;
 };
 
-extern std::shared_ptr<rmm::mr::device_memory_resource> mr_;
-
 /// Registers adapter to add cuDF operators to Drivers.
 void registerCudf();
 void unregisterCudf();

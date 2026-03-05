@@ -916,6 +916,45 @@ std::shared_ptr<CudfFunction> createCudfFunction(
   return nullptr;
 }
 
+void registerSparkFunctions(const std::string& prefix) {
+  using exec::FunctionSignatureBuilder;
+
+  registerCudfFunction(
+      prefix + "hash_with_seed",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<HashFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("bigint")
+           .constantArgumentType("integer")
+           .argumentType("any")
+           .variableArity()
+           .build()});
+
+  registerCudfFunction(
+      prefix + "date_add",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<DateAddFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("date")
+           .argumentType("date")
+           .constantArgumentType("tinyint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("date")
+           .argumentType("date")
+           .constantArgumentType("smallint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("date")
+           .argumentType("date")
+           .constantArgumentType("integer")
+           .build()});
+}
+
+void registerPrestoFunctions(const std::string& prefix) {}
+
 bool registerBuiltinFunctions(const std::string& prefix) {
   using exec::FunctionSignatureBuilder;
 
@@ -978,18 +1017,6 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .returnType("T")
            .argumentType("T")
            .variableArity("T")
-           .build()});
-
-  registerCudfFunction(
-      prefix + "hash_with_seed",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<HashFunction>(expr);
-      },
-      {FunctionSignatureBuilder()
-           .returnType("bigint")
-           .constantArgumentType("integer")
-           .argumentType("any")
-           .variableArity()
            .build()});
 
   registerCudfFunction(
@@ -1188,6 +1215,11 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .constantArgumentType("varchar")
            .build()});
 
+  if (CudfConfig::getInstance().functionEngine == "spark") {
+    registerSparkFunctions(prefix);
+  } else {
+    registerPrestoFunctions(prefix);
+  }
   return true;
 }
 
