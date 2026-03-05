@@ -36,13 +36,13 @@
 #include <cudf/strings/attributes.hpp>
 #include <cudf/strings/case.hpp>
 #include <cudf/strings/contains.hpp>
+#include <cudf/strings/convert/convert_datetime.hpp>
+#include <cudf/strings/convert/convert_integers.hpp>
 #include <cudf/strings/find.hpp>
 #include <cudf/strings/slice.hpp>
 #include <cudf/strings/split/split.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
-#include <cudf/strings/convert/convert_datetime.hpp>
-#include <cudf/strings/convert/convert_integers.hpp>
 #include <cudf/unary.hpp>
 
 namespace facebook::velox::cudf_velox {
@@ -66,20 +66,36 @@ static std::optional<std::string> prestoToCudfDateFormat(
     ++i;
     switch (prestoFormat[i]) {
       // Direct matches (cuDF has same specifier and meaning):
-      case 'Y': case 'y': case 'm': case 'd':
-      case 'H': case 'I': case 'S': case 'f':
+      case 'Y':
+      case 'y':
+      case 'm':
+      case 'd':
+      case 'H':
+      case 'I':
+      case 'S':
+      case 'f':
       case 'j':
         result += '%';
         result += prestoFormat[i];
         break;
       // Translations (same meaning, different specifier):
-      case 'i': result += "%M"; break; // Presto minutes -> cuDF minutes
-      case 's': result += "%S"; break; // Presto seconds (lowercase alias)
-      case 'h': result += "%I"; break; // Presto 12h hour alias
+      case 'i':
+        result += "%M";
+        break; // Presto minutes -> cuDF minutes
+      case 's':
+        result += "%S";
+        break; // Presto seconds (lowercase alias)
+      case 'h':
+        result += "%I";
+        break; // Presto 12h hour alias
       // Composite expansion:
-      case 'T': result += "%H:%M:%S"; break; // 24h time
+      case 'T':
+        result += "%H:%M:%S";
+        break; // 24h time
       // Literal percent:
-      case '%': result += "%%"; break;
+      case '%':
+        result += "%%";
+        break;
       // Unsupported — name-dependent specifiers (crash with empty names):
       // Presto %M (month name), %W (weekday name), %a, %b, %p, %r
       // Unsupported — no cuDF equivalent for unpadded variants:
@@ -245,8 +261,7 @@ class CastFunction : public CudfFunction {
     const auto& srcVeloxType = expr->inputs()[0]->type();
     const auto& dstVeloxType = expr->type();
 
-    if (srcVeloxType->isDate() &&
-        dstVeloxType->kind() == TypeKind::VARCHAR) {
+    if (srcVeloxType->isDate() && dstVeloxType->kind() == TypeKind::VARCHAR) {
       castMode_ = CastMode::kDateToString;
     } else if (
         (srcVeloxType->kind() == TypeKind::TINYINT ||
@@ -277,12 +292,13 @@ class CastFunction : public CudfFunction {
         return cudf::strings::from_timestamps(
             inputCol,
             "%Y-%m-%d",
-            cudf::strings_column_view(cudf::column_view{
-                cudf::data_type{cudf::type_id::STRING},
-                0,
-                nullptr,
-                nullptr,
-                0}),
+            cudf::strings_column_view(
+                cudf::column_view{
+                    cudf::data_type{cudf::type_id::STRING},
+                    0,
+                    nullptr,
+                    nullptr,
+                    0}),
             stream,
             mr);
       case CastMode::kIntToString:
@@ -326,12 +342,13 @@ class DateFormatFunction : public CudfFunction {
     return cudf::strings::from_timestamps(
         inputCol,
         cudfFormat_,
-        cudf::strings_column_view(cudf::column_view{
-            cudf::data_type{cudf::type_id::STRING},
-            0,
-            nullptr,
-            nullptr,
-            0}),
+        cudf::strings_column_view(
+            cudf::column_view{
+                cudf::data_type{cudf::type_id::STRING},
+                0,
+                nullptr,
+                nullptr,
+                0}),
         stream,
         mr);
   }
@@ -1205,8 +1222,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "date_format",
-      [](const std::string&,
-         const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<DateFormatFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -1336,13 +1352,12 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
   // This ensures unsupported format specifiers fall back to CPU gracefully
   // rather than crashing in the DateFormatFunction constructor.
   if (opName == "date_format" && expr->inputs().size() == 2) {
-    auto formatExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
-        expr->inputs()[1]);
+    auto formatExpr =
+        std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr->inputs()[1]);
     if (!formatExpr) {
       return false;
     }
-    return prestoToCudfDateFormat(formatExpr->value()->toString(0))
-        .has_value();
+    return prestoToCudfDateFormat(formatExpr->value()->toString(0)).has_value();
   }
   return true;
 }

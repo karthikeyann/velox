@@ -47,8 +47,7 @@ struct CudfConfig {
   static constexpr const char* kCudfIntraNodeExchange{
       "cudf.intra_node_exchange"};
   static constexpr const char* kUcxxBlockingPolling{"ucxx.blocking_polling"};
-  static constexpr const char* kCudfExchangeLogLevel{
-      "cudf.exchange_log_level"};
+  static constexpr const char* kCudfExchangeLogLevel{"cudf.exchange_log_level"};
   static constexpr const char* kCudfBatchSizeMinThreshold{
       "cudf.batch_size_min_threshold"};
   static constexpr const char* kCudfBatchSizeMaxThreshold{

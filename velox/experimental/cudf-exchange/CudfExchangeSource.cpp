@@ -21,8 +21,8 @@
 #include <folly/Uri.h>
 #include "velox/experimental/cudf-exchange/CudfExchangeSource.h"
 #include "velox/experimental/cudf-exchange/IntraNodeTransferRegistry.h"
-#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 
 using namespace facebook::velox::exec;
 namespace facebook::velox::cudf_exchange {

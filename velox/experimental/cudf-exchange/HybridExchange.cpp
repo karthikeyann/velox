@@ -120,7 +120,8 @@ void HybridExchange::getSplits(ContinueFuture* future) {
     exec::Split split;
     auto reason = operatorCtx_->task()->getSplitOrFuture(
         operatorCtx_->driverCtx()->driverId,
-        operatorCtx_->driverCtx()->splitGroupId, planNodeId(),
+        operatorCtx_->driverCtx()->splitGroupId,
+        planNodeId(),
         /*maxPreloadSplits=*/0,
         /*preload=*/nullptr,
         split,

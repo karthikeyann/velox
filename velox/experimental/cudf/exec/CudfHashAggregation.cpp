@@ -1135,7 +1135,8 @@ void CudfHashAggregation::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
   cudf::detail::join_streams(
       std::vector<rmm::cuda_stream_view>{inputTableStream}, finalStream);
 
-  auto concatenatedTable = cudf::concatenate(tablesToConcat, finalStream, get_temp_mr());
+  auto concatenatedTable =
+      cudf::concatenate(tablesToConcat, finalStream, get_temp_mr());
   auto compactedOutput = doGroupByAggregation(
       concatenatedTable->view(),
       groupingKeyOutputChannels_,

@@ -51,8 +51,7 @@ namespace facebook::velox::cudf_exchange {
 /// The return type of the getOutput method is always a CudfVector.
 /// If data origins from the HTTP ExchangeClient, then this data is
 /// converted into a CudfVector using the CudfFromVelox operator.
-class HybridExchange : public SourceOperator,
-                       public cudf_velox::NvtxHelper {
+class HybridExchange : public SourceOperator, public cudf_velox::NvtxHelper {
  public:
   HybridExchange(
       int32_t operatorId,
