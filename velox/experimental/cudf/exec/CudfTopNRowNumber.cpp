@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/gather.hpp>
@@ -185,7 +186,7 @@ RowVectorPtr CudfTopNRowNumber::getOutput() {
   // Concatenate all input batches
   // Use inputType_ (not outputType_) because inputs don't have row_number
   // column
-  auto concatenated = getConcatenatedTable(inputs_, inputType_, stream);
+  auto concatenated = getConcatenatedTable(inputs_, inputType_, stream, mr);
   inputs_.clear();
 
   // Compute deduplication
