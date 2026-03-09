@@ -17,12 +17,15 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 
 #include <cudf/detail/copy.hpp>
 #include <cudf/detail/gather.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/merge.hpp>
 #include <cudf/sorting.hpp>
+
+#include <algorithm>
 
 namespace facebook::velox::cudf_velox {
 CudfTopN::CudfTopN(
@@ -41,7 +44,8 @@ CudfTopN::CudfTopN(
           fmt::format("[{}]", topNNode->id())),
       count_(topNNode->count()),
       topNNode_(topNNode),
-      kBatchSize_(CudfConfig::getInstance().topNBatchSize) {
+      kBatchSize_(CudfConfig::getInstance().topNBatchSize),
+      cudaEvent_(std::make_unique<CudaEvent>(cudaEventDisableTiming)) {
   const auto numColumns{outputType_->children().size()};
   const auto numSortingKeys{topNNode->sortingKeys().size()};
   std::vector<bool> isSortingKey(numColumns);
@@ -89,6 +93,8 @@ CudfVectorPtr CudfTopN::mergeTopK(
   cudf::detail::join_streams(inputStreams, stream);
   auto mergedTable =
       cudf::merge(tableViews, sortKeys_, columnOrder_, nullOrder_, stream, mr);
+  // Ensure input-stream deallocations don't race with merge stream.
+  streamsWaitForStream(*cudaEvent_, inputStreams, stream);
   // slice it
   auto topk =
       cudf::split(

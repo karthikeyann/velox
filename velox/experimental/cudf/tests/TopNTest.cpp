@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/experimental/cudf/CudfQueryConfig.h"
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
@@ -249,10 +249,10 @@ TEST_F(TopNTest, multiBatch) {
   testSingleKey(vectors, "c2", 2'500);
 }
 
-TEST_F(TopNTest, decimalTopNSynchronization) {
-  constexpr vector_size_t batchSize = 32'768;
+TEST_F(TopNTest, numericTopNSynchronization) {
+  constexpr vector_size_t batchSize = 132000;
   constexpr int32_t numBatches = 6;
-  constexpr int32_t topN = 200;
+  constexpr int32_t topN = 1024;
   std::vector<RowVectorPtr> vectors;
   vectors.reserve(numBatches);
 
@@ -260,21 +260,16 @@ TEST_F(TopNTest, decimalTopNSynchronization) {
     auto id = makeFlatVector<int64_t>(batchSize, [&](vector_size_t row) {
       return static_cast<int64_t>(batch) * batchSize + row;
     });
-    auto d128 = makeFlatVector<int128_t>(
-        batchSize,
-        [&](vector_size_t row) {
-          // Generate repeating long-decimal values to force tie-breaking.
-          auto bucket = static_cast<int64_t>((row + batch * 17) % 257) - 128;
-          auto raw = static_cast<int128_t>(bucket) *
-              static_cast<int128_t>(1'000'000'000);
-          return raw;
-        },
-        nullptr,
-        DECIMAL(38, 10));
-    auto payload = makeFlatVector<int32_t>(batchSize, [&](vector_size_t row) {
-      return static_cast<int32_t>((row + batch) % 5);
+    auto key = makeFlatVector<double>(batchSize, [&](vector_size_t row) {
+      // Repeat a small key space to force tie-breaking on c0.
+      auto bucket =
+          static_cast<int64_t>((row + batch * 13) % 10007); // A custom hash.
+      return static_cast<double>(bucket);
     });
-    vectors.push_back(makeRowVector(std::vector<VectorPtr>{id, d128, payload}));
+    auto payload = makeFlatVector<int64_t>(batchSize, [&](vector_size_t row) {
+      return static_cast<int64_t>(row ^ (batch << 10));
+    });
+    vectors.push_back(makeRowVector(std::vector<VectorPtr>{id, key, payload}));
   }
 
   createDuckDbTable(vectors);
@@ -285,10 +280,11 @@ TEST_F(TopNTest, decimalTopNSynchronization) {
           .topN({"c1 DESC NULLS LAST", "c0 ASC NULLS LAST"}, topN, false)
           .planNode();
 
-  // Force per-input GPU batches and early merges to exercise cross-stream sync.
+  // Force configuration to maximize chance of replicating a missing stream
+  // sync.
   AssertQueryBuilder(plan, duckDbQueryRunner_)
       .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, batchSize)
-      .config(cudf_velox::CudfQueryConfig::kCudfTopNBatchSize, 2)
+      .config(cudf_velox::CudfConfig::kCudfTopNBatchSize, 1)
       .assertResults(
           fmt::format(
               "SELECT c0, c1, c2 FROM tmp ORDER BY c1 DESC, c0 LIMIT {}",
