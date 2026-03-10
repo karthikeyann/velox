@@ -917,7 +917,6 @@ void registerSparkFunctions(const std::string& prefix) {
            .returnType("bigint")
            .constantArgumentType("integer")
            .argumentType("any")
-           .variableArity()
            .build()});
 
   registerCudfFunction(
