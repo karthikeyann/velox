@@ -29,9 +29,9 @@ namespace facebook::velox::cudf_exchange {
 namespace {
 std::unique_ptr<VectorSerde::Options> getVectorSerdeOptions(
     const core::QueryConfig& queryConfig,
-    VectorSerde::Kind kind) {
+    std::string kind) {
   std::unique_ptr<VectorSerde::Options> options =
-      kind == VectorSerde::Kind::kPresto
+      kind == "Presto"
       ? std::make_unique<serializer::presto::PrestoVectorSerde::PrestoOptions>()
       : std::make_unique<VectorSerde::Options>();
   options->compressionKind =
@@ -279,13 +279,14 @@ RowVectorPtr HybridExchange::getOutputFromPages(const SerPageVector* pages) {
     }
     emptyResult(); // release the memory in the pages vector.
     recordInputStats(rawInputBytes, result);
-  } else if (serde->kind() == VectorSerde::Kind::kCompactRow) {
+  } else if (
+      serde->kind() == VectorSerde::kindName(VectorSerde::Kind::kCompactRow)) {
     result = getOutputFromCompactRows(serde, pages);
-  } else if (serde->kind() == VectorSerde::Kind::kUnsafeRow) {
+  } else if (
+      serde->kind() == VectorSerde::kindName(VectorSerde::Kind::kUnsafeRow)) {
     result = getOutputFromUnsafeRows(serde, pages);
   } else {
-    VELOX_UNREACHABLE(
-        "Unsupported serde kind: {}", VectorSerde::kindName(serde->kind()));
+    VELOX_UNREACHABLE("Unsupported serde kind: {}", serde->kind());
   }
   if (!result) {
     return result;
@@ -332,7 +333,7 @@ RowVectorPtr HybridExchange::getOutputFromCompactRows(
       &result,
       pool(),
       serdeOptions_.get());
-  const auto numOutputRows = result_->size();
+  const auto numOutputRows = result->size();
   VELOX_CHECK_GT(numOutputRows, 0);
 
   estimatedCompactRowSize_ = std::max(
@@ -427,7 +428,7 @@ void HybridExchange::close() {
     auto lockedStats = stats_.wlock();
     lockedStats->addRuntimeStat(
         Operator::kShuffleSerdeKind,
-        RuntimeCounter(static_cast<int64_t>(serdeKind_)));
+        RuntimeCounter(static_cast<int64_t>(VectorSerde::kindByName(serdeKind_))));
     lockedStats->addRuntimeStat(
         Operator::kShuffleCompressionKind,
         RuntimeCounter(static_cast<int64_t>(serdeOptions_->compressionKind)));

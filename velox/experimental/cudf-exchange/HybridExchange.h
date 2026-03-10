@@ -133,7 +133,7 @@ class HybridExchange : public SourceOperator, public cudf_velox::NvtxHelper {
   std::shared_ptr<ExchangeClientFacade> exchangeClient_;
 
   const uint64_t preferredOutputBatchBytes_;
-  VectorSerde::Kind serdeKind_;
+  std::string serdeKind_;
   std::unique_ptr<VectorSerde::Options> serdeOptions_;
 
   /// True if this operator is responsible for fetching splits from the Task
