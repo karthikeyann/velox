@@ -15,7 +15,7 @@
  */
 
 #include "velox/experimental/cudf-exchange/CudfPartitionedOutput.h"
-#include "velox/experimental/cudf-exchange/HybridExchange.h"
+#include "velox/experimental/cudf-exchange/UcxExchange.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/exec/CudfAssignUniqueId.h"
@@ -750,7 +750,7 @@ std::mutex& getCudfExchangeClientMapMutex() {
   return instance;
 }
 
-/// ExchangeAdapter - Replaces with HybridExchange for UCX transport.
+/// ExchangeAdapter - Replaces with UcxExchange for UCX transport.
 // Note: When exchange is enabled but transport is HTTP, canRunOnGPU()
 // returns false while keepOperator() returns false. In ToCudf.cpp's
 // compile(), this means replaceOp stays empty and the original Velox
@@ -831,7 +831,7 @@ class ExchangeAdapter : public OperatorAdapter {
       }
     }
     result.push_back(
-        std::make_unique<facebook::velox::cudf_exchange::HybridExchange>(
+        std::make_unique<facebook::velox::cudf_exchange::UcxExchange>(
             operatorId, ctx, planNode, client));
     return result;
   }
@@ -845,7 +845,7 @@ class ExchangeAdapter : public OperatorAdapter {
   }
 };
 
-/// MergeExchangeAdapter - Replaces with HybridExchange+CudfOrderBy for UCX
+/// MergeExchangeAdapter - Replaces with UcxExchange+CudfOrderBy for UCX
 /// transport
 class MergeExchangeAdapter : public OperatorAdapter {
  public:
@@ -881,11 +881,11 @@ class MergeExchangeAdapter : public OperatorAdapter {
       exec::DriverCtx* ctx,
       int32_t operatorId) const override {
     std::vector<std::unique_ptr<exec::Operator>> result;
-    // create a HybridExchange operator for the merge exchange.
-    // Pass a nullptr to force the HybridExchange op to create its
+    // create a UcxExchange operator for the merge exchange.
+    // Pass a nullptr to force the UcxExchange op to create its
     // own, private CudfExchangeClient.
     result.push_back(
-        std::make_unique<facebook::velox::cudf_exchange::HybridExchange>(
+        std::make_unique<facebook::velox::cudf_exchange::UcxExchange>(
             operatorId, ctx, planNode, nullptr));
     // Add an order-by node. SortingKeys and SortOrders will be taken from
     // the MergeExchangeNode.
