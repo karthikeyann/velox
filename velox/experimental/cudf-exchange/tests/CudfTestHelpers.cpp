@@ -79,7 +79,10 @@ std::shared_ptr<facebook::velox::exec::Task> createExchangeTask(
     int partitionId,
     core::PlanNodeId& exchangeNodeId) {
   auto planFragment = exec::test::PlanBuilder()
-                          .exchange(rowType, VectorSerde::Kind::kCompactRow)
+                          .exchange(
+                              rowType,
+                              VectorSerde::kindName(
+                                  VectorSerde::Kind::kCompactRow))
                           .capturePlanNodeId(exchangeNodeId)
                           .planFragment();
 

@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/cudf-exchange/tests/SourceDriverMock.h"
 #include "velox/experimental/cudf-exchange/tests/CudfTestHelpers.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
 namespace facebook::velox::cudf_exchange {
