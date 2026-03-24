@@ -72,6 +72,7 @@ velox_add_library(
   OrderBy.cpp
   OutputBuffer.cpp
   OutputBufferManager.cpp
+  OutputBufferManagerRegistry.cpp
   ParallelProject.cpp
   PartitionFunction.cpp
   PartitionStreamingWindowBuild.cpp
@@ -130,12 +131,6 @@ velox_link_libraries(
   velox_test_util
   velox_vector
 )
-
-if(${VELOX_ENABLE_CUDF})
-  velox_link_libraries(
-    velox_exec
-    cudf::cudf)
-endif()
 
 velox_add_library(velox_cursor Cursor.cpp)
 
