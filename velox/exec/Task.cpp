@@ -1959,15 +1959,15 @@ bool Task::checkNoMoreSplitGroupsLocked() {
     numTotalDrivers_ = seenSplitGroups_.size() * numDriversPerSplitGroup_ +
         numDriversUngrouped_;
     if (groupedPartitionedOutput_) {
-      auto bufferManager = OutputBufferManagerRegistry::getManagerAs<
-          OutputBufferManager>("default");
+      auto bufferManager =
+          OutputBufferManagerRegistry::getManagerAs<OutputBufferManager>(
+              "default");
       VELOX_CHECK_NOT_NULL(
           bufferManager,
           "Default OutputBufferManager not registered in "
           "OutputBufferManagerRegistry");
       bufferManager->updateNumDrivers(
-          taskId(),
-          numDriversInPartitionedOutput_ * seenSplitGroups_.size());
+          taskId(), numDriversInPartitionedOutput_ * seenSplitGroups_.size());
     }
 
     return checkIfFinishedLocked();
@@ -2645,9 +2645,10 @@ void Task::maybeRemoveFromOutputBufferManager() {
         std::lock_guard<std::timed_mutex> l(mutex_);
         auto optStats = manager->stats(taskId_);
         if (optStats.has_value()) {
-          if (!taskStats_.outputBufferStats.has_value() ||
-              optStats.value().totalPagesSent > 0) {
+          if (!taskStats_.outputBufferStats.has_value()) {
             taskStats_.outputBufferStats = optStats;
+          } else if (optStats.value().totalPagesSent > 0) {
+            taskStats_.outputBufferStats->add(optStats.value());
           }
         }
       }
@@ -2744,15 +2745,14 @@ TaskStats Task::taskStats() const {
     taskStats.longestRunningOpCallMs = 0;
   }
 
-  auto bufferManager = OutputBufferManagerRegistry::getManagerAs<
-      OutputBufferManager>("default");
+  auto bufferManager =
+      OutputBufferManagerRegistry::getManagerAs<OutputBufferManager>("default");
   VELOX_CHECK_NOT_NULL(
       bufferManager,
       "Default OutputBufferManager not registered in "
       "OutputBufferManagerRegistry");
   taskStats.outputBufferUtilization = bufferManager->getUtilization(taskId_);
-  taskStats.outputBufferOverutilized =
-      bufferManager->isOverutilized(taskId_);
+  taskStats.outputBufferOverutilized = bufferManager->isOverutilized(taskId_);
   if (!taskStats.outputBufferStats.has_value()) {
     taskStats.outputBufferStats = bufferManager->stats(taskId_);
   }
@@ -3004,8 +3004,9 @@ folly::dynamic Task::toJson() const {
   }
   obj["drivers"] = drivers;
 
-  if (auto buffers = OutputBufferManagerRegistry::getManagerAs<
-          OutputBufferManager>("default")) {
+  if (auto buffers =
+          OutputBufferManagerRegistry::getManagerAs<OutputBufferManager>(
+              "default")) {
     if (auto buffer = buffers->getBufferIfExists(taskId_)) {
       obj["buffer"] = buffer->toString();
     }
