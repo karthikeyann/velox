@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Velox Architecture &amp; GPU Planning Guide</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0e17;
+  --surface: #111827;
+  --surface-2: #1a2235;
+  --surface-3: #243049;
+  --border: #2d3a52;
+  --text: #e2e8f0;
+  --text-dim: #8892a8;
+  --accent: #38bdf8;
+  --accent-2: #818cf8;
+  --accent-3: #f472b6;
+  --green: #34d399;
+  --amber: #fbbf24;
+  --red: #f87171;
+  --orange: #fb923c;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; }
+
+.hero {
+  padding: 48px 40px 28px;
+  background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #0f172a 100%);
+  border-bottom: 1px solid var(--border);
+  position: relative;
+}
+.hero::before {
+  content: ''; position: absolute; top: -50%; right: -20%;
+  width: 600px; height: 600px;
+  background: radial-gradient(circle, rgba(56,189,248,0.08) 0%, transparent 70%);
+  pointer-events: none;
+}
+.hero h1 {
+  font-family: 'DM Serif Display', serif; font-size: 2.2em; letter-spacing: -0.02em;
+  background: linear-gradient(135deg, #e2e8f0, #38bdf8);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  margin-bottom: 6px;
+}
+.hero .sub { color: var(--text-dim); font-size: 0.9em; font-weight: 300; }
+
+.stats-row { display: flex; gap: 20px; margin-top: 18px; flex-wrap: wrap; }
+.stat { background: rgba(255,255,255,0.04); border: 1px solid var(--border); border-radius: 8px; padding: 10px 18px; }
+.stat .v { font-family: 'JetBrains Mono', monospace; font-size: 1.4em; font-weight: 700; color: var(--accent); }
+.stat .l { font-size: 0.7em; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+
+nav.tabs {
+  display: flex; background: var(--surface); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 100; overflow-x: auto;
+}
+nav.tabs button {
+  background: none; border: none; color: var(--text-dim);
+  padding: 13px 22px; font-family: 'Inter'; font-size: 0.84em; font-weight: 500;
+  cursor: pointer; border-bottom: 2px solid transparent; white-space: nowrap; transition: all 0.2s;
+}
+nav.tabs button:hover { color: var(--text); background: rgba(255,255,255,0.03); }
+nav.tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.sec { display: none; padding: 28px 40px; max-width: 1140px; margin: 0 auto; }
+.sec.active { display: block; animation: fadeIn 0.25s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+h2 { font-family: 'DM Serif Display', serif; font-size: 1.5em; margin-bottom: 16px; }
+h3 { font-size: 1.05em; font-weight: 600; margin: 22px 0 10px; color: var(--accent); }
+h4 { font-size: 0.92em; font-weight: 600; margin: 14px 0 6px; color: var(--accent-2); }
+p, li { font-size: 0.88em; margin-bottom: 7px; }
+ul { padding-left: 18px; }
+li { margin-bottom: 5px; }
+strong { color: var(--text); }
+
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 22px; margin-bottom: 14px; }
+.card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+
+.timeline { position: relative; padding-left: 26px; }
+.timeline::before { content: ''; position: absolute; left: 5px; top: 0; bottom: 0; width: 2px; background: linear-gradient(to bottom, var(--accent), var(--accent-2), var(--accent-3)); }
+.tl-item { position: relative; margin-bottom: 16px; padding: 12px 16px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; transition: border-color 0.2s; }
+.tl-item:hover { border-color: var(--accent); }
+.tl-item::before { content: ''; position: absolute; left: -24px; top: 16px; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); border: 2px solid var(--bg); }
+.tl-item.inf::before { background: var(--accent-3); box-shadow: 0 0 8px rgba(244,114,182,0.5); width: 12px; height: 12px; left: -25px; }
+.tl-date { font-family: 'JetBrains Mono', monospace; font-size: 0.76em; color: var(--accent); font-weight: 500; }
+.tl-title { font-weight: 600; margin: 3px 0; font-size: 0.92em; }
+.tl-desc { font-size: 0.83em; color: var(--text-dim); }
+.tl-why { font-size: 0.82em; color: var(--accent-3); margin-top: 4px; font-style: italic; }
+
+table { width: 100%; border-collapse: collapse; font-size: 0.84em; margin: 14px 0; }
+th { text-align: left; padding: 9px 12px; background: var(--surface-2); color: var(--accent); font-weight: 600; font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 2px solid var(--border); }
+td { padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+tr:hover td { background: rgba(255,255,255,0.02); }
+
+.b { display: inline-block; padding: 2px 9px; border-radius: 12px; font-size: 0.73em; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+.b.high { background: rgba(248,113,113,0.15); color: var(--red); }
+.b.med { background: rgba(251,191,36,0.15); color: var(--amber); }
+.b.low { background: rgba(52,211,153,0.15); color: var(--green); }
+.b.good { background: rgba(56,189,248,0.15); color: var(--accent); }
+.b.hard { background: rgba(251,146,60,0.15); color: var(--orange); }
+.b.na { background: rgba(136,146,168,0.15); color: var(--text-dim); }
+.b.stable { background: rgba(52,211,153,0.15); color: var(--green); }
+.b.mature { background: rgba(56,189,248,0.15); color: var(--accent); }
+.b.early { background: rgba(251,191,36,0.15); color: var(--amber); }
+
+.opinion {
+  background: linear-gradient(135deg, rgba(129,140,248,0.08), rgba(244,114,182,0.06));
+  border: 1px solid rgba(129,140,248,0.2); border-radius: 10px;
+  padding: 14px 18px; margin: 14px 0; font-size: 0.88em;
+}
+.opinion::before { content: 'WHY THIS MATTERS FOR cuDF'; display: block; font-size: 0.68em; font-weight: 700; color: var(--accent-2); letter-spacing: 0.06em; margin-bottom: 6px; }
+
+.arch-box { font-family: 'JetBrains Mono', monospace; font-size: 0.7em; line-height: 1.7; overflow-x: auto; white-space: pre; color: var(--text-dim); padding: 14px; }
+
+.bar { height: 6px; border-radius: 3px; background: var(--surface-3); overflow: hidden; margin-top: 4px; }
+.bar .fill { height: 100%; border-radius: 3px; }
+
+code { font-family: 'JetBrains Mono', monospace; font-size: 0.84em; background: var(--surface-2); padding: 1px 5px; border-radius: 4px; color: var(--accent); }
+
+.phase { border-left: 3px solid; padding: 18px 22px; margin-bottom: 18px; background: var(--surface); border-radius: 0 10px 10px 0; }
+.phase.p1 { border-color: var(--green); }
+.phase.p2 { border-color: var(--accent); }
+.phase.p3 { border-color: var(--accent-3); }
+.phase-h { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.phase-n { font-family: 'JetBrains Mono'; font-size: 0.78em; font-weight: 700; padding: 3px 9px; border-radius: 5px; }
+.p1 .phase-n { background: rgba(52,211,153,0.15); color: var(--green); }
+.p2 .phase-n { background: rgba(56,189,248,0.15); color: var(--accent); }
+.p3 .phase-n { background: rgba(244,114,182,0.15); color: var(--accent-3); }
+
+@media (max-width: 768px) {
+  .hero { padding: 28px 18px; }
+  .sec { padding: 20px 18px; }
+  .card-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>Velox Architecture &amp; GPU Planning Guide</h1>
+  <div class="sub">How Velox evolved, what each module does, and what it means for Velox-cuDF</div>
+  <div class="stats-row">
+    <div class="stat"><div class="v">4,081</div><div class="l">Stars</div></div>
+    <div class="stat"><div class="v">12.8K</div><div class="l">Commits</div></div>
+    <div class="stat"><div class="v">1M+</div><div class="l">Lines C++</div></div>
+    <div class="stat"><div class="v">~30</div><div class="l">Core Contributors</div></div>
+    <div class="stat"><div class="v">4.7 yrs</div><div class="l">Since Open Source</div></div>
+  </div>
+</div>
+
+<nav class="tabs" id="tabs">
+  <button class="active" data-tab="evo">1. Evolution</button>
+  <button data-tab="arch">2. Architecture</button>
+  <button data-tab="modules">3. Module Assessment</button>
+  <button data-tab="cudf">4. Implications for cuDF</button>
+</nav>
+
+<!-- ===== SECTION 1: EVOLUTION ===== -->
+<div class="sec active" id="evo">
+  <h2>How Velox Got Here</h2>
+  <p style="color:var(--text-dim);margin-bottom:20px;">The project evolved through four distinct phases. Each phase left architectural decisions that shape what cuDF can and cannot do today. <span style="color:var(--accent-3);">&#9679;</span> = inflection points.</p>
+
+  <div class="timeline">
+
+    <div class="tl-item inf">
+      <div class="tl-date">Phase 1: Foundation (2021)</div>
+      <div class="tl-title">Meta open-sources the execution engine from Presto</div>
+      <div class="tl-desc">Shipped Day 1 with a complete pipeline-based execution engine: Task/Driver/Operator model, Hive connector, DWRF file reader, expression compiler, Presto function library, and a columnar vector format with dictionary/constant/lazy encodings. Already battle-tested at Meta scale.</div>
+      <div class="tl-why">Architecture locked in early: the Operator interface (addInput/getOutput), the Driver pipeline model, and RowVector as the unit of data flow. cuDF must work within these, not replace them.</div>
+    </div>
+
+    <div class="tl-item">
+      <div class="tl-date">Key Decision: Operator as the abstraction boundary</div>
+      <div class="tl-title">Each operator is a self-contained unit with typed input/output</div>
+      <div class="tl-desc">Unlike systems that fuse operators into compiled pipelines (e.g., HyPer/Umbra), Velox keeps operators as distinct objects that a Driver iterates over. Data flows as RowVector batches between operators.</div>
+      <div class="tl-why">This is exactly why cuDF integration works: you can swap individual operators without touching the pipeline. DriverAdapter exploits this boundary. If Velox had chosen whole-pipeline codegen, GPU integration would be orders of magnitude harder.</div>
+    </div>
+
+    <div class="tl-item inf">
+      <div class="tl-date">Phase 2: Ecosystem Growth (2022 &mdash; 2,914 commits)</div>
+      <div class="tl-title">Multi-engine adoption: Presto, Spark (Gluten), Trino</div>
+      <div class="tl-desc">Spark adoption via Gluten drives a parallel Spark SQL function library (200+ functions). DuckDB bridge added for SQL parsing. Native Parquet reader development begins. External contributors grow rapidly. Velox becomes a library, not just a Presto component.</div>
+      <div class="tl-why">Dual-dialect function library (Presto + Spark) doubles the GPU expression coverage problem. Any function that cuDF supports must work with both Presto and Spark semantics. The function registry abstraction makes this manageable but the surface area is large.</div>
+    </div>
+
+    <div class="tl-item inf">
+      <div class="tl-date">Key Decision: Hierarchical Memory with Arbitration (2022-H2)</div>
+      <div class="tl-title">MemoryPool tree: query &rarr; task &rarr; node &rarr; operator</div>
+      <div class="tl-desc">A 4-level pool hierarchy where each operator gets a scoped allocator, tasks can be killed under memory pressure, and an arbitrator mediates between competing queries. This enables multi-tenant execution without OOM.</div>
+      <div class="tl-why">This is the single most important abstraction for GPU planning. GPU memory (managed by RMM) currently lives outside this hierarchy entirely. Velox's arbitrator has zero visibility into GPU memory. Bridging these two worlds is the hardest problem in the cuDF roadmap.</div>
+    </div>
+
+    <div class="tl-item inf">
+      <div class="tl-date">Phase 3: Production Hardening (2023 &mdash; 3,251 commits, peak year)</div>
+      <div class="tl-title">Spill, SSD cache, Iceberg, comprehensive fuzz testing</div>
+      <div class="tl-desc">Spill-to-disk for hash joins and aggregation. SSD-backed async data cache with TTL. Iceberg V2 in the Hive connector. TypeSignature parser via Flex/Bison. The fuzz testing framework (join, aggregation, expression fuzzers) becomes a gatekeeper for correctness.</div>
+      <div class="tl-why">The spill framework is CPU-only (serializes to disk via RowVector). cuDF cannot reuse it directly; GPU spill needs device&rarr;host serialization first. The fuzz testing infrastructure is essential for cuDF quality but not yet integrated with GPU operators.</div>
+    </div>
+
+    <div class="tl-item">
+      <div class="tl-date">2023-08: Wave GPU Experiment</div>
+      <div class="tl-title">First GPU attempt: custom CUDA kernels (43K LoC)</div>
+      <div class="tl-desc">Custom WaveVector format, GPU arena allocator, hand-written CUDA kernels for decode/filter/project/aggregate. Targets maximum throughput for IO-heavy workloads. Nimble format GPU decode. Required CUDA expertise for every new operator.</div>
+      <div class="tl-why">Wave proved GPU execution is viable in Velox but showed the maintenance cost of custom kernels is prohibitive for broad operator coverage. This directly motivated the cuDF pivot: use a library instead of writing kernels.</div>
+    </div>
+
+    <div class="tl-item inf">
+      <div class="tl-date">Phase 4: GPU Acceleration (2025&ndash;present)</div>
+      <div class="tl-title">cuDF backend via DriverAdapter &mdash; library over kernels</div>
+      <div class="tl-desc">Strategic pivot from custom CUDA (Wave) to RAPIDS libcudf. DriverAdapter rewrites operators at compile time. 12+ GPU operators in &lt;1 year (OrderBy, HashAgg, HashJoin, FilterProject, TopN, Limit, LocalPartition, Window, Expand, NestedLoopJoin, AssignUniqueId). CudfHiveConnector for GPU-direct Parquet reads. AST + JIT expression evaluation on device.</div>
+      <div class="tl-why">The DriverAdapter abstraction (added for Wave) made cuDF integration possible without modifying core Velox. This was not designed for cuDF specifically &mdash; it's a general operator-rewriting hook. cuDF's rapid progress validates the architectural decision.</div>
+    </div>
+
+    <div class="tl-item">
+      <div class="tl-date">Key Decision: DriverAdapter as the GPU seam</div>
+      <div class="tl-title">Operators swap transparently; plan IR stays device-agnostic</div>
+      <div class="tl-desc">CudfDriverAdapter inspects each driver's operator list and replaces CPU operators with GPU equivalents. CudfFromVelox/CudfToVelox conversion operators are inserted at CPU&harr;GPU boundaries. The plan IR (PlanNode) never knows about GPU.</div>
+      <div class="tl-why">This is clean but has limits: the adapter can only replace whole operators, not fuse them. GPU-optimal execution sometimes wants to fuse scan+filter+project, but Velox's operator boundaries prevent this. cuDF must work within the granularity Velox gives.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== SECTION 2: ARCHITECTURE ===== -->
+<div class="sec" id="arch">
+  <h2>Current Architecture</h2>
+
+  <h3>Layer Diagram</h3>
+  <div class="card">
+    <div class="arch-box"><span style="color:var(--accent-3);font-weight:bold;">LAYER 4: GPU EXTENSION</span>
+  <span style="background:rgba(244,114,182,0.12);padding:2px 6px;border-radius:3px;">experimental/cudf/</span>  CudfDriverAdapter, 12+ GPU operators, CudfHiveConnector
+  <span style="background:rgba(136,146,168,0.12);padding:2px 6px;border-radius:3px;">experimental/wave/</span>   Custom CUDA kernels, WaveVector, GPU decode (maintenance mode)
+  ───────────────────────────────────────────────────────────────────────
+<span style="color:var(--accent);font-weight:bold;">LAYER 3: EXECUTION</span>
+  <span style="background:rgba(56,189,248,0.12);padding:2px 6px;border-radius:3px;">exec/</span>          Task &rarr; Driver &rarr; Operator pipeline. Spill. Exchange. 220K LoC.
+  <span style="background:rgba(56,189,248,0.12);padding:2px 6px;border-radius:3px;">connectors/</span>    Connector/DataSource/DataSink. Hive+Iceberg, TPC-H/DS. 44K LoC.
+  <span style="background:rgba(56,189,248,0.12);padding:2px 6px;border-radius:3px;">dwio/</span>          Format readers/writers: DWRF, Parquet, ORC, text. 223K LoC.
+  ───────────────────────────────────────────────────────────────────────
+<span style="color:var(--green);font-weight:bold;">LAYER 2: COMPUTATION</span>
+  <span style="background:rgba(52,211,153,0.12);padding:2px 6px;border-radius:3px;">expression/</span>    Expr compiler + evaluator, VectorFunction, special forms. 61K LoC.
+  <span style="background:rgba(52,211,153,0.12);padding:2px 6px;border-radius:3px;">functions/</span>     Presto (300+) + Spark (200+) function libraries. 277K LoC.
+  ───────────────────────────────────────────────────────────────────────
+<span style="color:var(--amber);font-weight:bold;">LAYER 1: FOUNDATIONS</span>
+  <span style="background:rgba(251,191,36,0.12);padding:2px 6px;border-radius:3px;">core/</span>          PlanNode IR, QueryCtx, ITypedExpr, PlanFragment. 22K LoC.
+  <span style="background:rgba(251,191,36,0.12);padding:2px 6px;border-radius:3px;">vector/</span>        BaseVector, encodings (flat/dict/const/lazy), Arrow bridge. 53K LoC.
+  <span style="background:rgba(251,191,36,0.12);padding:2px 6px;border-radius:3px;">type/</span>          Type/TypeKind, Filter, Subfield, Variant. 37K LoC.
+  <span style="background:rgba(251,191,36,0.12);padding:2px 6px;border-radius:3px;">common/memory/</span> MemoryPool hierarchy, Arbitrator, Allocators. 36K LoC.
+  <span style="background:rgba(251,191,36,0.12);padding:2px 6px;border-radius:3px;">buffer/</span>        Column backing buffers.
+  <span style="background:rgba(251,191,36,0.12);padding:2px 6px;border-radius:3px;">row/</span>           CompactRow, UnsafeRow serialization.</div>
+  </div>
+
+  <h3>Key Abstractions (What cuDF Plugs Into)</h3>
+  <div class="card-grid">
+    <div class="card">
+      <h4><code>Operator</code> <span style="font-size:0.8em;color:var(--text-dim);">exec/Operator.h</span></h4>
+      <p>The compute unit. <code>addInput(RowVector)</code> &rarr; process &rarr; <code>getOutput() &rarr; RowVector</code>. Every GPU operator inherits this. The cuDF path creates GPU equivalents that accept/produce <code>CudfVector</code> (a RowVector subclass wrapping cudf::table).</p>
+    </div>
+    <div class="card">
+      <h4><code>Driver</code> <span style="font-size:0.8em;color:var(--text-dim);">exec/Driver.h</span></h4>
+      <p>Runs a pipeline: an ordered list of operators. Iterates calling getOutput on source, feeding through the chain. <code>DriverAdapter</code> is the hook that cuDF uses to rewrite this list before execution starts.</p>
+    </div>
+    <div class="card">
+      <h4><code>Task</code> <span style="font-size:0.8em;color:var(--text-dim);">exec/Task.h</span></h4>
+      <p>Owns a PlanFragment, creates Drivers for each pipeline, manages lifecycle and memory. Serial or parallel execution modes. cuDF does not modify Task &mdash; it operates purely at the Driver/Operator level.</p>
+    </div>
+    <div class="card">
+      <h4><code>DriverAdapter</code> <span style="font-size:0.8em;color:var(--text-dim);">exec/Driver.h</span></h4>
+      <p>The GPU integration seam. Registered globally via <code>DriverFactory::registerAdapter</code>. Inspects each driver's operator list and can replace, remove, or insert operators. CudfDriverAdapter uses this to swap CPU operators for GPU equivalents and insert conversion boundaries.</p>
+    </div>
+    <div class="card">
+      <h4><code>MemoryPool</code> <span style="font-size:0.8em;color:var(--text-dim);">common/memory/MemoryPool.h</span></h4>
+      <p>4-level hierarchy: root &rarr; query &rarr; task &rarr; operator. Tracks allocations, enforces limits, supports arbitration. GPU memory (RMM) is entirely outside this tree. This is the architectural gap cuDF must eventually bridge.</p>
+    </div>
+    <div class="card">
+      <h4><code>Connector / DataSource</code> <span style="font-size:0.8em;color:var(--text-dim);">connectors/Connector.h</span></h4>
+      <p>Abstract interface: <code>addSplit</code>, <code>next() &rarr; RowVector</code>. CudfHiveConnector extends HiveConnector to use cuDF's Parquet reader, keeping data on GPU from the start.</p>
+    </div>
+  </div>
+
+  <h3>Data Flow: CPU vs GPU Path</h3>
+  <div class="card">
+    <div class="arch-box"><span style="color:var(--green);">CPU Path (default):</span>
+  Parquet file &rarr; <span style="color:var(--green);">DWIO reader</span> &rarr; RowVector &rarr; <span style="color:var(--green);">Filter</span> &rarr; <span style="color:var(--green);">Project</span> &rarr; <span style="color:var(--green);">HashJoin</span> &rarr; <span style="color:var(--green);">Aggregate</span> &rarr; result
+                     CPU memory throughout, managed by MemoryPool
+
+<span style="color:var(--accent-3);">GPU Path (cuDF):</span>
+  Parquet file &rarr; <span style="color:var(--accent-3);">cuDF Parquet IO</span> &rarr; CudfVector &rarr; <span style="color:var(--accent-3);">CudfFilter</span> &rarr; <span style="color:var(--accent-3);">CudfProject</span> &rarr; <span style="color:var(--accent-3);">CudfHashJoin</span> &rarr; <span style="color:var(--accent-3);">CudfAgg</span> &rarr; <span style="color:var(--accent);">CudfToVelox</span> &rarr; result
+                     GPU memory (RMM), conversion at boundaries only
+
+<span style="color:var(--amber);">Mixed Path (fallback):</span>
+  Parquet &rarr; <span style="color:var(--accent-3);">cuDF scan</span> &rarr; CudfVector &rarr; <span style="color:var(--accent-3);">CudfFilter</span> &rarr; <span style="color:var(--accent);">CudfToVelox</span> &rarr; <span style="color:var(--green);">CPU HashJoin</span> &rarr; <span style="color:var(--accent);">CudfFromVelox</span> &rarr; <span style="color:var(--accent-3);">CudfAgg</span> &rarr; result
+                     Conversion operators inserted automatically where GPU can't handle an operator</div>
+  </div>
+</div>
+
+<!-- ===== SECTION 3: MODULE ASSESSMENT ===== -->
+<div class="sec" id="modules">
+  <h2>Module Assessment for GPU Planning</h2>
+  <p style="color:var(--text-dim);margin-bottom:18px;">Each module scored on four dimensions relevant to cuDF planning. The "GPU Work Required" column is the actionable signal.</p>
+
+  <table>
+    <thead>
+      <tr><th>Module</th><th>LoC</th><th>Importance</th><th>Complexity</th><th>Coupling</th><th>GPU Suitability</th><th>GPU Work Required</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>exec/</strong><br><span style="color:var(--text-dim);font-size:0.85em;">Operators &amp; Pipeline</span></td>
+        <td>221K</td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b good">Good</span></td>
+        <td>Primary target. 12 operators done. Remaining: Window (partial), EnforceSingleRow, RowNumber, MarkDistinct. DriverAdapter makes swaps clean. Each new operator is isolated work.</td>
+      </tr>
+      <tr>
+        <td><strong>expression/</strong><br><span style="color:var(--text-dim);font-size:0.85em;">Expr Compiler &amp; Evaluator</span></td>
+        <td>61K</td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b med">Med</span></td>
+        <td><span class="b hard">Hard</span></td>
+        <td>Hardest coverage problem. cuDF has AST evaluator + JIT path, but maps only a fraction of Velox's expressions. Every unsupported expression forces CPU fallback for the entire FilterProject. Long tail dominates effort.</td>
+      </tr>
+      <tr>
+        <td><strong>functions/</strong><br><span style="color:var(--text-dim);font-size:0.85em;">Presto + Spark Libraries</span></td>
+        <td>277K</td>
+        <td><span class="b med">Med</span></td>
+        <td><span class="b med">Med</span></td>
+        <td><span class="b low">Low</span></td>
+        <td><span class="b hard">Hard</span></td>
+        <td>500+ functions, each independent. cuDF has equivalents for ~50-80. Per-function porting effort. Diminishing returns past top-50 by usage frequency. Low coupling means you can pick and choose.</td>
+      </tr>
+      <tr>
+        <td><strong>connectors/</strong><br><span style="color:var(--text-dim);font-size:0.85em;">Hive, Iceberg, TPC</span></td>
+        <td>44K</td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b med">Med</span></td>
+        <td><span class="b med">Med</span></td>
+        <td><span class="b good">Good</span></td>
+        <td>CudfHiveConnector already works for Parquet. Missing: dynamic filter pushdown, split preload, write path. Iceberg metadata stays CPU (correct; it's just metadata). Main value is getting data onto GPU without CPU detour.</td>
+      </tr>
+      <tr>
+        <td><strong>dwio/</strong><br><span style="color:var(--text-dim);font-size:0.85em;">File Format IO</span></td>
+        <td>223K</td>
+        <td><span class="b med">Med</span></td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b med">Med</span></td>
+        <td><span class="b good">Good</span></td>
+        <td>cuDF's Parquet reader replaces DWIO for GPU path. No need to port DWRF/ORC/text to GPU (Parquet is dominant). cuDF Parquet reader is mature. Low GPU work needed here.</td>
+      </tr>
+      <tr>
+        <td><strong>common/memory/</strong><br><span style="color:var(--text-dim);font-size:0.85em;">Pools &amp; Arbitration</span></td>
+        <td>36K</td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b hard">Hard</span></td>
+        <td>Most architecturally challenging. MemoryPool has no GPU awareness. RMM (GPU) and MemoryPool (CPU) are independent worlds. Bridging them for unified memory pressure is a multi-quarter project. Current state: dual-pool with no cross-device signaling.</td>
+      </tr>
+      <tr>
+        <td><strong>vector/</strong><br><span style="color:var(--text-dim);font-size:0.85em;">Columnar Representation</span></td>
+        <td>53K</td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b med">Med</span></td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b good">Good</span></td>
+        <td>CudfVector (RowVector subclass wrapping cudf::table) already solves this. Arrow bridge handles type conversion. Main gap: lazy vector loading doesn't map to GPU (cuDF materializes eagerly). Packed table views avoid unnecessary copies.</td>
+      </tr>
+      <tr>
+        <td><strong>type/</strong><br><span style="color:var(--text-dim);font-size:0.85em;">Type System</span></td>
+        <td>37K</td>
+        <td><span class="b med">Med</span></td>
+        <td><span class="b low">Low</span></td>
+        <td><span class="b low">Low</span></td>
+        <td><span class="b na">N/A</span></td>
+        <td>Device-agnostic. VeloxCudfInterop handles mapping. DECIMAL and TIMESTAMP need care (width differences) but this is solved. No ongoing GPU work needed.</td>
+      </tr>
+      <tr>
+        <td><strong>core/</strong><br><span style="color:var(--text-dim);font-size:0.85em;">Plan IR &amp; QueryCtx</span></td>
+        <td>22K</td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b low">Low</span></td>
+        <td><span class="b high">High</span></td>
+        <td><span class="b na">N/A</span></td>
+        <td>No GPU changes needed. PlanNode is device-agnostic by design. cuDF reads PlanNodes and rewrites at Driver level, never modifies the IR. This is correct and should stay this way.</td>
+      </tr>
+      <tr>
+        <td><strong>row/</strong><br><span style="color:var(--text-dim);font-size:0.85em;">Row Serialization</span></td>
+        <td>small</td>
+        <td><span class="b low">Low</span></td>
+        <td><span class="b low">Low</span></td>
+        <td><span class="b low">Low</span></td>
+        <td><span class="b na">N/A</span></td>
+        <td>CompactRow/UnsafeRow used for spill and shuffle serialization. Only relevant to GPU if GPU spill is implemented (Phase 2+ work).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Effort vs Impact Matrix</h3>
+  <div class="card">
+    <div class="arch-box">
+                HIGH IMPACT
+                    |
+     <span style="color:var(--green);font-weight:bold;">memory/</span>         |  <span style="color:var(--accent);font-weight:bold;">exec/ operators</span>          <span style="color:var(--accent);font-weight:bold;">connectors/</span>
+     (bridge RMM     |  (each new GPU op)        (GPU Parquet scan)
+      +MemoryPool)   |
+                     |  <span style="color:var(--amber);font-weight:bold;">expression/</span>
+                     |  (AST/JIT coverage)
+                     |
+  HIGH EFFORT -------+------- LOW EFFORT
+                     |
+     <span style="color:var(--text-dim);">functions/</span>      |  <span style="color:var(--text-dim);">type/</span>  <span style="color:var(--text-dim);">core/</span>  <span style="color:var(--text-dim);">dwio/</span>
+     (500+ to port,  |  (done)  (N/A)   (cuDF replaces)
+      diminishing     |
+      returns)       |
+                     |
+                LOW IMPACT</div>
+  </div>
+
+  <div class="opinion">
+    <strong>Where to spend cuDF engineering time:</strong> The matrix says operators (exec/) and connector (Parquet scan) give the best ROI. Expression coverage is high-impact but hard &mdash; invest selectively by profiling which functions appear in real workloads, not by trying to port all 500. Memory integration is the right long-term bet but wrong near-term priority. Type system and core IR are done &mdash; don't touch them. DWIO is replaced by cuDF's Parquet reader &mdash; no work needed. Functions are a trap: each one is small but the total effort is enormous with diminishing returns.
+  </div>
+</div>
+
+<!-- ===== SECTION 4: IMPLICATIONS FOR cuDF ===== -->
+<div class="sec" id="cudf">
+  <h2>What This Means for Velox-cuDF Planning</h2>
+
+  <h3>Architecture Gives You</h3>
+  <div class="card-grid">
+    <div class="card" style="border-left:3px solid var(--green);">
+      <h4 style="color:var(--green);">Clean operator swaps via DriverAdapter</h4>
+      <p>Each GPU operator is isolated, testable, and doesn't affect CPU path. You can add operators incrementally. The adapter pattern means cuDF is purely additive &mdash; it can't break existing Velox behavior.</p>
+    </div>
+    <div class="card" style="border-left:3px solid var(--green);">
+      <h4 style="color:var(--green);">Device-agnostic plan IR</h4>
+      <p>PlanNode/QueryCtx know nothing about GPU. This means cuDF doesn't need upstream changes to core Velox for basic operator support. You can ship GPU features without coordinating plan-level changes.</p>
+    </div>
+    <div class="card" style="border-left:3px solid var(--green);">
+      <h4 style="color:var(--green);">CudfVector fits the existing contract</h4>
+      <p>Subclassing RowVector means GPU data can flow through the existing pipeline machinery (Driver iteration, stats collection, pipeline splits) without modifications.</p>
+    </div>
+    <div class="card" style="border-left:3px solid var(--green);">
+      <h4 style="color:var(--green);">Automatic CPU fallback</h4>
+      <p>The adapter inserts CudfFromVelox/CudfToVelox conversion operators at GPU&harr;CPU boundaries. Any operator the GPU can't handle simply stays CPU. This makes partial GPU coverage viable from Day 1.</p>
+    </div>
+  </div>
+
+  <h3>Architecture Constrains You</h3>
+  <div class="card-grid">
+    <div class="card" style="border-left:3px solid var(--red);">
+      <h4 style="color:var(--red);">No operator fusion</h4>
+      <p>Velox's operator-per-node model means you can't fuse scan+filter+project into a single GPU kernel. Each operator launches its own cuDF calls. The overhead is small for large batches but matters for high-selectivity queries with small intermediates.</p>
+    </div>
+    <div class="card" style="border-left:3px solid var(--red);">
+      <h4 style="color:var(--red);">Memory is split-brain</h4>
+      <p>MemoryPool tracks CPU. RMM tracks GPU. Under memory pressure, Velox's arbitrator will kill a query that's consuming GPU memory it can't see, or fail to kill one that's hoarding GPU memory. This is the biggest production risk.</p>
+    </div>
+    <div class="card" style="border-left:3px solid var(--red);">
+      <h4 style="color:var(--red);">Spill is CPU-only</h4>
+      <p>Velox's spill framework serializes RowVectors to disk. GPU data must first transfer to host. There's no device&rarr;disk path. Under GPU memory pressure, the only option today is full CPU fallback, not graceful spill.</p>
+    </div>
+    <div class="card" style="border-left:3px solid var(--red);">
+      <h4 style="color:var(--red);">Expression coverage is a gating factor</h4>
+      <p>A single unsupported function in a FilterProject expression forces the entire operator to CPU. This is all-or-nothing at the expression level, not per-function. The practical GPU coverage of real queries depends more on expression support than operator support.</p>
+    </div>
+  </div>
+
+  <h3>Recommended Planning Priorities</h3>
+
+  <div class="phase p1">
+    <div class="phase-h">
+      <span class="phase-n">NEAR-TERM</span>
+      <strong style="font-size:0.95em;">Maximize query coverage on GPU</strong>
+    </div>
+    <p>The architecture supports incremental operator addition with zero risk to CPU path. Focus on:</p>
+    <ul>
+      <li><strong>Expression coverage over operator coverage.</strong> You have 12 operators. A query that uses HashJoin but has an unsupported function in FilterProject will still fall back to CPU for the filter. Profile real workloads to find the top-30 functions blocking GPU execution, then port those.</li>
+      <li><strong>Remaining high-value operators:</strong> EnforceSingleRow (unblocks subquery patterns), RowNumber (common in analytics), full Window support.</li>
+      <li><strong>GPU CI in mainline.</strong> 828 commits/year to exec/ means the Operator interface, Driver lifecycle, and DriverAdapter could change under you. Without CI, you're debugging regressions manually.</li>
+    </ul>
+  </div>
+
+  <div class="phase p2">
+    <div class="phase-h">
+      <span class="phase-n">MID-TERM</span>
+      <strong style="font-size:0.95em;">Production readiness</strong>
+    </div>
+    <p>The dual-memory-world is the architectural ceiling. Tackle it before production deployment:</p>
+    <ul>
+      <li><strong>GPU memory visibility:</strong> Bridge RMM failure callbacks to MemoryArbitrator. Start with advisory limits (GPU usage reported to Velox, soft enforcement), not hard integration. This is a multi-quarter project.</li>
+      <li><strong>GPU spill:</strong> Device&rarr;host spill for hash tables. Reuse Velox's spill file management but serialize from GPU memory directly. This unblocks large-data workloads that exceed GPU memory.</li>
+      <li><strong>Dynamic filter pushdown:</strong> Currently disabled in CudfHiveConnector. Star-schema queries (common in analytics) rely on this for performance. Requires GPU-side bloom filter support.</li>
+      <li><strong>Fuzz testing:</strong> Integrate existing join/aggregation/expression fuzzers with CudfDriverAdapter. This will find bugs you can't find with hand-written tests.</li>
+    </ul>
+  </div>
+
+  <div class="phase p3">
+    <div class="phase-h">
+      <span class="phase-n">LONG-TERM</span>
+      <strong style="font-size:0.95em;">Advanced optimization</strong>
+    </div>
+    <p>Only after single-GPU execution is production-stable:</p>
+    <ul>
+      <li><strong>Cost-based GPU/CPU decision:</strong> Not all operators benefit from GPU (small cardinality, high selectivity). An operator-level cost model that routes to GPU only when beneficial. Requires profiling data from production workloads.</li>
+      <li><strong>Multi-GPU:</strong> NCCL-based exchange for multi-GPU nodes. Partition-aware placement. Only matters for workloads that don't fit in a single GPU's memory after spill.</li>
+      <li><strong>Operator fusion:</strong> If the Velox operator boundary becomes a bottleneck, consider proposing upstream changes to support fused scan+filter+project as a single compound operator. This requires Velox community buy-in.</li>
+    </ul>
+  </div>
+
+  <div class="opinion" style="margin-top:24px;">
+    <strong>Bottom line:</strong> Velox's architecture is well-suited for GPU integration at the operator level. The DriverAdapter pattern was the right design choice and cuDF is exploiting it effectively. The two areas where the architecture will fight you are <strong>(1) expression coverage</strong> (all-or-nothing per operator, long tail of functions) and <strong>(2) memory management</strong> (split-brain between CPU and GPU). Expression coverage determines how many queries actually run on GPU. Memory integration determines whether those queries survive production workloads. Plan accordingly: expressions first, memory second, everything else is incremental.
+  </div>
+</div>
+
+<script>
+document.querySelectorAll('nav.tabs button').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('nav.tabs button').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.sec').forEach(s => s.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById(tab.dataset.tab).classList.add('active');
+  });
+});
+</script>
+</body>
+</html>

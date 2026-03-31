@@ -1,0 +1,1539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cross-Platform Feature Maturity Matrix</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=IBM+Plex+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0e17;
+  --surface: #111827;
+  --surface-2: #1a2235;
+  --surface-3: #222d42;
+  --border: #2a3654;
+  --text: #e2e8f0;
+  --text-dim: #8b95a8;
+  --text-muted: #5a6580;
+  --accent: #38bdf8;
+  --accent-dim: #0c4a6e;
+  --green: #34d399;
+  --green-dim: #064e3b;
+  --amber: #fbbf24;
+  --amber-dim: #78350f;
+  --red: #f87171;
+  --red-dim: #7f1d1d;
+  --purple: #a78bfa;
+  --purple-dim: #3b0764;
+  --pink: #f472b6;
+  --teal: #2dd4bf;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+
+.hero {
+  background: linear-gradient(135deg, #0f1729 0%, #1a1040 50%, #0f1729 100%);
+  border-bottom: 1px solid var(--border);
+  padding: 48px 40px 40px;
+  position: relative;
+  overflow: hidden;
+}
+.hero::before {
+  content: '';
+  position: absolute;
+  top: -50%; left: -50%;
+  width: 200%; height: 200%;
+  background: radial-gradient(circle at 30% 50%, rgba(56, 189, 248, 0.06) 0%, transparent 50%),
+              radial-gradient(circle at 70% 30%, rgba(167, 139, 250, 0.05) 0%, transparent 50%);
+  animation: pulse 8s ease-in-out infinite alternate;
+}
+@keyframes pulse { from { opacity: 0.6; } to { opacity: 1; } }
+
+.hero h1 {
+  font-family: 'DM Serif Display', serif;
+  font-size: 36px;
+  font-weight: 400;
+  letter-spacing: -0.5px;
+  position: relative;
+  background: linear-gradient(135deg, var(--accent), var(--purple));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.hero .subtitle {
+  color: var(--text-dim);
+  font-size: 16px;
+  margin-top: 8px;
+  position: relative;
+}
+.hero .meta {
+  display: flex; gap: 24px; margin-top: 16px; position: relative;
+  flex-wrap: wrap;
+}
+.hero .meta span {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 4px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: rgba(10, 14, 23, 0.92);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+  padding: 0 40px;
+  display: flex;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.nav::-webkit-scrollbar { display: none; }
+.nav a {
+  color: var(--text-dim);
+  text-decoration: none;
+  padding: 12px 16px;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  transition: all 0.2s;
+  cursor: pointer;
+}
+.nav a:hover, .nav a.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.container {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 0 40px;
+}
+
+section {
+  padding: 32px 0;
+  border-bottom: 1px solid var(--border);
+}
+section:last-child { border-bottom: none; }
+
+h2 {
+  font-family: 'DM Serif Display', serif;
+  font-size: 28px;
+  font-weight: 400;
+  margin-bottom: 8px;
+  color: var(--text);
+}
+h3 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 24px 0 12px;
+}
+.section-desc {
+  color: var(--text-dim);
+  margin-bottom: 24px;
+  max-width: 900px;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+.badge-green { background: var(--green-dim); color: var(--green); }
+.badge-amber { background: var(--amber-dim); color: var(--amber); }
+.badge-red { background: var(--red-dim); color: var(--red); }
+.badge-purple { background: var(--purple-dim); color: var(--purple); }
+.badge-blue { background: var(--accent-dim); color: var(--accent); }
+.badge-gray { background: #1e293b; color: #64748b; }
+
+.legend {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 24px;
+  margin-bottom: 24px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: center;
+}
+.legend-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+  margin-right: 8px;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.tab-container { margin: 16px 0; }
+.tab-buttons {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+}
+.tab-btn {
+  padding: 10px 20px;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: 'IBM Plex Sans', sans-serif;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+.tab-btn:hover { color: var(--text-dim); }
+.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-content { display: none; padding-top: 16px; }
+.tab-content.active { display: block; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  padding: 10px 12px;
+  border-bottom: 2px solid var(--border);
+  position: sticky;
+  top: 44px;
+  background: var(--bg);
+  z-index: 10;
+}
+td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  vertical-align: top;
+}
+tr:hover td { background: var(--surface); }
+td:first-child { color: var(--text); font-weight: 500; }
+
+.group-header td {
+  background: var(--surface-2);
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.group-header:hover td { background: var(--surface-2); }
+
+code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  background: var(--surface-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: var(--accent);
+}
+
+.stat-row {
+  display: flex;
+  gap: 16px;
+  margin: 16px 0;
+  flex-wrap: wrap;
+}
+.stat {
+  flex: 1;
+  min-width: 120px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
+}
+.stat-val {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 32px;
+  font-weight: 700;
+  color: var(--accent);
+}
+.stat-lbl {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-top: 4px;
+}
+
+.callout {
+  padding: 16px 20px;
+  background: var(--surface-2);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  margin: 16px 0;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+@media (max-width: 900px) {
+  .container { padding: 0 16px; }
+  .hero { padding: 28px 16px; }
+  .nav { padding: 0 16px; }
+  th, td { padding: 8px 6px; font-size: 11px; }
+  .badge { font-size: 9px; padding: 1px 5px; }
+}
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>Cross-Platform Feature Maturity Matrix</h1>
+  <div class="subtitle">Comprehensive feature comparison across Presto Native, Velox, and Gluten execution engines &mdash; CPU and GPU</div>
+  <div class="meta">
+    <span>Presto Native (prestodb/presto)</span>
+    <span>Velox (facebookincubator/velox)</span>
+    <span>Gluten (apache/gluten)</span>
+    <span>March 2026</span>
+  </div>
+</div>
+
+<nav class="nav" id="topnav">
+  <a class="active" onclick="showTab(event, 'tab-operators')">Operators</a>
+  <a onclick="showTab(event, 'tab-connectors')">Connectors &amp; Formats</a>
+  <a onclick="showTab(event, 'tab-execution')">Execution &amp; Infra</a>
+  <a onclick="showTab(event, 'tab-functions')">Functions &amp; Expressions</a>
+  <a onclick="showTab(event, 'tab-memory')">Memory &amp; Performance</a>
+</nav>
+
+<div class="container">
+
+<section>
+  <h2>Feature Maturity Matrix</h2>
+  <p class="section-desc">Current capabilities across five platforms, derived from source code analysis of all three codebases. Each cell reflects the actual implementation status as of Q1 2026.</p>
+
+  <div class="legend">
+    <span class="legend-title">Legend:</span>
+    <span class="legend-item"><span class="badge badge-green">Production</span> Battle-tested at scale</span>
+    <span class="legend-item"><span class="badge badge-blue">Stable</span> Complete, well-tested</span>
+    <span class="legend-item"><span class="badge badge-amber">Active Dev</span> Functional, evolving</span>
+    <span class="legend-item"><span class="badge badge-purple">Experimental</span> Partial or prototype</span>
+    <span class="legend-item"><span class="badge badge-red">Not Supported</span> Not implemented</span>
+    <span class="legend-item"><span class="badge badge-gray">N/A</span> Not applicable</span>
+  </div>
+
+  <div class="stat-row">
+    <div class="stat"><div class="stat-val">29</div><div class="stat-lbl">Presto Plan Nodes</div></div>
+    <div class="stat"><div class="stat-val">40+</div><div class="stat-lbl">Velox Operators</div></div>
+    <div class="stat"><div class="stat-val">8</div><div class="stat-lbl">cuDF GPU Operators</div></div>
+    <div class="stat"><div class="stat-val">25+</div><div class="stat-lbl">Gluten Transformers</div></div>
+    <div class="stat"><div class="stat-val">600+</div><div class="stat-lbl">Velox Presto Functions</div></div>
+  </div>
+
+  <div class="tab-container">
+    <div class="tab-buttons">
+      <button class="tab-btn active" onclick="showTab(event, 'tab-operators')">Operators</button>
+      <button class="tab-btn" onclick="showTab(event, 'tab-connectors')">Connectors &amp; Formats</button>
+      <button class="tab-btn" onclick="showTab(event, 'tab-execution')">Execution &amp; Infra</button>
+      <button class="tab-btn" onclick="showTab(event, 'tab-functions')">Functions &amp; Expressions</button>
+      <button class="tab-btn" onclick="showTab(event, 'tab-memory')">Memory &amp; Performance</button>
+    </div>
+
+<!-- ========== TAB 1: OPERATORS ========== -->
+<div id="tab-operators" class="tab-content active">
+<table>
+<tr>
+  <th style="min-width:180px;">Operator</th>
+  <th>Presto Native</th>
+  <th>Presto GPU</th>
+  <th>Velox</th>
+  <th>Gluten</th>
+  <th>Gluten GPU</th>
+</tr>
+
+<tr class="group-header"><td colspan="6">Scan</td></tr>
+<tr>
+  <td>TableScan<br><span style="font-size:11px;color:var(--text-muted)">Read from data source</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">CudfHiveDataSource</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">FileSourceScan + BatchScan</span></td>
+  <td><span class="badge badge-red">Not Supported</span><br><span style="font-size:11px;color:var(--text-muted)">CPU scan, GPU transfer</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Filter / Project</td></tr>
+<tr>
+  <td>Filter<br><span style="font-size:11px;color:var(--text-muted)">Row filtering</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">CudfFilterProject</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">GPU via Velox cuDF</span></td>
+</tr>
+<tr>
+  <td>Project<br><span style="font-size:11px;color:var(--text-muted)">Column transformation</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">CudfFilterProject</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">Expr coverage limited</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Joins</td></tr>
+<tr>
+  <td>HashJoin<br><span style="font-size:11px;color:var(--text-muted)">Build + Probe</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">Anti-join gap</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">7 join types, spill, mixed mode</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">BHJ + SHJ</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">BHJ bug #11794</span></td>
+</tr>
+<tr>
+  <td>MergeJoin<br><span style="font-size:11px;color:var(--text-muted)">Sorted input merge</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">SortMergeJoin</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>SemiJoin<br><span style="font-size:11px;color:var(--text-muted)">IN subquery</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Left-Semi, Left-Anti, counting</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Via HashJoin types</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>IndexJoin / IndexSource<br><span style="font-size:11px;color:var(--text-muted)">Index lookup join</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">IndexLookupJoin</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Spark has no equivalent</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>NestedLoopJoin<br><span style="font-size:11px;color:var(--text-muted)">Cross join, inequality</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Via JoinNode types</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">BNLJ + CartesianProduct</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>SpatialJoin<br><span style="font-size:11px;color:var(--text-muted)">Geospatial join</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">Build + Probe + fuzzer</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Not in Spark SQL</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Aggregation</td></tr>
+<tr>
+  <td>HashAggregation<br><span style="font-size:11px;color:var(--text-muted)">Grouped + global aggregation</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">CudfHashAggregation</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Partial/final/intermediate, spill, DISTINCT</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Regular + Sort + Flushable</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">TPC-H validated</span></td>
+</tr>
+<tr>
+  <td>StreamingAggregation<br><span style="font-size:11px;color:var(--text-muted)">Pre-sorted input</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Via AggregationNode</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Via HashAggregate sort mode</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Sort / Limit</td></tr>
+<tr>
+  <td>OrderBy / Sort<br><span style="font-size:11px;color:var(--text-muted)">Multi-key sort</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">CudfOrderBy</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Spill support</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">GPU via Velox cuDF</span></td>
+</tr>
+<tr>
+  <td>TopN<br><span style="font-size:11px;color:var(--text-muted)">Partial + final top-N</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">CudfTopN</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">TakeOrderedAndProject</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>Limit<br><span style="font-size:11px;color:var(--text-muted)">Row count cap</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">CudfLimit</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Global + Local</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>DistinctLimit<br><span style="font-size:11px;color:var(--text-muted)">Distinct + limit combo</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Presto-specific node</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Window</td></tr>
+<tr>
+  <td>Window Functions<br><span style="font-size:11px;color:var(--text-muted)">ROW_NUMBER, RANK, NTILE, agg windows</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">Spill, sub-partitioned sort</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>RowNumber<br><span style="font-size:11px;color:var(--text-muted)">Standalone row numbering</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">Spill added 2026</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Via WindowExec</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>TopNRowNumber<br><span style="font-size:11px;color:var(--text-muted)">Top-N per partition</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">WindowGroupLimit</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Misc Operators</td></tr>
+<tr>
+  <td>Unnest / Generate<br><span style="font-size:11px;color:var(--text-muted)">Array/map explode</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">GenerateExecTransformer</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>Expand / GroupId<br><span style="font-size:11px;color:var(--text-muted)">GROUPING SETS, CUBE, ROLLUP</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">ExpandExecTransformer</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>MarkDistinct<br><span style="font-size:11px;color:var(--text-muted)">Distinct aggregation helper</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">Spill + fuzzer 2026</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Spark uses different approach</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>AssignUniqueId<br><span style="font-size:11px;color:var(--text-muted)">Unique ID per row</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">CudfAssignUniqueId</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Spark uses MonotonicallyIncreasingID</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>EnforceSingleRow<br><span style="font-size:11px;color:var(--text-muted)">Scalar subquery enforcement</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Handled by Spark</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>EnforceDistinct<br><span style="font-size:11px;color:var(--text-muted)">Distinct enforcement</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-amber">Active Dev</span><br><span style="font-size:11px;color:var(--text-muted)">Added Feb 2026</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>Union<br><span style="font-size:11px;color:var(--text-muted)">Combine result sets</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Via Exchange</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">MixedUnion</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">UnionExecTransformer</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>Sample<br><span style="font-size:11px;color:var(--text-muted)">Random row sampling</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Rewritten to source plan</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">SampleExecTransformer</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>Values<br><span style="font-size:11px;color:var(--text-muted)">Inline constant data</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Write</td></tr>
+<tr>
+  <td>TableWriter<br><span style="font-size:11px;color:var(--text-muted)">Data output / insert</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Tests disabled</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">+ TableWriteMerge</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">WriteFilesExec, complex types v1.6</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>Delete<br><span style="font-size:11px;color:var(--text-muted)">Row deletion</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Via TableWrite</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Exchange / Shuffle</td></tr>
+<tr>
+  <td>HTTP Exchange<br><span style="font-size:11px;color:var(--text-muted)">Remote data transfer</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">HTTP/2, compression</span></td>
+  <td><span class="badge badge-red">CPU only</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Exchange + MergeExchange</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Uses Spark shuffle</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>LocalPartition<br><span style="font-size:11px;color:var(--text-muted)">Intra-task partitioning</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">CudfLocalPartition</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Spark manages partitioning</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>Columnar Shuffle<br><span style="font-size:11px;color:var(--text-muted)">Native shuffle writer/reader</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">External shuffle framework</span></td>
+  <td><span class="badge badge-red">CPU only</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">PartitionedOutput, compression</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Hash + Sort shuffle</span></td>
+  <td><span class="badge badge-amber">Active Dev</span><br><span style="font-size:11px;color:var(--text-muted)">GPU shuffle writer/reader</span></td>
+</tr>
+<tr>
+  <td>BroadcastExchange<br><span style="font-size:11px;color:var(--text-muted)">Broadcast join data</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">CPU only</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Active Dev</span><br><span style="font-size:11px;color:var(--text-muted)">cudf::table output</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">GPU Infrastructure</td></tr>
+<tr>
+  <td>CPU-to-GPU Conversion<br><span style="font-size:11px;color:var(--text-muted)">CudfFromVelox / CudfToVelox</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Working</span><br><span style="font-size:11px;color:var(--text-muted)">Arrow C ABI bridge</span></td>
+  <td><span class="badge badge-green">Working</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Working</span><br><span style="font-size:11px;color:var(--text-muted)">Via Velox conversion ops</span></td>
+</tr>
+<tr>
+  <td>Batch Concat Optimization<br><span style="font-size:11px;color:var(--text-muted)">Accumulate small batches for GPU</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">CudfBatchConcat</span></td>
+  <td><span class="badge badge-green">Working</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Via Velox</span><br><span style="font-size:11px;color:var(--text-muted)">+ GpuBufferBatchResizer</span></td>
+</tr>
+<tr>
+  <td>DriverAdapter<br><span style="font-size:11px;color:var(--text-muted)">Operator substitution hook</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Working</span><br><span style="font-size:11px;color:var(--text-muted)">CudfDriverAdapter</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Working</span><br><span style="font-size:11px;color:var(--text-muted)">Via Velox</span></td>
+</tr>
+</table>
+</div>
+
+<!-- ========== TAB 2: CONNECTORS & FORMATS ========== -->
+<div id="tab-connectors" class="tab-content">
+<table>
+<tr>
+  <th style="min-width:180px;">Feature</th>
+  <th>Presto Native</th>
+  <th>Presto GPU</th>
+  <th>Velox</th>
+  <th>Gluten</th>
+  <th>Gluten GPU</th>
+</tr>
+
+<tr class="group-header"><td colspan="6">Connectors</td></tr>
+<tr>
+  <td>Hive Connector<br><span style="font-size:11px;color:var(--text-muted)">Primary table connector</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">CudfHiveConnector</span><br><span style="font-size:11px;color:var(--text-muted)">Replaces Hive when cuDF on</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Split mgmt, partition pruning</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">HiveTableScanExec</span></td>
+  <td><span class="badge badge-purple">Experimental</span><br><span style="font-size:11px;color:var(--text-muted)">Via Velox CudfHiveDataSource</span></td>
+</tr>
+<tr>
+  <td>Iceberg<br><span style="font-size:11px;color:var(--text-muted)">Table format with ACID</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-amber">Active Dev</span><br><span style="font-size:11px;color:var(--text-muted)">V2 support, delete files</span></td>
+  <td><span class="badge badge-amber">Partial</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>Delta Lake<br><span style="font-size:11px;color:var(--text-muted)">Delta table format</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-amber">Active Dev</span><br><span style="font-size:11px;color:var(--text-muted)">Delta split reader 2025</span></td>
+  <td><span class="badge badge-amber">Partial</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>Hudi<br><span style="font-size:11px;color:var(--text-muted)">Hudi table format</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-purple">Experimental</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>Paimon<br><span style="font-size:11px;color:var(--text-muted)">Apache Paimon format</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-amber">Active Dev</span><br><span style="font-size:11px;color:var(--text-muted)">Paimon connector module</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">Optional profile</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>TPC-H<br><span style="font-size:11px;color:var(--text-muted)">Benchmark data generator</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Uses Spark TPC-H tools</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>TPC-DS<br><span style="font-size:11px;color:var(--text-muted)">Benchmark data generator</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Uses Spark TPC-DS tools</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>Arrow Flight<br><span style="font-size:11px;color:var(--text-muted)">Arrow Flight RPC connector</span></td>
+  <td><span class="badge badge-purple">Experimental</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>System Connector<br><span style="font-size:11px;color:var(--text-muted)">Internal metadata queries</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">File Formats (Read)</td></tr>
+<tr>
+  <td>Parquet Read<br><span style="font-size:11px;color:var(--text-muted)">Columnar format</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Native reader default</span></td>
+  <td><span class="badge badge-green">cuDF Parquet reader</span><br><span style="font-size:11px;color:var(--text-muted)">GPU-direct scan</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Selective, pushdown, DELTA encoding</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-purple">Experimental</span><br><span style="font-size:11px;color:var(--text-muted)">Via CudfHiveDataSource</span></td>
+</tr>
+<tr>
+  <td>ORC Read<br><span style="font-size:11px;color:var(--text-muted)">Row-columnar format</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">CPU only</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-amber">Partial</span></td>
+  <td><span class="badge badge-red">CPU only</span></td>
+</tr>
+<tr>
+  <td>DWRF Read<br><span style="font-size:11px;color:var(--text-muted)">Meta internal format</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">CPU only</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>Text / CSV Read<br><span style="font-size:11px;color:var(--text-muted)">Delimited text</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">CPU only</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">TextReadFormat</span></td>
+  <td><span class="badge badge-red">CPU only</span></td>
+</tr>
+<tr>
+  <td>JSON Read<br><span style="font-size:11px;color:var(--text-muted)">JSON format</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">JsonReadFormat</span></td>
+  <td><span class="badge badge-red">CPU only</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">File Formats (Write)</td></tr>
+<tr>
+  <td>Parquet Write<br><span style="font-size:11px;color:var(--text-muted)">Columnar output</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Tests disabled</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">Row group flush, NaN stats</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Complex types in v1.6</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>ORC Write</td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Storage Adapters</td></tr>
+<tr>
+  <td>S3<br><span style="font-size:11px;color:var(--text-muted)">Amazon / MinIO</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">S3 tested via CudfHive</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Multi-FS, bucket config, MRAP</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Via CudfHiveConnector</span></td>
+</tr>
+<tr>
+  <td>GCS<br><span style="font-size:11px;color:var(--text-muted)">Google Cloud Storage</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not tested</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">Custom OAuth</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not tested</span></td>
+</tr>
+<tr>
+  <td>HDFS<br><span style="font-size:11px;color:var(--text-muted)">Hadoop filesystem</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not tested</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not tested</span></td>
+</tr>
+<tr>
+  <td>ABFS<br><span style="font-size:11px;color:var(--text-muted)">Azure Blob Storage</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not tested</span></td>
+  <td><span class="badge badge-amber">Active Dev</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not tested</span></td>
+</tr>
+<tr>
+  <td>Local FS<br><span style="font-size:11px;color:var(--text-muted)">Local filesystem</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Working</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Working</span></td>
+</tr>
+</table>
+</div>
+
+<!-- ========== TAB 3: EXECUTION & INFRA ========== -->
+<div id="tab-execution" class="tab-content">
+<table>
+<tr>
+  <th style="min-width:180px;">Feature</th>
+  <th>Presto Native</th>
+  <th>Presto GPU</th>
+  <th>Velox</th>
+  <th>Gluten</th>
+  <th>Gluten GPU</th>
+</tr>
+
+<tr class="group-header"><td colspan="6">Core Execution</td></tr>
+<tr>
+  <td>Vectorized Execution<br><span style="font-size:11px;color:var(--text-muted)">Columnar batch processing</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">GPU vectorized</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">RowVector batches</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Columnar batches via Velox</span></td>
+  <td><span class="badge badge-green">GPU vectorized</span><br><span style="font-size:11px;color:var(--text-muted)">cudf::table batches</span></td>
+</tr>
+<tr>
+  <td>Dynamic Filtering<br><span style="font-size:11px;color:var(--text-muted)">Runtime filter from joins</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span><br><span style="font-size:11px;color:var(--text-muted)">CudfHiveDataSource NYI</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Push into hash joins</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Bloom filter push</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>Adaptive Query Execution<br><span style="font-size:11px;color:var(--text-muted)">Runtime re-optimization</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Presto has own optimizer</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Spark AQE integration</span></td>
+  <td><span class="badge badge-amber">Active Dev</span><br><span style="font-size:11px;color:var(--text-muted)">GPU-aware AQE planned</span></td>
+</tr>
+<tr>
+  <td>Query Trace / Replay<br><span style="font-size:11px;color:var(--text-muted)">Debugging infrastructure</span></td>
+  <td><span class="badge badge-amber">Active Dev</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-amber">Active Dev</span><br><span style="font-size:11px;color:var(--text-muted)">TaskDebuggerCursor 2026</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>RPC Operator<br><span style="font-size:11px;color:var(--text-muted)">Remote function calls in pipeline</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-amber">Active Dev</span><br><span style="font-size:11px;color:var(--text-muted)">RPC framework 2026</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Spill</td></tr>
+<tr>
+  <td>Aggregation Spill<br><span style="font-size:11px;color:var(--text-muted)">Spill hash tables to disk</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">+ distinct agg spill</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">No GPU spill</span></td>
+</tr>
+<tr>
+  <td>Join Spill<br><span style="font-size:11px;color:var(--text-muted)">Spill join build side</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Recursive partitioning</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">No GPU spill</span></td>
+</tr>
+<tr>
+  <td>OrderBy Spill</td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">No GPU spill</span></td>
+</tr>
+<tr>
+  <td>Window Spill</td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">Batch read 2025</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">No GPU spill</span></td>
+</tr>
+<tr>
+  <td>RowNumber / MarkDistinct Spill</td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">Added Mar 2026</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>OutputBuffer Spill</td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">PageSpill 2025</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Caching</td></tr>
+<tr>
+  <td>SSD Cache<br><span style="font-size:11px;color:var(--text-muted)">Disk-backed data cache</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">Data on device</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">AsyncDataCache, TTL, maxEntries</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>Split Preload<br><span style="font-size:11px;color:var(--text-muted)">Prefetch upcoming splits</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Disabled</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Native preload 2026</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Disabled</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Shuffle Services</td></tr>
+<tr>
+  <td>Celeborn<br><span style="font-size:11px;color:var(--text-muted)">Remote shuffle service</span></td>
+  <td><span class="badge badge-amber">Active Dev</span><br><span style="font-size:11px;color:var(--text-muted)">C++ client requested</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">v0.6.1</span></td>
+  <td><span class="badge badge-purple">Experimental</span><br><span style="font-size:11px;color:var(--text-muted)">GPU shuffle + Celeborn untested</span></td>
+</tr>
+<tr>
+  <td>Uniffle<br><span style="font-size:11px;color:var(--text-muted)">Remote shuffle service</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">v0.10.0</span></td>
+  <td><span class="badge badge-purple">Experimental</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">GPU-Specific Infrastructure</td></tr>
+<tr>
+  <td>GPU Plan Validation<br><span style="font-size:11px;color:var(--text-muted)">Check GPU eligibility</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-amber">In Progress</span><br><span style="font-size:11px;color:var(--text-muted)">CudfPlanChecker PR</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Working</span><br><span style="font-size:11px;color:var(--text-muted)">CudfPlanValidator</span></td>
+</tr>
+<tr>
+  <td>GPU Session Config<br><span style="font-size:11px;color:var(--text-muted)"><code>cudf.enabled</code>, fallback, etc.</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-amber">In Progress</span><br><span style="font-size:11px;color:var(--text-muted)">PR #27204</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">CudfConfig 15+ keys</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">VeloxConfig cudf.* keys</span></td>
+</tr>
+<tr>
+  <td>CPU Fallback<br><span style="font-size:11px;color:var(--text-muted)"><code>allowCpuFallback</code></span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Working</span></td>
+  <td><span class="badge badge-green">Working</span><br><span style="font-size:11px;color:var(--text-muted)">DriverAdapter auto-inserts conversions</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Working</span><br><span style="font-size:11px;color:var(--text-muted)">Fallback to Spark or CPU Velox</span></td>
+</tr>
+<tr>
+  <td>Sidecar GPU Awareness<br><span style="font-size:11px;color:var(--text-muted)">Coordinator knows GPU workers</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-amber">In Progress</span><br><span style="font-size:11px;color:var(--text-muted)">PR #27164</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not Supported</span><br><span style="font-size:11px;color:var(--text-muted)">Issue #11524</span></td>
+</tr>
+<tr>
+  <td>GPU CI Pipeline<br><span style="font-size:11px;color:var(--text-muted)">Automated GPU testing</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-amber">In Progress</span><br><span style="font-size:11px;color:var(--text-muted)">PR #27369</span></td>
+  <td><span class="badge badge-amber">Active Dev</span><br><span style="font-size:11px;color:var(--text-muted)">Compile CI; GPU runners needed</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Working</span><br><span style="font-size:11px;color:var(--text-muted)">GPU build CI, Docker images</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Presto / Spark Specific</td></tr>
+<tr>
+  <td>Sidecar Expression Optimizer<br><span style="font-size:11px;color:var(--text-muted)">Native expression optimization</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Known bugs being fixed</span></td>
+  <td><span class="badge badge-amber">In Progress</span><br><span style="font-size:11px;color:var(--text-muted)">PR #27164 GPU extension</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>Remote Functions (REST UDF)<br><span style="font-size:11px;color:var(--text-muted)">REST-based remote UDF</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">Thrift RPC client/server</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>Spark Version Support<br><span style="font-size:11px;color:var(--text-muted)">Multi-version compat</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">3.3, 3.4, 3.5, 4.0, 4.1</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Same Spark versions</span></td>
+</tr>
+<tr>
+  <td>Flink Integration<br><span style="font-size:11px;color:var(--text-muted)">Flink + Velox execution</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-purple">Experimental</span><br><span style="font-size:11px;color:var(--text-muted)">Flink 1.19, Velox4j</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+</table>
+</div>
+
+<!-- ========== TAB 4: FUNCTIONS & EXPRESSIONS ========== -->
+<div id="tab-functions" class="tab-content">
+<table>
+<tr>
+  <th style="min-width:180px;">Category</th>
+  <th>Presto Native</th>
+  <th>Presto GPU</th>
+  <th>Velox</th>
+  <th>Gluten</th>
+  <th>Gluten GPU</th>
+</tr>
+
+<tr class="group-header"><td colspan="6">Scalar Functions</td></tr>
+<tr>
+  <td>Math / Arithmetic<br><span style="font-size:11px;color:var(--text-muted)">abs, ceil, floor, round, power, sqrt, log, mod, sin, cos, etc.</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">~49 registrations</span></td>
+  <td><span class="badge badge-green">Good</span><br><span style="font-size:11px;color:var(--text-muted)">Most in cuDF AST</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Presto + Spark math</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Via Velox functions</span></td>
+  <td><span class="badge badge-green">Good</span><br><span style="font-size:11px;color:var(--text-muted)">AST evaluator coverage</span></td>
+</tr>
+<tr>
+  <td>String<br><span style="font-size:11px;color:var(--text-muted)">substr, concat, upper, lower, trim, split, replace, like, regexp</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">~50 registrations</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">Basic ops in cuDF</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Partial</span></td>
+</tr>
+<tr>
+  <td>Date / Time<br><span style="font-size:11px;color:var(--text-muted)">date_add, date_diff, date_format, from_unixtime, year, month</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">~112 registrations</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">date_format recently added</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Partial</span></td>
+</tr>
+<tr>
+  <td>Comparison / Logic<br><span style="font-size:11px;color:var(--text-muted)">=, &lt;&gt;, &lt;, &gt;, between, in, is null, greatest, least</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Good</span><br><span style="font-size:11px;color:var(--text-muted)">Most in cuDF AST</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Good</span></td>
+</tr>
+<tr>
+  <td>Array Functions<br><span style="font-size:11px;color:var(--text-muted)">array_constructor, element_at, slice, contains, transform, filter</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">~49 registrations</span></td>
+  <td><span class="badge badge-red">Limited</span><br><span style="font-size:11px;color:var(--text-muted)">Complex array ops hard on GPU</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span><br><span style="font-size:11px;color:var(--text-muted)">Complex types NS</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>Map Functions<br><span style="font-size:11px;color:var(--text-muted)">map_keys, map_values, map_entries, map_concat, map_filter</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Limited</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span><br><span style="font-size:11px;color:var(--text-muted)">Complex types NS</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>JSON Functions<br><span style="font-size:11px;color:var(--text-muted)">json_extract, json_parse, json_format, get_json_object</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span><br><span style="font-size:11px;color:var(--text-muted)">GPU JSON is hard</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Partial</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>URL / Network<br><span style="font-size:11px;color:var(--text-muted)">url_extract_host, url_encode, ip_prefix</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>Geospatial<br><span style="font-size:11px;color:var(--text-muted)">ST_Point, ST_Distance, ST_Contains</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">~77 registrations</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>HLL / Sketch<br><span style="font-size:11px;color:var(--text-muted)">approx_set, merge, cardinality</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Partial</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Aggregate Functions</td></tr>
+<tr>
+  <td>Core Aggregates<br><span style="font-size:11px;color:var(--text-muted)">count, sum, min, max, avg</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Mapped</span><br><span style="font-size:11px;color:var(--text-muted)">CudfHashAggregation</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Mapped</span></td>
+</tr>
+<tr>
+  <td>Complex Aggregates<br><span style="font-size:11px;color:var(--text-muted)">approx_distinct, array_agg, map_agg, histogram, checksum</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Limited</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">40+ aggregate files</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">Velox aggs available</span></td>
+  <td><span class="badge badge-red">Limited</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Window Functions</td></tr>
+<tr>
+  <td>Ranking Functions<br><span style="font-size:11px;color:var(--text-muted)">row_number, rank, dense_rank, ntile, percent_rank, cume_dist</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>Value Functions<br><span style="font-size:11px;color:var(--text-muted)">lag, lead, first_value, last_value, nth_value</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Expression Framework</td></tr>
+<tr>
+  <td>Expression Compiler<br><span style="font-size:11px;color:var(--text-muted)">ITypedExpr to Expr DAG</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">cuDF AST compiler</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Constant folding, CSE</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Via Substrait + Velox</span></td>
+  <td><span class="badge badge-green">cuDF AST / JIT</span></td>
+</tr>
+<tr>
+  <td>Special Forms<br><span style="font-size:11px;color:var(--text-muted)">IF, SWITCH, CAST, COALESCE, AND/OR, TRY</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">Some mapped to cuDF AST</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Partial</span></td>
+</tr>
+<tr>
+  <td>Lambda Functions<br><span style="font-size:11px;color:var(--text-muted)">transform, filter, reduce with lambdas</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span><br><span style="font-size:11px;color:var(--text-muted)">GPU can't do per-element callbacks</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-red">Not Supported</span><br><span style="font-size:11px;color:var(--text-muted)">Complex types NS</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>Cast Framework<br><span style="font-size:11px;color:var(--text-muted)">Type coercion, CastHooks, decimal cast</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">Basic casts mapped</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">CastPolicies, Spark ANSI</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Partial</span></td>
+</tr>
+<tr>
+  <td>Decimal Arithmetic<br><span style="font-size:11px;color:var(--text-muted)">Short (64-bit) + Long (128-bit)</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Active Dev</span><br><span style="font-size:11px;color:var(--text-muted)">GPU Decimal Part 1 Mar 2026</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-red">Not Supported</span><br><span style="font-size:11px;color:var(--text-muted)">Decimal NS across operators</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>GPU Expression JIT<br><span style="font-size:11px;color:var(--text-muted)">JIT-compiled GPU expression eval</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-purple">Experimental</span></td>
+  <td><span class="badge badge-purple">Experimental</span><br><span style="font-size:11px;color:var(--text-muted)">JitExpression in CudfFilterProject</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-purple">Experimental</span><br><span style="font-size:11px;color:var(--text-muted)">Via Velox JIT path</span></td>
+</tr>
+<tr>
+  <td>Spark Functions<br><span style="font-size:11px;color:var(--text-muted)">Spark-specific function library</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-amber">Active Dev</span><br><span style="font-size:11px;color:var(--text-muted)">~234 registrations, TIMESTAMP_NTZ</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Via Velox sparksql/</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">Spark-specific mappings needed</span></td>
+</tr>
+<tr>
+  <td>Expression Fuzzer<br><span style="font-size:11px;color:var(--text-muted)">Random expression testing</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">Multi-batch, IPADDRESS support</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not integrated</span></td>
+</tr>
+</table>
+</div>
+
+<!-- ========== TAB 5: MEMORY & PERFORMANCE ========== -->
+<div id="tab-memory" class="tab-content">
+<table>
+<tr>
+  <th style="min-width:180px;">Feature</th>
+  <th>Presto Native</th>
+  <th>Presto GPU</th>
+  <th>Velox</th>
+  <th>Gluten</th>
+  <th>Gluten GPU</th>
+</tr>
+
+<tr class="group-header"><td colspan="6">Memory Management</td></tr>
+<tr>
+  <td>MemoryPool Hierarchy<br><span style="font-size:11px;color:var(--text-muted)">Query &rarr; task &rarr; node &rarr; operator</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">CPU side only</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">4-level scoped allocators</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">VeloxMemoryManager + off-heap</span></td>
+  <td><span class="badge badge-green">CPU side only</span></td>
+</tr>
+<tr>
+  <td>Memory Arbitration<br><span style="font-size:11px;color:var(--text-muted)">Global spill/kill under pressure</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">SharedArbitrator default</span></td>
+  <td><span class="badge badge-red">No GPU integration</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Global + local arbitration</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Spark memory consumer bridge</span></td>
+  <td><span class="badge badge-red">No GPU integration</span></td>
+</tr>
+<tr>
+  <td>GPU Memory (RMM)<br><span style="font-size:11px;color:var(--text-muted)">RAPIDS Memory Manager</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Working</span><br><span style="font-size:11px;color:var(--text-muted)">Pool/async/arena/managed modes</span></td>
+  <td><span class="badge badge-green">Working</span><br><span style="font-size:11px;color:var(--text-muted)">Separate output_mr + temp_mr</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Working</span><br><span style="font-size:11px;color:var(--text-muted)">Global RMM pool</span></td>
+</tr>
+<tr>
+  <td>Unified CPU+GPU Memory<br><span style="font-size:11px;color:var(--text-muted)">Cross-device pressure signaling</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not Supported</span><br><span style="font-size:11px;color:var(--text-muted)">Dual systems, no bridge</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not Supported</span><br><span style="font-size:11px;color:var(--text-muted)">Three-domain problem</span></td>
+</tr>
+<tr>
+  <td>GPU Spill<br><span style="font-size:11px;color:var(--text-muted)">GPU &rarr; disk overflow</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not Supported</span><br><span style="font-size:11px;color:var(--text-muted)">GPU OOM crashes process</span></td>
+</tr>
+<tr>
+  <td>Off-Heap Memory Isolation<br><span style="font-size:11px;color:var(--text-muted)">Task-level memory isolation</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">spark.gluten.memory.isolation</span></td>
+  <td><span class="badge badge-amber">Partial</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Vector / Type System</td></tr>
+<tr>
+  <td>Arrow Bridge<br><span style="font-size:11px;color:var(--text-muted)">Velox &harr; Arrow zero-copy</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Core of GPU bridge</span><br><span style="font-size:11px;color:var(--text-muted)">Arrow C ABI for conversions</span></td>
+  <td><span class="badge badge-blue">Stable</span><br><span style="font-size:11px;color:var(--text-muted)">import/export, Utf8View</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Arrow batch protocol</span></td>
+  <td><span class="badge badge-green">Core of GPU bridge</span></td>
+</tr>
+<tr>
+  <td>Vector Encodings<br><span style="font-size:11px;color:var(--text-muted)">Flat, Dictionary, Constant, Lazy</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Via conversion</span><br><span style="font-size:11px;color:var(--text-muted)">Stripped at GPU boundary</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">+ Sequence, Bias</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Via conversion</span></td>
+</tr>
+<tr>
+  <td>Type System<br><span style="font-size:11px;color:var(--text-muted)">All SQL types, DECIMAL, HUGEINT</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">MAP, VARBINARY gaps</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">TIME_MICRO_UTC 2026</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">Primitives full</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">Complex types limited</span></td>
+</tr>
+<tr>
+  <td>Complex Types<br><span style="font-size:11px;color:var(--text-muted)">ARRAY, MAP, STRUCT / ROW</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-amber">Partial</span><br><span style="font-size:11px;color:var(--text-muted)">Incomplete on GPU</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span><br><span style="font-size:11px;color:var(--text-muted)">NS across most operators</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Performance Optimizations</td></tr>
+<tr>
+  <td>Filter Pushdown (I/O)<br><span style="font-size:11px;color:var(--text-muted)">Row-group and page-level skipping</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-blue">Via cuDF reader</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-blue">Via cuDF reader</span></td>
+</tr>
+<tr>
+  <td>Adaptive Filter Reordering<br><span style="font-size:11px;color:var(--text-muted)">Reorder conjuncts by selectivity</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>Dictionary Lazy Loading<br><span style="font-size:11px;color:var(--text-muted)">Avoid unnecessary decoding</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span><br><span style="font-size:11px;color:var(--text-muted)">cuDF materializes eagerly</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+</tr>
+<tr>
+  <td>Broadcast Hash Table Reuse<br><span style="font-size:11px;color:var(--text-muted)">Reuse built tables across tasks</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">HashTable reuse (Gluten contrib)</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>Partitioned Writer Scaling<br><span style="font-size:11px;color:var(--text-muted)">Dynamic writer task scaling</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-green">Production</span><br><span style="font-size:11px;color:var(--text-muted)">ScaleWriterLocalPartition</span></td>
+  <td><span class="badge badge-green">Production</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>GPU Hybrid Scan<br><span style="font-size:11px;color:var(--text-muted)">cudf::io experimental hybrid_scan</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-purple">Experimental</span></td>
+  <td><span class="badge badge-purple">Experimental</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-purple">Experimental</span></td>
+</tr>
+<tr>
+  <td>Multi-GPU Support<br><span style="font-size:11px;color:var(--text-muted)">Data partitioning across GPUs</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>GPU-Direct RDMA / UCX<br><span style="font-size:11px;color:var(--text-muted)">GPU-to-GPU data transfer</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+<tr>
+  <td>CUDA MPS / MIG<br><span style="font-size:11px;color:var(--text-muted)">Multi-tenant GPU sharing</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not Supported</span></td>
+</tr>
+
+<tr class="group-header"><td colspan="6">Fuzz Testing</td></tr>
+<tr>
+  <td>Expression Fuzzer</td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not integrated</span></td>
+</tr>
+<tr>
+  <td>Join / Aggregation Fuzzer</td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not integrated</span></td>
+</tr>
+<tr>
+  <td>Memory Arbitration Fuzzer</td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-blue">Stable</span></td>
+  <td><span class="badge badge-gray">N/A</span></td>
+  <td><span class="badge badge-red">Not integrated</span></td>
+</tr>
+</table>
+</div>
+
+  </div>
+
+  <div class="callout" style="margin-top: 24px;">
+    <strong>Key Observations:</strong><br>
+    <strong>1. Velox is the GPU engine for both Presto and Gluten.</strong> Both platforms delegate GPU execution to Velox's experimental/cudf module. GPU operator coverage is identical at the engine level.<br>
+    <strong>2. Gluten adds GPU shuffle.</strong> Gluten has GPU shuffle writer/reader not present in Presto Native, giving it a distinct advantage for Spark workloads.<br>
+    <strong>3. Complex types are a shared gap.</strong> ARRAY/MAP/STRUCT support is incomplete on GPU across all platforms, and Gluten marks them Not Supported even on CPU.<br>
+    <strong>4. Memory is the production blocker.</strong> No platform has unified CPU+GPU memory management. GPU OOM causes crashes, not graceful spill.<br>
+    <strong>5. Expression coverage gates real GPU usage.</strong> A single unsupported function in FilterProject forces the entire operator to CPU.
+  </div>
+</section>
+
+</div>
+
+<div style="text-align: center; padding: 40px; color: var(--text-muted); font-size: 12px; border-top: 1px solid var(--border);">
+  Generated March 2026 &middot; Sources: prestodb/presto, facebookincubator/velox, apache/gluten<br>
+  Velox: 40+ operators, 600+ Presto functions, 234 Spark functions &middot; Presto Native: 29 plan nodes &middot; Gluten: 25+ transformers, Spark 3.3&ndash;4.1
+</div>
+
+<script>
+function showTab(event, tabId) {
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
+  document.getElementById(tabId).classList.add('active');
+  if (event && event.target) {
+    if (event.target.classList.contains('tab-btn')) {
+      event.target.classList.add('active');
+    }
+  }
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    if (b.getAttribute('onclick') && b.getAttribute('onclick').indexOf(tabId) !== -1) {
+      b.classList.add('active');
+    }
+  });
+  document.querySelectorAll('.nav a').forEach(a => {
+    if (a.getAttribute('onclick') && a.getAttribute('onclick').indexOf(tabId) !== -1) {
+      a.classList.add('active');
+    }
+  });
+}
+</script>
+</body>
+</html>

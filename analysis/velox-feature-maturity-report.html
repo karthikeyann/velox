@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Velox Feature Maturity &amp; Timeline Report</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=Source+Sans+3:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#08090d;--s1:#10131a;--s2:#171c28;--s3:#1f2637;--bdr:#2a3148;--tx:#d8dee9;--dim:#6b7894;--ac:#5ccfff;--ac2:#a78bfa;--ac3:#fb7185;--grn:#4ade80;--amb:#facc15;--red:#f87171;--orn:#fb923c;--pink:#ec4899}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Source Sans 3',sans-serif;background:var(--bg);color:var(--tx);line-height:1.55}
+.hero{padding:40px 36px 24px;background:linear-gradient(120deg,#0c1020 0%,#1a1040 60%,#0c1020 100%);border-bottom:1px solid var(--bdr)}
+.hero h1{font-family:'Playfair Display',serif;font-size:2em;background:linear-gradient(135deg,#d8dee9,#5ccfff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px}
+.hero .sub{color:var(--dim);font-size:.88em;font-weight:300}
+nav.t{display:flex;background:var(--s1);border-bottom:1px solid var(--bdr);position:sticky;top:0;z-index:100;overflow-x:auto}
+nav.t button{background:none;border:none;color:var(--dim);padding:12px 20px;font-family:inherit;font-size:.82em;font-weight:500;cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap;transition:.2s}
+nav.t button:hover{color:var(--tx);background:rgba(255,255,255,.02)}
+nav.t button.on{color:var(--ac);border-bottom-color:var(--ac)}
+.sec{display:none;padding:28px 36px;max-width:1200px;margin:0 auto}
+.sec.on{display:block;animation:fi .25s ease}
+@keyframes fi{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+h2{font-family:'Playfair Display',serif;font-size:1.4em;margin-bottom:14px}
+h3{font-size:1em;font-weight:600;margin:20px 0 8px;color:var(--ac)}
+h4{font-size:.9em;font-weight:600;margin:12px 0 5px;color:var(--ac2)}
+p,li{font-size:.86em;margin-bottom:6px}
+ul{padding-left:16px}li{margin-bottom:4px}
+code{font-family:'IBM Plex Mono',monospace;font-size:.83em;background:var(--s2);padding:1px 5px;border-radius:3px;color:var(--ac)}
+table{width:100%;border-collapse:collapse;font-size:.82em;margin:12px 0}
+th{text-align:left;padding:8px 10px;background:var(--s2);color:var(--ac);font-weight:600;font-size:.76em;text-transform:uppercase;letter-spacing:.04em;border-bottom:2px solid var(--bdr)}
+td{padding:8px 10px;border-bottom:1px solid var(--bdr);vertical-align:top}
+tr:hover td{background:rgba(255,255,255,.015)}
+.b{display:inline-block;padding:1px 8px;border-radius:10px;font-size:.72em;font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+.b.prod{background:rgba(74,222,128,.12);color:var(--grn)}.b.stab{background:rgba(92,207,255,.12);color:var(--ac)}.b.actv{background:rgba(250,204,21,.12);color:var(--amb)}.b.earl{background:rgba(251,113,133,.12);color:var(--ac3)}.b.none{background:rgba(107,120,148,.12);color:var(--dim)}
+.b.high{background:rgba(248,113,113,.12);color:var(--red)}.b.med{background:rgba(250,204,21,.12);color:var(--amb)}.b.low{background:rgba(74,222,128,.12);color:var(--grn)}
+.card{background:var(--s1);border:1px solid var(--bdr);border-radius:8px;padding:16px 18px;margin-bottom:12px}
+.card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+
+/* Timeline styles */
+.tl-cat{margin-bottom:28px}
+.tl-cat-title{font-family:'IBM Plex Mono',monospace;font-size:.78em;font-weight:600;text-transform:uppercase;letter-spacing:.06em;padding:6px 12px;border-radius:6px;display:inline-block;margin-bottom:12px}
+.tl-cat-title.func{background:rgba(92,207,255,.1);color:var(--ac)}
+.tl-cat-title.perf{background:rgba(74,222,128,.1);color:var(--grn)}
+.tl-cat-title.user{background:rgba(167,139,250,.1);color:var(--ac2)}
+.tl-cat-title.misc{background:rgba(251,113,133,.1);color:var(--ac3)}
+
+.tl-row{display:flex;gap:8px;margin-bottom:6px;align-items:flex-start}
+.tl-date{font-family:'IBM Plex Mono',monospace;font-size:.72em;color:var(--ac);min-width:66px;padding-top:2px;flex-shrink:0}
+.tl-dot{width:8px;height:8px;border-radius:50%;margin-top:5px;flex-shrink:0}
+.tl-dot.func{background:var(--ac)}.tl-dot.perf{background:var(--grn)}.tl-dot.user{background:var(--ac2)}.tl-dot.misc{background:var(--ac3)}
+.tl-text{font-size:.84em;color:var(--tx)}
+.tl-text .module{color:var(--dim);font-size:.85em}
+
+.yr-sep{font-family:'Playfair Display',serif;font-size:1.1em;color:var(--ac);margin:20px 0 10px;padding:6px 0;border-top:1px solid var(--bdr)}
+
+/* Maturity grid */
+.mat-row{display:grid;grid-template-columns:180px repeat(6,1fr);gap:1px;margin-bottom:1px}
+.mat-cell{padding:7px 8px;font-size:.78em;background:var(--s1);border:1px solid var(--bdr)}
+.mat-cell.hdr{background:var(--s2);color:var(--ac);font-weight:600;text-transform:uppercase;font-size:.7em;letter-spacing:.04em}
+.mat-cell.mod{font-weight:600;color:var(--tx)}
+.mat-cell .sub{display:block;color:var(--dim);font-size:.9em;margin-top:2px}
+
+.opinion{background:linear-gradient(135deg,rgba(167,139,250,.06),rgba(236,72,153,.04));border:1px solid rgba(167,139,250,.18);border-radius:8px;padding:12px 16px;margin:12px 0;font-size:.86em}
+.opinion::before{content:'PLANNING INSIGHT';display:block;font-size:.66em;font-weight:700;color:var(--ac2);letter-spacing:.06em;margin-bottom:5px}
+
+@media(max-width:768px){.hero{padding:24px 16px}.sec{padding:20px 16px}.card-grid{grid-template-columns:1fr}.mat-row{grid-template-columns:120px repeat(6,1fr);font-size:.7em}}
+</style>
+</head>
+<body>
+<div class="hero">
+<h1>Velox Feature Maturity &amp; Timeline</h1>
+<div class="sub">Detailed feature inventory by module, maturity level, and categorized milestone timeline for cuDF roadmap planning</div>
+</div>
+
+<nav class="t" id="tabs">
+<button class="on" data-t="tl">Timeline (All Categories)</button>
+<button data-t="mat">Feature Maturity Matrix</button>
+<button data-t="exec">Exec Detail</button>
+<button data-t="expr">Expr &amp; Functions</button>
+<button data-t="io">IO &amp; Connectors</button>
+<button data-t="infra">Memory &amp; Infra</button>
+</nav>
+
+<!-- ===== TIMELINE ===== -->
+<div class="sec on" id="tl">
+<h2>Categorized Milestone Timeline</h2>
+<p style="color:var(--dim);margin-bottom:16px">Every major Velox milestone, categorized. <span style="color:var(--ac);">&#9679;</span> Functionality <span style="color:var(--grn);">&#9679;</span> Performance <span style="color:var(--ac2);">&#9679;</span> User/Adoption <span style="color:var(--ac3);">&#9679;</span> Misc (Build/Infra/Quality)</p>
+
+<div class="yr-sep">2021 &mdash; Foundation (1,017 commits)</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title func">Functionality</div>
+<div class="tl-row"><div class="tl-date">Aug 08</div><div class="tl-dot func"></div><div class="tl-text">Initial open-source commit: 13 operators (TableScan, FilterProject, HashBuild/Probe, HashAggregation, OrderBy, TopN, Limit, Exchange, PartitionedOutput, LocalPartition, TableWrite, Values) <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Aug 08</div><div class="tl-dot func"></div><div class="tl-text">Expression compiler &amp; evaluator, VectorFunction interface, special forms (if, switch, cast, coalesce, and/or) <span class="module">expression/</span></div></div>
+<div class="tl-row"><div class="tl-date">Aug 08</div><div class="tl-dot func"></div><div class="tl-text">Type system: BOOLEAN through BIGINT, REAL, DOUBLE, VARCHAR, VARBINARY, TIMESTAMP, DATE, ARRAY, MAP, ROW <span class="module">type/</span></div></div>
+<div class="tl-row"><div class="tl-date">Aug 08</div><div class="tl-dot func"></div><div class="tl-text">Columnar vectors: BaseVector with flat, dictionary, constant, lazy encodings; RowVector <span class="module">vector/</span></div></div>
+<div class="tl-row"><div class="tl-date">Aug 08</div><div class="tl-dot func"></div><div class="tl-text">DWRF reader/writer (Meta internal format) <span class="module">dwio/</span></div></div>
+<div class="tl-row"><div class="tl-date">Aug 08</div><div class="tl-dot func"></div><div class="tl-text">Hive connector, split management <span class="module">connectors/</span></div></div>
+<div class="tl-row"><div class="tl-date">Aug 08</div><div class="tl-dot func"></div><div class="tl-text">Presto function library (100+ functions Day 1) <span class="module">functions/</span></div></div>
+<div class="tl-row"><div class="tl-date">Aug 12</div><div class="tl-dot func"></div><div class="tl-text">Unnest operator <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Sep 01</div><div class="tl-dot func"></div><div class="tl-text">GroupingSet extracted to separate class <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Sep 17</div><div class="tl-dot func"></div><div class="tl-text">EnforceSingleRow operator <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Oct 14</div><div class="tl-dot func"></div><div class="tl-text">S3 filesystem adapter <span class="module">connectors/</span></div></div>
+<div class="tl-row"><div class="tl-date">Nov 09</div><div class="tl-dot func"></div><div class="tl-text">AssignUniqueId operator <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Nov 18</div><div class="tl-dot func"></div><div class="tl-text">MergeJoin operator <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Dec 20</div><div class="tl-dot func"></div><div class="tl-text">StreamingAggregation operator <span class="module">exec/</span></div></div>
+</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title user">User / Adoption</div>
+<div class="tl-row"><div class="tl-date">Aug 08</div><div class="tl-dot user"></div><div class="tl-text">Velox open-sourced by Meta (was internal "koski" project)</div></div>
+<div class="tl-row"><div class="tl-date">Q3-Q4</div><div class="tl-dot user"></div><div class="tl-text">Prestissimo (Presto native worker) begins using Velox</div></div>
+</div>
+
+<div class="yr-sep">2022 &mdash; Ecosystem Growth (2,914 commits)</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title func">Functionality</div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">DuckDB bridge for SQL parsing <span class="module">duckdb/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">Native Parquet reader development begins (selective reading, column pruning) <span class="module">dwio/parquet/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">DECIMAL type support (Short + Long decimal) <span class="module">type/</span></div></div>
+<div class="tl-row"><div class="tl-date">Jul 20</div><div class="tl-dot func"></div><div class="tl-text">Window operator (ROW_NUMBER, RANK, DENSE_RANK, NTILE, aggregate windows) <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">Spark SQL function library begins (sparksql/ directory, 50+ initial functions) <span class="module">functions/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">MemoryPool hierarchy redesign: query &rarr; task &rarr; node &rarr; operator <span class="module">common/memory/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">Memory arbitration framework <span class="module">common/memory/</span></div></div>
+<div class="tl-row"><div class="tl-date">Sep 23</div><div class="tl-dot func"></div><div class="tl-text">HashJoin refactored (HashBuild/HashProbe split into separate files) <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">Presto serializer for exchange <span class="module">serializers/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">Arrow bridge (Velox &harr; Arrow zero-copy conversion) <span class="module">vector/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">Lambda expression support <span class="module">expression/</span></div></div>
+</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title perf">Performance</div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot perf"></div><div class="tl-text">Dictionary vector lazy loading optimization <span class="module">vector/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot perf"></div><div class="tl-text">ML preprocessing benchmark added <span class="module">benchmarks/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot perf"></div><div class="tl-text">Adaptive hash table sizing <span class="module">exec/</span></div></div>
+</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title user">User / Adoption</div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot user"></div><div class="tl-text">Gluten project (Spark native engine) adopts Velox as backend</div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot user"></div><div class="tl-text">PyVelox Python bindings initial work <span class="module">python/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot user"></div><div class="tl-text">Substrait support explored (cross-engine plan format)</div></div>
+</div>
+
+<div class="yr-sep">2023 &mdash; Production Hardening (3,251 commits, peak year)</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title func">Functionality</div>
+<div class="tl-row"><div class="tl-date">Apr 19</div><div class="tl-dot func"></div><div class="tl-text">Expand operator (GROUPING SETS, CUBE, ROLLUP) <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Apr 20</div><div class="tl-dot func"></div><div class="tl-text">NestedLoopJoin operator (cross joins, inequality joins) <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Jun 01</div><div class="tl-dot func"></div><div class="tl-text">RowNumber operator <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Jun 06</div><div class="tl-dot func"></div><div class="tl-text">MarkDistinct operator <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">HashJoin spill-to-disk (recursive partitioning) <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">Aggregation spill-to-disk <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">OrderBy spill-to-disk <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">SSD-backed AsyncDataCache with TTL <span class="module">common/caching/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">Iceberg V2 support in Hive connector <span class="module">connectors/hive/iceberg/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">Status class (structured error handling) <span class="module">common/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">TypeSignature parser via Flex/Bison <span class="module">type/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">DELTA_BINARY_PACKED Parquet encoding support <span class="module">dwio/parquet/</span></div></div>
+<div class="tl-row"><div class="tl-date">Aug</div><div class="tl-dot func"></div><div class="tl-text"><strong>Wave GPU experiment begins</strong> &mdash; custom CUDA kernels, WaveVector, GPU arena <span class="module">experimental/wave/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">max_spill_bytes configuration <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">Dynamic filter pushdown for hash joins <span class="module">exec/</span></div></div>
+</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title perf">Performance</div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot perf"></div><div class="tl-text">Lazy materialization for complex types <span class="module">vector/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot perf"></div><div class="tl-text">Wave GPU aggregation TPC-H Q1 benchmark <span class="module">experimental/wave/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot perf"></div><div class="tl-text">OutputBuffer stats for exchange performance analysis <span class="module">exec/</span></div></div>
+</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title misc">Misc / Quality</div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot misc"></div><div class="tl-text">Expression fuzzer framework <span class="module">expression/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot misc"></div><div class="tl-text">Join fuzzer, Aggregation fuzzer <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot misc"></div><div class="tl-text">Multiple S3 filesystem support <span class="module">connectors/</span></div></div>
+</div>
+
+<div class="yr-sep">2024 &mdash; Stabilization &amp; Maturation (2,485 commits)</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title func">Functionality</div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">Query trace framework (capture + replay for debugging) <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">Fine-grained per-split cache control (cacheable flag) <span class="module">connectors/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">Spill for distinct aggregations <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">ABFS (Azure Blob) storage adapter with auth <span class="module">connectors/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">S3 bucket-specific config <span class="module">connectors/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">Shuffle compression support <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">TableWriterBuilder plan API <span class="module">core/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">Dictionary combining utilities <span class="module">vector/</span></div></div>
+</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title perf">Performance</div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot perf"></div><div class="tl-text">Expression fuzzer multi-batch support <span class="module">expression/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot perf"></div><div class="tl-text">Stats filter reordering (disable option) <span class="module">connectors/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot perf"></div><div class="tl-text">SIMD build optimization for multiple platforms <span class="module">common/</span></div></div>
+</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title user">User / Adoption</div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot user"></div><div class="tl-text">Query tracing blog published <span class="module">docs/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot user"></div><div class="tl-text">Verax MetadataConnector preparation (Connector + Runner refactor) <span class="module">connectors/</span></div></div>
+</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title misc">Misc / Quality</div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot misc"></div><div class="tl-text">Fault injection in cache fuzzer <span class="module">common/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot misc"></div><div class="tl-text">VectorFuzzer::randTypeByWidth for broader type coverage <span class="module">vector/</span></div></div>
+</div>
+
+<div class="yr-sep">2025 &mdash; GPU Era Begins (2,522 commits)</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title func">Functionality</div>
+<div class="tl-row"><div class="tl-date">Apr 14</div><div class="tl-dot func"></div><div class="tl-text"><strong>cuDF OrderBy</strong> &mdash; first cuDF GPU operator <span class="module">experimental/cudf/</span></div></div>
+<div class="tl-row"><div class="tl-date">May 16</div><div class="tl-dot func"></div><div class="tl-text">cuDF HashAggregation <span class="module">experimental/cudf/</span></div></div>
+<div class="tl-row"><div class="tl-date">Jun 02</div><div class="tl-dot func"></div><div class="tl-text">cuDF HashJoin, FilterProject, Limit, LocalPartition, Parquet scan <span class="module">experimental/cudf/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">Mixed execution mode for hash join (parallel + serial) <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">Async SpillMerger in LocalMerge <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">PageSpill for OutputBuffer <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">GCS custom OAuth credentials <span class="module">connectors/</span></div></div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot func"></div><div class="tl-text">HDFS close() disconnect API <span class="module">connectors/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">Clustered Iceberg writer mode <span class="module">dwio/parquet/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">NaN statistics in Parquet writer <span class="module">dwio/parquet/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">cuDF: NestedLoopJoin, LeftSemiProject, NAAJ-with-filter <span class="module">experimental/cudf/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">cuDF: CudfExpand, CudfWindow operators <span class="module">experimental/cudf/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">Sub-partitioned sort window build optimization <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">Window spill data read in batches <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">Multi-round spill merge for sorted files <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot func"></div><div class="tl-text">Exchange checksum config <span class="module">serializers/</span></div></div>
+<div class="tl-row"><div class="tl-date">Dec</div><div class="tl-dot func"></div><div class="tl-text">HashTable reuse in HashBuild (Gluten contribution) <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Dec</div><div class="tl-dot func"></div><div class="tl-text">Delta Lake split reader <span class="module">dwio/parquet/</span></div></div>
+<div class="tl-row"><div class="tl-date">Dec</div><div class="tl-dot func"></div><div class="tl-text">SSD cache maxEntries limit <span class="module">common/caching/</span></div></div>
+<div class="tl-row"><div class="tl-date">Dec</div><div class="tl-dot func"></div><div class="tl-text">cgroups-aware thread pool sizing <span class="module">common/</span></div></div>
+</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title perf">Performance</div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot perf"></div><div class="tl-text">Window SubPartitionedSortWindowBuild <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot perf"></div><div class="tl-text">CUDA 12.0 &rarr; migration <span class="module">experimental/</span></div></div>
+</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title user">User / Adoption</div>
+<div class="tl-row"><div class="tl-date">H1</div><div class="tl-dot user"></div><div class="tl-text">Pyspark-Velox merge source start processing <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">H2</div><div class="tl-dot user"></div><div class="tl-text">cuDF TPC-H benchmark extended to GPU (PR #13695)</div></div>
+</div>
+
+<div class="yr-sep">2026 (Q1) &mdash; GPU Expansion + New Features (581 commits YTD)</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title func">Functionality</div>
+<div class="tl-row"><div class="tl-date">Jan</div><div class="tl-dot func"></div><div class="tl-text">General spill for distinct aggregation <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Jan</div><div class="tl-dot func"></div><div class="tl-text">Query trace: TaskDebuggerCursor, custom trace provider <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Jan</div><div class="tl-dot func"></div><div class="tl-text">PartitionedVector introduction <span class="module">vector/</span></div></div>
+<div class="tl-row"><div class="tl-date">Feb</div><div class="tl-dot func"></div><div class="tl-text">Spark TIMESTAMP_NTZ type <span class="module">functions/sparksql/</span></div></div>
+<div class="tl-row"><div class="tl-date">Feb</div><div class="tl-dot func"></div><div class="tl-text">EnforceDistinct operator <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Feb</div><div class="tl-dot func"></div><div class="tl-text">Stripe-level batched index read <span class="module">serializers/</span></div></div>
+<div class="tl-row"><div class="tl-date">Feb</div><div class="tl-dot func"></div><div class="tl-text">Parquet row group flush by buffered bytes <span class="module">dwio/parquet/</span></div></div>
+<div class="tl-row"><div class="tl-date">Feb</div><div class="tl-dot func"></div><div class="tl-text">Window function result type resolution APIs <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot func"></div><div class="tl-text">cuDF GPU Decimal (Part 1 of 3) <span class="module">experimental/cudf/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot func"></div><div class="tl-text">RPC operator framework (types, client, operator, plan translator) [1-5/8] <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot func"></div><div class="tl-text">TIME_MICRO_UTC type <span class="module">type/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot func"></div><div class="tl-text">Counting semi-join and anti-join <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot func"></div><div class="tl-text">MarkDistinct spill support <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot func"></div><div class="tl-text">Spill for RowNumber operator <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot func"></div><div class="tl-text">MarkSorted operator <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot func"></div><div class="tl-text">Parquet columnStatistics() reader API, TIME_MILLIS support <span class="module">dwio/parquet/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot func"></div><div class="tl-text">Cache lookup + zero-copy APIs in BufferedInput <span class="module">common/caching/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot func"></div><div class="tl-text">Native preload in DirectBufferedInput and CachedBufferedInput <span class="module">dwio/</span></div></div>
+</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title perf">Performance</div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot perf"></div><div class="tl-text">simdFill utility, SIMD unicode processing <span class="module">common/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot perf"></div><div class="tl-text">map_intersect / map_except optimization (early exit, branch hints) <span class="module">functions/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot perf"></div><div class="tl-text">Skip hash cache in VectorHasher when not beneficial <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot perf"></div><div class="tl-text">Expression FlatNoNulls fast path batch size limit removed <span class="module">expression/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot perf"></div><div class="tl-text">Spill RowContainer string extraction optimization <span class="module">exec/</span></div></div>
+</div>
+
+<div class="tl-cat">
+<div class="tl-cat-title misc">Misc / Quality</div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot misc"></div><div class="tl-text">cuDF tests running in CI <span class="module">experimental/cudf/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot misc"></div><div class="tl-text">MarkDistinct fuzzer <span class="module">exec/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot misc"></div><div class="tl-text">CI optimization: test splitting + 32-core runners <span class="module">ci/</span></div></div>
+<div class="tl-row"><div class="tl-date">Mar</div><div class="tl-dot misc"></div><div class="tl-text">VectorSerde named registration refactor <span class="module">serializers/</span></div></div>
+<div class="tl-row"><div class="tl-date">Feb</div><div class="tl-dot misc"></div><div class="tl-text">rtdsc-based Timer utility for micro-benchmarking <span class="module">common/</span></div></div>
+</div>
+</div>
+
+<!-- ===== FEATURE MATURITY MATRIX ===== -->
+<div class="sec" id="mat">
+<h2>Feature Maturity Matrix</h2>
+<p style="color:var(--dim);margin-bottom:4px">Maturity: <span class="b prod">Production</span> battle-tested at scale <span class="b stab">Stable</span> complete, well-tested <span class="b actv">Active Dev</span> functional, evolving <span class="b earl">Early</span> partial/experimental <span class="b none">None</span></p>
+<p style="color:var(--dim);margin-bottom:16px">Complexity for cuDF: <span class="b high">High</span> significant GPU work <span class="b med">Med</span> moderate effort <span class="b low">Low</span> minimal/done</p>
+
+<h3>Execution Engine (exec/)</h3>
+<table>
+<thead><tr><th>Feature</th><th>Introduced</th><th>Maturity</th><th>Sub-features</th><th>cuDF Status</th><th>cuDF Complexity</th></tr></thead>
+<tbody>
+<tr><td><strong>HashJoin</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>Inner, Left, Right, Full, Semi, Anti, Null-aware anti; dynamic filters; spill; mixed execution mode</td><td>CudfHashJoinBuild/Probe (inner, left, semi, anti). NAAJ-with-filter, NestedLoopJoin added</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>HashAggregation</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>Partial + final + intermediate + single; spill; GroupingSet; DISTINCT aggregates; compact memory</td><td>CudfHashAggregation. Global count(*) rejected, empty-row case rejected</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>StreamingAggregation</strong></td><td>2021</td><td><span class="b stab">Stable</span></td><td>Pre-sorted input aggregation</td><td>No GPU equivalent yet</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>MergeJoin</strong></td><td>2021</td><td><span class="b stab">Stable</span></td><td>Sorted input merge; trace/replay support added 2025</td><td>No GPU equivalent</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>NestedLoopJoin</strong></td><td>2023</td><td><span class="b stab">Stable</span></td><td>Cross join, inequality join conditions</td><td>CudfNestedLoopJoin done</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>FilterProject</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>Fused filter+project; expression evaluation; pushdown</td><td>CudfFilterProject (requires canBeEvaluatedByCudf)</td><td><span class="b high">High</span></td></tr>
+<tr><td><strong>OrderBy</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>Multi-key sort; spill</td><td>CudfOrderBy &mdash; first cuDF operator</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>TopN</strong></td><td>2021</td><td><span class="b stab">Stable</span></td><td>Partial + final TopN</td><td>CudfTopN done</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>Window</strong></td><td>2022</td><td><span class="b stab">Stable</span></td><td>ROW_NUMBER, RANK, NTILE, aggregate windows; spill; sub-partitioned sort build; result type resolution</td><td>CudfWindow (limited). TopNRowNumber for N=1</td><td><span class="b high">High</span></td></tr>
+<tr><td><strong>RowNumber</strong></td><td>2023</td><td><span class="b stab">Stable</span></td><td>Spill support added 2026</td><td>No GPU equivalent</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>MarkDistinct</strong></td><td>2023</td><td><span class="b stab">Stable</span></td><td>Spill added 2026; fuzzer added 2026</td><td>No GPU equivalent</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>Expand</strong></td><td>2023</td><td><span class="b stab">Stable</span></td><td>GROUPING SETS, CUBE, ROLLUP</td><td>CudfExpand done</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>TableScan</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>Split preload; dynamic filter pushdown; lazy vectors; stats filter reordering</td><td>CudfHiveConnector (Parquet only, no dynamic filters, no preload)</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>Exchange</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>Local + remote; MergeExchange; shuffle compression; checksum; PartitionedOutput</td><td>CudfPartitionedOutput (batch accumulation, backpressure). No GPU shuffle</td><td><span class="b high">High</span></td></tr>
+<tr><td><strong>TableWrite</strong></td><td>2021</td><td><span class="b stab">Stable</span></td><td>TableWriteMerge; commit protocols; Iceberg stats; Parquet writer</td><td>CudfHiveDataSink exists but disabled</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>Spill Framework</strong></td><td>2023</td><td><span class="b prod">Production</span></td><td>Join, Agg, OrderBy, RowNumber, MarkDistinct, Window, OutputBuffer spill. Async merge. Multi-round merge</td><td>No GPU spill (CPU fallback only)</td><td><span class="b high">High</span></td></tr>
+<tr><td><strong>Query Trace</strong></td><td>2024</td><td><span class="b actv">Active Dev</span></td><td>Capture, replay, TaskRunner, TaskDebuggerCursor, custom provider, Exchange/BroadcastRead trace</td><td>N/A (debugging tool)</td><td><span class="b none">None</span></td></tr>
+<tr><td><strong>DriverAdapter</strong></td><td>2023</td><td><span class="b stab">Stable</span></td><td>Operator rewriting hook; CudfDriverAdapter registered</td><td>Core integration point. Works.</td><td><span class="b low">Low</span></td></tr>
+</tbody>
+</table>
+
+<h3>Expression &amp; Functions</h3>
+<table>
+<thead><tr><th>Feature</th><th>Introduced</th><th>Maturity</th><th>Sub-features</th><th>cuDF Status</th><th>cuDF Complexity</th></tr></thead>
+<tbody>
+<tr><td><strong>Expression Compiler</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>ITypedExpr &rarr; Expr DAG; constant folding; common subexpression; null propagation</td><td>cuDF uses own AST compiler (cudf::ast::tree)</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>Special Forms</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>IF, SWITCH, CAST, COALESCE, AND/OR, TRY, COALESCE</td><td>Partial: some mapped to cuDF AST ops</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>Lambda Functions</strong></td><td>2022</td><td><span class="b stab">Stable</span></td><td>transform, filter, reduce with lambdas</td><td>No GPU lambda support</td><td><span class="b high">High</span></td></tr>
+<tr><td><strong>Cast Framework</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>Type coercion; CastHooks; CastPolicies; decimal cast; Spark ANSI mode</td><td>Partial: basic casts mapped</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>Presto Functions</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>300+ scalar + aggregate. Math, string, date, JSON, URL, regexp, array, map, HLL, geospatial, IP</td><td>~30-50 mapped via CudfFunction registry + cuDF built-ins</td><td><span class="b high">High</span></td></tr>
+<tr><td><strong>Spark Functions</strong></td><td>2022</td><td><span class="b actv">Active Dev</span></td><td>200+ functions. ANSI mode, TIMESTAMP_NTZ, collect_set RESPECT NULLS, sequence, approx_percentile</td><td>Spark-specific mappings needed</td><td><span class="b high">High</span></td></tr>
+<tr><td><strong>Aggregate Functions</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>count, sum, min, max, avg, approx_distinct, arbitrary, array_agg, map_agg, map_union, histogram, etc.</td><td>Core aggregates mapped in CudfHashAggregation</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>Decimal Arithmetic</strong></td><td>2022</td><td><span class="b stab">Stable</span></td><td>Short (64-bit) + Long (128-bit) decimal; add/sub/mul/div; checked arithmetic</td><td>cuDF GPU Decimal Part 1 landed Mar 2026</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>Expression Fuzzer</strong></td><td>2023</td><td><span class="b stab">Stable</span></td><td>Random expression generation; multi-batch; IPADDRESS support; reference engine comparison</td><td>Not integrated with cuDF path</td><td><span class="b med">Med</span></td></tr>
+</tbody>
+</table>
+
+<h3>IO &amp; Connectors</h3>
+<table>
+<thead><tr><th>Feature</th><th>Introduced</th><th>Maturity</th><th>Sub-features</th><th>cuDF Status</th><th>cuDF Complexity</th></tr></thead>
+<tbody>
+<tr><td><strong>Parquet Reader</strong></td><td>2022</td><td><span class="b prod">Production</span></td><td>Selective reading; column pruning; predicate pushdown; DELTA encoding; RLE; page index; stats filtering; TIME_MILLIS; struct schema evolution</td><td>cuDF Parquet reader replaces DWIO entirely</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>Parquet Writer</strong></td><td>2022</td><td><span class="b stab">Stable</span></td><td>Arrow writer path; row group flush by bytes; NaN stats; column statistics</td><td>CudfHiveDataSink disabled. cuDF writer exists</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>DWRF Reader/Writer</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>Meta internal format; full read/write; filter pushdown</td><td>No cuDF equivalent. CPU only.</td><td><span class="b none">None</span></td></tr>
+<tr><td><strong>ORC Reader</strong></td><td>2022</td><td><span class="b stab">Stable</span></td><td>Read support</td><td>No cuDF equivalent. CPU only.</td><td><span class="b none">None</span></td></tr>
+<tr><td><strong>Text/CSV Reader</strong></td><td>2022</td><td><span class="b stab">Stable</span></td><td>Basic delimited text</td><td>No cuDF equivalent. CPU only.</td><td><span class="b none">None</span></td></tr>
+<tr><td><strong>Hive Connector</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>Split management; partition pruning; dynamic filter pushdown; bucket handling; caching; preload; fileformat stats</td><td>CudfHiveConnector (Parquet only, no dynamic filters, no preload)</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>Iceberg Connector</strong></td><td>2023</td><td><span class="b actv">Active Dev</span></td><td>V2 support; delete files; stats collection; clustered writer</td><td>N/A (metadata-only, stays CPU)</td><td><span class="b none">None</span></td></tr>
+<tr><td><strong>Storage: S3</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>Multi-filesystem; bucket config; MRAP; IMDS</td><td>Works via CudfHiveConnector</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>Storage: GCS</strong></td><td>2022</td><td><span class="b stab">Stable</span></td><td>Custom OAuth credentials</td><td>Works via CudfHiveConnector</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>Storage: HDFS</strong></td><td>2022</td><td><span class="b stab">Stable</span></td><td>Read/write; close() disconnect</td><td>Works via CudfHiveConnector</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>Storage: ABFS</strong></td><td>2024</td><td><span class="b actv">Active Dev</span></td><td>Auth support; client caching optimization</td><td>Works via CudfHiveConnector</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>TPC-H/TPC-DS Gen</strong></td><td>2021</td><td><span class="b stab">Stable</span></td><td>Data generators for benchmarking</td><td>CudfTpchBenchmark, CudfTpcdsBenchmark exist</td><td><span class="b low">Low</span></td></tr>
+</tbody>
+</table>
+
+<h3>Memory, Vectors &amp; Infrastructure</h3>
+<table>
+<thead><tr><th>Feature</th><th>Introduced</th><th>Maturity</th><th>Sub-features</th><th>cuDF Status</th><th>cuDF Complexity</th></tr></thead>
+<tbody>
+<tr><td><strong>MemoryPool Hierarchy</strong></td><td>2022</td><td><span class="b prod">Production</span></td><td>4-level tree; scoped allocators; tracking; MmapAllocator; MallocAllocator options</td><td>CPU only. GPU uses RMM separately. No cross-device visibility.</td><td><span class="b high">High</span></td></tr>
+<tr><td><strong>Memory Arbitration</strong></td><td>2022</td><td><span class="b prod">Production</span></td><td>Global + local arbitration; shared arbitration; query kill under pressure; arbitration fuzzer</td><td>Not integrated with GPU memory</td><td><span class="b high">High</span></td></tr>
+<tr><td><strong>HashStringAllocator</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>Variable-width data in hash tables; used by aggregation, join</td><td>cuDF uses cudf::column internally instead</td><td><span class="b none">None</span></td></tr>
+<tr><td><strong>AsyncDataCache</strong></td><td>2022</td><td><span class="b prod">Production</span></td><td>SSD-backed; TTL; sharding; maxEntries; flush threshold; zero-copy lookup; preload</td><td>N/A for GPU path (data on device)</td><td><span class="b none">None</span></td></tr>
+<tr><td><strong>Vector Encodings</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>Flat, Dictionary, Constant, Sequence, Lazy, Bias; DecodedVector for peeling</td><td>CudfVector wraps cudf::table. Conversions strip encodings via Arrow bridge.</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>Arrow Bridge</strong></td><td>2022</td><td><span class="b stab">Stable</span></td><td>Velox &harr; Arrow zero-copy; importFromArrow; exportToArrow; Utf8View</td><td>Core of VeloxCudfInterop. Works.</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>PartitionedVector</strong></td><td>2026</td><td><span class="b earl">Early</span></td><td>Pre-partitioned columnar data; partitioned constant vector</td><td>Could be useful for GPU partition-aware processing</td><td><span class="b med">Med</span></td></tr>
+<tr><td><strong>Presto Serializer</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>Named serde; exchange compression; estimation utils</td><td>CudfPartitionedOutput uses own serialization</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>Type System</strong></td><td>2021</td><td><span class="b prod">Production</span></td><td>All SQL types; DECIMAL; HUGEINT; INTERVAL; TIME_MICRO_UTC; Timestamp with TZ</td><td>VeloxCudfInterop handles mapping. Done.</td><td><span class="b low">Low</span></td></tr>
+<tr><td><strong>Fuzz Testing</strong></td><td>2023</td><td><span class="b stab">Stable</span></td><td>Expression, Join, Aggregation, Window, MarkDistinct, SpatialJoin, Memory Arbitration fuzzers</td><td>Not integrated with cuDF</td><td><span class="b med">Med</span></td></tr>
+</tbody>
+</table>
+
+<div class="opinion">
+<strong>Reading this matrix for cuDF planning:</strong> Focus on rows where cuDF Complexity is <span class="b high">High</span> and Maturity is <span class="b prod">Production</span>. These are features that real workloads depend on heavily but are hard to GPU-accelerate: <strong>FilterProject</strong> (expression coverage), <strong>Exchange</strong> (GPU shuffle), <strong>Spill</strong> (GPU memory overflow), <strong>MemoryPool/Arbitration</strong> (unified pressure). The <span class="b low">Low</span> complexity items are either done or don't need GPU work &mdash; don't spend time there. The <span class="b none">None</span> items (DWRF, ORC, cache, trace) should stay CPU permanently.
+</div>
+</div>
+
+<!-- ===== EXEC DETAIL ===== -->
+<div class="sec" id="exec">
+<h2>Execution Engine Feature Detail</h2>
+<p style="color:var(--dim);margin-bottom:14px">Operator inventory with feature breakdown and GPU relevance.</p>
+
+<div class="card-grid">
+<div class="card">
+<h4>HashJoin <span class="b prod">Production</span></h4>
+<p><strong>Sub-features:</strong> 7 join types (Inner, Left, Right, Full, Left-Semi, Left-Anti, Null-Aware-Anti) &middot; Dynamic filter generation for probe-side scan &middot; Spill with recursive partitioning &middot; Mixed execution mode (parallel build + serial probe) &middot; Hash table reuse across builds</p>
+<p><strong>cuDF gap:</strong> NAAJ-with-filter disabled. Some join types gated by isSupportedJoinType. No spill.</p>
+</div>
+<div class="card">
+<h4>HashAggregation <span class="b prod">Production</span></h4>
+<p><strong>Sub-features:</strong> Partial/Final/Intermediate/Single modes &middot; GroupingSet/CUBE/ROLLUP &middot; DISTINCT aggregates &middot; Spill &middot; Memory compaction &middot; Adaptive hash table &middot; Streaming pre-aggregation</p>
+<p><strong>cuDF gap:</strong> Global count(*) without groups rejected. Empty-row edge case. No spill.</p>
+</div>
+<div class="card">
+<h4>Window <span class="b stab">Stable</span></h4>
+<p><strong>Sub-features:</strong> ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST &middot; Aggregate window functions &middot; Frame types (ROWS, RANGE) &middot; Sub-partitioned sort &middot; Spill &middot; Result type resolution</p>
+<p><strong>cuDF gap:</strong> CudfWindow is limited coverage. TopNRowNumber for N=1 only. Frame types may be incomplete.</p>
+</div>
+<div class="card">
+<h4>Exchange / Shuffle <span class="b prod">Production</span></h4>
+<p><strong>Sub-features:</strong> Local exchange &middot; Remote exchange (Presto wire protocol) &middot; MergeExchange &middot; Broadcast &middot; PartitionedOutput &middot; Shuffle compression &middot; Checksum &middot; OutputBuffer spill</p>
+<p><strong>cuDF gap:</strong> CudfPartitionedOutput with batch accumulation and backpressure. TransportType annotation for cudf exchange. No GPU-native shuffle.</p>
+</div>
+<div class="card">
+<h4>Spill <span class="b prod">Production</span></h4>
+<p><strong>Sub-features:</strong> HashJoin spill &middot; Aggregation spill &middot; OrderBy spill &middot; Window spill &middot; RowNumber spill &middot; MarkDistinct spill &middot; OutputBuffer spill &middot; Async merge &middot; Multi-round merge &middot; Concatenate files merge stream</p>
+<p><strong>cuDF gap:</strong> No GPU spill at all. Full CPU fallback is the only option under GPU memory pressure.</p>
+</div>
+<div class="card">
+<h4>Newer Operators</h4>
+<p><strong>MarkSorted</strong> (2026): Sort verification operator with Python bindings, performance optimizations<br>
+<strong>EnforceDistinct</strong> (2026): Spark-specific distinct enforcement<br>
+<strong>Counting Semi/Anti Join</strong> (2026): New join variants<br>
+<strong>RPC Operator</strong> (2026): Remote procedure calls during execution (sidecar pattern)<br>
+<strong>SpatialJoin</strong> (2025): Geospatial join with fuzzer</p>
+</div>
+</div>
+</div>
+
+<!-- ===== EXPR & FUNCTIONS DETAIL ===== -->
+<div class="sec" id="expr">
+<h2>Expression &amp; Function Detail</h2>
+
+<h3>Expression Evaluation Architecture</h3>
+<div class="card">
+<p><strong>CPU path:</strong> ITypedExpr &rarr; ExprCompiler &rarr; Expr DAG &rarr; EvalCtx &rarr; VectorFunction calls &rarr; RowVector output</p>
+<p><strong>GPU path:</strong> ITypedExpr &rarr; CudfExpression framework (priority-based selection):</p>
+<ul>
+<li><strong>ASTExpression:</strong> Translates to cudf::ast::tree. Covers arithmetic, comparisons, logical ops, simple casts. Fastest path.</li>
+<li><strong>JitExpression:</strong> JIT-compiled GPU kernels for expressions not in cuDF AST. Broader coverage, higher compile cost.</li>
+<li><strong>CudfFunction registry:</strong> Per-function GPU implementations (e.g., date_format, casts). Manual mapping.</li>
+<li><strong>Fallback:</strong> If none match, entire FilterProject falls back to CPU.</li>
+</ul>
+</div>
+
+<h3>Function Library Breakdown</h3>
+<table>
+<thead><tr><th>Category</th><th>~Count</th><th>Examples</th><th>cuDF Coverage</th></tr></thead>
+<tbody>
+<tr><td>Math/Arithmetic</td><td>40+</td><td>abs, ceil, floor, round, power, sqrt, log, mod, sin, cos</td><td><span class="b stab">Good</span> most in cuDF AST</td></tr>
+<tr><td>String</td><td>60+</td><td>substr, concat, upper, lower, trim, split, replace, like, regexp</td><td><span class="b actv">Partial</span> basic ops available</td></tr>
+<tr><td>Date/Time</td><td>40+</td><td>date_add, date_diff, date_format, from_unixtime, year, month, day, hour</td><td><span class="b actv">Partial</span> date_format recently added</td></tr>
+<tr><td>Comparison/Logic</td><td>20+</td><td>=, <>, <, >, between, in, is null, is distinct from, greatest, least</td><td><span class="b stab">Good</span> most in cuDF AST</td></tr>
+<tr><td>Array</td><td>30+</td><td>array_constructor, element_at, slice, contains, transform, filter, reduce</td><td><span class="b earl">Limited</span> complex array ops hard on GPU</td></tr>
+<tr><td>Map</td><td>20+</td><td>map_keys, map_values, map_entries, map_concat, map_filter, map_from_entries</td><td><span class="b earl">Limited</span></td></tr>
+<tr><td>JSON</td><td>10+</td><td>json_extract, json_parse, json_format, get_json_object</td><td><span class="b none">None</span> GPU JSON is hard</td></tr>
+<tr><td>URL/Network</td><td>10+</td><td>url_extract_host, url_encode, ip_prefix</td><td><span class="b none">None</span></td></tr>
+<tr><td>Aggregate</td><td>30+</td><td>count, sum, min, max, avg, approx_distinct, array_agg, map_agg, histogram, checksum</td><td><span class="b stab">Good</span> core aggs mapped in CudfHashAgg</td></tr>
+<tr><td>Window</td><td>10+</td><td>row_number, rank, dense_rank, ntile, lag, lead, first_value, last_value</td><td><span class="b earl">Limited</span> CudfWindow partial</td></tr>
+<tr><td>HLL/Sketch</td><td>5+</td><td>approx_set, merge, cardinality</td><td><span class="b none">None</span></td></tr>
+<tr><td>Geospatial</td><td>10+</td><td>ST_Point, ST_Distance, ST_Contains</td><td><span class="b none">None</span></td></tr>
+</tbody>
+</table>
+
+<div class="opinion">
+<strong>Function porting strategy:</strong> The top-4 categories by query coverage (Math, Comparison, Date/Time, String) account for ~80% of expressions in typical OLAP workloads. These are where cuDF should invest. Array/Map lambdas are architecturally hard (GPU doesn't do per-element callbacks well). JSON/URL/Geospatial/HLL are niche &mdash; leave on CPU.
+</div>
+</div>
+
+<!-- ===== IO & CONNECTORS DETAIL ===== -->
+<div class="sec" id="io">
+<h2>IO &amp; Connector Detail</h2>
+
+<h3>Parquet Reader Feature Matrix</h3>
+<table>
+<thead><tr><th>Feature</th><th>CPU (DWIO)</th><th>GPU (cuDF)</th></tr></thead>
+<tbody>
+<tr><td>Selective column reading</td><td><span class="b prod">Yes</span></td><td><span class="b stab">Yes</span></td></tr>
+<tr><td>Predicate pushdown (stats)</td><td><span class="b prod">Yes</span></td><td><span class="b stab">Yes (via cuDF)</span></td></tr>
+<tr><td>Row group pruning</td><td><span class="b prod">Yes</span></td><td><span class="b stab">Yes</span></td></tr>
+<tr><td>Page index filtering</td><td><span class="b stab">Yes</span></td><td><span class="b actv">Partial</span></td></tr>
+<tr><td>DELTA_BINARY_PACKED</td><td><span class="b stab">Yes</span></td><td><span class="b stab">Yes</span></td></tr>
+<tr><td>Dictionary encoding</td><td><span class="b prod">Yes</span></td><td><span class="b stab">Yes</span></td></tr>
+<tr><td>Bloom filter</td><td><span class="b stab">Partial</span></td><td><span class="b earl">Partial</span></td></tr>
+<tr><td>Struct schema evolution</td><td><span class="b stab">Yes</span></td><td><span class="b earl">Unknown</span></td></tr>
+<tr><td>TIME_MILLIS type</td><td><span class="b stab">Yes (2026)</span></td><td><span class="b earl">Check cuDF</span></td></tr>
+<tr><td>NaN statistics</td><td><span class="b stab">Yes</span></td><td><span class="b stab">Yes</span></td></tr>
+<tr><td>Dynamic filter from joins</td><td><span class="b prod">Yes</span></td><td><span class="b none">Disabled</span></td></tr>
+<tr><td>Split preload</td><td><span class="b prod">Yes</span></td><td><span class="b none">Disabled</span></td></tr>
+</tbody>
+</table>
+
+<h3>Connector Feature Matrix</h3>
+<table>
+<thead><tr><th>Feature</th><th>CPU</th><th>GPU</th></tr></thead>
+<tbody>
+<tr><td>Parquet read</td><td><span class="b prod">Full</span></td><td><span class="b stab">Full (cuDF reader)</span></td></tr>
+<tr><td>Parquet write</td><td><span class="b stab">Full</span></td><td><span class="b earl">Disabled</span></td></tr>
+<tr><td>Partition pruning</td><td><span class="b prod">Yes</span></td><td><span class="b stab">Yes</span></td></tr>
+<tr><td>Dynamic filter pushdown</td><td><span class="b prod">Yes</span></td><td><span class="b none">Disabled</span></td></tr>
+<tr><td>Split preload</td><td><span class="b prod">Yes</span></td><td><span class="b none">Disabled</span></td></tr>
+<tr><td>Bucket handling</td><td><span class="b stab">Yes</span></td><td><span class="b earl">Unknown</span></td></tr>
+<tr><td>Caching integration</td><td><span class="b prod">Yes</span></td><td><span class="b none">N/A (data on device)</span></td></tr>
+<tr><td>Iceberg V2</td><td><span class="b actv">Yes</span></td><td><span class="b none">N/A (metadata CPU)</span></td></tr>
+<tr><td>S3/GCS/HDFS/ABFS</td><td><span class="b prod">All</span></td><td><span class="b stab">All (via connector)</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<!-- ===== MEMORY & INFRA DETAIL ===== -->
+<div class="sec" id="infra">
+<h2>Memory &amp; Infrastructure Detail</h2>
+
+<h3>Memory Management Feature Inventory</h3>
+<table>
+<thead><tr><th>Feature</th><th>Maturity</th><th>What It Does</th><th>GPU Relevance</th></tr></thead>
+<tbody>
+<tr><td>MemoryPool hierarchy</td><td><span class="b prod">Production</span></td><td>4-level scoped allocation tracking. Each operator gets a pool. Limits enforced.</td><td>GPU allocations invisible to this. Need bridge to RMM.</td></tr>
+<tr><td>Memory Arbitration</td><td><span class="b prod">Production</span></td><td>Global coordinator decides which query to spill/kill when memory scarce.</td><td>Cannot arbitrate GPU memory. Critical gap.</td></tr>
+<tr><td>MmapAllocator</td><td><span class="b prod">Production</span></td><td>Large contiguous allocations via mmap. Efficient for hash tables.</td><td>N/A for GPU (RMM handles device alloc).</td></tr>
+<tr><td>MallocAllocator</td><td><span class="b stab">Stable</span></td><td>Standard malloc-based. New: contiguous allocation support, Options struct.</td><td>N/A for GPU.</td></tr>
+<tr><td>StlAllocator</td><td><span class="b stab">Stable</span></td><td>MemoryPool-backed STL allocator. Move/swap semantics added 2026.</td><td>N/A for GPU.</td></tr>
+<tr><td>AsyncDataCache</td><td><span class="b prod">Production</span></td><td>In-memory + SSD cache for IO data. Sharding, TTL, maxEntries, flush thresholds.</td><td>N/A. GPU path reads directly to device.</td></tr>
+<tr><td>Spill File Management</td><td><span class="b prod">Production</span></td><td>Temp file creation, cleanup, custom base dir. Multi-round merge.</td><td>Could be reused if GPU spill serializes to host first.</td></tr>
+</tbody>
+</table>
+
+<h3>GPU Memory (Current State in cuDF)</h3>
+<div class="card">
+<p><strong>RMM (RAPIDS Memory Manager):</strong> Device memory allocation. Modes: cuda (raw), pool, async (default), arena, managed, managed_pool. Configurable via cudf.memory_resource config.</p>
+<p><strong>Output MR:</strong> Separate resource for operator output allocations (cudf.output_mr config).</p>
+<p><strong>Pinned Pool:</strong> Auto-sizing with 8GB minimum. PreferredPinnedPool for graceful pageable fallback.</p>
+<p><strong>Stream Pool:</strong> cuDF stream pool for concurrent GPU operations (cudfGlobalStreamPool).</p>
+<p><strong>What's missing:</strong> No visibility into Velox's MemoryArbitrator. No device-to-host spill. No memory budget enforcement at query level for GPU. No cross-device memory pressure signaling.</p>
+</div>
+
+<h3>Build &amp; CI Infrastructure</h3>
+<table>
+<thead><tr><th>Feature</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>CMake build system</td><td><span class="b prod">Production</span> C++20, conditional modules via options</td></tr>
+<tr><td>docker-compose dev images</td><td><span class="b stab">Stable</span> adapters-cuda image for GPU builds</td></tr>
+<tr><td>VELOX_ENABLE_CUDF option</td><td><span class="b stab">Stable</span> Fetches cuDF via CMake</td></tr>
+<tr><td>cuDF build in CI</td><td><span class="b actv">Active</span> Compile in adapters build (no GPU needed)</td></tr>
+<tr><td>cuDF test in CI</td><td><span class="b earl">Early</span> Recently added (Mar 2026). GPU runners needed.</td></tr>
+<tr><td>Fuzz testing CI</td><td><span class="b prod">Production</span> Nightly fuzzer runs for CPU. Not for GPU.</td></tr>
+<tr><td>32-core CI runners</td><td><span class="b stab">Stable</span> Test splitting for parallelism</td></tr>
+</tbody>
+</table>
+</div>
+
+<script>
+document.querySelectorAll('nav.t button').forEach(b=>{
+b.addEventListener('click',()=>{
+document.querySelectorAll('nav.t button').forEach(x=>x.classList.remove('on'));
+document.querySelectorAll('.sec').forEach(x=>x.classList.remove('on'));
+b.classList.add('on');
+document.getElementById(b.dataset.t).classList.add('on');
+});
+});
+</script>
+</body>
+</html>

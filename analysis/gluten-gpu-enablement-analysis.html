@@ -1,0 +1,1168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Apache Gluten — Principal Engineer Analysis & GPU Enablement Roadmap</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0e17;
+  --surface: #111827;
+  --surface2: #1a2332;
+  --border: #1e293b;
+  --border-bright: #334155;
+  --text: #e2e8f0;
+  --text-muted: #94a3b8;
+  --text-dim: #64748b;
+  --accent: #f59e0b;
+  --accent2: #10b981;
+  --accent3: #6366f1;
+  --accent4: #ef4444;
+  --accent5: #06b6d4;
+  --gpu: #76b900;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: 'IBM Plex Sans', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  font-size: 14px;
+}
+
+.container {
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 40px 24px;
+}
+
+.report-header {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: end;
+  border-bottom: 2px solid var(--accent);
+  padding-bottom: 24px;
+  margin-bottom: 48px;
+}
+.report-header h1 {
+  font-family: 'DM Serif Display', serif;
+  font-size: 36px;
+  color: var(--accent);
+  letter-spacing: -0.5px;
+}
+.report-header .meta {
+  text-align: right;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.report-header .meta .badge {
+  display: inline-block;
+  background: var(--accent);
+  color: var(--bg);
+  padding: 2px 10px;
+  border-radius: 3px;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.stats-row {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 12px;
+  margin-bottom: 48px;
+}
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px;
+  text-align: center;
+}
+.stat-card .number {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--accent);
+}
+.stat-card .label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-top: 4px;
+}
+
+.tab-nav {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 32px;
+  overflow-x: auto;
+}
+.tab-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  padding: 10px 18px;
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+section { margin-bottom: 40px; }
+section h2 {
+  font-family: 'DM Serif Display', serif;
+  font-size: 24px;
+  color: var(--accent);
+  margin-bottom: 20px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+section h3 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 20px 0 12px;
+}
+section h4 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent5);
+  margin: 16px 0 8px;
+}
+p, li { color: var(--text-muted); }
+strong { color: var(--text); font-weight: 600; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 16px 0;
+  font-size: 13px;
+}
+th {
+  background: var(--surface2);
+  color: var(--text);
+  font-weight: 600;
+  text-align: left;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+td {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+tr:nth-child(even) td { background: var(--surface); }
+
+.badge-s { background: #065f46; color: #6ee7b7; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+.badge-ps { background: #78350f; color: #fbbf24; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+.badge-ns { background: #7f1d1d; color: #fca5a5; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+.badge-exp { background: #312e81; color: #a5b4fc; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+.badge-gpu { background: #365314; color: #84cc16; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+
+.timeline { position: relative; padding-left: 32px; }
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 8px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--border-bright);
+}
+.tl-item {
+  position: relative;
+  margin-bottom: 24px;
+}
+.tl-item::before {
+  content: '';
+  position: absolute;
+  left: -28px;
+  top: 6px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+}
+.tl-item.phase::before { background: var(--accent3); width: 14px; height: 14px; left: -29px; }
+.tl-date {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: 500;
+}
+.tl-title {
+  font-weight: 600;
+  color: var(--text);
+  font-size: 14px;
+}
+.tl-desc {
+  color: var(--text-dim);
+  font-size: 13px;
+  margin-top: 2px;
+}
+
+.arch-diagram {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 4px;
+  margin: 20px 0;
+}
+.arch-layer {
+  border: 1px solid var(--border-bright);
+  border-radius: 6px;
+  padding: 14px 18px;
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  gap: 16px;
+  align-items: center;
+}
+.arch-layer .layer-name {
+  font-weight: 700;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.arch-layer .layer-detail {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.l-spark { background: linear-gradient(135deg, #1e1b4b 0%, #0f172a 100%); border-color: #4338ca; }
+.l-spark .layer-name { color: #818cf8; }
+.l-gluten-core { background: linear-gradient(135deg, #172554 0%, #0f172a 100%); border-color: #2563eb; }
+.l-gluten-core .layer-name { color: #60a5fa; }
+.l-substrait { background: linear-gradient(135deg, #134e4a 0%, #0f172a 100%); border-color: #0d9488; }
+.l-substrait .layer-name { color: #2dd4bf; }
+.l-jni { background: linear-gradient(135deg, #422006 0%, #0f172a 100%); border-color: #d97706; }
+.l-jni .layer-name { color: #fbbf24; }
+.l-native { background: linear-gradient(135deg, #14532d 0%, #0f172a 100%); border-color: #16a34a; }
+.l-native .layer-name { color: #4ade80; }
+.l-gpu { background: linear-gradient(135deg, #365314 0%, #0f172a 100%); border-color: #65a30d; }
+.l-gpu .layer-name { color: #84cc16; }
+
+.arrow-down {
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 18px;
+  padding: 2px;
+}
+
+.flow-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 16px 0;
+}
+.flow-box {
+  background: var(--surface);
+  border: 1px solid var(--border-bright);
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: 'IBM Plex Mono', monospace;
+  color: var(--text);
+}
+.flow-arrow { color: var(--accent); font-size: 16px; }
+
+.risk-high { color: #ef4444; }
+.risk-med { color: #f59e0b; }
+.risk-low { color: #10b981; }
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+  margin: 16px 0;
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 18px;
+}
+.card h4 {
+  margin-top: 0;
+  color: var(--text);
+  font-size: 15px;
+}
+.card ul {
+  margin: 8px 0 0 16px;
+  font-size: 13px;
+}
+.card li { margin-bottom: 4px; }
+
+.bar-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 16px 0;
+}
+.bar-row {
+  display: grid;
+  grid-template-columns: 160px 1fr 60px;
+  gap: 12px;
+  align-items: center;
+}
+.bar-label {
+  font-size: 13px;
+  color: var(--text-muted);
+  text-align: right;
+}
+.bar-track {
+  height: 24px;
+  background: var(--surface);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.5s ease;
+}
+.bar-val {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+ul { list-style: disc; padding-left: 20px; }
+li { margin-bottom: 6px; }
+
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+@media (max-width: 800px) {
+  .two-col { grid-template-columns: 1fr; }
+  .stats-row { grid-template-columns: repeat(3, 1fr); }
+}
+
+.phase-header {
+  background: var(--surface2);
+  border: 1px solid var(--accent3);
+  border-radius: 6px;
+  padding: 14px 18px;
+  margin: 24px 0 16px;
+}
+.phase-header h3 {
+  color: var(--accent3);
+  margin: 0;
+}
+.phase-header .ph-meta {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+.opinion {
+  background: var(--surface2);
+  border-left: 3px solid var(--accent);
+  padding: 14px 18px;
+  margin: 16px 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.opinion strong { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="report-header">
+  <div>
+    <h1>Apache Gluten</h1>
+    <p style="color:var(--text-muted);font-size:15px;margin-top:4px;">Principal Engineer Analysis &amp; GPU Enablement Roadmap</p>
+  </div>
+  <div class="meta">
+    <div><span class="badge">TLP</span> Graduated Feb 2026</div>
+    <div style="margin-top:4px;">Report Date: 2026-03-30</div>
+    <div>Repository: apache/gluten</div>
+  </div>
+</div>
+
+<div class="stats-row">
+  <div class="stat-card"><div class="number">1,542</div><div class="label">GitHub Stars</div></div>
+  <div class="stat-card"><div class="number">587</div><div class="label">Forks</div></div>
+  <div class="stat-card"><div class="number">6,151</div><div class="label">Total Commits</div></div>
+  <div class="stat-card"><div class="number">873</div><div class="label">Open Issues</div></div>
+  <div class="stat-card"><div class="number">9</div><div class="label">Releases</div></div>
+  <div class="stat-card"><div class="number">185</div><div class="label">GPU Items</div></div>
+</div>
+
+<div class="tab-nav">
+  <button class="tab-btn active" data-tab="timeline">1. Timeline</button>
+  <button class="tab-btn" data-tab="arch">2. Architecture</button>
+  <button class="tab-btn" data-tab="features">3. Feature Matrix</button>
+  <button class="tab-btn" data-tab="issues">4. Issue Analysis</button>
+  <button class="tab-btn" data-tab="boundaries">5. Responsibility Map</button>
+  <button class="tab-btn" data-tab="gpu">6. GPU Feasibility</button>
+  <button class="tab-btn" data-tab="modules">7. Module Evaluation</button>
+  <button class="tab-btn" data-tab="roadmap">8. GPU Roadmap</button>
+</div>
+
+<!-- ========== TAB 1: TIMELINE ========== -->
+<div class="tab-content active" id="timeline">
+<section>
+<h2>1. Project Evolution Timeline</h2>
+
+<div class="opinion">
+<strong>Principal's Take:</strong> Gluten's trajectory from Intel's experimental prototype (2021) to Apache TLP (2026) in ~4 years is remarkably fast for an execution-layer project. The consistent ~150-200 commits/month through 2024-2025 signals genuine production adoption pressure, not just academic interest. The inflection point was the ClickHouse backend addition (mid-2022) which doubled the community surface area.
+</div>
+
+<div class="timeline">
+  <div class="tl-item phase"><div class="tl-date">Phase 1 &mdash; Prototype (Dec 2021 &ndash; Sep 2022)</div></div>
+  <div class="tl-item">
+    <div class="tl-date">2021-12-06</div>
+    <div class="tl-title">Initial commit &mdash; "Gazelle Jni" project created</div>
+    <div class="tl-desc">Intel-led initiative for Spark native execution via Arrow/Gandiva. Originally named GazellePlugin targeting columnar processing.</div>
+  </div>
+  <div class="tl-item">
+    <div class="tl-date">2022-Q1</div>
+    <div class="tl-title">Velox backend prototype</div>
+    <div class="tl-desc">Integration with Meta's Velox execution library begins. Arrow data format bridge established. ~40 commits/month.</div>
+  </div>
+  <div class="tl-item">
+    <div class="tl-date">2022-Q2/Q3</div>
+    <div class="tl-title">ClickHouse backend added + Substrait adoption</div>
+    <div class="tl-desc">Kyligence contributes ClickHouse local engine backend. Project adopts Substrait as cross-backend plan IR. Renamed to "Gluten" (glue for native engines). 509 commits in 2022.</div>
+  </div>
+  <div class="tl-item">
+    <div class="tl-date">2022-09-01</div>
+    <div class="tl-title">First tagged release: spark311</div>
+    <div class="tl-desc">Spark 3.1.1 compatibility baseline.</div>
+  </div>
+
+  <div class="tl-item phase"><div class="tl-date">Phase 2 &mdash; Integration (Oct 2022 &ndash; Jun 2023)</div></div>
+  <div class="tl-item">
+    <div class="tl-date">2022-11/12</div>
+    <div class="tl-title">Activity doubles &mdash; 100+ commits/month</div>
+    <div class="tl-desc">Major operator coverage expansion. Hash joins, aggregations, window functions. Shuffle integration with Celeborn.</div>
+  </div>
+  <div class="tl-item">
+    <div class="tl-date">2023-04-07</div>
+    <div class="tl-title">Release 0.5.0 &mdash; first stable release</div>
+    <div class="tl-desc">Substantial operator coverage. Backend abstraction solidified.</div>
+  </div>
+  <div class="tl-item">
+    <div class="tl-date">2023-07-14</div>
+    <div class="tl-title">Release v1.0.0</div>
+    <div class="tl-desc">Production-ready declaration. 30+ operators. Spark 3.2/3.3/3.4 support. 157 commits/month rate.</div>
+  </div>
+
+  <div class="tl-item phase"><div class="tl-date">Phase 3 &mdash; Stabilization (Jul 2023 &ndash; Feb 2024)</div></div>
+  <div class="tl-item">
+    <div class="tl-date">2023-11-30</div>
+    <div class="tl-title">Release v1.1.0</div>
+    <div class="tl-desc">Performance tuning. Spill support. Memory management improvements. TPC-DS benchmark validation.</div>
+  </div>
+  <div class="tl-item">
+    <div class="tl-date">2024-03</div>
+    <div class="tl-title">Apache Incubator entry + v1.1.1</div>
+    <div class="tl-desc">Project enters Apache Incubation. Community governance established. 213 commits/month peak.</div>
+  </div>
+
+  <div class="tl-item phase"><div class="tl-date">Phase 4 &mdash; Adoption & Expansion (Mar 2024 &ndash; Present)</div></div>
+  <div class="tl-item">
+    <div class="tl-date">2024-08-21</div>
+    <div class="tl-title">Release v1.2.0</div>
+    <div class="tl-desc">Spark 3.5 support. Iceberg/Delta lake format integration. Object storage (S3, ABFS, GCS).</div>
+  </div>
+  <div class="tl-item">
+    <div class="tl-date">2025-01-16</div>
+    <div class="tl-title">Release v1.3.0</div>
+    <div class="tl-desc">Flink integration (experimental). GPU/cuDF work begins in earnest (Issue #8851, #9098).</div>
+  </div>
+  <div class="tl-item">
+    <div class="tl-date">2025-06-06</div>
+    <div class="tl-title">Release v1.4.0 &mdash; Spark 4.0 support</div>
+    <div class="tl-desc">GPU operator validation on TPC-H SF1. Qualification tool released.</div>
+  </div>
+  <div class="tl-item">
+    <div class="tl-date">2025-10-29</div>
+    <div class="tl-title">Release v1.5.0</div>
+    <div class="tl-desc">GPU shuffle reader/writer. Celeborn/Uniffle columnar shuffle. ARM optimization.</div>
+  </div>
+  <div class="tl-item">
+    <div class="tl-date">2026-02</div>
+    <div class="tl-title">Apache TLP graduation</div>
+    <div class="tl-desc">Graduated from incubator to Top-Level Project. Renamed to apache/gluten.</div>
+  </div>
+  <div class="tl-item">
+    <div class="tl-date">2026-03-04</div>
+    <div class="tl-title">Release v1.6.0 (current)</div>
+    <div class="tl-desc">Spark 4.1 support. GPU CI enabled. cuDF Docker images. Native Parquet write for complex types. Version 1.7 in development.</div>
+  </div>
+</div>
+
+<h3>Commit Velocity by Year</h3>
+<div class="bar-chart">
+  <div class="bar-row"><div class="bar-label">2022</div><div class="bar-track"><div class="bar-fill" style="width:23%;background:var(--accent3)"></div></div><div class="bar-val">509</div></div>
+  <div class="bar-row"><div class="bar-label">2023</div><div class="bar-track"><div class="bar-fill" style="width:77%;background:var(--accent3)"></div></div><div class="bar-val">1,671</div></div>
+  <div class="bar-row"><div class="bar-label">2024</div><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--accent)"></div></div><div class="bar-val">2,178</div></div>
+  <div class="bar-row"><div class="bar-label">2025</div><div class="bar-track"><div class="bar-fill" style="width:69%;background:var(--accent3)"></div></div><div class="bar-val">1,508</div></div>
+  <div class="bar-row"><div class="bar-label">2026 (Q1)</div><div class="bar-track"><div class="bar-fill" style="width:12%;background:var(--accent5)"></div></div><div class="bar-val">262</div></div>
+</div>
+</section>
+</div>
+
+<!-- ========== TAB 2: ARCHITECTURE ========== -->
+<div class="tab-content" id="arch">
+<section>
+<h2>2. System Architecture</h2>
+
+<div class="opinion">
+<strong>Principal's Take:</strong> The architecture is well-layered but tightly coupled at the Substrait boundary. The single-backend constraint (exactly one SubstraitBackend per JVM) is a significant design limitation for GPU hybrid execution. The backend abstraction is too coarse-grained &mdash; it operates at the plan level, not the operator level. GPU enablement will require breaking this into operator-level backend selection.
+</div>
+
+<h3>Layered Architecture</h3>
+<div class="arch-diagram">
+  <div class="arch-layer l-spark">
+    <div class="layer-name">Spark SQL Layer</div>
+    <div class="layer-detail">
+      <strong>GlutenPlugin</strong> (SparkPlugin) &rarr; <strong>GlutenSessionExtensions</strong> &rarr; injects columnar rules via <strong>Injector</strong><br>
+      Manages off-heap memory reservation, shuffle routing, shim layer for Spark 3.3&ndash;4.1
+    </div>
+  </div>
+  <div class="arrow-down">&#9660;</div>
+  <div class="arch-layer l-gluten-core">
+    <div class="layer-name">Gluten Core</div>
+    <div class="layer-detail">
+      <strong>Component</strong> discovery (META-INF/gluten-components/) &rarr; <strong>Backend</strong> lifecycle<br>
+      <strong>ColumnarRuleExecutor</strong> &rarr; <strong>HeuristicTransform</strong> &rarr; <strong>OffloadSingleNode</strong> &rarr; transitions/fallback<br>
+      Shuffle: <strong>GlutenShuffleManager</strong> &rarr; <strong>ShuffleManagerRouter</strong> &rarr; columnar vs vanilla
+    </div>
+  </div>
+  <div class="arrow-down">&#9660;</div>
+  <div class="arch-layer l-substrait">
+    <div class="layer-name">Substrait Translation</div>
+    <div class="layer-detail">
+      <strong>*ExecTransformer</strong> classes (WholeStageTransformer, FilterExecTransformer, JoinExecTransformer, etc.)<br>
+      <strong>RelBuilder</strong> (Java) constructs Substrait protobuf plan. <strong>ExpressionConverter</strong> maps Spark expressions &rarr; Substrait functions<br>
+      <strong>BackendsApiManager</strong> routes to exactly one <strong>SubstraitBackend</strong>
+    </div>
+  </div>
+  <div class="arrow-down">&#9660; JNI Boundary</div>
+  <div class="arch-layer l-jni">
+    <div class="layer-name">JNI Bridge</div>
+    <div class="layer-detail">
+      <strong>JniWrapper.cc</strong> (core): RuntimeJniWrapper, PlanEvaluatorJniWrapper, ColumnarBatchOutIterator, NativeMemoryManager<br>
+      <strong>VeloxJniWrapper.cc</strong> (Velox): NativeBackendInitializer, VeloxColumnarBatch, UdfJni, CudfPlanValidator, HashJoinBuilder<br>
+      Memory bridge: <strong>SparkAllocationListener</strong> &rarr; Java <strong>ReservationListener</strong> (reserve/unreserve)
+    </div>
+  </div>
+  <div class="arrow-down">&#9660;</div>
+  <div class="arch-layer l-native">
+    <div class="layer-name">Native Backend (Velox)</div>
+    <div class="layer-detail">
+      <strong>VeloxRuntime</strong> &rarr; <strong>VeloxPlanConverter</strong> &rarr; <strong>SubstraitToVeloxPlanConverter</strong> (Substrait &rarr; Velox PlanNode tree)<br>
+      <strong>WholeStageResultIterator</strong> wraps Velox <strong>exec::Task</strong> (serial execution mode)<br>
+      Shuffle: VeloxHashShuffleWriter, VeloxSortShuffleWriter | Memory: <strong>VeloxMemoryManager</strong> + ArrowMemoryPool
+    </div>
+  </div>
+  <div class="arrow-down">&#9660; (when GPU enabled)</div>
+  <div class="arch-layer l-gpu">
+    <div class="layer-name">GPU Layer (cuDF)</div>
+    <div class="layer-detail">
+      <strong>Velox experimental/cudf</strong>: CudfHashAgg, CudfHashJoin, CudfFilter, CudfOrderBy &rarr; delegates to libcudf<br>
+      <strong>GpuBufferColumnarBatch</strong>, <strong>VeloxGpuShuffleWriter/Reader</strong>, <strong>CudfPlanValidator</strong><br>
+      Memory: <strong>RMM</strong> pool (global, not aligned with Spark memory system)
+    </div>
+  </div>
+</div>
+
+<h3>Data Flow</h3>
+<div class="flow-row">
+  <div class="flow-box">Spark SQL</div><span class="flow-arrow">&rarr;</span>
+  <div class="flow-box">Spark Physical Plan</div><span class="flow-arrow">&rarr;</span>
+  <div class="flow-box">Gluten Rules</div><span class="flow-arrow">&rarr;</span>
+  <div class="flow-box">*ExecTransformer</div><span class="flow-arrow">&rarr;</span>
+  <div class="flow-box">Substrait Protobuf</div><span class="flow-arrow">&rarr; JNI &rarr;</span>
+  <div class="flow-box">SubstraitToVeloxPlan</div><span class="flow-arrow">&rarr;</span>
+  <div class="flow-box">Velox PlanNode</div><span class="flow-arrow">&rarr;</span>
+  <div class="flow-box">exec::Task</div><span class="flow-arrow">&rarr;</span>
+  <div class="flow-box">Columnar Batches</div>
+</div>
+
+<h3>Key Source Modules</h3>
+<table>
+<tr><th>Module</th><th>Language</th><th>Key Files</th><th>Purpose</th></tr>
+<tr><td><code>gluten-core</code></td><td>Scala</td><td>GlutenPlugin.scala, Component.scala, GlutenSessionExtensions.scala</td><td>Spark integration, plugin lifecycle, rule injection</td></tr>
+<tr><td><code>gluten-substrait</code></td><td>Scala/Java</td><td>WholeStageTransformer.scala, RelBuilder.java, ExpressionConverter.scala</td><td>Spark plan &rarr; Substrait IR translation</td></tr>
+<tr><td><code>gluten-arrow</code></td><td>Java</td><td>NativeBackendInitializer.java, PlanEvaluatorJniWrapper.java</td><td>JNI entry points, native lifecycle</td></tr>
+<tr><td><code>backends-velox</code></td><td>Scala/Java</td><td>VeloxBackend.scala, VeloxRuleApi.scala, VeloxSparkPlanExecApi.scala</td><td>Velox backend API impl, rules, configs</td></tr>
+<tr><td><code>cpp/core</code></td><td>C++</td><td>JniWrapper.cc, MemoryManager.cc, ShuffleWriter.cc</td><td>Core native runtime, memory, shuffle</td></tr>
+<tr><td><code>cpp/velox</code></td><td>C++</td><td>VeloxRuntime.cc, SubstraitToVeloxPlan.cc, WholeStageResultIterator.cc</td><td>Velox execution, plan conversion, GPU paths</td></tr>
+<tr><td><code>shims</code></td><td>Scala</td><td>SparkShims.scala (per Spark version)</td><td>Spark version compatibility</td></tr>
+</table>
+</section>
+</div>
+
+<!-- ========== TAB 3: FEATURE MATRIX ========== -->
+<div class="tab-content" id="features">
+<section>
+<h2>3. Feature Maturity Matrix</h2>
+
+<div class="opinion">
+<strong>Principal's Take:</strong> Gluten's CPU operator coverage is strong for core SQL (30+ operators on primitive types). The critical gap is complex types (ARRAY, MAP, STRUCT) which are marked NS across almost all operators &mdash; this is a Velox limitation being worked on upstream. GPU coverage is thin: only Filter/OrderBy are fully implemented; Scan (the most common operator) is not supported on GPU, which severely limits end-to-end GPU pipelines.
+</div>
+
+<h3>Operator Coverage (Velox Backend &mdash; CPU)</h3>
+<table>
+<tr><th>Operator</th><th>CPU Status</th><th>Primitives</th><th>Complex Types</th><th>Decimal/Timestamp</th><th>GPU Status</th></tr>
+<tr><td>FileSourceScan / BatchScan</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">Not Supported</span></td></tr>
+<tr><td>Filter</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-gpu">GPU &#10003;</span></td></tr>
+<tr><td>Project</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-ps">Partial</span></td></tr>
+<tr><td>HashAggregate</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-ps">Partial (TPCH)</span></td></tr>
+<tr><td>BroadcastHashJoin</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-ps">Partial (bug #11794)</span></td></tr>
+<tr><td>ShuffledHashJoin</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-ps">Partial</span></td></tr>
+<tr><td>SortMergeJoin</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td></tr>
+<tr><td>Sort / OrderBy</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-gpu">GPU &#10003;</span></td></tr>
+<tr><td>Window</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td></tr>
+<tr><td>Expand (GroupId)</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td></tr>
+<tr><td>Union</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td></tr>
+<tr><td>Limit (Global/Local)</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td></tr>
+<tr><td>Generate (Explode)</td><td><span class="badge-s">S</span></td><td>UnnestNode</td><td>&mdash;</td><td>&mdash;</td><td><span class="badge-ns">NS</span></td></tr>
+<tr><td>CartesianProduct</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td></tr>
+<tr><td>DataWrite</td><td><span class="badge-s">S</span></td><td>Full + Array/Struct</td><td><span class="badge-s">S</span></td><td><span class="badge-ns">NS</span></td><td><span class="badge-ns">NS</span></td></tr>
+<tr><td>Columnar Shuffle</td><td><span class="badge-s">S</span></td><td>Native impl</td><td><span class="badge-ns">NS</span></td><td>&mdash;</td><td><span class="badge-ps">Writer/Reader &#10003;</span></td></tr>
+<tr><td>BroadcastExchange</td><td><span class="badge-s">S</span></td><td>Full</td><td><span class="badge-ns">NS</span></td><td><span class="badge-s">S</span></td><td><span class="badge-ps">cudf::table</span></td></tr>
+<tr><td>PySpark UDFs</td><td><span class="badge-ns">NS</span></td><td colspan="4">Fallback to Spark</td></tr>
+</table>
+
+<h3>Platform & Format Support</h3>
+<table>
+<tr><th>Category</th><th>Feature</th><th>Maturity</th></tr>
+<tr><td rowspan="3">Spark Versions</td><td>Spark 3.3, 3.4, 3.5</td><td><span class="badge-s">Stable</span></td></tr>
+<tr><td>Spark 4.0</td><td><span class="badge-ps">GA in progress</span></td></tr>
+<tr><td>Spark 4.1</td><td><span class="badge-exp">Experimental</span></td></tr>
+<tr><td rowspan="4">File Formats</td><td>Parquet (read/write)</td><td><span class="badge-s">Stable</span> (complex type write added v1.6)</td></tr>
+<tr><td>ORC (read)</td><td><span class="badge-ps">Partial</span></td></tr>
+<tr><td>CSV/JSON</td><td><span class="badge-ps">Partial</span></td></tr>
+<tr><td>ORC (write)</td><td><span class="badge-ns">Not Supported</span></td></tr>
+<tr><td rowspan="3">Data Lakes</td><td>Iceberg</td><td><span class="badge-ps">Partial</span></td></tr>
+<tr><td>Delta Lake</td><td><span class="badge-ps">Partial</span></td></tr>
+<tr><td>Hudi</td><td><span class="badge-exp">Experimental</span></td></tr>
+<tr><td rowspan="3">Object Storage</td><td>S3</td><td><span class="badge-s">Stable</span></td></tr>
+<tr><td>ABFS</td><td><span class="badge-s">Stable</span></td></tr>
+<tr><td>GCS</td><td><span class="badge-s">Stable</span></td></tr>
+<tr><td rowspan="2">Shuffle Services</td><td>Celeborn</td><td><span class="badge-s">Stable</span></td></tr>
+<tr><td>Uniffle</td><td><span class="badge-s">Stable</span></td></tr>
+<tr><td>GPU (cuDF)</td><td>Velox + cuDF backend</td><td><span class="badge-exp">Experimental (TPC-H SF1)</span></td></tr>
+<tr><td>Flink</td><td>Flink + Velox</td><td><span class="badge-exp">Experimental</span></td></tr>
+</table>
+</section>
+</div>
+
+<!-- ========== TAB 4: ISSUES ========== -->
+<div class="tab-content" id="issues">
+<section>
+<h2>4. Issue / PR / Discussion Analysis</h2>
+
+<div class="opinion">
+<strong>Principal's Take:</strong> The 363 open bugs vs 398 enhancement requests is a healthy ratio for a project at this maturity &mdash; it means the community is both stress-testing existing features and requesting new ones. The 22/43 triage-unresolved rate in recent issues is concerning; it suggests maintainer bandwidth may be stretched. GPU items (185 total) represent a fast-growing segment, having jumped from near-zero to significant volume in 18 months.
+</div>
+
+<h3>Open Issues by Label</h3>
+<div class="bar-chart">
+  <div class="bar-row"><div class="bar-label">enhancement</div><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--accent5)"></div></div><div class="bar-val">398</div></div>
+  <div class="bar-row"><div class="bar-label">bug</div><div class="bar-track"><div class="bar-fill" style="width:91%;background:var(--accent4)"></div></div><div class="bar-val">363</div></div>
+  <div class="bar-row"><div class="bar-label">GPU/cuDF related</div><div class="bar-track"><div class="bar-fill" style="width:46%;background:var(--gpu)"></div></div><div class="bar-val">185</div></div>
+  <div class="bar-row"><div class="bar-label">performance/perf</div><div class="bar-track"><div class="bar-fill" style="width:27%;background:var(--accent)"></div></div><div class="bar-val">~109</div></div>
+  <div class="bar-row"><div class="bar-label">build</div><div class="bar-track"><div class="bar-fill" style="width:5.8%;background:var(--text-dim)"></div></div><div class="bar-val">23</div></div>
+  <div class="bar-row"><div class="bar-label">OOM/memory</div><div class="bar-track"><div class="bar-fill" style="width:3.2%;background:var(--accent4)"></div></div><div class="bar-val">13</div></div>
+</div>
+
+<h3>Issue & PR Classification</h3>
+<table>
+<tr><th>Category</th><th>Count</th><th>Trend</th><th>Top Themes</th><th>Representative Items</th></tr>
+<tr>
+  <td><strong>1. Build / Tooling</strong></td>
+  <td>23 open</td>
+  <td>Stable</td>
+  <td>ARM64/aarch64 failures, macOS glog breakage, VCPKG adoption, cuDF Docker, CMake complexity</td>
+  <td>#11633, #11639, #11763, #11836</td>
+</tr>
+<tr>
+  <td><strong>2a. Features</strong></td>
+  <td>398 open</td>
+  <td>&#8593; Increasing</td>
+  <td>TIMESTAMP_NTZ, ANSI mode, Variant type, new Spark functions, GPU operators, Flink</td>
+  <td>#11622, #11371, #10134, #11808</td>
+</tr>
+<tr>
+  <td><strong>2b. Bugs</strong></td>
+  <td>363 open</td>
+  <td>Stable</td>
+  <td>Aggregation correctness (var_samp), OOM/memory, shuffle failures, timezone edge cases, GPU BHJ crash</td>
+  <td>#11849, #11747, #11716, #11794</td>
+</tr>
+<tr>
+  <td><strong>3. Performance</strong></td>
+  <td>~109 open</td>
+  <td>&#8593; Increasing</td>
+  <td>Hash build side selection, bloom filter push, dynamic filters, multi-core per task, shuffle buffer reuse</td>
+  <td>#11774, #11771, #11605, #7810</td>
+</tr>
+<tr>
+  <td><strong>4. User Requests</strong></td>
+  <td>~50</td>
+  <td>Stable</td>
+  <td>Qualification tool, C++ stack from Spark UI, complex types, PySpark UDFs, Kyuubi integration</td>
+  <td>#11677, #11746, #11673, #11827</td>
+</tr>
+<tr>
+  <td><strong>5. Compatibility</strong></td>
+  <td>~80</td>
+  <td>&#8593; (Spark 4.x)</td>
+  <td>Spark 4.0/4.1 test suites, ANSI mode, new types, function semantics mismatch</td>
+  <td>#11550, #11400, #11683, #4039</td>
+</tr>
+<tr>
+  <td><strong>6. Backend Limits</strong></td>
+  <td>~40</td>
+  <td>Stable</td>
+  <td>Complex types in Velox, Velox upstream sync, daily bumps causing breaks, CH version lag</td>
+  <td>#11585, #8782, #11746, #11734</td>
+</tr>
+<tr>
+  <td><strong>7. GPU Specific</strong></td>
+  <td>185 total</td>
+  <td>&#8593;&#8593; Fast</td>
+  <td>GPU BHJ bugs, GPU shuffle reader, concurrent GPU tasks, CPU/GPU mixed scheduling, GPU code cleanup</td>
+  <td>#11794, #11779, #11149, #11524, #9098</td>
+</tr>
+</table>
+
+<h3>PR Activity (Last 100 PRs)</h3>
+<div class="two-col">
+  <div>
+    <h4>By State</h4>
+    <ul>
+      <li><strong>Closed/Merged:</strong> 68 (68%)</li>
+      <li><strong>Open:</strong> 32 (32%)</li>
+    </ul>
+  </div>
+  <div>
+    <h4>By Label (Top)</h4>
+    <ul>
+      <li><strong>VELOX:</strong> 49 PRs (dominant)</li>
+      <li><strong>CORE:</strong> 41 PRs</li>
+      <li><strong>BUILD:</strong> 19 PRs</li>
+      <li><strong>DOCS:</strong> 14 PRs</li>
+      <li><strong>CLICKHOUSE:</strong> 9 PRs</li>
+    </ul>
+  </div>
+</div>
+</section>
+</div>
+
+<!-- ========== TAB 5: BOUNDARIES ========== -->
+<div class="tab-content" id="boundaries">
+<section>
+<h2>5. Spark vs Gluten vs Velox &mdash; Responsibility Map</h2>
+
+<div class="opinion">
+<strong>Principal's Take:</strong> The tri-party boundary creates a complex dependency chain. Gluten's daily Velox version bumps are both a strength (staying current) and a risk (any Velox API break cascades immediately). The tightest coupling is the Substrait &rarr; Velox plan conversion, which embeds deep assumptions about Velox's operator model. For GPU, the coupling gets worse: Velox's experimental cuDF path is itself unstable, and Gluten must track both Velox main AND Velox cuDF experimental changes.
+</div>
+
+<table>
+<tr><th style="width:15%">Concern</th><th style="width:28%">Spark Owns</th><th style="width:29%">Gluten Owns</th><th style="width:28%">Velox Owns</th></tr>
+<tr>
+  <td><strong>Plan Generation</strong></td>
+  <td>Logical plan, optimizer rules, physical plan strategies, AQE</td>
+  <td>Columnar rule injection, operator-to-Transformer mapping, Substrait plan construction, validation/fallback</td>
+  <td>Substrait &rarr; Velox PlanNode conversion, plan validation, operator selection</td>
+</tr>
+<tr>
+  <td><strong>Execution</strong></td>
+  <td>Task scheduling, stage management, driver/executor lifecycle</td>
+  <td>WholeStage boundary, JNI lifecycle, split injection, iterator protocol</td>
+  <td>exec::Task execution (serial), operator pipeline, spill coordination</td>
+</tr>
+<tr>
+  <td><strong>Operators</strong></td>
+  <td>Fallback operators (unsupported)</td>
+  <td>Transformer wrappers, columnar-to-row transitions, validation</td>
+  <td>All native operators + cuDF GPU operators</td>
+</tr>
+<tr>
+  <td><strong>Memory</strong></td>
+  <td>Spark memory manager (on-heap + storage)</td>
+  <td>Off-heap reservation bridge, task resource lifecycle</td>
+  <td>VeloxMemoryManager, ArrowMemoryPool, GPU: RMM (unmanaged)</td>
+</tr>
+<tr>
+  <td><strong>Shuffle</strong></td>
+  <td>ShuffleManager interface, RSS hooks</td>
+  <td>GlutenShuffleManager routing, ColumnarShuffleDependency</td>
+  <td>Native writers/readers (hash, sort, GPU), RSS partition writer</td>
+</tr>
+<tr>
+  <td><strong>Data I/O</strong></td>
+  <td>Data source APIs, catalog integration</td>
+  <td>DataSource JNI wrappers, Iceberg/Delta/Hudi bridges</td>
+  <td>Parquet/ORC readers/writers, HiveDataSource</td>
+</tr>
+<tr>
+  <td><strong>GPU</strong></td>
+  <td>No GPU awareness</td>
+  <td>CudfTag, GpuColumnarShuffleExchange, GpuBufferBatchResizer, CudfPlanValidator JNI</td>
+  <td>velox/experimental/cudf: CudfHashAgg, CudfHashJoin, CudfFilter, CudfOrderBy, CudfHiveDataSource</td>
+</tr>
+</table>
+
+<h3>Tight Coupling Risks</h3>
+<div class="card-grid">
+  <div class="card">
+    <h4 class="risk-high">HIGH &mdash; Velox API Surface</h4>
+    <ul>
+      <li>Daily Velox bumps mean any API change breaks Gluten</li>
+      <li>SubstraitToVeloxPlan.cc embeds Velox PlanNode hierarchy knowledge</li>
+      <li>No Velox stable release cadence &mdash; Gluten tracks HEAD</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h4 class="risk-high">HIGH &mdash; GPU Memory Model</h4>
+    <ul>
+      <li>RMM pool is global and separate from Spark's memory system</li>
+      <li>No back-pressure from GPU memory to Spark's off-heap budget</li>
+      <li>GPU OOM crashes the JVM without graceful fallback</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h4 class="risk-med">MEDIUM &mdash; Substrait as Single IR</h4>
+    <ul>
+      <li>Substrait v0.23.0 base with Gluten-specific extensions</li>
+      <li>Backend-specific behavior in "extension" fields &mdash; not standardized</li>
+      <li>No GPU-specific plan annotations in Substrait spec</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h4 class="risk-med">MEDIUM &mdash; Single Backend Constraint</h4>
+    <ul>
+      <li>BackendsApiManager enforces exactly one SubstraitBackend per JVM</li>
+      <li>Cannot run Velox-CPU and Velox-GPU as separate backends</li>
+      <li>GPU/CPU hybrid must happen within single Velox backend</li>
+    </ul>
+  </div>
+</div>
+
+<h3>Abstraction Leaks</h3>
+<ul>
+  <li><strong>Velox-specific configs exposed in Spark:</strong> <code>spark.gluten.sql.columnar.backend.velox.*</code> &mdash; 50+ settings leak Velox internals</li>
+  <li><strong>Arrow format dependency:</strong> Columnar batch assumes Arrow ABI; ClickHouse uses different block format</li>
+  <li><strong>GPU conditional compilation:</strong> <code>#ifdef GLUTEN_ENABLE_GPU</code> scattered across JNI/native code</li>
+  <li><strong>Shuffle format lock-in:</strong> Velox shuffle uses Presto serializer &mdash; not interchangeable with other backends</li>
+</ul>
+</section>
+</div>
+
+<!-- ========== TAB 6: GPU FEASIBILITY ========== -->
+<div class="tab-content" id="gpu">
+<section>
+<h2>6. GPU Extension Feasibility Analysis</h2>
+
+<div class="opinion">
+<strong>Principal's Take:</strong> GPU support through Velox's experimental cuDF path is the right strategic choice &mdash; it avoids building a separate GPU backend and leverages existing Substrait translation. However, the current implementation has three critical gaps: (1) no GPU table scan means data must enter via CPU, (2) RMM memory is invisible to Spark's memory manager creating OOM risk, and (3) CPU&#8596;GPU data movement on every fallback nullifies performance gains. The 8.1x speedup on TPC-H is promising but only for cherry-picked compute-heavy queries.
+</div>
+
+<h3>Current GPU Integration Points</h3>
+<table>
+<tr><th>Component</th><th>Status</th><th>Key Files</th></tr>
+<tr><td>GPU operator dispatch</td><td><span class="badge-gpu">Active</span></td><td><code>SubstraitToVeloxPlan.cc</code> routes to Cudf* operators when GPU enabled</td></tr>
+<tr><td>CudfPlanValidator</td><td><span class="badge-gpu">Active</span></td><td><code>cpp/velox/cudf/CudfPlanValidator.cc</code> + JNI wrapper</td></tr>
+<tr><td>GPU shuffle writer</td><td><span class="badge-gpu">Active</span></td><td><code>VeloxGpuShuffleWriter.cc</code>, <code>VeloxGpuHashShuffleWriter</code></td></tr>
+<tr><td>GPU shuffle reader</td><td><span class="badge-gpu">Active</span></td><td><code>VeloxGpuShuffleReader.cc</code> &mdash; multi-threaded decompression in progress</td></tr>
+<tr><td>GPU batch serializer</td><td><span class="badge-gpu">Active</span></td><td><code>VeloxGpuColumnarBatchSerializer</code></td></tr>
+<tr><td>GPU buffer resizer</td><td><span class="badge-gpu">Active</span></td><td><code>GpuBufferBatchResizer</code></td></tr>
+<tr><td>GPU broadcast</td><td><span class="badge-ps">In Progress</span></td><td>BroadcastExchange outputs cudf::table (#11441)</td></tr>
+<tr><td>GPU scan (cuDF Hive)</td><td><span class="badge-exp">Experimental</span></td><td><code>velox/experimental/cudf/connectors/hive/CudfHiveDataSource.cpp</code> (Velox repo)</td></tr>
+<tr><td>GPU memory (RMM)</td><td><span class="badge-ps">Partial</span></td><td>Global RMM &mdash; NOT integrated with Spark memory</td></tr>
+<tr><td>GPU CI</td><td><span class="badge-gpu">Active</span></td><td>GPU build CI enabled (#11668), Docker for JDK 8/17 + CUDA 12.8/12.9</td></tr>
+</table>
+
+<h3>Key Technical Challenges</h3>
+
+<h4>1. JVM &rarr; Native &rarr; GPU Memory Transitions</h4>
+<ul>
+  <li><strong>Current:</strong> Spark (JVM) &rarr; Gluten off-heap (ReservationListener) &rarr; Velox MemoryPool &rarr; RMM (device memory)</li>
+  <li><strong>Problem:</strong> Three memory domains with no unified back-pressure. GPU failure can't propagate to Spark for spill.</li>
+  <li><strong>Risk:</strong> <span class="risk-high">HIGH</span> &mdash; GPU OOM causes process crash, not graceful task failure.</li>
+  <li><strong>Mitigation:</strong> Integrate RMM callbacks into SparkAllocationListener chain; implement GPU spill to host.</li>
+</ul>
+
+<h4>2. Substrait Plan Compatibility with GPU</h4>
+<ul>
+  <li><strong>Current:</strong> Same plan sent to native; CudfPlanValidator checks GPU capability; unsupported stays on CPU.</li>
+  <li><strong>Problem:</strong> Validation is binary. No cost-based "is GPU faster for this data size?" decision.</li>
+  <li><strong>Risk:</strong> <span class="risk-med">MEDIUM</span> &mdash; Small batches on GPU may be slower due to kernel launch overhead.</li>
+</ul>
+
+<h4>3. Operator Coverage Gaps</h4>
+<ul>
+  <li><strong>Critical:</strong> Scan not on GPU &rarr; every pipeline starts with CPU-to-GPU transfer</li>
+  <li><strong>Critical:</strong> Window functions not on GPU &rarr; complex analytics fall back entirely</li>
+  <li><strong>High:</strong> SortMergeJoin not on GPU &rarr; large fact-dimension joins can't use GPU</li>
+</ul>
+
+<h4>4. CPU &#8596; GPU Data Movement</h4>
+<ul>
+  <li><strong>Problem:</strong> PCIe bandwidth (32 GB/s Gen4 x16) becomes bottleneck for large intermediates</li>
+  <li><strong>Risk:</strong> <span class="risk-high">HIGH</span> &mdash; Each transition adds latency; mixed pipelines may be net-negative.</li>
+  <li><strong>Mitigation:</strong> Group GPU-compatible operators; pin data to GPU for multi-stage pipelines.</li>
+</ul>
+
+<h4>5. Mixed Cluster Scheduling</h4>
+<ul>
+  <li><strong>Issue #11524:</strong> GPU and CPU mixed cluster scheduling not supported</li>
+  <li><strong>Issue #11828:</strong> GPU code runs on CPU nodes when cudf enabled</li>
+  <li><strong>Risk:</strong> <span class="risk-med">MEDIUM</span> &mdash; Deployment complexity and resource waste.</li>
+</ul>
+
+<h3>Missing Abstractions for GPU Support</h3>
+<table>
+<tr><th>Abstraction</th><th>Current State</th><th>Needed For GPU</th></tr>
+<tr><td>Operator-level backend selection</td><td>Plan-level only (whole stage)</td><td>Per-operator CPU/GPU decision with cost model</td></tr>
+<tr><td>Unified memory manager</td><td>Separate: Spark, Velox, RMM</td><td>Single reservation chain with GPU spill</td></tr>
+<tr><td>Device placement annotations</td><td>CudfTag boolean in WholeStageTransformer</td><td>Per-operator device in Substrait plan</td></tr>
+<tr><td>Data locality tracking</td><td>None (CPU assumed)</td><td>Track batch location (host/device)</td></tr>
+<tr><td>GPU resource discovery</td><td>Static config</td><td>Runtime CUDA detection, multi-GPU</td></tr>
+<tr><td>Fallback cost model</td><td>Binary: supported or not</td><td>Cost of transfer vs. CPU execution</td></tr>
+</table>
+</section>
+</div>
+
+<!-- ========== TAB 7: MODULES ========== -->
+<div class="tab-content" id="modules">
+<section>
+<h2>7. Module Importance & Effort Analysis</h2>
+
+<div class="opinion">
+<strong>Principal's Take:</strong> The highest-leverage investment for GPU enablement is the memory management layer &mdash; getting RMM integrated with Spark's memory system unlocks everything else. The highest-risk area is the Substrait translation layer, which needs operator-level device annotations without breaking CPU-only compatibility. The shuffle layer is surprisingly well-positioned: GPU shuffle writer/reader already exist, just need stabilization.
+</div>
+
+<table>
+<tr><th>Module</th><th>Importance</th><th>Complexity</th><th>Coupling</th><th>GPU Suitability</th><th>Assessment</th></tr>
+<tr>
+  <td><strong>Spark Integration</strong><br><small>gluten-core</small></td>
+  <td><span class="risk-high">High</span></td>
+  <td><span class="risk-high">High</span></td>
+  <td><span class="risk-high">High</span></td>
+  <td><span class="badge-ps">Moderate</span></td>
+  <td>GPU needs: resource discovery, device-aware scheduling. Spark API is large and version-dependent.</td>
+</tr>
+<tr>
+  <td><strong>Substrait Translation</strong><br><small>gluten-substrait</small></td>
+  <td><span class="risk-high">High</span></td>
+  <td><span class="risk-high">High</span></td>
+  <td><span class="risk-med">Medium</span></td>
+  <td><span class="badge-ps">Hard</span></td>
+  <td>Must add device annotations without breaking CPU. Every GPU operator needs Substrait mapping. Critical path.</td>
+</tr>
+<tr>
+  <td><strong>Backend Abstraction</strong><br><small>SubstraitBackend</small></td>
+  <td><span class="risk-med">Medium</span></td>
+  <td><span class="risk-med">Medium</span></td>
+  <td><span class="risk-high">High</span></td>
+  <td><span class="badge-ns">Hard</span></td>
+  <td>Single-backend constraint is key blocker. Evolve to multi-device model or keep GPU as Velox-internal.</td>
+</tr>
+<tr>
+  <td><strong>Velox Backend</strong><br><small>backends-velox + cpp/velox</small></td>
+  <td><span class="risk-high">High</span></td>
+  <td><span class="risk-high">High</span></td>
+  <td><span class="risk-high">High</span></td>
+  <td><span class="badge-s">Good</span></td>
+  <td>GPU operators are Velox PlanNodes (experimental/cudf). Primary vehicle. Well-positioned but unstable API.</td>
+</tr>
+<tr>
+  <td><strong>Memory Management</strong><br><small>SparkAllocationListener, VeloxMemoryMgr, RMM</small></td>
+  <td><span class="risk-high">High</span></td>
+  <td><span class="risk-high">High</span></td>
+  <td><span class="risk-med">Medium</span></td>
+  <td><span class="badge-ns">Critical Gap</span></td>
+  <td><strong>Highest-leverage GPU investment.</strong> RMM &harr; Spark integration is mandatory for production.</td>
+</tr>
+<tr>
+  <td><strong>Shuffle / Exchange</strong><br><small>ColumnarShuffleManager, native shuffle</small></td>
+  <td><span class="risk-high">High</span></td>
+  <td><span class="risk-med">Medium</span></td>
+  <td><span class="risk-med">Medium</span></td>
+  <td><span class="badge-s">Good</span></td>
+  <td>GPU shuffle writer/reader exist. Multi-threaded decompression in progress. RSS integration straightforward.</td>
+</tr>
+<tr>
+  <td><strong>JNI Bridge</strong><br><small>JniWrapper.cc</small></td>
+  <td><span class="risk-med">Medium</span></td>
+  <td><span class="risk-med">Medium</span></td>
+  <td><span class="risk-high">High</span></td>
+  <td><span class="badge-ps">Moderate</span></td>
+  <td>GPU JNI (GpuBufferBatchResizer, CudfPlanValidator) exist. Needs GPU memory callbacks.</td>
+</tr>
+<tr>
+  <td><strong>Data Lake Connectors</strong><br><small>gluten-iceberg/delta/hudi</small></td>
+  <td><span class="risk-med">Medium</span></td>
+  <td><span class="risk-low">Low</span></td>
+  <td><span class="risk-low">Low</span></td>
+  <td><span class="badge-ns">N/A</span></td>
+  <td>No GPU relevance. Metadata/catalog layers.</td>
+</tr>
+<tr>
+  <td><strong>Shims Layer</strong></td>
+  <td><span class="risk-low">Low</span></td>
+  <td><span class="risk-med">Medium</span></td>
+  <td><span class="risk-low">Low</span></td>
+  <td><span class="badge-ns">N/A</span></td>
+  <td>Version compat. No GPU relevance.</td>
+</tr>
+</table>
+
+<h3>Opportunity Matrix</h3>
+<div class="two-col">
+  <div class="card">
+    <h4 style="color:var(--accent2)">High Impact, Lower Effort</h4>
+    <ul>
+      <li><strong>GPU shuffle stabilization</strong> &mdash; writer/reader exist, need testing</li>
+      <li><strong>RMM reservation callback</strong> &mdash; bridge RMM to SparkAllocationListener</li>
+      <li><strong>CudfPlanValidator improvements</strong> &mdash; data-size thresholds</li>
+      <li><strong>GPU CI hardening</strong> &mdash; coverage expansion</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h4 style="color:var(--accent4)">High Risk Areas</h4>
+    <ul>
+      <li><strong>GPU scan</strong> &mdash; depends on Velox cuDF HiveDataSource</li>
+      <li><strong>Memory unification</strong> &mdash; three-domain problem with spill</li>
+      <li><strong>Mixed CPU/GPU execution</strong> &mdash; needs operator-level placement</li>
+      <li><strong>Velox experimental/cudf stability</strong> &mdash; upstream churn</li>
+    </ul>
+  </div>
+</div>
+</section>
+</div>
+
+<!-- ========== TAB 8: ROADMAP ========== -->
+<div class="tab-content" id="roadmap">
+<section>
+<h2>8. Phased Roadmap for GPU Enablement</h2>
+
+<div class="opinion">
+<strong>Principal's Take:</strong> The roadmap must be pragmatic. Phase 1 focuses on making existing GPU operators production-safe (memory, scheduling, CI). Phase 2 tackles the hard architecture problem of hybrid execution. Phase 3 is aspirational and depends heavily on Velox upstream maturity. Each phase has a clear gate: don't advance until the previous phase's validation criteria are met. I estimate 6-8 months per phase for a team of 3-4 engineers, with significant Velox upstream dependency.
+</div>
+
+<div class="phase-header">
+  <h3>Phase 1: Foundation & Stabilization (Months 1-6)</h3>
+  <div class="ph-meta">Goal: Production-safe GPU for compute-heavy stages &middot; TPC-H SF100 validated</div>
+</div>
+
+<h4>Components to Build</h4>
+<table>
+<tr><th>Component</th><th>Description</th><th>Effort</th></tr>
+<tr><td>RMM &#8596; Spark Memory Bridge</td><td>Integrate RMM callbacks into SparkAllocationListener. GPU allocation counts against Spark off-heap. OOM triggers spill-to-host.</td><td>L (8-10 wk)</td></tr>
+<tr><td>GPU Node Detection</td><td>Runtime CUDA detection at driver init. Don't load GPU libs on CPU nodes (#11828, #11844). Expose GPU to Spark scheduler.</td><td>S (2-3 wk)</td></tr>
+<tr><td>CudfPlanValidator V2</td><td>Data-size thresholds. Expression coverage checks. Better error messages.</td><td>M (4-5 wk)</td></tr>
+<tr><td>GPU CI Expansion</td><td>TPC-H SF10/SF100 on GPU. Correctness tests. Concurrent GPU workloads.</td><td>M (4-5 wk)</td></tr>
+<tr><td>GPU Shuffle Stabilization</td><td>Fix multi-threaded decompression (#11779). Validate with Celeborn. Large shuffle sizes.</td><td>M (4-5 wk)</td></tr>
+<tr><td>BHJ GPU Bug Fix</td><td>Fix #11794. Validate broadcast + hash join end-to-end.</td><td>S (2-3 wk)</td></tr>
+</table>
+
+<h4>Risks &amp; Validation</h4>
+<ul>
+  <li><span class="risk-high">HIGH:</span> RMM integration may require Velox upstream changes to memory arbitrator</li>
+  <li><span class="risk-med">MEDIUM:</span> GPU shuffle with RSS (Celeborn/Uniffle) untested at scale</li>
+  <li><strong>Gate:</strong> TPC-H SF100 all 22 queries pass. No GPU OOM crashes. 10+ concurrent GPU tasks stable.</li>
+</ul>
+
+<div class="phase-header">
+  <h3>Phase 2: Hybrid CPU+GPU Execution (Months 7-14)</h3>
+  <div class="ph-meta">Goal: Dynamic CPU/GPU operator placement &middot; TPC-DS validated</div>
+</div>
+
+<h4>Components to Build</h4>
+<table>
+<tr><th>Component</th><th>Description</th><th>Effort</th></tr>
+<tr><td>Operator-Level Device Placement</td><td>SubstraitContext device annotations. CudfPlanValidator per-operator. Plan split with minimal data movement.</td><td>XL (12-16 wk)</td></tr>
+<tr><td>GPU Table Scan</td><td>CudfHiveDataSource for Parquet. GPU-direct storage (GDS). Depends on Velox cuDF connector.</td><td>L (8-10 wk)</td></tr>
+<tr><td>Data Locality Tracking</td><td>Track batch location (host/device). Avoid unnecessary copies. Prefetch to GPU.</td><td>L (8-10 wk)</td></tr>
+<tr><td>Cost-Based GPU Decision</td><td>Per-operator cost model: data size, operator type, kernel overhead, PCIe cost.</td><td>L (8-10 wk)</td></tr>
+<tr><td>GPU Window Functions</td><td>CudfWindow operator in Velox. Map window frames to cuDF.</td><td>L (8-10 wk)</td></tr>
+<tr><td>Multi-GPU Support</td><td>Per-task device selection. CUDA affinity. Memory pool per GPU.</td><td>M (4-5 wk)</td></tr>
+</table>
+
+<h4>Risks &amp; Validation</h4>
+<ul>
+  <li><span class="risk-high">HIGH:</span> Operator-level placement changes fundamental execution model</li>
+  <li><span class="risk-high">HIGH:</span> GPU scan depends on Velox upstream (external)</li>
+  <li><strong>Gate:</strong> TPC-DS SF100 full suite. 30%+ queries with GPU speedup. Max 2 CPU&#8596;GPU transfers per pipeline.</li>
+</ul>
+
+<div class="phase-header">
+  <h3>Phase 3: Full GPU Acceleration (Months 15-24)</h3>
+  <div class="ph-meta">Goal: End-to-end GPU pipelines &middot; Production workloads &middot; TCO breakeven</div>
+</div>
+
+<h4>Components to Build</h4>
+<table>
+<tr><th>Component</th><th>Description</th><th>Effort</th></tr>
+<tr><td>End-to-End GPU Pipelines</td><td>Scan&rarr;Filter&rarr;Join&rarr;Agg&rarr;Shuffle on GPU. Zero host-device copies in hot path. GDS spill.</td><td>XL (16-20 wk)</td></tr>
+<tr><td>GPU-Optimized Shuffle</td><td>GPU-direct RDMA. UCX/NCCL for GPU-to-GPU. Avoid serialize-to-host path.</td><td>XL (16-20 wk)</td></tr>
+<tr><td>Adaptive GPU Scheduling</td><td>Runtime profiling: GPU utilization, memory pressure. Dynamic operator migration.</td><td>XL (16-20 wk)</td></tr>
+<tr><td>Multi-Query GPU Sharing</td><td>MPS/MIG for GPU partitioning. Per-query memory quotas. Fair scheduling.</td><td>L (8-10 wk)</td></tr>
+<tr><td>Complete Operator Coverage</td><td>All CPU operators with GPU paths. SortMergeJoin, Generate, all window frames.</td><td>XL (ongoing)</td></tr>
+<tr><td>GPU-Aware AQE</td><td>GPU cost model in Spark AQE. Re-plan after shuffle to prefer GPU.</td><td>L (8-10 wk)</td></tr>
+</table>
+
+<h4>Risks &amp; Validation</h4>
+<ul>
+  <li><span class="risk-high">HIGH:</span> GPU-direct RDMA shuffle is a research problem</li>
+  <li><span class="risk-high">HIGH:</span> Adaptive scheduling needs Spark task scheduler integration</li>
+  <li><strong>Gate:</strong> Production workloads running on GPU. GPU utilization >60%. TCO breakeven vs CPU-only.</li>
+</ul>
+
+<h3 style="margin-top:40px">Roadmap Summary</h3>
+<table>
+<tr><th>Phase</th><th>Timeline</th><th>Key Deliverable</th><th>Gate Criteria</th><th>Team</th></tr>
+<tr><td><span class="badge-s">Phase 1</span></td><td>Mo 1-6</td><td>Production-safe GPU with memory integration</td><td>TPC-H SF100, no OOM crashes</td><td>3-4 eng</td></tr>
+<tr><td><span class="badge-ps">Phase 2</span></td><td>Mo 7-14</td><td>Hybrid CPU+GPU, operator-level placement</td><td>TPC-DS SF100, GPU scan</td><td>4-5 eng</td></tr>
+<tr><td><span class="badge-exp">Phase 3</span></td><td>Mo 15-24</td><td>End-to-end GPU for production</td><td>Production workloads, TCO breakeven</td><td>5-6 eng</td></tr>
+</table>
+
+<div class="opinion" style="margin-top:24px">
+<strong>Strategic Recommendation:</strong> Invest in Phase 1 immediately &mdash; it de-risks GPU adoption without requiring architectural changes. Phase 2 is the critical make-or-break phase; if Velox upstream doesn't deliver cuDF scan and window operators, consider contributing them directly. Phase 3 should be viewed as aspirational; start planning but don't commit resources until Phase 2 validation succeeds. The biggest non-technical risk is organizational: this work spans Gluten, Velox, and RAPIDS teams &mdash; alignment on priorities is as important as the code itself.
+</div>
+</section>
+</div>
+
+</div><!-- container -->
+
+<script>
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById(btn.dataset.tab).classList.add('active');
+  });
+});
+</script>
+</body>
+</html>

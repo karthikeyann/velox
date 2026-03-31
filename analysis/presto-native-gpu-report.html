@@ -1,0 +1,1415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Presto Native Execution — GPU Enablement Report</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=IBM+Plex+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0e17;
+  --surface: #111827;
+  --surface-2: #1a2235;
+  --surface-3: #222d42;
+  --border: #2a3654;
+  --text: #e2e8f0;
+  --text-dim: #8b95a8;
+  --text-muted: #5a6580;
+  --accent: #38bdf8;
+  --accent-dim: #0c4a6e;
+  --green: #34d399;
+  --green-dim: #064e3b;
+  --amber: #fbbf24;
+  --amber-dim: #78350f;
+  --red: #f87171;
+  --red-dim: #7f1d1d;
+  --purple: #a78bfa;
+  --purple-dim: #3b0764;
+  --pink: #f472b6;
+  --teal: #2dd4bf;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+
+.hero {
+  background: linear-gradient(135deg, #0f1729 0%, #1a1040 50%, #0f1729 100%);
+  border-bottom: 1px solid var(--border);
+  padding: 48px 40px 40px;
+  position: relative;
+  overflow: hidden;
+}
+.hero::before {
+  content: '';
+  position: absolute;
+  top: -50%; left: -50%;
+  width: 200%; height: 200%;
+  background: radial-gradient(circle at 30% 50%, rgba(56, 189, 248, 0.06) 0%, transparent 50%),
+              radial-gradient(circle at 70% 30%, rgba(167, 139, 250, 0.05) 0%, transparent 50%);
+  animation: pulse 8s ease-in-out infinite alternate;
+}
+@keyframes pulse { from { opacity: 0.6; } to { opacity: 1; } }
+
+.hero h1 {
+  font-family: 'DM Serif Display', serif;
+  font-size: 36px;
+  font-weight: 400;
+  letter-spacing: -0.5px;
+  position: relative;
+  background: linear-gradient(135deg, var(--accent), var(--purple));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.hero .subtitle {
+  color: var(--text-dim);
+  font-size: 16px;
+  margin-top: 8px;
+  position: relative;
+}
+.hero .meta {
+  display: flex; gap: 24px; margin-top: 16px; position: relative;
+  flex-wrap: wrap;
+}
+.hero .meta span {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 4px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: rgba(10, 14, 23, 0.92);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+  padding: 0 40px;
+  display: flex;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.nav::-webkit-scrollbar { display: none; }
+.nav a {
+  color: var(--text-dim);
+  text-decoration: none;
+  padding: 12px 16px;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  transition: all 0.2s;
+}
+.nav a:hover, .nav a.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 40px;
+}
+
+section {
+  padding: 48px 0;
+  border-bottom: 1px solid var(--border);
+}
+section:last-child { border-bottom: none; }
+
+h2 {
+  font-family: 'DM Serif Display', serif;
+  font-size: 28px;
+  font-weight: 400;
+  margin-bottom: 8px;
+  color: var(--text);
+}
+h2 .num {
+  color: var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 18px;
+  margin-right: 8px;
+}
+h3 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 24px 0 12px;
+}
+.section-desc {
+  color: var(--text-dim);
+  margin-bottom: 24px;
+  max-width: 700px;
+}
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+@media (max-width: 800px) {
+  .grid-2, .grid-3 { grid-template-columns: 1fr; }
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px;
+  transition: border-color 0.2s;
+}
+.card:hover { border-color: var(--accent); }
+.card-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.badge-green { background: var(--green-dim); color: var(--green); }
+.badge-amber { background: var(--amber-dim); color: var(--amber); }
+.badge-red { background: var(--red-dim); color: var(--red); }
+.badge-purple { background: var(--purple-dim); color: var(--purple); }
+.badge-blue { background: var(--accent-dim); color: var(--accent); }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  padding: 10px 12px;
+  border-bottom: 2px solid var(--border);
+  position: sticky;
+  top: 44px;
+  background: var(--bg);
+}
+td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  vertical-align: top;
+}
+tr:hover td { background: var(--surface); }
+td:first-child { color: var(--text); font-weight: 500; }
+
+.timeline {
+  position: relative;
+  padding-left: 32px;
+}
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 8px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: linear-gradient(to bottom, var(--accent), var(--purple), var(--green));
+}
+.tl-item {
+  position: relative;
+  margin-bottom: 24px;
+  padding-bottom: 4px;
+}
+.tl-item::before {
+  content: '';
+  position: absolute;
+  left: -28px;
+  top: 6px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 2px solid var(--accent);
+}
+.tl-item.major::before {
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.4);
+}
+.tl-date {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+.tl-title {
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+.tl-desc {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.arch-diagram {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 32px;
+  margin: 20px 0;
+  position: relative;
+  overflow-x: auto;
+}
+
+.arch-layer {
+  display: flex;
+  align-items: center;
+  margin: 8px 0;
+}
+.arch-label {
+  width: 140px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.arch-boxes {
+  display: flex;
+  gap: 8px;
+  flex: 1;
+  flex-wrap: wrap;
+}
+.arch-box {
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid;
+  flex: 1;
+  min-width: 120px;
+  text-align: center;
+}
+.arch-box.java { background: rgba(251, 191, 36, 0.08); border-color: rgba(251, 191, 36, 0.3); color: var(--amber); }
+.arch-box.cpp { background: rgba(56, 189, 248, 0.08); border-color: rgba(56, 189, 248, 0.3); color: var(--accent); }
+.arch-box.velox { background: rgba(167, 139, 250, 0.08); border-color: rgba(167, 139, 250, 0.3); color: var(--purple); }
+.arch-box.gpu { background: rgba(52, 211, 153, 0.08); border-color: rgba(52, 211, 153, 0.3); color: var(--green); }
+.arch-arrow {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 18px;
+  margin: 4px 0;
+  padding-left: 140px;
+}
+
+.bar-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  height: 120px;
+  padding: 0 4px;
+  margin-top: 16px;
+}
+.bar-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: 1;
+}
+.bar {
+  width: 100%;
+  max-width: 48px;
+  background: linear-gradient(to top, var(--accent), var(--purple));
+  border-radius: 4px 4px 0 0;
+  transition: height 0.6s ease;
+  position: relative;
+}
+.bar-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+.bar-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+.phase-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 24px;
+  margin-bottom: 16px;
+  border-left: 4px solid;
+}
+.phase-card.p1 { border-left-color: var(--green); }
+.phase-card.p2 { border-left-color: var(--amber); }
+.phase-card.p3 { border-left-color: var(--accent); }
+.phase-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.phase-tag {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+.phase-tag.p1 { background: var(--green-dim); color: var(--green); }
+.phase-tag.p2 { background: var(--amber-dim); color: var(--amber); }
+.phase-tag.p3 { background: var(--accent-dim); color: var(--accent); }
+
+ul { margin: 8px 0 8px 20px; }
+li { margin: 4px 0; color: var(--text-dim); font-size: 13px; }
+li strong { color: var(--text); font-weight: 600; }
+
+.risk {
+  padding: 12px 16px;
+  background: var(--red-dim);
+  border: 1px solid rgba(248, 113, 113, 0.2);
+  border-radius: 6px;
+  margin: 8px 0;
+  font-size: 13px;
+  color: var(--red);
+}
+.risk::before { content: '\26a0 '; }
+
+.callout {
+  padding: 16px 20px;
+  background: var(--surface-2);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  margin: 16px 0;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.stat-row {
+  display: flex;
+  gap: 16px;
+  margin: 16px 0;
+  flex-wrap: wrap;
+}
+.stat {
+  flex: 1;
+  min-width: 120px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
+}
+.stat-val {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 32px;
+  font-weight: 700;
+  color: var(--accent);
+}
+.stat-lbl {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-top: 4px;
+}
+
+.dep-map {
+  display: grid;
+  grid-template-columns: 1fr 80px 1fr;
+  gap: 0;
+  align-items: stretch;
+}
+.dep-col {
+  padding: 16px;
+}
+.dep-col h4 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.dep-col.presto h4 { color: var(--accent); }
+.dep-col.velox h4 { color: var(--purple); }
+.dep-arrows {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  color: var(--text-muted);
+  font-size: 20px;
+  gap: 4px;
+}
+.dep-item {
+  font-size: 12px;
+  padding: 6px 10px;
+  margin: 3px 0;
+  background: var(--surface-2);
+  border-radius: 4px;
+  color: var(--text-dim);
+}
+
+.tab-container { margin: 16px 0; }
+.tab-buttons {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+}
+.tab-btn {
+  padding: 10px 20px;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: 'IBM Plex Sans', sans-serif;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.tab-btn:hover { color: var(--text-dim); }
+.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-content { display: none; padding-top: 16px; }
+.tab-content.active { display: block; }
+
+code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  background: var(--surface-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: var(--accent);
+}
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>Presto Native Execution</h1>
+  <div class="subtitle">Architecture Analysis & GPU Enablement Roadmap — Principal Engineer Assessment</div>
+  <div class="meta">
+    <span>prestodb/presto</span>
+    <span>2,036 commits</span>
+    <span>2022–2026</span>
+    <span>March 2026</span>
+  </div>
+</div>
+
+<nav class="nav" id="topnav">
+  <a href="#timeline" class="active">Timeline</a>
+  <a href="#architecture">Architecture</a>
+  <a href="#features">Feature Matrix</a>
+  <a href="#issues">Issues & PRs</a>
+  <a href="#velox-map">Velox Map</a>
+  <a href="#gpu">GPU Design</a>
+  <a href="#modules">Modules</a>
+  <a href="#roadmap">Roadmap</a>
+</nav>
+
+<div class="container">
+
+<!-- ============ 1. TIMELINE ============ -->
+<section id="timeline">
+  <h2><span class="num">01</span>Evolution Timeline</h2>
+  <p class="section-desc">Presto Native Execution (Prestissimo) began as an internal Facebook project (presto_cpp) and was open-sourced into prestodb/presto in April 2022. Built on Velox, it replaces the Java execution engine with a high-performance C++ worker.</p>
+
+  <div class="stat-row">
+    <div class="stat"><div class="stat-val">2,036</div><div class="stat-lbl">Total Commits</div></div>
+    <div class="stat"><div class="stat-val">4 yrs</div><div class="stat-lbl">Active Development</div></div>
+    <div class="stat"><div class="stat-val">25+</div><div class="stat-lbl">Plan Node Types</div></div>
+    <div class="stat"><div class="stat-val">5</div><div class="stat-lbl">Connectors</div></div>
+  </div>
+
+  <h3>Commit Volume by Year</h3>
+  <div class="bar-chart">
+    <div class="bar-col"><div class="bar-value">154</div><div class="bar" style="height: 22%"></div><div class="bar-label">2022</div></div>
+    <div class="bar-col"><div class="bar-value">709</div><div class="bar" style="height: 100%"></div><div class="bar-label">2023</div></div>
+    <div class="bar-col"><div class="bar-value">552</div><div class="bar" style="height: 78%"></div><div class="bar-label">2024</div></div>
+    <div class="bar-col"><div class="bar-value">527</div><div class="bar" style="height: 74%"></div><div class="bar-label">2025</div></div>
+    <div class="bar-col"><div class="bar-value">90</div><div class="bar" style="height: 13%"></div><div class="bar-label">2026*</div></div>
+  </div>
+  <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">* 2026 is Q1 only (through March)</div>
+
+  <h3>Key Milestones</h3>
+  <div class="timeline">
+    <div class="tl-item major">
+      <div class="tl-date">Apr 4, 2022</div>
+      <div class="tl-title">Initial Open-Source Commit</div>
+      <div class="tl-desc">"Init commit of moving presto_cpp to presto" — Velox submodule added. Codebase migrated from internal Facebook repository. Core plan translation, HTTP server, task management already present at inception.</div>
+    </div>
+    <div class="tl-item">
+      <div class="tl-date">Jun–Aug 2022</div>
+      <div class="tl-title">Foundation Stabilization</div>
+      <div class="tl-desc">Migrated CI workflows from presto_cpp. Periodic Velox advances. Build system cleanup. MMap allocator support. 154 commits in the first year (partial).</div>
+    </div>
+    <div class="tl-item major">
+      <div class="tl-date">Sep–Dec 2022</div>
+      <div class="tl-title">Shuffle & Spill Architecture</div>
+      <div class="tl-desc">External shuffle support (ShuffleWrite/ShuffleRead operators). Spill framework integration. HDFS connector. WindowNode conversion to Velox. Presto-on-Spark batch mode foundations. Local persistent shuffle.</div>
+    </div>
+    <div class="tl-item major">
+      <div class="tl-date">Jan–Jun 2023</div>
+      <div class="tl-title">Production Readiness Push</div>
+      <div class="tl-desc">Native Parquet reader set as default (Feb 2023). Window function e2e tests. Shuffle refactoring. Presto-on-Spark integration. 709 commits this year — peak development velocity.</div>
+    </div>
+    <div class="tl-item">
+      <div class="tl-date">Jul–Dec 2023</div>
+      <div class="tl-title">Feature Parity Acceleration</div>
+      <div class="tl-desc">Iceberg connector additions. SpatialJoin, MergeJoin support completed. Memory arbitration with SharedArbitrator. SSD cache integration. Multiple exchange optimizations. ORC reader support.</div>
+    </div>
+    <div class="tl-item major">
+      <div class="tl-date">2024</div>
+      <div class="tl-title">Enterprise Hardening</div>
+      <div class="tl-desc">552 commits. Shuffle compression. Partitioned writer scaling. Arrow Flight connector (experimental). Tracing/replay infrastructure. Session property expansion. REST-based remote functions. Container-based testing.</div>
+    </div>
+    <div class="tl-item major">
+      <div class="tl-date">2025</div>
+      <div class="tl-title">Maturity & GPU Exploration</div>
+      <div class="tl-desc">527 commits. Sidecar expression optimizer. TPCDS connector. Iceberg V3 feature requests. Theta sketch functions. First GPU/cuDF commits arrive (CUDA 12.8→12.9, cuDF namespace registration). GCC 14 for cuDF builds. Sorted exchange for Spark.</div>
+    </div>
+    <div class="tl-item">
+      <div class="tl-date">Q1 2026</div>
+      <div class="tl-title">GPU Integration Active</div>
+      <div class="tl-desc">cuDF plan checker PR (#27273). cuDF session property provider (#27204). Sidecar GPU execution PR (#27164). cuDF in native tests (#27369). Lance connector prototype (#27445). Continued hardening: spill configs, code quality, Iceberg improvements.</div>
+    </div>
+  </div>
+
+  <div class="callout">
+    <strong>Architectural Inflection Points:</strong><br>
+    1) <strong>2022-Q2:</strong> Open-source migration — established Velox-as-submodule pattern<br>
+    2) <strong>2022-Q4:</strong> Shuffle/Spill — moved from read-only to full execution engine<br>
+    3) <strong>2023:</strong> Peak velocity — aggressive feature parity with Java engine<br>
+    4) <strong>2025-Q4/2026-Q1:</strong> GPU entry — cuDF integration hooks arriving in both Velox and Presto layers
+  </div>
+</section>
+
+<!-- ============ 2. ARCHITECTURE ============ -->
+<section id="architecture">
+  <h2><span class="num">02</span>System Architecture</h2>
+  <p class="section-desc">Presto Native Execution is a C++ worker process that replaces the Java worker. The Java coordinator remains unchanged. The architecture is a thin translation layer over Velox's execution engine.</p>
+
+  <div class="arch-diagram">
+    <div class="arch-layer">
+      <div class="arch-label">Client</div>
+      <div class="arch-boxes">
+        <div class="arch-box java">SQL Client (JDBC / CLI / HTTP)</div>
+      </div>
+    </div>
+    <div class="arch-arrow">↓ SQL</div>
+    <div class="arch-layer">
+      <div class="arch-label">Coordinator</div>
+      <div class="arch-boxes">
+        <div class="arch-box java">Presto Coordinator (Java)</div>
+        <div class="arch-box java">Query Optimizer</div>
+        <div class="arch-box java">Plan Generator</div>
+      </div>
+    </div>
+    <div class="arch-arrow">↓ JSON Plan Fragments (HTTP REST /v1/task)</div>
+    <div class="arch-layer">
+      <div class="arch-label">Native Worker</div>
+      <div class="arch-boxes">
+        <div class="arch-box cpp">PrestoServer (Proxygen HTTP)</div>
+        <div class="arch-box cpp">TaskResource / TaskManager</div>
+        <div class="arch-box cpp">Announcer / Heartbeat</div>
+      </div>
+    </div>
+    <div class="arch-arrow">↓ protocol::PlanNode → Velox core::PlanNode</div>
+    <div class="arch-layer">
+      <div class="arch-label">Translation</div>
+      <div class="arch-boxes">
+        <div class="arch-box cpp">PrestoToVeloxQueryPlan</div>
+        <div class="arch-box cpp">PrestoToVeloxExpr</div>
+        <div class="arch-box cpp">PrestoToVeloxConnector</div>
+        <div class="arch-box cpp">SessionProperties</div>
+      </div>
+    </div>
+    <div class="arch-arrow">↓ Velox Plan Nodes</div>
+    <div class="arch-layer">
+      <div class="arch-label">Execution</div>
+      <div class="arch-boxes">
+        <div class="arch-box velox">Velox Task</div>
+        <div class="arch-box velox">Velox Driver</div>
+        <div class="arch-box velox">Velox Operators</div>
+        <div class="arch-box velox">Memory Arbitrator</div>
+      </div>
+    </div>
+    <div class="arch-arrow">↓ DriverAdapter (compile-time operator rewrite)</div>
+    <div class="arch-layer">
+      <div class="arch-label">GPU (Optional)</div>
+      <div class="arch-boxes">
+        <div class="arch-box gpu">CudfDriverAdapter</div>
+        <div class="arch-box gpu">CudfFromVelox / CudfToVelox</div>
+        <div class="arch-box gpu">GPU Operators (cuDF)</div>
+        <div class="arch-box gpu">RMM Memory</div>
+      </div>
+    </div>
+    <div class="arch-arrow">↓ Data I/O</div>
+    <div class="arch-layer">
+      <div class="arch-label">Connectors</div>
+      <div class="arch-boxes">
+        <div class="arch-box velox">Hive (Parquet/ORC/DWRF)</div>
+        <div class="arch-box velox">Iceberg</div>
+        <div class="arch-box velox">TPC-H / TPC-DS</div>
+        <div class="arch-box cpp">Arrow Flight</div>
+        <div class="arch-box gpu">CudfHiveConnector</div>
+      </div>
+    </div>
+    <div class="arch-arrow">↓ Storage</div>
+    <div class="arch-layer">
+      <div class="arch-label">Storage</div>
+      <div class="arch-boxes">
+        <div class="arch-box java">S3 / GCS / HDFS / ABFS / Local FS</div>
+      </div>
+    </div>
+  </div>
+
+  <h3>Data Flow: SQL → Results</h3>
+  <div class="callout">
+    <strong>1.</strong> SQL → Java Coordinator (parse, analyze, optimize, generate distributed plan)<br>
+    <strong>2.</strong> Coordinator sends JSON plan fragments to native workers via HTTP REST (<code>/v1/task/{taskId}</code>)<br>
+    <strong>3.</strong> <code>TaskResource</code> deserializes JSON → <code>protocol::PlanFragment</code><br>
+    <strong>4.</strong> <code>VeloxQueryPlanConverter</code> walks protocol plan tree via <code>dynamic_pointer_cast</code> dispatch (25+ node types)<br>
+    <strong>5.</strong> Each protocol node maps to a Velox <code>core::PlanNode</code><br>
+    <strong>6.</strong> Root <code>OutputNode</code> synthesized as Velox <code>PartitionedOutputNode</code><br>
+    <strong>7.</strong> Velox creates Task → Driver pipelines → Operators execute on vectorized column batches<br>
+    <strong>8.</strong> <em>(GPU path):</em> <code>CudfDriverAdapter</code> rewrites operator chain at compile time, inserting <code>CudfFromVelox</code>/<code>CudfToVelox</code> at CPU↔GPU boundaries<br>
+    <strong>9.</strong> Results returned via HTTP to coordinator or downstream exchange
+  </div>
+
+  <h3>Key Source Files (by complexity)</h3>
+  <table>
+    <tr><th>File</th><th>Lines</th><th>Role</th></tr>
+    <tr><td><code>PrestoToVeloxQueryPlan.cpp</code></td><td>2,602</td><td>Plan translation — 25+ plan node types via dynamic_pointer_cast chain</td></tr>
+    <tr><td><code>CudfHashAggregation.cpp</code></td><td>2,092</td><td>GPU hash aggregation operator — most complex cuDF operator</td></tr>
+    <tr><td><code>PrestoServer.cpp</code></td><td>2,002</td><td>Server lifecycle, connector/function/cuDF registration, memory init</td></tr>
+    <tr><td><code>TaskManager.cpp</code></td><td>1,504</td><td>Task creation, Velox QueryCtx setup, spill directory, cleanup</td></tr>
+    <tr><td><code>TaskResource.cpp</code></td><td>784</td><td>HTTP API endpoints — createOrUpdateTask, getTaskResults, etc.</td></tr>
+    <tr><td><code>ToCudf.cpp</code></td><td>422</td><td>GPU driver adapter — CompileState::compile() operator rewrite logic</td></tr>
+  </table>
+</section>
+
+<!-- ============ 3. FEATURE MATRIX ============ -->
+<section id="features">
+  <h2><span class="num">03</span>Feature Maturity Matrix</h2>
+  <p class="section-desc">Current capabilities across operators, connectors, execution features, and performance optimizations. Based on source code analysis and active PR tracking.</p>
+
+  <div class="tab-container">
+    <div class="tab-buttons">
+      <button class="tab-btn active" onclick="showTab(event, 'tab-operators')">Operators</button>
+      <button class="tab-btn" onclick="showTab(event, 'tab-connectors')">Connectors</button>
+      <button class="tab-btn" onclick="showTab(event, 'tab-execution')">Execution</button>
+      <button class="tab-btn" onclick="showTab(event, 'tab-perf')">Performance</button>
+    </div>
+
+    <div id="tab-operators" class="tab-content active">
+      <table>
+        <tr><th>Operator / Feature</th><th>CPU Status</th><th>Maturity</th><th>GPU Support</th></tr>
+        <tr><td>TableScan</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td><span class="badge badge-green">CudfHiveDataSource</span></td></tr>
+        <tr><td>Filter / Project</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td><span class="badge badge-green">CudfFilterProject</span></td></tr>
+        <tr><td>HashAggregation</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td><span class="badge badge-green">CudfHashAggregation</span></td></tr>
+        <tr><td>HashJoin (Build + Probe)</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td><span class="badge badge-amber">Partial (anti-join gap)</span></td></tr>
+        <tr><td>MergeJoin</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">None</span></td></tr>
+        <tr><td>SemiJoin</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">None</span></td></tr>
+        <tr><td>IndexJoin / IndexSource</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">None</span></td></tr>
+        <tr><td>SpatialJoin</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-amber">Production</span></td><td><span class="badge badge-red">None</span></td></tr>
+        <tr><td>TopN</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td><span class="badge badge-green">CudfTopN</span></td></tr>
+        <tr><td>OrderBy / Sort</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td><span class="badge badge-green">CudfOrderBy</span></td></tr>
+        <tr><td>Limit</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td><span class="badge badge-green">CudfLimit</span></td></tr>
+        <tr><td>Window Functions</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">None</span></td></tr>
+        <tr><td>RowNumber / TopNRowNumber</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">None</span></td></tr>
+        <tr><td>MarkDistinct</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">None</span></td></tr>
+        <tr><td>AssignUniqueId</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-green">CudfAssignUniqueId</span></td></tr>
+        <tr><td>Unnest</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">None</span></td></tr>
+        <tr><td>GroupId</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">None</span></td></tr>
+        <tr><td>DistinctLimit</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">None</span></td></tr>
+        <tr><td>TableWriter / Delete</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">Tests disabled</span></td></tr>
+        <tr><td>Exchange (HTTP / Shuffle)</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td><span class="badge badge-red">CPU only</span></td></tr>
+        <tr><td>LocalPartition</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td><span class="badge badge-green">CudfLocalPartition</span></td></tr>
+        <tr><td>EnforceSingleRow / Sample</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">N/A</span></td></tr>
+        <tr><td>Table-Valued Functions</td><td><span class="badge badge-amber">In Progress</span></td><td><span class="badge badge-amber">Experimental</span></td><td><span class="badge badge-red">None</span></td></tr>
+      </table>
+    </div>
+
+    <div id="tab-connectors" class="tab-content">
+      <table>
+        <tr><th>Connector</th><th>Status</th><th>Maturity</th><th>GPU Path</th></tr>
+        <tr><td>Hive (Parquet)</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td><span class="badge badge-green">CudfHiveConnector (GPU-direct scan)</span></td></tr>
+        <tr><td>Hive (DWRF)</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td><span class="badge badge-red">CPU only</span></td></tr>
+        <tr><td>Hive (ORC)</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">CPU only</span></td></tr>
+        <tr><td>Hive (Text/CSV)</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">CPU only</span></td></tr>
+        <tr><td>Iceberg (Parquet)</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">None (planned)</span></td></tr>
+        <tr><td>TPC-H</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td><span class="badge badge-red">N/A</span></td></tr>
+        <tr><td>TPC-DS</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-red">N/A</span></td></tr>
+        <tr><td>System</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td><span class="badge badge-red">N/A</span></td></tr>
+        <tr><td>Arrow Flight</td><td><span class="badge badge-amber">Optional</span></td><td><span class="badge badge-amber">Experimental</span></td><td><span class="badge badge-red">None</span></td></tr>
+        <tr><td>Lance</td><td><span class="badge badge-amber">In Progress</span></td><td><span class="badge badge-red">Prototype</span></td><td><span class="badge badge-red">None</span></td></tr>
+        <tr><td>S3 / GCS / HDFS / ABFS</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td><span class="badge badge-amber">via CudfHive (S3 tested)</span></td></tr>
+      </table>
+    </div>
+
+    <div id="tab-execution" class="tab-content">
+      <table>
+        <tr><th>Feature</th><th>Status</th><th>Maturity</th><th>Notes</th></tr>
+        <tr><td>Vectorized Execution</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td>Velox columnar batch execution engine</td></tr>
+        <tr><td>Memory Arbitration</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td>SharedArbitrator; global arbitration enabled by default</td></tr>
+        <tr><td>Spill to Disk</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td>Aggregation, join, sort spill; configurable paths + max bytes</td></tr>
+        <tr><td>HTTP Exchange</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Mature</span></td><td>PrestoExchangeSource, HTTP/2, compression</td></tr>
+        <tr><td>External Shuffle</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td>ShuffleInterface framework, pluggable factories</td></tr>
+        <tr><td>SSD Cache</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td>Velox SsdCache with TTL controller</td></tr>
+        <tr><td>Dynamic Filtering</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-green">Production</span></td><td>CPU path only; GPU connector NYI</td></tr>
+        <tr><td>Sidecar Expression Optimizer</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-amber">Production</span></td><td>Known bugs being fixed (nested lambdas, TRY, SWITCH)</td></tr>
+        <tr><td>Remote Functions (REST UDF)</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-amber">Production</span></td><td>REST-based remote UDF invocation</td></tr>
+        <tr><td>Tracing / Replay</td><td><span class="badge badge-green">Supported</span></td><td><span class="badge badge-amber">Production</span></td><td>Velox trace replay tools for debugging</td></tr>
+        <tr><td>Fault Tolerance</td><td><span class="badge badge-amber">Partial</span></td><td><span class="badge badge-amber">Experimental</span></td><td>Batch retry via QueryContextManager; no full FT</td></tr>
+        <tr><td>Multi-GPU Scaling</td><td><span class="badge badge-red">Missing</span></td><td><span class="badge badge-red">N/A</span></td><td>Not yet designed</td></tr>
+        <tr><td>GPU Spill</td><td><span class="badge badge-red">Missing</span></td><td><span class="badge badge-red">N/A</span></td><td>No GPU→disk spill path exists</td></tr>
+      </table>
+    </div>
+
+    <div id="tab-perf" class="tab-content">
+      <table>
+        <tr><th>Feature</th><th>Status</th><th>Impact</th></tr>
+        <tr><td>Columnar Vectorization</td><td><span class="badge badge-green">Core</span></td><td>Fundamental execution model via Velox RowVector batches</td></tr>
+        <tr><td>Dictionary/RLE Lazy Encoding</td><td><span class="badge badge-green">Enabled</span></td><td>Lazy materialization avoids unnecessary decoding</td></tr>
+        <tr><td>Filter Pushdown (I/O)</td><td><span class="badge badge-green">Enabled</span></td><td>Parquet row-group and page-level skipping</td></tr>
+        <tr><td>Adaptive Filter Reordering</td><td><span class="badge badge-green">Enabled</span></td><td>Velox reorders conjuncts by selectivity</td></tr>
+        <tr><td>Hash Table Caching (Broadcast)</td><td><span class="badge badge-green">Enabled</span></td><td>Reuse built hash tables across tasks in broadcast joins</td></tr>
+        <tr><td>Partitioned Writer Scaling</td><td><span class="badge badge-green">Enabled</span></td><td>Dynamic scaling of writer tasks for partitioned output</td></tr>
+        <tr><td>Batch Concat Optimization (GPU)</td><td><span class="badge badge-green">Enabled</span></td><td>Accumulate small CPU batches before GPU aggregation</td></tr>
+        <tr><td>GPU Hybrid Scan (cuDF)</td><td><span class="badge badge-amber">Experimental</span></td><td>cudf::io::experimental::hybrid_scan for Parquet</td></tr>
+        <tr><td>GPU Expression JIT</td><td><span class="badge badge-amber">Experimental</span></td><td>JIT-compiled GPU expression evaluation in CudfFilterProject</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 4. ISSUE/PR ANALYSIS ============ -->
+<section id="issues">
+  <h2><span class="num">04</span>Issue & PR Analysis</h2>
+  <p class="section-desc">GitHub issues and PR trends for presto-native-execution as of March 2026. Data from GitHub API and git log analysis.</p>
+
+  <div class="stat-row">
+    <div class="stat"><div class="stat-val">375</div><div class="stat-lbl">Open Issues (native)</div></div>
+    <div class="stat"><div class="stat-val">210</div><div class="stat-lbl">Closed Issues</div></div>
+    <div class="stat"><div class="stat-val">69</div><div class="stat-lbl">Open Bugs</div></div>
+    <div class="stat"><div class="stat-val">62</div><div class="stat-lbl">Feature Requests</div></div>
+  </div>
+
+  <h3>Issue Classification</h3>
+  <table>
+    <tr><th>Category</th><th>Count</th><th>Trend</th><th>Top Themes</th><th>Representative Issues</th></tr>
+    <tr>
+      <td><strong>Bugs</strong></td>
+      <td>69 open</td>
+      <td><span class="badge badge-amber">Stable</span></td>
+      <td>Sidecar expression optimizer failures (nested lambdas, TRY, SWITCH), memory tracking gaps, incorrect results with merged aggregations, VARCHAR length mismatch, Parquet array column errors</td>
+      <td>#27449, #27433, #27321, #27317, #27034</td>
+    </tr>
+    <tr>
+      <td><strong>Feature Requests</strong></td>
+      <td>62 open</td>
+      <td><span class="badge badge-green">Increasing</span></td>
+      <td>Iceberg V3 (deletion vectors, row lineage, default columns), Celeborn C++ shuffle client, sorted exchange, Sketch functions, GPU extensions, container CI</td>
+      <td>#27198, #27197, #27196, #27195, #27158</td>
+    </tr>
+    <tr>
+      <td><strong>Build / Tooling</strong></td>
+      <td>6 labeled</td>
+      <td><span class="badge badge-green">Stable</span></td>
+      <td>GCC 12→14 upgrade, Docker image cleanup (jmx.properties), CUDA dependency management, deps container fixes</td>
+      <td>#26787, #26702, #27145</td>
+    </tr>
+    <tr>
+      <td><strong>Compatibility Gaps</strong></td>
+      <td>~30 est.</td>
+      <td><span class="badge badge-amber">Decreasing</span></td>
+      <td>Running splits fewer than Java (#26872), memory reports all as user memory (#25881), sidecar function migration (#25905), native vs Java result differences</td>
+      <td>#26872, #25881, #25905, #26323</td>
+    </tr>
+    <tr>
+      <td><strong>Performance</strong></td>
+      <td>~15 est.</td>
+      <td><span class="badge badge-green">Stable</span></td>
+      <td>Broadcast join optimization, writer scaling, exchange buffer sizing, memory compaction reclaim, lazy partition loading</td>
+      <td>#26880, #26695, #26854</td>
+    </tr>
+    <tr>
+      <td><strong>Adoption Blockers</strong></td>
+      <td>~10 est.</td>
+      <td><span class="badge badge-amber">Decreasing</span></td>
+      <td>Memory limit accuracy, sidecar stability, documentation gaps, config compatibility, session property discoverability</td>
+      <td>#25884, #25881, #26401</td>
+    </tr>
+  </table>
+
+  <h3>Active PR Themes (Q1 2026)</h3>
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-title" style="color: var(--green);">GPU Integration (5 PRs)</div>
+      <ul>
+        <li><strong>#27369</strong> — Enable cuDF in native tests</li>
+        <li><strong>#27273</strong> — Add cuDF plan checker</li>
+        <li><strong>#27204</strong> — cuDF session property provider</li>
+        <li><strong>#27164</strong> — Extend sidecar for GPU execution</li>
+        <li><strong>#27275</strong> — VeloxPlanChecker consolidation</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-title" style="color: var(--accent);">Code Quality & Hardening (8+ PRs)</div>
+      <ul>
+        <li><strong>#27405</strong> — Code quality improvements in types/</li>
+        <li><strong>#27308</strong> — Replace raw throws with VELOX_USER_FAIL</li>
+        <li><strong>#27306</strong> — Replace assert() with VELOX_CHECK</li>
+        <li><strong>#27223</strong> — Replace unsafe atol() with folly::to</li>
+        <li><strong>#27224</strong> — Extract HTTP handler boilerplate</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-title" style="color: var(--purple);">Iceberg (6+ PRs/Issues)</div>
+      <ul>
+        <li><strong>#27272</strong> — Iceberg branch/tag support tests</li>
+        <li><strong>#27020</strong> — Iceberg materialized views</li>
+        <li><strong>#26889</strong> — Partition transform tests</li>
+        <li><strong>#27198–27195</strong> — Iceberg V3 feature requests (4 issues)</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-title" style="color: var(--amber);">Spill & Memory (4 PRs)</div>
+      <ul>
+        <li><strong>#27247</strong> — mark_distinct_spill_enabled</li>
+        <li><strong>#27299</strong> — Aggregation/hash join spill file configs</li>
+        <li><strong>#27132</strong> — kMaxSpillBytes config mapping fix</li>
+        <li><strong>#27221</strong> — Memory compaction reclaim session property</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Monthly Commit Velocity (2025–2026)</h3>
+  <div class="bar-chart" style="height: 100px;">
+    <div class="bar-col"><div class="bar-value">30</div><div class="bar" style="height: 42%"></div><div class="bar-label">Jan</div></div>
+    <div class="bar-col"><div class="bar-value">32</div><div class="bar" style="height: 45%"></div><div class="bar-label">Feb</div></div>
+    <div class="bar-col"><div class="bar-value">42</div><div class="bar" style="height: 59%"></div><div class="bar-label">Mar</div></div>
+    <div class="bar-col"><div class="bar-value">42</div><div class="bar" style="height: 59%"></div><div class="bar-label">Apr</div></div>
+    <div class="bar-col"><div class="bar-value">34</div><div class="bar" style="height: 48%"></div><div class="bar-label">May</div></div>
+    <div class="bar-col"><div class="bar-value">45</div><div class="bar" style="height: 63%"></div><div class="bar-label">Jun</div></div>
+    <div class="bar-col"><div class="bar-value">38</div><div class="bar" style="height: 54%"></div><div class="bar-label">Jul</div></div>
+    <div class="bar-col"><div class="bar-value">59</div><div class="bar" style="height: 83%"></div><div class="bar-label">Aug</div></div>
+    <div class="bar-col"><div class="bar-value">46</div><div class="bar" style="height: 65%"></div><div class="bar-label">Sep</div></div>
+    <div class="bar-col"><div class="bar-value">71</div><div class="bar" style="height: 100%"></div><div class="bar-label">Oct</div></div>
+    <div class="bar-col"><div class="bar-value">49</div><div class="bar" style="height: 69%"></div><div class="bar-label">Nov</div></div>
+    <div class="bar-col"><div class="bar-value">32</div><div class="bar" style="height: 45%"></div><div class="bar-label">Dec</div></div>
+    <div class="bar-col" style="border-left: 1px dashed var(--border); padding-left: 6px;"><div class="bar-value">33</div><div class="bar" style="height: 46%; background: linear-gradient(to top, var(--green), var(--teal));"></div><div class="bar-label">'26 Jan</div></div>
+    <div class="bar-col"><div class="bar-value">32</div><div class="bar" style="height: 45%; background: linear-gradient(to top, var(--green), var(--teal));"></div><div class="bar-label">Feb</div></div>
+    <div class="bar-col"><div class="bar-value">27</div><div class="bar" style="height: 38%; background: linear-gradient(to top, var(--green), var(--teal));"></div><div class="bar-label">Mar</div></div>
+  </div>
+  <div style="font-size: 11px; color: var(--text-muted); margin-top: 8px;">2025 shown in blue/purple gradient. 2026 shown in green/teal. Development velocity sustained at ~35–45 commits/month.</div>
+</section>
+
+<!-- ============ 5. VELOX MAP ============ -->
+<section id="velox-map">
+  <h2><span class="num">05</span>Presto vs Velox Responsibility Map</h2>
+  <p class="section-desc">Presto Native is architecturally a thin translation and protocol layer over Velox. This boundary defines what Presto owns vs what it delegates, and has direct implications for GPU enablement strategy.</p>
+
+  <div class="arch-diagram">
+    <div class="dep-map">
+      <div class="dep-col presto">
+        <h4>Presto Native Owns</h4>
+        <div class="dep-item"><strong>HTTP Server</strong> — Proxygen, HTTP/2, JWT auth</div>
+        <div class="dep-item"><strong>Presto Protocol</strong> — JSON wire format parsing</div>
+        <div class="dep-item"><strong>Plan Translation</strong> — PrestoToVeloxQueryPlan (25+ nodes)</div>
+        <div class="dep-item"><strong>Connector Bridge</strong> — PrestoToVeloxConnector adapters</div>
+        <div class="dep-item"><strong>Session Properties</strong> — Presto↔Velox config mapping</div>
+        <div class="dep-item"><strong>Task API</strong> — TaskResource, TaskManager lifecycle</div>
+        <div class="dep-item"><strong>Coordinator Comms</strong> — Announcer, Heartbeat, Discovery</div>
+        <div class="dep-item"><strong>Exchange Operators</strong> — PartitionAndSerialize, Shuffle*</div>
+        <div class="dep-item"><strong>Expression Optimizer</strong> — Sidecar native optimizer</div>
+        <div class="dep-item"><strong>Remote Functions</strong> — REST UDF framework</div>
+        <div class="dep-item"><strong>Batch Mode</strong> — Presto-on-Spark specific handling</div>
+      </div>
+      <div class="dep-arrows">→<br>→<br>→<br>→<br>→<br>→<br>→<br>→<br>→<br>→<br>→</div>
+      <div class="dep-col velox">
+        <h4>Velox Provides</h4>
+        <div class="dep-item"><strong>Execution Engine</strong> — Driver, Task, Operator model</div>
+        <div class="dep-item"><strong>Plan Nodes</strong> — core::PlanNode hierarchy</div>
+        <div class="dep-item"><strong>All Core Operators</strong> — HashAgg, Join, Sort, Window, etc.</div>
+        <div class="dep-item"><strong>Connector Framework</strong> — HiveConnector, IcebergConnector</div>
+        <div class="dep-item"><strong>Memory Management</strong> — MemoryManager, SharedArbitrator</div>
+        <div class="dep-item"><strong>Vector/Type System</strong> — RowVector, FlatVector, Complex types</div>
+        <div class="dep-item"><strong>File I/O</strong> — Parquet, ORC, DWRF readers/writers</div>
+        <div class="dep-item"><strong>Storage Adapters</strong> — S3, GCS, HDFS, ABFS</div>
+        <div class="dep-item"><strong>Expression Engine</strong> — Expr evaluation, codegen</div>
+        <div class="dep-item"><strong>Spill Framework</strong> — Disk spill for operators</div>
+        <div class="dep-item"><strong>cuDF GPU Module</strong> — experimental/cudf/ operators</div>
+      </div>
+    </div>
+  </div>
+
+  <h3>Coupling Risk Assessment</h3>
+  <table>
+    <tr><th>Interface Point</th><th>Coupling</th><th>Risk</th><th>Analysis</th></tr>
+    <tr>
+      <td>Velox Submodule Pin</td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td>Frequent "Advance Velox" commits (~monthly). API changes cascade. The submodule tracks near-HEAD. GPU features in Velox are available immediately but breaking changes propagate instantly.</td>
+    </tr>
+    <tr>
+      <td>Plan Node Dispatch</td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td>25+ node types via dynamic_pointer_cast chain in a 2,602-line file. New Velox plan nodes require manual Presto translation additions. Fragile but well-understood pattern.</td>
+    </tr>
+    <tr>
+      <td>Operator Registration</td>
+      <td><span class="badge badge-green">Low</span></td>
+      <td><span class="badge badge-green">Low</span></td>
+      <td>Well-defined registration API (registerOperator, registerExchangeSource). Custom operators are purely additive. GPU DriverAdapter hooks in cleanly.</td>
+    </tr>
+    <tr>
+      <td>Memory Model</td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td>Direct use of Velox MemoryManager and SharedArbitrator. Config mapping required. GPU adds second memory system (RMM) without unified pressure signaling. Highest coupling risk for GPU path.</td>
+    </tr>
+    <tr>
+      <td>Connector Interface</td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td>Bridge pattern (PrestoToVeloxConnector) provides abstraction, but implementations tightly coupled to Velox HiveConnector internals (split types, handle types).</td>
+    </tr>
+    <tr>
+      <td>cuDF Build Integration</td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td>PRESTO_ENABLE_CUDF flag propagated to VELOX_ENABLE_CUDF. CMake coordination required. GCC 14+ requirement when cuDF enabled adds build matrix complexity.</td>
+    </tr>
+  </table>
+
+  <div class="callout">
+    <strong>Key Insight:</strong> Presto Native's thin-layer architecture is simultaneously its greatest strength and its GPU enablement advantage. Since the heavy lifting (operator execution, memory management, I/O) lives in Velox, GPU support in Velox's experimental/cudf/ module propagates to Presto Native with minimal additional Presto-layer work. The Presto-specific work is: session config wiring, plan validation, and sidecar GPU awareness. The hard GPU engineering is entirely in Velox.
+  </div>
+</section>
+
+<!-- ============ 6. GPU DESIGN ============ -->
+<section id="gpu">
+  <h2><span class="num">06</span>GPU Integration Design</h2>
+  <p class="section-desc">GPU acceleration leverages Velox's cuDF experimental module. The design uses a DriverAdapter pattern — a compile-time rewrite of the operator chain that substitutes CPU operators with GPU equivalents and inserts conversion operators at boundaries.</p>
+
+  <h3>Current GPU Operator Coverage</h3>
+  <div class="grid-3">
+    <div class="card" style="border-left: 3px solid var(--green);">
+      <div class="card-title" style="color: var(--green);">Implemented (8 operators)</div>
+      <ul>
+        <li><strong>CudfFilterProject</strong> — AST/JIT GPU expression eval</li>
+        <li><strong>CudfHashAggregation</strong> — Grouped & global aggregations</li>
+        <li><strong>CudfHashJoin</strong> — Build + Probe (partial)</li>
+        <li><strong>CudfOrderBy</strong> — GPU parallel sort</li>
+        <li><strong>CudfTopN</strong> — GPU top-N selection</li>
+        <li><strong>CudfLimit</strong> — GPU limit</li>
+        <li><strong>CudfLocalPartition</strong> — GPU partitioning</li>
+        <li><strong>CudfAssignUniqueId</strong> — GPU unique ID</li>
+      </ul>
+    </div>
+    <div class="card" style="border-left: 3px solid var(--amber);">
+      <div class="card-title" style="color: var(--amber);">Infrastructure Operators (3)</div>
+      <ul>
+        <li><strong>CudfFromVelox</strong> — CPU→GPU conversion<br>Velox RowVector → Arrow C ABI → cudf::table</li>
+        <li><strong>CudfToVelox</strong> — GPU→CPU conversion<br>cudf::to_arrow_host → Velox RowVector</li>
+        <li><strong>CudfBatchConcat</strong> — Batches small inputs before GPU aggregation</li>
+      </ul>
+    </div>
+    <div class="card" style="border-left: 3px solid var(--red);">
+      <div class="card-title" style="color: var(--red);">Missing for GPU</div>
+      <ul>
+        <li>Window Functions</li>
+        <li>MergeJoin / SemiJoin / SpatialJoin</li>
+        <li>Unnest / GroupId</li>
+        <li>RowNumber / TopNRowNumber</li>
+        <li>MarkDistinct / DistinctLimit</li>
+        <li>Exchange (GPU-aware)</li>
+        <li>TableWriter (tests disabled)</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>GPU Hook Points in Architecture</h3>
+  <table>
+    <tr><th>Hook Point</th><th>Mechanism</th><th>Status</th><th>Risk</th></tr>
+    <tr>
+      <td><strong>Operator Substitution</strong></td>
+      <td><code>OperatorAdapterRegistry</code> — adapters registered per CPU operator type. <code>CudfDriverAdapter::compile()</code> walks operator list and replaces using adapter's <code>createReplacements()</code>.</td>
+      <td><span class="badge badge-green">Working</span></td>
+      <td><span class="badge badge-green">Low</span></td>
+    </tr>
+    <tr>
+      <td><strong>CPU↔GPU Conversion</strong></td>
+      <td><code>CudfFromVelox</code>/<code>CudfToVelox</code> auto-inserted at boundaries. Uses Arrow C ABI bridge: <code>exportToArrow()</code> → <code>cudf::from_arrow()</code> and reverse.</td>
+      <td><span class="badge badge-green">Working</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+    </tr>
+    <tr>
+      <td><strong>GPU Connector</strong></td>
+      <td><code>CudfHiveConnectorFactory</code> replaces <code>HiveConnectorFactory</code> when <code>PRESTO_ENABLE_CUDF</code>. Parquet read directly to GPU memory via <code>cudf::io::parquet</code>.</td>
+      <td><span class="badge badge-green">Working</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+    </tr>
+    <tr>
+      <td><strong>GPU Memory</strong></td>
+      <td>RMM (RAPIDS Memory Manager) with configurable backends: pool, async, arena, managed, prefetch. Separate <code>output_mr</code> and <code>temp_mr</code>.</td>
+      <td><span class="badge badge-green">Working</span></td>
+      <td><span class="badge badge-red">High</span></td>
+    </tr>
+    <tr>
+      <td><strong>Session Config</strong></td>
+      <td><code>cudf.enabled</code> query config gates GPU activation. PR #27204 adds Presto-layer session property provider.</td>
+      <td><span class="badge badge-amber">In Progress</span></td>
+      <td><span class="badge badge-green">Low</span></td>
+    </tr>
+    <tr>
+      <td><strong>Plan Validation</strong></td>
+      <td>PR #27273 adds <code>CudfPlanChecker</code>. Validates plan fragment GPU-eligibility before execution.</td>
+      <td><span class="badge badge-amber">In Progress</span></td>
+      <td><span class="badge badge-green">Low</span></td>
+    </tr>
+    <tr>
+      <td><strong>Sidecar GPU Extension</strong></td>
+      <td>PR #27164 extends sidecar plugin so coordinator knows about GPU capability — enables GPU-aware task routing.</td>
+      <td><span class="badge badge-amber">In Progress</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+    </tr>
+  </table>
+
+  <h3>Critical Design Risks</h3>
+  <div class="grid-2">
+    <div>
+      <div class="risk">Arrow C ABI as CPU↔GPU bridge adds per-batch serialization cost. For batches under ~10K rows, conversion overhead may exceed GPU compute benefit. CudfBatchConcat mitigates for aggregation but no universal solution exists.</div>
+      <div class="risk">GPU memory (RMM) is completely separate from Velox's MemoryManager/SharedArbitrator. No unified memory pressure signaling exists. GPU OOM will crash the worker rather than triggering spill.</div>
+      <div class="risk">Dynamic filters are NYI in CudfHiveDataSource. Queries relying on dynamic filtering will either fall back to CPU or execute suboptimal full-table GPU scans.</div>
+    </div>
+    <div>
+      <div class="risk">Exchange/shuffle is CPU-only. Data must be converted GPU→CPU before every exchange and CPU→GPU after. Multi-stage join queries will see significant boundary conversion overhead.</div>
+      <div class="risk">Null-aware anti-join with filter is explicitly disabled in CudfHashJoinBaseAdapter. Certain TPC-DS queries will fall back to CPU execution.</div>
+      <div class="risk">Type coverage: MAP types, some interval types, VARBINARY (exported as string for cuDF) are incomplete on GPU. Complex nested type queries will trigger unexpected fallbacks.</div>
+    </div>
+  </div>
+
+  <div class="callout">
+    <strong>Design Principle:</strong> The cuDF integration follows a "progressive replacement" model. The DriverAdapter walks the operator chain and replaces what it can, inserting conversion operators at boundaries. The <code>allowCpuFallback</code> flag controls whether unsupported operators trigger an error or fall back to CPU. This is architecturally sound — it means partial GPU execution is always possible, and GPU coverage can be incrementally expanded.
+  </div>
+</section>
+
+<!-- ============ 7. MODULE EVALUATION ============ -->
+<section id="modules">
+  <h2><span class="num">07</span>Module Evaluation Table</h2>
+  <p class="section-desc">Each system module scored across four dimensions. Scores drive the phased roadmap priorities.</p>
+
+  <table>
+    <tr><th>Module</th><th>Importance</th><th>Complexity</th><th>Coupling</th><th>GPU Suitability</th><th>Assessment</th></tr>
+    <tr>
+      <td><strong>Plan Translation</strong><br><span style="font-size:11px; color:var(--text-muted)">PrestoToVeloxQueryPlan</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td>Critical path. GPU plan checking hooks here (CudfPlanChecker). 2,602 LOC, 25+ node types. Low GPU-specific work needed — plan checking is additive, not invasive.</td>
+    </tr>
+    <tr>
+      <td><strong>HashAggregation</strong><br><span style="font-size:11px; color:var(--text-muted)">CudfHashAggregation</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-green">Good</span></td>
+      <td>Most complex GPU operator (2,092 LOC). High GPU speedup potential for grouped aggregations on large datasets. Already working — needs testing at scale.</td>
+    </tr>
+    <tr>
+      <td><strong>HashJoin</strong><br><span style="font-size:11px; color:var(--text-muted)">CudfHashJoin</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td>GPU implementation exists but anti-join with filter disabled. Build-side must fit in GPU memory. High impact when applicable, but memory constraints limit large builds.</td>
+    </tr>
+    <tr>
+      <td><strong>Filter / Project</strong><br><span style="font-size:11px; color:var(--text-muted)">CudfFilterProject</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-green">Low</span></td>
+      <td><span class="badge badge-green">Good</span></td>
+      <td>Expression evaluation via AST/JIT on GPU. High parallelism. Expression coverage depends on cuDF function support. Highest impact-to-effort ratio.</td>
+    </tr>
+    <tr>
+      <td><strong>TableScan / Connector</strong><br><span style="font-size:11px; color:var(--text-muted)">CudfHiveDataSource</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-green">Good</span></td>
+      <td>GPU-direct Parquet scan eliminates H2D copy for data ingestion. Hybrid scan experimental. Dynamic filter NYI is a real gap for production.</td>
+    </tr>
+    <tr>
+      <td><strong>Exchange / Shuffle</strong><br><span style="font-size:11px; color:var(--text-muted)">PrestoExchangeSource, Shuffle*</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-red">Hard</span></td>
+      <td>CPU-only today. GPU-aware exchange (UCX, GPUDirect RDMA) would eliminate D2H/H2D at shuffle but is a very large effort requiring network stack changes.</td>
+    </tr>
+    <tr>
+      <td><strong>Memory Management</strong><br><span style="font-size:11px; color:var(--text-muted)">Velox MemoryManager + RMM</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-red">Hard</span></td>
+      <td>Dual memory systems without unified pressure. GPU OOM not integrated with Velox spill. Highest risk area for production GPU execution.</td>
+    </tr>
+    <tr>
+      <td><strong>Window Functions</strong><br><span style="font-size:11px; color:var(--text-muted)">Velox WindowNode</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-red">High</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td>No GPU implementation. cuDF has grouped_rolling_window but full Presto window semantics (frames, custom bounds) are complex. Medium-term target.</td>
+    </tr>
+    <tr>
+      <td><strong>OrderBy / TopN / Limit</strong><br><span style="font-size:11px; color:var(--text-muted)">CudfOrderBy, CudfTopN, CudfLimit</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-green">Low</span></td>
+      <td><span class="badge badge-green">Low</span></td>
+      <td><span class="badge badge-green">Good</span></td>
+      <td>Already implemented and clean. GPU sort is highly parallel. Low risk, already working.</td>
+    </tr>
+    <tr>
+      <td><strong>HTTP Server / Task API</strong><br><span style="font-size:11px; color:var(--text-muted)">Proxygen, TaskResource</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-green">Low</span></td>
+      <td><span class="badge badge-red">N/A</span></td>
+      <td>Networking layer. No GPU involvement needed. Stable, well-tested, being actively hardened.</td>
+    </tr>
+    <tr>
+      <td><strong>Spill Framework</strong><br><span style="font-size:11px; color:var(--text-muted)">Velox Spiller</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-amber">Medium</span></td>
+      <td><span class="badge badge-red">Hard</span></td>
+      <td>GPU→disk spill not designed. Options: GPU→CPU→disk (simplest, slow) or GPU→NVMe via GDS (fast, complex). Critical for production GPU.</td>
+    </tr>
+    <tr>
+      <td><strong>Presto Protocol</strong><br><span style="font-size:11px; color:var(--text-muted)">presto_protocol/ JSON types</span></td>
+      <td><span class="badge badge-green">Low</span></td>
+      <td><span class="badge badge-green">Low</span></td>
+      <td><span class="badge badge-green">Low</span></td>
+      <td><span class="badge badge-red">N/A</span></td>
+      <td>Wire format. Generated/maintained separately. No GPU relevance.</td>
+    </tr>
+  </table>
+
+  <h3>Opportunity Matrix</h3>
+  <div class="grid-2">
+    <div class="card" style="border-left: 3px solid var(--green);">
+      <div class="card-title" style="color: var(--green);">High Impact, Low Effort — Act Now</div>
+      <ul>
+        <li><strong>Session config wiring</strong> — Enable cuDF toggle via Presto session properties (PR in flight)</li>
+        <li><strong>Plan checker</strong> — Validate GPU eligibility before execution (PR in flight)</li>
+        <li><strong>E2E test integration</strong> — cuDF in native tests CI (PR in flight)</li>
+        <li><strong>Scan-filter-agg queries</strong> — All GPU operators for this pattern already exist</li>
+      </ul>
+    </div>
+    <div class="card" style="border-left: 3px solid var(--red);">
+      <div class="card-title" style="color: var(--red);">High Risk, Must Address</div>
+      <ul>
+        <li><strong>Unified Memory Management</strong> — Dual CPU/GPU systems without coordinated pressure</li>
+        <li><strong>GPU Spill</strong> — No GPU→disk path anywhere in the stack</li>
+        <li><strong>Exchange Conversion Overhead</strong> — CPU↔GPU at every shuffle boundary</li>
+        <li><strong>Type Coverage Gaps</strong> — MAP, nested types, intervals incomplete on GPU</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 8. ROADMAP ============ -->
+<section id="roadmap">
+  <h2><span class="num">08</span>GPU Enablement Roadmap</h2>
+  <p class="section-desc">Three-phase roadmap from minimal GPU execution through hybrid CPU+GPU to full acceleration. Each phase is independently valuable and deployable.</p>
+
+  <div class="phase-card p1">
+    <div class="phase-header">
+      <h3 style="margin: 0;">Phase 1: Minimal GPU Execution</h3>
+      <span class="phase-tag p1">Q2–Q3 2026 · 3–4 months</span>
+    </div>
+    <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 12px;"><strong>Goal:</strong> End-to-end GPU execution for scan → filter → aggregate queries on Parquet data. Prove the Presto↔Velox↔cuDF integration works through TPC-H subset.</p>
+    <div class="grid-2">
+      <div>
+        <h3>Components to Build</h3>
+        <ul>
+          <li><strong>cuDF Session Property Provider</strong> — Wire <code>cudf.enabled</code> through Presto session props (PR #27204)</li>
+          <li><strong>CudfPlanChecker integration</strong> — Validate plan GPU-eligibility in TaskResource before creating tasks (PR #27273, #27275)</li>
+          <li><strong>GPU CI pipeline</strong> — cuDF in native e2e tests on GPU hardware (PR #27369)</li>
+          <li><strong>Sidecar GPU awareness</strong> — Coordinator knows which workers have GPU capability (PR #27164)</li>
+          <li><strong>Fallback mechanism</strong> — <code>allowCpuFallback=true</code> for unsupported operators; log fallback events for visibility</li>
+          <li><strong>Monitoring</strong> — GPU utilization, conversion overhead, and fallback rate metrics</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Validation Strategy</h3>
+        <ul>
+          <li>TPC-H Q1, Q3, Q5, Q6, Q10 (cover scan + filter + agg + join patterns)</li>
+          <li>Correctness: bit-exact results vs CPU-only execution</li>
+          <li>Performance: measure wall-clock speedup on SF100 and SF1000</li>
+          <li>Memory: monitor GPU memory high-water mark, validate no leaks</li>
+          <li>Fallback: verify graceful degradation for unsupported plan fragments</li>
+        </ul>
+        <h3>Key Risks</h3>
+        <div class="risk" style="font-size: 12px;">Arrow conversion overhead may negate GPU benefit for small datasets. Minimum viable batch size needed.</div>
+        <div class="risk" style="font-size: 12px;">Expression coverage gaps in AST/JIT evaluator for complex Presto scalar functions.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="phase-card p2">
+    <div class="phase-header">
+      <h3 style="margin: 0;">Phase 2: Hybrid CPU+GPU Execution</h3>
+      <span class="phase-tag p2">Q4 2026 – Q2 2027 · 4–6 months</span>
+    </div>
+    <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 12px;"><strong>Goal:</strong> Robust hybrid execution where GPU and CPU operators coexist within the same query. Smart routing decisions. Full TPC-H coverage with minimal fallback.</p>
+    <div class="grid-2">
+      <div>
+        <h3>Components to Build</h3>
+        <ul>
+          <li><strong>Intelligent plan routing</strong> — Cost model: GPU vs CPU per fragment based on data size, operator mix, GPU memory availability</li>
+          <li><strong>Dynamic filter GPU support</strong> — Implement <code>addDynamicFilter</code> in CudfHiveDataSource</li>
+          <li><strong>GPU Window functions</strong> — CudfWindow operator using <code>cudf::grouped_rolling_window</code></li>
+          <li><strong>Unified memory pressure</strong> — Bridge RMM OOM callbacks to Velox SharedArbitrator for coordinated memory management</li>
+          <li><strong>GPU spill (basic)</strong> — GPU→CPU→disk path for aggregation and join spill under memory pressure</li>
+          <li><strong>Complete anti-join</strong> — Null-aware anti-join with filter in CudfHashJoin</li>
+          <li><strong>Iceberg GPU path</strong> — Extend CudfHiveDataSource pattern to Iceberg Parquet reads</li>
+          <li><strong>Type coverage</strong> — MAP types, interval types, VARBINARY proper handling</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Validation Strategy</h3>
+        <ul>
+          <li>Full TPC-H (22 queries) at SF1000 — target ≥18 queries fully on GPU</li>
+          <li>TPC-DS representative subset (30+ queries)</li>
+          <li>Mixed workload testing: GPU + CPU queries running concurrently</li>
+          <li>Memory pressure: trigger spill under GPU memory limits, verify correctness</li>
+          <li>Full TPC-DS 99 queries produce correct results (fallback allowed)</li>
+        </ul>
+        <h3>Key Risks</h3>
+        <div class="risk" style="font-size: 12px;">Coordinating CPU and GPU memory arbitration is architecturally novel — potential for deadlock or resource starvation.</div>
+        <div class="risk" style="font-size: 12px;">GPU spill path (GPU→CPU→disk) performance may be worse than CPU-only for some query shapes, requiring smart routing to avoid.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="phase-card p3">
+    <div class="phase-header">
+      <h3 style="margin: 0;">Phase 3: Full GPU Acceleration</h3>
+      <span class="phase-tag p3">Q3 2027+ · 6–12 months</span>
+    </div>
+    <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 12px;"><strong>Goal:</strong> End-to-end GPU execution for the majority of production queries. Multi-GPU scaling. GPU-aware network exchange. Production-grade reliability and performance.</p>
+    <div class="grid-2">
+      <div>
+        <h3>Components to Build</h3>
+        <ul>
+          <li><strong>GPU-aware exchange</strong> — UCX or GPUDirect RDMA for GPU→GPU data transfer between workers, eliminating D2H/H2D at shuffle boundaries</li>
+          <li><strong>Multi-GPU support</strong> — Data partitioning across GPUs within a worker. GPU-affinity-aware task scheduling</li>
+          <li><strong>GPU TableWriter</strong> — Re-enable and complete GPU write path using cuDF Parquet writer</li>
+          <li><strong>Complete operator coverage</strong> — MergeJoin, SemiJoin, Unnest, GroupId, RowNumber, TopNRowNumber, MarkDistinct on GPU</li>
+          <li><strong>GPU-native spill</strong> — Direct GPU→NVMe via GDS (GPU Direct Storage) or cuFile</li>
+          <li><strong>Adaptive execution</strong> — Runtime GPU↔CPU migration based on actual performance signals and resource utilization</li>
+          <li><strong>CUDA MPS / MIG</strong> — Multi-tenant GPU sharing with compute and memory isolation</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Validation Strategy</h3>
+        <ul>
+          <li>Full TPC-DS 99 queries on GPU (minimal fallback, target ≥90)</li>
+          <li>Production workload replay testing from real clusters</li>
+          <li>Multi-GPU scaling efficiency (near-linear on 2/4/8 GPUs)</li>
+          <li>24/7 stability testing under sustained mixed workloads</li>
+          <li>TCO comparison: GPU worker cluster vs CPU-only at equivalent $/query</li>
+        </ul>
+        <h3>Dependencies</h3>
+        <ul>
+          <li>UCX integration in Velox exchange layer (does not exist today)</li>
+          <li>cuDF window function maturity for full Presto frame semantics</li>
+          <li>RAPIDS 26.x+ feature completeness for all aggregation types</li>
+          <li>CUDA driver + GDS support in target deployment environment</li>
+          <li>Network infrastructure supporting GPUDirect RDMA (RoCE/InfiniBand)</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <h3>Decision Framework</h3>
+  <div class="callout">
+    <strong>Recommendation:</strong> Phase 1 is immediately executable — all key PRs are in flight (#27204, #27273, #27275, #27369, #27164). The primary gating factor is GPU test infrastructure and validation throughput. Begin Phase 2 design in parallel, with unified memory management as the highest-risk item requiring early prototyping.<br><br>
+    <strong>Key Architectural Advantage:</strong> Presto Native's thin-layer-over-Velox architecture means GPU support in <code>velox/experimental/cudf/</code> propagates to Presto with minimal Presto-specific engineering. The Presto layer work is configuration, validation, and session management. The hard GPU engineering lives entirely in Velox.<br><br>
+    <strong>Go/No-Go Criteria for Phase 2:</strong><br>
+    ✓ TPC-H Q1+Q6 produce correct results end-to-end on GPU<br>
+    ✓ GPU execution is ≥2x faster than CPU for qualifying queries at SF100<br>
+    ✓ Fallback mechanism works reliably — no crashes, no silent wrong results<br>
+    ✓ GPU CI pipeline runs green for 2+ weeks continuously
+  </div>
+</section>
+
+</div>
+
+<div style="text-align: center; padding: 40px; color: var(--text-muted); font-size: 12px; border-top: 1px solid var(--border);">
+  Generated March 2026 · Source: prestodb/presto @ fea-plan-dump-dir, facebookincubator/velox @ fea-TPCDS_plans<br>
+  Analysis of 2,036 commits · 375+ open issues · 30+ active PRs · Velox experimental/cudf source review
+</div>
+
+<script>
+function showTab(event, tabId) {
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById(tabId).classList.add('active');
+  event.target.classList.add('active');
+}
+
+document.querySelectorAll('.nav a').forEach(link => {
+  link.addEventListener('click', function(e) {
+    document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
+    this.classList.add('active');
+  });
+});
+
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      const id = entry.target.id;
+      document.querySelectorAll('.nav a').forEach(a => {
+        a.classList.toggle('active', a.getAttribute('href') === '#' + id);
+      });
+    }
+  });
+}, { threshold: 0.2 });
+
+document.querySelectorAll('section[id]').forEach(section => observer.observe(section));
+</script>
+</body>
+</html>
