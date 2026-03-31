@@ -150,12 +150,10 @@ int main(int argc, char** argv) {
       facebook::velox::exec::test::createLocalExchangeSource);
 
   // Register the presto serialized/deserializer.
-  if (!isRegisteredNamedVectorSerde(
-          VectorSerde::kindName(VectorSerde::Kind::kPresto))) {
+  if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kPresto)) {
     serializer::presto::PrestoVectorSerde::registerNamedVectorSerde();
   }
-  if (!isRegisteredNamedVectorSerde(
-          VectorSerde::kindName(VectorSerde::Kind::kCompactRow))) {
+  if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kCompactRow)) {
     facebook::velox::serializer::CompactRowVectorSerde::
         registerNamedVectorSerde();
   }
@@ -185,8 +183,7 @@ int main(int argc, char** argv) {
                             kNumDestinations, // just one destination.
                             std::vector<std::string>{
                                 "station_name", "measurement"}, // output layout
-                            VectorSerde::kindName(
-                                VectorSerde::Kind::kCompactRow))
+                            VectorSerde::Kind::kCompactRow)
                         .planFragment();
 
   std::shared_ptr<folly::Executor> executor(

@@ -403,6 +403,73 @@ TEST_F(SubfieldFilterAstTest, Int32SingleValueOutOfRange) {
   testFilterExecution(rowType, columnName, *filter, vec, expr);
 }
 
+// Single value at the exact type boundary (INT32_MAX on INTEGER column).
+// The value is representable so the filter should match.
+TEST_F(SubfieldFilterAstTest, Int32SingleValueAtMax) {
+  const std::string columnName = "c0";
+  auto rowType = ROW({{columnName, INTEGER()}});
+  const int64_t value = std::numeric_limits<int32_t>::max();
+  auto filter = std::make_unique<common::BigintRange>(
+      value, value, /*nullAllowed*/ false);
+
+  common::Subfield subfield(columnName);
+  cudf::ast::tree tree;
+  std::vector<std::unique_ptr<cudf::scalar>> scalars;
+  const auto& expr =
+      createAstFromSubfieldFilter(subfield, *filter, tree, scalars, rowType);
+
+  EXPECT_GT(tree.size(), 0UL);
+  EXPECT_EQ(scalars.size(), 1UL)
+      << "Single value at INT32_MAX should create 1 scalar for equality";
+
+  auto vec = makeTestVector(rowType, 100);
+  testFilterExecution(rowType, columnName, *filter, vec, expr);
+}
+
+// Single value at the exact type boundary (INT32_MIN on INTEGER column).
+TEST_F(SubfieldFilterAstTest, Int32SingleValueAtMin) {
+  const std::string columnName = "c0";
+  auto rowType = ROW({{columnName, INTEGER()}});
+  const int64_t value = std::numeric_limits<int32_t>::min();
+  auto filter = std::make_unique<common::BigintRange>(
+      value, value, /*nullAllowed*/ false);
+
+  common::Subfield subfield(columnName);
+  cudf::ast::tree tree;
+  std::vector<std::unique_ptr<cudf::scalar>> scalars;
+  const auto& expr =
+      createAstFromSubfieldFilter(subfield, *filter, tree, scalars, rowType);
+
+  EXPECT_GT(tree.size(), 0UL);
+  EXPECT_EQ(scalars.size(), 1UL)
+      << "Single value at INT32_MIN should create 1 scalar for equality";
+
+  auto vec = makeTestVector(rowType, 100);
+  testFilterExecution(rowType, columnName, *filter, vec, expr);
+}
+
+// Single value at TINYINT boundary (127 on TINYINT column).
+TEST_F(SubfieldFilterAstTest, TinyIntSingleValueAtMax) {
+  const std::string columnName = "c0";
+  auto rowType = ROW({{columnName, TINYINT()}});
+  const int64_t value = std::numeric_limits<int8_t>::max();
+  auto filter = std::make_unique<common::BigintRange>(
+      value, value, /*nullAllowed*/ false);
+
+  common::Subfield subfield(columnName);
+  cudf::ast::tree tree;
+  std::vector<std::unique_ptr<cudf::scalar>> scalars;
+  const auto& expr =
+      createAstFromSubfieldFilter(subfield, *filter, tree, scalars, rowType);
+
+  EXPECT_GT(tree.size(), 0UL);
+  EXPECT_EQ(scalars.size(), 1UL)
+      << "Single value at INT8_MAX should create 1 scalar for equality";
+
+  auto vec = makeTestVector(rowType, 100);
+  testFilterExecution(rowType, columnName, *filter, vec, expr);
+}
+
 // Type boundary tests
 TEST_F(SubfieldFilterAstTest, IntegerOverflowBounds) {
   const std::string columnName = "c0";
@@ -689,17 +756,27 @@ INSTANTIATE_TEST_SUITE_P(
       return std::string(info.param.name);
     });
 
-// BigintMultiRange tests (FilterKind::kBigintMultiRange, type 17)
-TEST_F(SubfieldFilterAstTest, BigintMultiRangeDisjoint) {
-  const std::string columnName = "c0";
-  auto rowType = ROW({{columnName, BIGINT()}});
+struct BigintMultiRangeCase {
+  TypeKind kind;
+  std::vector<std::pair<int64_t, int64_t>> ranges;
+  const char* name;
+};
 
-  // Create disjoint ranges: [1,5] OR [10,20]
+class BigintMultiRangeParamTest
+    : public SubfieldFilterAstTest,
+      public ::testing::WithParamInterface<BigintMultiRangeCase> {};
+
+TEST_P(BigintMultiRangeParamTest, BigintMultiRange) {
+  const auto& p = GetParam();
+  const std::string columnName = "c0";
+  auto rowType = ROW({{columnName, buildTypeForKind(p.kind)}});
+
   std::vector<std::unique_ptr<common::BigintRange>> ranges;
-  ranges.push_back(
-      std::make_unique<common::BigintRange>(1, 5, /*nullAllowed*/ false));
-  ranges.push_back(
-      std::make_unique<common::BigintRange>(10, 20, /*nullAllowed*/ false));
+  for (const auto& [lower, upper] : p.ranges) {
+    ranges.push_back(
+        std::make_unique<common::BigintRange>(
+            lower, upper, /*nullAllowed*/ false));
+  }
   auto filter = std::make_unique<common::BigintMultiRange>(
       std::move(ranges), /*nullAllowed*/ false);
 
@@ -709,41 +786,39 @@ TEST_F(SubfieldFilterAstTest, BigintMultiRangeDisjoint) {
   const auto& expr =
       createAstFromSubfieldFilter(subfield, *filter, tree, scalars, rowType);
 
-  ASSERT_GT(tree.size(), 0UL) << "No expressions created for BigintMultiRange";
-  // Each range needs 2 scalars (lower and upper bound)
-  EXPECT_EQ(scalars.size(), 4UL)
-      << "Expected 4 scalars for two BigintRange filters";
-
-  // Execution validation
-  auto vec = makeTestVector(rowType, 100);
-  testFilterExecution(rowType, columnName, *filter, vec, expr);
-}
-
-TEST_F(SubfieldFilterAstTest, BigintMultiRangeSingleRange) {
-  const std::string columnName = "c0";
-  auto rowType = ROW({{columnName, INTEGER()}});
-
-  // Single range in multi-range: [5,15]
-  std::vector<std::unique_ptr<common::BigintRange>> ranges;
-  ranges.push_back(
-      std::make_unique<common::BigintRange>(5, 15, /*nullAllowed*/ false));
-  auto filter = std::make_unique<common::BigintMultiRange>(
-      std::move(ranges), /*nullAllowed*/ false);
-
-  common::Subfield subfield(columnName);
-  cudf::ast::tree tree;
-  std::vector<std::unique_ptr<cudf::scalar>> scalars;
-  const auto& expr =
-      createAstFromSubfieldFilter(subfield, *filter, tree, scalars, rowType);
-
-  ASSERT_GT(tree.size(), 0UL) << "No expressions created for single-range case";
-  EXPECT_EQ(scalars.size(), 2UL) << "Expected 2 scalars for single range";
+  ASSERT_GT(tree.size(), 0UL);
+  // Each range needs 2 scalars (lower and upper bound).
+  EXPECT_EQ(scalars.size(), p.ranges.size() * 2);
 
   auto vec = makeTestVector(rowType, 100);
   testFilterExecution(rowType, columnName, *filter, vec, expr);
 }
 
-// MultiRange tests (FilterKind::kMultiRange, type 18)
+INSTANTIATE_TEST_SUITE_P(
+    BigintMultiRange,
+    BigintMultiRangeParamTest,
+    ::testing::Values(
+        BigintMultiRangeCase{TypeKind::BIGINT, {{1, 5}, {10, 20}}, "Bigint"},
+        BigintMultiRangeCase{TypeKind::INTEGER, {{5, 15}, {20, 30}}, "Integer"},
+        BigintMultiRangeCase{
+            TypeKind::SMALLINT,
+            {{1, 100}, {200, 300}},
+            "SmallInt"},
+        BigintMultiRangeCase{
+            TypeKind::TINYINT,
+            {{-100, -50}, {10, 50}},
+            "TinyInt"},
+        BigintMultiRangeCase{
+            TypeKind::BIGINT,
+            {{1, 10}, {20, 30}, {50, 60}},
+            "ThreeRanges"}),
+    [](const ::testing::TestParamInfo<BigintMultiRangeCase>& info) {
+      return std::string(info.param.name);
+    });
+
+// MultiRange tests (FilterKind::kMultiRange)
+// MultiRange wraps arbitrary sub-filters with OR semantics. Common use case:
+// not-equal predicates represented as (< X) OR (> X).
 TEST_F(SubfieldFilterAstTest, MultiRangeDoubleNotEqual) {
   const std::string columnName = "c0";
   auto rowType = ROW({{columnName, DOUBLE()}});
@@ -916,6 +991,21 @@ TEST_F(SubfieldFilterAstTest, MultiRangeMixedFilters) {
 
   auto vec = makeTestVector(rowType, 100);
   testFilterExecution(rowType, columnName, *filter, vec, expr);
+}
+
+TEST_F(SubfieldFilterAstTest, EmptyMultiRangeThrows) {
+  auto rowType = ROW({{"c0", DOUBLE()}});
+
+  // MultiRange with empty filter list should throw.
+  auto filter = std::make_unique<common::MultiRange>(
+      std::vector<std::unique_ptr<common::Filter>>{}, /*nullAllowed*/ false);
+
+  common::Subfield subfield("c0");
+  cudf::ast::tree tree;
+  std::vector<std::unique_ptr<cudf::scalar>> scalars;
+  EXPECT_THROW(
+      createAstFromSubfieldFilter(subfield, *filter, tree, scalars, rowType),
+      VeloxException);
 }
 
 } // namespace
