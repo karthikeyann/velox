@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Velox Connector Coverage Analysis — Core vs. cuDF (GPU)</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@400;500;700&family=Playfair+Display:wght@700;900&display=swap');
+
+  :root {
+    --bg: #0c0e14;
+    --surface: #151821;
+    --surface-2: #1c2030;
+    --border: #2a2f42;
+    --text: #e0e4f0;
+    --text-dim: #8a90a8;
+    --accent: #6c5ce7;
+    --accent-light: #a29bfe;
+    --green: #00b894;
+    --green-bg: rgba(0, 184, 148, 0.12);
+    --red: #e17055;
+    --red-bg: rgba(225, 112, 85, 0.10);
+    --yellow: #fdcb6e;
+    --yellow-bg: rgba(253, 203, 110, 0.10);
+    --blue: #74b9ff;
+    --card-shadow: 0 4px 24px rgba(0,0,0,0.3);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Sans', system-ui, sans-serif;
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+
+  .grain {
+    position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+  }
+
+  header {
+    padding: 3rem 2rem 2rem;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, rgba(108,92,231,0.06) 0%, transparent 100%);
+  }
+
+  header h1 {
+    font-family: 'Playfair Display', serif;
+    font-weight: 900;
+    font-size: clamp(1.8rem, 4vw, 2.8rem);
+    letter-spacing: -0.02em;
+    background: linear-gradient(135deg, var(--accent-light), var(--blue));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 0.5rem;
+  }
+
+  header .subtitle {
+    color: var(--text-dim);
+    font-size: 0.95rem;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem;
+  }
+
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1rem;
+    margin-bottom: 2.5rem;
+  }
+
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    text-align: center;
+    transition: transform 0.2s, border-color 0.2s;
+  }
+
+  .stat-card:hover {
+    transform: translateY(-2px);
+    border-color: var(--accent);
+  }
+
+  .stat-card .number {
+    font-family: 'Playfair Display', serif;
+    font-size: 2.5rem;
+    font-weight: 900;
+    line-height: 1;
+    margin-bottom: 0.25rem;
+  }
+
+  .stat-card .label {
+    color: var(--text-dim);
+    font-size: 0.82rem;
+    font-family: 'JetBrains Mono', monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .stat-card.core .number { color: var(--accent-light); }
+  .stat-card.cudf .number { color: var(--green); }
+  .stat-card.gap .number { color: var(--red); }
+  .stat-card.pct .number { color: var(--yellow); }
+
+  section { margin-bottom: 3rem; }
+
+  section h2 {
+    font-family: 'Playfair Display', serif;
+    font-size: 1.5rem;
+    font-weight: 700;
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 2px solid var(--accent);
+    display: inline-block;
+  }
+
+  section p.desc {
+    color: var(--text-dim);
+    margin-bottom: 1.25rem;
+    max-width: 70ch;
+    font-size: 0.92rem;
+  }
+
+  .table-wrap {
+    overflow-x: auto;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    box-shadow: var(--card-shadow);
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+  }
+
+  thead th {
+    background: var(--surface-2);
+    padding: 0.85rem 1rem;
+    text-align: left;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 600;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    border-bottom: 2px solid var(--border);
+    white-space: nowrap;
+  }
+
+  tbody td {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    vertical-align: middle;
+  }
+
+  tbody tr:last-child td { border-bottom: none; }
+
+  tbody tr:hover td {
+    background: var(--surface-2);
+  }
+
+  code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    background: rgba(108,92,231,0.12);
+    padding: 0.15em 0.45em;
+    border-radius: 4px;
+    color: var(--accent-light);
+  }
+
+  .badge {
+    display: inline-block;
+    padding: 0.2em 0.7em;
+    border-radius: 999px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .badge-yes { background: var(--green-bg); color: var(--green); border: 1px solid rgba(0,184,148,0.25); }
+  .badge-no  { background: var(--red-bg); color: var(--red); border: 1px solid rgba(225,112,85,0.2); }
+  .badge-wip { background: var(--yellow-bg); color: var(--yellow); border: 1px solid rgba(253,203,110,0.2); }
+  .badge-na  { background: rgba(138,144,168,0.1); color: var(--text-dim); border: 1px solid rgba(138,144,168,0.15); }
+
+  .inherit-tag {
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    font-style: italic;
+    display: block;
+    margin-top: 2px;
+  }
+
+  .hierarchy {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 2rem;
+    box-shadow: var(--card-shadow);
+  }
+
+  .tree { list-style: none; padding: 0; }
+  .tree ul { list-style: none; padding-left: 2rem; border-left: 2px solid var(--border); margin-left: 0.75rem; }
+  .tree li { position: relative; padding: 0.4rem 0; }
+  .tree li::before {
+    content: '';
+    position: absolute;
+    left: -2rem;
+    top: 50%;
+    width: 1.5rem;
+    height: 2px;
+    background: var(--border);
+  }
+  .tree > li::before { display: none; }
+
+  .tree .node {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.35rem 0.9rem;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    transition: border-color 0.15s;
+  }
+
+  .tree .node:hover { border-color: var(--accent); }
+
+  .tree .node .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .dot-base { background: var(--text-dim); }
+  .dot-core { background: var(--accent-light); }
+  .dot-gpu  { background: var(--green); }
+
+  .progress-track {
+    background: var(--surface-2);
+    border-radius: 999px;
+    height: 24px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    position: relative;
+    max-width: 400px;
+    margin-top: 1rem;
+  }
+
+  .progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--green), var(--accent-light));
+    border-radius: 999px;
+    transition: width 1s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: #fff;
+    min-width: 4rem;
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    margin-top: 1rem;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .legend-item .swatch {
+    width: 12px; height: 12px;
+    border-radius: 3px;
+  }
+
+  .notes {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    box-shadow: var(--card-shadow);
+  }
+
+  .notes ul {
+    padding-left: 1.25rem;
+    color: var(--text-dim);
+    font-size: 0.88rem;
+  }
+
+  .notes li { margin-bottom: 0.5rem; }
+  .notes li strong { color: var(--text); }
+
+  footer {
+    text-align: center;
+    padding: 2rem;
+    color: var(--text-dim);
+    font-size: 0.78rem;
+    font-family: 'JetBrains Mono', monospace;
+    border-top: 1px solid var(--border);
+  }
+
+  @media (max-width: 600px) {
+    .container { padding: 1rem; }
+    header { padding: 2rem 1rem 1.5rem; }
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+<div class="grain"></div>
+
+<header>
+  <h1>Velox Connector Coverage Analysis</h1>
+  <div class="subtitle">Core Connectors vs. Experimental cuDF (GPU) Connectors</div>
+</header>
+
+<div class="container">
+
+  <!-- Summary Stats -->
+  <section>
+    <div class="stats-grid">
+      <div class="stat-card core">
+        <div class="number">6</div>
+        <div class="label">Core Connectors</div>
+      </div>
+      <div class="stat-card cudf">
+        <div class="number">1</div>
+        <div class="label">cuDF Connectors</div>
+      </div>
+      <div class="stat-card gap">
+        <div class="number">5</div>
+        <div class="label">Without cuDF Counterpart</div>
+      </div>
+      <div class="stat-card pct">
+        <div class="number">16.7%</div>
+        <div class="label">cuDF Coverage</div>
+      </div>
+    </div>
+
+    <div class="progress-track">
+      <div class="progress-fill" style="width: 16.7%">1 / 6</div>
+    </div>
+
+    <div class="legend">
+      <div class="legend-item"><div class="swatch" style="background: var(--green);"></div> cuDF Implemented</div>
+      <div class="legend-item"><div class="swatch" style="background: var(--surface-2); border: 1px solid var(--border);"></div> Not Implemented</div>
+    </div>
+  </section>
+
+  <!-- Core Connectors Table -->
+  <section>
+    <h2>Velox Core Connectors</h2>
+    <p class="desc">
+      All connectors implement <code>Connector</code> (or a subclass) plus a <code>ConnectorFactory</code>, registered via <code>ConnectorRegistry</code>.
+      Located under <code>velox/connectors/</code>.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Registered Name</th>
+            <th>Class</th>
+            <th>Inherits From</th>
+            <th>Source Path</th>
+            <th>CMake Target</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td><code>"hive"</code></td>
+            <td><code>HiveConnector</code></td>
+            <td><code>Connector</code></td>
+            <td><code>velox/connectors/hive/</code></td>
+            <td><code>velox_hive_connector</code></td>
+          </tr>
+          <tr>
+            <td>2</td>
+            <td><code>"iceberg"</code></td>
+            <td><code>IcebergConnector</code></td>
+            <td><code>HiveConnector</code><span class="inherit-tag">extends Hive</span></td>
+            <td><code>velox/connectors/hive/iceberg/</code></td>
+            <td><code>velox_hive_iceberg_splitreader</code></td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td><code>"paimon"</code></td>
+            <td><code>PaimonConnector</code></td>
+            <td><code>HiveConnector</code><span class="inherit-tag">extends Hive</span></td>
+            <td><code>velox/connectors/hive/paimon/</code></td>
+            <td><code>velox_hive_paimon_connector</code></td>
+          </tr>
+          <tr>
+            <td>4</td>
+            <td><code>"tpch"</code></td>
+            <td><code>TpchConnector</code></td>
+            <td><code>Connector</code></td>
+            <td><code>velox/connectors/tpch/</code></td>
+            <td><code>velox_tpch_connector</code></td>
+          </tr>
+          <tr>
+            <td>5</td>
+            <td><code>"tpcds"</code></td>
+            <td><code>TpcdsConnector</code></td>
+            <td><code>Connector</code></td>
+            <td><code>velox/connectors/tpcds/</code></td>
+            <td><code>velox_tpcds_connector</code></td>
+          </tr>
+          <tr>
+            <td>6</td>
+            <td><code>"fuzzer"</code></td>
+            <td><code>FuzzerConnector</code></td>
+            <td><code>Connector</code></td>
+            <td><code>velox/connectors/fuzzer/</code></td>
+            <td><code>velox_fuzzer_connector</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- cuDF Connectors Table -->
+  <section>
+    <h2>cuDF Experimental Connectors</h2>
+    <p class="desc">
+      Located under <code>velox/experimental/cudf/connectors/</code>. The cuDF module is gated by the <code>VELOX_ENABLE_CUDF</code> CMake flag.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>cuDF Connector</th>
+            <th>Class</th>
+            <th>Inherits From</th>
+            <th>Source Path</th>
+            <th>CMake Target</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td>Hive (cuDF / GPU)</td>
+            <td><code>CudfHiveConnector</code></td>
+            <td><code>HiveConnector</code></td>
+            <td><code>velox/experimental/cudf/connectors/hive/</code></td>
+            <td><code>velox_cudf_hive_connector</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="notes" style="margin-top: 1rem;">
+      <ul>
+        <li><strong>CudfHiveConnectorFactory</strong> extends <strong>HiveConnectorFactory</strong> and overrides <code>newConnector()</code> to produce a GPU-backed instance.</li>
+        <li><strong>Key files:</strong> CudfHiveConnector.h/.cpp, CudfHiveDataSource.h/.cpp, CudfHiveDataSink.h/.cpp, CudfHiveTableHandle.h/.cpp, CudfHiveConfig.h/.cpp, CudfHiveConnectorSplit.h/.cpp</li>
+        <li><strong>GPU Read:</strong> Implemented via cuDF Parquet reader.</li>
+        <li><strong>GPU Write:</strong> Work-in-progress (TODO noted in source).</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Coverage Matrix -->
+  <section>
+    <h2>Coverage Matrix: cuDF vs. Core Connectors</h2>
+    <p class="desc">
+      Maps each core Velox connector to its cuDF GPU counterpart, if one exists.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Core Connector</th>
+            <th>Registered Name</th>
+            <th>cuDF Counterpart?</th>
+            <th>cuDF Class</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td><code>HiveConnector</code></td>
+            <td><code>"hive"</code></td>
+            <td><span class="badge badge-yes">Yes</span></td>
+            <td><code>CudfHiveConnector</code></td>
+            <td><span class="badge badge-wip">GPU Read OK / Write WIP</span></td>
+          </tr>
+          <tr>
+            <td>2</td>
+            <td><code>IcebergConnector</code></td>
+            <td><code>"iceberg"</code></td>
+            <td><span class="badge badge-no">No</span></td>
+            <td>&mdash;</td>
+            <td><span class="badge badge-no">Not Implemented</span></td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td><code>PaimonConnector</code></td>
+            <td><code>"paimon"</code></td>
+            <td><span class="badge badge-no">No</span></td>
+            <td>&mdash;</td>
+            <td><span class="badge badge-no">Not Implemented</span></td>
+          </tr>
+          <tr>
+            <td>4</td>
+            <td><code>TpchConnector</code></td>
+            <td><code>"tpch"</code></td>
+            <td><span class="badge badge-no">No</span></td>
+            <td>&mdash;</td>
+            <td><span class="badge badge-na">N/A &mdash; Synthetic</span></td>
+          </tr>
+          <tr>
+            <td>5</td>
+            <td><code>TpcdsConnector</code></td>
+            <td><code>"tpcds"</code></td>
+            <td><span class="badge badge-no">No</span></td>
+            <td>&mdash;</td>
+            <td><span class="badge badge-na">N/A &mdash; Synthetic</span></td>
+          </tr>
+          <tr>
+            <td>6</td>
+            <td><code>FuzzerConnector</code></td>
+            <td><code>"fuzzer"</code></td>
+            <td><span class="badge badge-no">No</span></td>
+            <td>&mdash;</td>
+            <td><span class="badge badge-na">N/A &mdash; Testing Only</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Class Hierarchy -->
+  <section>
+    <h2>Connector Class Hierarchy</h2>
+    <p class="desc">
+      Inheritance tree of all Velox connector classes. Green indicates GPU (cuDF) implementation.
+    </p>
+    <div class="hierarchy">
+      <ul class="tree">
+        <li>
+          <span class="node"><span class="dot dot-base"></span> Connector <span style="color:var(--text-dim);font-size:0.72rem;">(base)</span></span>
+          <ul>
+            <li>
+              <span class="node"><span class="dot dot-core"></span> HiveConnector</span>
+              <ul>
+                <li><span class="node"><span class="dot dot-core"></span> IcebergConnector</span></li>
+                <li><span class="node"><span class="dot dot-core"></span> PaimonConnector</span></li>
+                <li><span class="node"><span class="dot dot-gpu"></span> CudfHiveConnector <span style="color:var(--green);font-size:0.72rem;">(GPU)</span></span></li>
+              </ul>
+            </li>
+            <li><span class="node"><span class="dot dot-core"></span> TpchConnector</span></li>
+            <li><span class="node"><span class="dot dot-core"></span> TpcdsConnector</span></li>
+            <li><span class="node"><span class="dot dot-core"></span> FuzzerConnector</span></li>
+          </ul>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Verification Notes -->
+  <section>
+    <h2>Verification Notes</h2>
+    <div class="notes">
+      <ul>
+        <li><code>velox/connectors/</code> has exactly <strong>4</strong> top-level connector subdirectories: <code>fuzzer/</code>, <code>hive/</code>, <code>tpch/</code>, <code>tpcds/</code> (plus <code>tests/</code> which is not a connector). Confirmed via filesystem listing.</li>
+        <li>Under <code>hive/</code>, two sub-connectors exist: <code>iceberg/</code> and <code>paimon/</code>. Each has its own <code>ConnectorFactory</code> and a distinct registered name. <code>storage_adapters/</code> and <code>benchmarks/</code> are <strong>not</strong> connectors.</li>
+        <li><code>velox/experimental/cudf/connectors/</code> contains exactly <strong>one</strong> subdirectory: <code>hive/</code>. Its <code>CMakeLists.txt</code> has only <code>add_subdirectory(hive)</code>.</li>
+        <li><code>CudfHiveConnector</code> (line 32 of <code>CudfHiveConnector.h</code>) extends <code>HiveConnector</code>, and <code>CudfHiveConnectorFactory</code> extends <code>HiveConnectorFactory</code>.</li>
+        <li>No other cuDF connector implementations exist anywhere in <code>velox/experimental/cudf/</code>.</li>
+        <li><code>hive/storage_adapters/</code> provides filesystem I/O plugins (S3, HDFS, GCS, ABFS) — these are <strong>not</strong> separate connectors in the <code>Connector</code>/<code>ConnectorFactory</code> sense.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Observations -->
+  <section>
+    <h2>Key Observations</h2>
+    <div class="notes">
+      <ul>
+        <li>Only <strong>1 out of 6</strong> Velox core connectors has a cuDF GPU counterpart today.</li>
+        <li>Since <strong>Iceberg</strong> and <strong>Paimon</strong> both extend <code>HiveConnector</code>, a cuDF implementation for those could potentially build on <code>CudfHiveConnector</code> — but that work does not exist yet.</li>
+        <li><strong>TPC-H</strong>, <strong>TPC-DS</strong>, and <strong>Fuzzer</strong> are synthetic / in-memory data generators where GPU acceleration at the connector level is less relevant (GPU acceleration matters more at the execution/expression layer for these workloads).</li>
+        <li>Considering only the <strong>3 production-grade I/O connectors</strong> (Hive, Iceberg, Paimon), the cuDF coverage is <strong>1 out of 3 (33.3%)</strong>.</li>
+      </ul>
+    </div>
+  </section>
+
+</div>
+
+<footer>
+  Generated from Velox source at /home/knataraj/velox &mdash; 2025-03-31
+</footer>
+
+</body>
+</html>

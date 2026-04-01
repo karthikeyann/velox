@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Velox vs cuDF — Data Type Coverage Matrix</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg: #0c0e12;
+  --surface: #141820;
+  --surface2: #1a1f2a;
+  --border: #252b38;
+  --text: #e2e4e9;
+  --text2: #8890a0;
+  --accent: #3b82f6;
+  --green: #22c55e;
+  --yellow: #eab308;
+  --orange: #f97316;
+  --red: #ef4444;
+  --cyan: #06b6d4;
+  --pink: #ec4899;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'DM Mono', monospace;
+  min-height: 100vh;
+  padding: 2.5rem 3rem;
+}
+
+h1 {
+  font-family: 'Instrument Serif', serif;
+  font-size: 3rem;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.2rem;
+}
+h1 span { color: var(--accent); }
+
+.subtitle {
+  color: var(--text2);
+  font-size: 0.8rem;
+  margin-bottom: 2.5rem;
+  letter-spacing: 0.05em;
+}
+.subtitle code {
+  background: var(--surface2);
+  padding: 0.15rem 0.4rem;
+  border-radius: 3px;
+  font-size: 0.72rem;
+}
+
+/* ── Stats ── */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1rem;
+  margin-bottom: 2.5rem;
+}
+.stat {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  position: relative;
+  overflow: hidden;
+}
+.stat::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0;
+  width: 3px; height: 100%;
+}
+.stat:nth-child(1)::before { background: var(--accent); }
+.stat:nth-child(2)::before { background: var(--green); }
+.stat:nth-child(3)::before { background: var(--red); }
+.stat:nth-child(4)::before { background: var(--cyan); }
+.stat .num { font-size: 2.2rem; font-weight: 500; line-height: 1; }
+.stat .label {
+  color: var(--text2);
+  font-size: 0.68rem;
+  margin-top: 0.4rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.stat .detail {
+  color: var(--text2);
+  font-size: 0.62rem;
+  margin-top: 0.2rem;
+  opacity: 0.8;
+}
+
+/* ── Charts ── */
+.charts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  margin-bottom: 2.5rem;
+}
+.chart-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+}
+.chart-box h3 {
+  font-family: 'Instrument Serif', serif;
+  font-size: 1.2rem;
+  font-weight: 400;
+  margin-bottom: 1rem;
+}
+.chart-wrap {
+  position: relative;
+  max-height: 300px;
+  display: flex;
+  justify-content: center;
+}
+
+/* ── Section titles ── */
+.section-title {
+  font-family: 'Instrument Serif', serif;
+  font-size: 1.6rem;
+  font-weight: 400;
+  margin: 2.5rem 0 1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ── Filters ── */
+.filters {
+  display: flex;
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.filters .label {
+  color: var(--text2);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-right: 0.5rem;
+}
+.filters button {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text2);
+  font-family: 'DM Mono', monospace;
+  font-size: 0.68rem;
+  padding: 0.35rem 0.85rem;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.filters button:hover,
+.filters button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.filters button[data-filter="mapped"].active { background: var(--green); border-color: var(--green); }
+.filters button[data-filter="partial"].active { background: var(--yellow); border-color: var(--yellow); color: #000; }
+.filters button[data-filter="unsupported"].active { background: var(--red); border-color: var(--red); }
+.filters button[data-filter="na"].active { background: #4b5563; border-color: #4b5563; }
+.filters button[data-filter="cudf-only"].active { background: var(--cyan); border-color: var(--cyan); color: #000; }
+
+.filter-count {
+  color: var(--text2);
+  font-size: 0.68rem;
+  margin-left: 0.5rem;
+}
+
+/* ── Table ── */
+.table-wrap {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  margin-bottom: 2.5rem;
+}
+.scroll-table {
+  max-height: 700px;
+  overflow-y: auto;
+}
+.scroll-table::-webkit-scrollbar { width: 6px; }
+.scroll-table::-webkit-scrollbar-track { background: var(--surface); }
+.scroll-table::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+table { width: 100%; border-collapse: collapse; font-size: 0.75rem; }
+th {
+  background: var(--surface2);
+  color: var(--text2);
+  font-weight: 500;
+  text-align: left;
+  padding: 0.75rem 1rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.62rem;
+  position: sticky;
+  top: 0;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  z-index: 2;
+}
+th:hover { color: var(--text); }
+th .sort-arrow { margin-left: 0.3rem; opacity: 0.4; }
+th.sorted .sort-arrow { opacity: 1; color: var(--accent); }
+td {
+  padding: 0.55rem 1rem;
+  border-top: 1px solid var(--border);
+  vertical-align: middle;
+}
+td code {
+  background: var(--surface2);
+  padding: 0.1rem 0.35rem;
+  border-radius: 3px;
+  font-size: 0.68rem;
+}
+tr:hover td { background: rgba(59, 130, 246, 0.04); }
+
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.55rem;
+  border-radius: 3px;
+  font-size: 0.62rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+.badge.mapped     { background: rgba(34,197,94,0.15);  color: var(--green); }
+.badge.partial    { background: rgba(234,179,8,0.15);  color: var(--yellow); }
+.badge.unsupported { background: rgba(239,68,68,0.15); color: var(--red); }
+.badge.na         { background: rgba(136,144,160,0.1); color: var(--text2); }
+.badge.cudf-only  { background: rgba(6,182,212,0.15);  color: var(--cyan); }
+
+.tier-tag {
+  display: inline-block;
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  font-size: 0.6rem;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+}
+.tier-tag.t1 { background: rgba(34,197,94,0.1); color: var(--green); }
+.tier-tag.t2 { background: rgba(239,68,68,0.1); color: var(--red); }
+.tier-tag.t3 { background: rgba(249,115,22,0.1); color: var(--orange); }
+.tier-tag.t4 { background: rgba(236,72,153,0.1); color: var(--pink); }
+.tier-tag.t5 { background: rgba(6,182,212,0.1); color: var(--cyan); }
+
+/* ── Compare ── */
+.compare {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2rem;
+  margin-bottom: 2.5rem;
+}
+.compare-col {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+}
+.compare-col h3 {
+  font-family: 'Instrument Serif', serif;
+  font-size: 1.15rem;
+  font-weight: 400;
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.compare-col h3 .dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.compare-col ul { list-style: none; font-size: 0.74rem; line-height: 2.1; }
+.compare-col li {
+  color: var(--text2);
+  padding-left: 1.2rem;
+  position: relative;
+}
+.compare-col li::before {
+  content: '>';
+  position: absolute;
+  left: 0;
+  color: var(--accent);
+  font-weight: 500;
+}
+.compare-col li strong { color: var(--text); }
+
+/* ── Diff section ── */
+.diff-section { margin-top: 1.5rem; }
+.diff-item {
+  display: flex;
+  gap: 1.5rem;
+  padding: 0.8rem 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.74rem;
+  align-items: flex-start;
+}
+.diff-item .dim {
+  color: var(--text2);
+  min-width: 170px;
+  flex-shrink: 0;
+  font-weight: 500;
+}
+.diff-item .val { color: var(--text); line-height: 1.6; }
+
+/* ── Animations ── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.stat, .chart-box, .table-wrap, .compare-col { animation: fadeIn 0.4s ease both; }
+.stat:nth-child(2) { animation-delay: 0.05s; }
+.stat:nth-child(3) { animation-delay: 0.1s; }
+.stat:nth-child(4) { animation-delay: 0.15s; }
+.chart-box:nth-child(2) { animation-delay: 0.1s; }
+
+/* ── Footer ── */
+.footer {
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border);
+  color: var(--text2);
+  font-size: 0.65rem;
+  display: flex;
+  justify-content: space-between;
+}
+</style>
+</head>
+<body>
+
+<h1>Velox <span>vs</span> cuDF</h1>
+<p class="subtitle">
+  Data Type Coverage Matrix &mdash;
+  <code>velox/type/Type.h</code> lines 71-93 +
+  <code>velox/experimental/cudf/exec/VeloxCudfInterop.cpp</code> lines 48-117
+</p>
+
+<!-- ════════ STATS CARDS ════════ -->
+<div class="stats">
+  <div class="stat">
+    <div class="num">43</div>
+    <div class="label">Total Velox Types</div>
+    <div class="detail">18 TypeKind + 7 Logical + 18 Extension</div>
+  </div>
+  <div class="stat">
+    <div class="num">15</div>
+    <div class="label">Mapped to cuDF</div>
+    <div class="detail">34.9% of Velox types + 2 partial</div>
+  </div>
+  <div class="stat">
+    <div class="num">27</div>
+    <div class="label">Unmapped Velox Types</div>
+    <div class="detail">5 TypeKind + 4 Logical + 18 Extension</div>
+  </div>
+  <div class="stat">
+    <div class="num">29</div>
+    <div class="label">cuDF type_id Total</div>
+    <div class="detail">15 have no Velox counterpart</div>
+  </div>
+</div>
+
+<!-- ════════ CHARTS ════════ -->
+<div class="charts">
+  <div class="chart-box">
+    <h3>Velox Type Coverage by Tier</h3>
+    <div class="chart-wrap"><canvas id="tierChart"></canvas></div>
+  </div>
+  <div class="chart-box">
+    <h3>cuDF type_id Utilization</h3>
+    <div class="chart-wrap"><canvas id="cudfChart"></canvas></div>
+  </div>
+</div>
+
+<!-- ════════ MATRIX TABLE ════════ -->
+<h2 class="section-title">Full Coverage Matrix</h2>
+
+<div class="filters">
+  <span class="label">Filter:</span>
+  <button class="active" data-filter="all">All (58)</button>
+  <button data-filter="mapped">Mapped (15)</button>
+  <button data-filter="partial">Partial (2)</button>
+  <button data-filter="unsupported">Unsupported (22)</button>
+  <button data-filter="na">N/A (4)</button>
+  <button data-filter="cudf-only">cuDF-Only (15)</button>
+  <span class="filter-count" id="filterCount"></span>
+</div>
+
+<div class="table-wrap">
+  <div class="scroll-table">
+    <table id="matrix">
+      <thead>
+        <tr>
+          <th data-col="0"># <span class="sort-arrow">&#9650;</span></th>
+          <th data-col="1">Velox Type <span class="sort-arrow">&#9650;</span></th>
+          <th data-col="2">Tier <span class="sort-arrow">&#9650;</span></th>
+          <th data-col="3">TypeKind / Source <span class="sort-arrow">&#9650;</span></th>
+          <th data-col="4">C++ Backing <span class="sort-arrow">&#9650;</span></th>
+          <th data-col="5">cuDF type_id <span class="sort-arrow">&#9650;</span></th>
+          <th data-col="6">Status <span class="sort-arrow">&#9650;</span></th>
+          <th data-col="7">Notes <span class="sort-arrow">&#9650;</span></th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ════════ ARCHITECTURE COMPARISON ════════ -->
+<h2 class="section-title">Type System Architecture Comparison</h2>
+
+<div class="compare">
+  <div class="compare-col">
+    <h3><span class="dot" style="background:var(--accent)"></span> Velox Type System</h3>
+    <ul>
+      <li><strong>Two-tier design:</strong> Physical TypeKind enum + Logical subclasses</li>
+      <li><strong>18 TypeKind values</strong> define storage layout and vector encoding</li>
+      <li><strong>Logical overlay:</strong> DATE, DECIMAL, INTERVAL, TIME share a TypeKind</li>
+      <li><strong>Backing types:</strong> bool, int8&ndash;64, int128, float, double, StringView, Timestamp</li>
+      <li><strong>No unsigned integers</strong> in the type system</li>
+      <li><strong>Single TIMESTAMP</strong> with (seconds, nanos) struct pair</li>
+      <li><strong>Dictionary encoding</strong> at vector level (DictionaryVector), not type level</li>
+      <li><strong>Extension types</strong> via name() + C++ class identity (18 Presto types)</li>
+      <li><strong>Type factory:</strong> TypeFactory&lt;KIND&gt; + helpers like INTEGER(), DECIMAL(p,s)</li>
+    </ul>
+  </div>
+  <div class="compare-col">
+    <h3><span class="dot" style="background:var(--cyan)"></span> cuDF Type System</h3>
+    <ul>
+      <li><strong>Flat enum design:</strong> Single cudf::type_id with 29 entries</li>
+      <li><strong>cudf::data_type</strong> wraps type_id + optional scale_type metadata</li>
+      <li><strong>Every type explicit:</strong> No logical subclasses or overlays</li>
+      <li><strong>Backing types:</strong> bool, int8&ndash;64, uint8&ndash;64, float, double, string_view</li>
+      <li><strong>Unsigned integers</strong> are first-class (UINT8&ndash;64)</li>
+      <li><strong>5 timestamp precisions:</strong> days, seconds, ms, &mu;s, ns as separate enums</li>
+      <li><strong>DICTIONARY32</strong> is a type_id (encoding in the type system)</li>
+      <li><strong>No extension mechanism</strong> (Arrow extensions could bridge)</li>
+      <li><strong>DECIMAL32/64/128:</strong> three decimal widths vs Velox's two</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ════════ KEY DIFFERENCES ════════ -->
+<h2 class="section-title">Key Differences in Detail</h2>
+
+<div class="diff-section">
+  <div class="diff-item">
+    <div class="dim">Unsigned Integers</div>
+    <div class="val">cuDF has UINT8/16/32/64 as first-class types; Velox has no unsigned integer types at all. Queries producing unsigned results cannot round-trip through the Velox type system.</div>
+  </div>
+  <div class="diff-item">
+    <div class="dim">Timestamp Precision</div>
+    <div class="val">cuDF has 5 resolutions (TIMESTAMP_DAYS / _SECONDS / _MILLISECONDS / _MICROSECONDS / _NANOSECONDS). Velox has a single Timestamp type storing a (seconds, nanos) pair internally, with DATE as a separate logical type on INTEGER. The bridge always emits TIMESTAMP_NANOSECONDS.</div>
+  </div>
+  <div class="diff-item">
+    <div class="dim">Duration / Interval</div>
+    <div class="val">cuDF has 5 DURATION_* types. Velox has INTERVAL_DAY_TIME (milliseconds as int64, overlaid on BIGINT) and INTERVAL_YEAR_MONTH (months as int32, overlaid on INTEGER). Only partial expression-layer mapping exists for DURATION_MS; INTERVAL_YEAR_MONTH explicitly fails.</div>
+  </div>
+  <div class="diff-item">
+    <div class="dim">DECIMAL32</div>
+    <div class="val">cuDF supports 32-bit fixed-point decimal; Velox skips to DECIMAL64 (ShortDecimalType on BIGINT) and DECIMAL128 (LongDecimalType on HUGEINT). The bridge never produces DECIMAL32.</div>
+  </div>
+  <div class="diff-item">
+    <div class="dim">Binary vs String</div>
+    <div class="val">Velox distinguishes VARCHAR (text) and VARBINARY (binary bytes); cuDF has only STRING. The bridge maps both to STRING, losing VARBINARY identity. Round-trip is recovered via an Arrow format marker ("z") hack in the Arrow bridge path.</div>
+  </div>
+  <div class="diff-item">
+    <div class="dim">MAP Type</div>
+    <div class="val">Velox has a native MAP TypeKind (key+value children); cuDF has no MAP type. It is typically represented as LIST&lt;STRUCT&lt;key, value&gt;&gt;. The bridge has commented-out MAP support.</div>
+  </div>
+  <div class="diff-item">
+    <div class="dim">Dictionary Encoding</div>
+    <div class="val">cuDF treats DICTIONARY32 as a type_id. Velox handles dictionary encoding orthogonally at the vector level via DictionaryVector, independent of the type system entirely.</div>
+  </div>
+  <div class="diff-item">
+    <div class="dim">Extension Types</div>
+    <div class="val">Velox supports 18 Presto extension types (UUID, JSON, IPADDRESS, HyperLogLog, sketches, etc.) via C++ subclass identity and distinct name(). cuDF has no extension type mechanism. None of these 18 types are mapped in the bridge.</div>
+  </div>
+  <div class="diff-item">
+    <div class="dim">Conversion Mechanism</div>
+    <div class="val">Two paths exist: (1) Direct switch via veloxToCudfDataType() for metadata/empty tables/AST expressions, and (2) Arrow bridge via exportToArrow &rarr; cudf::from_arrow for actual data batches. There is no reverse mapping; cuDF&rarr;Velox always goes through Arrow import.</div>
+  </div>
+</div>
+
+<div class="footer">
+  <span>Source: /home/knataraj/velox &mdash; velox/type/Type.h, velox/experimental/cudf/exec/VeloxCudfInterop.cpp, velox/experimental/cudf/vector/TableViewPrinter.h</span>
+  <span>Generated: 2026-03-31</span>
+</div>
+
+<script>
+const DATA = [
+  // Tier 1: Fully Mapped
+  { n:1,  velox:'BOOLEAN',           tier:'Tier 1', tierN:1, kind:'BOOLEAN(0)',           cpp:'bool',               cudf:'BOOL8',              status:'mapped',      notes:'Direct 1:1 mapping' },
+  { n:2,  velox:'TINYINT',           tier:'Tier 1', tierN:1, kind:'TINYINT(1)',           cpp:'int8_t',             cudf:'INT8',               status:'mapped',      notes:'Direct 1:1 mapping' },
+  { n:3,  velox:'SMALLINT',          tier:'Tier 1', tierN:1, kind:'SMALLINT(2)',          cpp:'int16_t',            cudf:'INT16',              status:'mapped',      notes:'Direct 1:1 mapping' },
+  { n:4,  velox:'INTEGER',           tier:'Tier 1', tierN:1, kind:'INTEGER(3)',           cpp:'int32_t',            cudf:'INT32',              status:'mapped',      notes:'Direct 1:1 mapping' },
+  { n:5,  velox:'BIGINT',            tier:'Tier 1', tierN:1, kind:'BIGINT(4)',            cpp:'int64_t',            cudf:'INT64',              status:'mapped',      notes:'Direct 1:1 mapping' },
+  { n:6,  velox:'REAL',              tier:'Tier 1', tierN:1, kind:'REAL(5)',              cpp:'float',              cudf:'FLOAT32',            status:'mapped',      notes:'Direct 1:1 mapping' },
+  { n:7,  velox:'DOUBLE',            tier:'Tier 1', tierN:1, kind:'DOUBLE(6)',            cpp:'double',             cudf:'FLOAT64',            status:'mapped',      notes:'Direct 1:1 mapping' },
+  { n:8,  velox:'VARCHAR',           tier:'Tier 1', tierN:1, kind:'VARCHAR(7)',           cpp:'StringView',         cudf:'STRING',             status:'mapped',      notes:'Direct 1:1 mapping' },
+  { n:9,  velox:'VARBINARY',         tier:'Tier 1', tierN:1, kind:'VARBINARY(8)',         cpp:'StringView',         cudf:'STRING',             status:'mapped',      notes:'Lossy: both map to STRING; round-trip uses Arrow "z" hack' },
+  { n:10, velox:'TIMESTAMP',         tier:'Tier 1', tierN:1, kind:'TIMESTAMP(9)',         cpp:'Timestamp(sec+nano)',cudf:'TIMESTAMP_NS',       status:'mapped',      notes:'Velox (sec,nano) pair vs cuDF single int64 nanos' },
+  { n:11, velox:'DATE',              tier:'Tier 1', tierN:1, kind:'INTEGER(3) logical',   cpp:'int32_t (days)',     cudf:'TIMESTAMP_DAYS',     status:'mapped',      notes:'Mapped via isDate() branch in INTEGER case' },
+  { n:12, velox:'SHORT DECIMAL',     tier:'Tier 1', tierN:1, kind:'BIGINT(4) logical',    cpp:'int64_t (unscaled)', cudf:'DECIMAL64 + scale',  status:'mapped',      notes:'Scale preserved via cudf::numeric::scale_type' },
+  { n:13, velox:'LONG DECIMAL',      tier:'Tier 1', tierN:1, kind:'HUGEINT(10) logical',  cpp:'int128_t (unscaled)',cudf:'DECIMAL128 + scale', status:'mapped',      notes:'Scale preserved; HUGEINT must be decimal' },
+  { n:14, velox:'ARRAY',             tier:'Tier 1', tierN:1, kind:'ARRAY(30)',            cpp:'nested children',    cudf:'LIST',               status:'mapped',      notes:'Recursive child type mapping' },
+  { n:15, velox:'ROW',               tier:'Tier 1', tierN:1, kind:'ROW(32)',              cpp:'named fields',       cudf:'STRUCT',             status:'mapped',      notes:'Field names lost in cuDF STRUCT' },
+
+  // Tier 1 edge case
+  { n:16, velox:'HUGEINT (non-dec)', tier:'Tier 1', tierN:1, kind:'HUGEINT(10)',          cpp:'int128_t',           cudf:'(fails)',            status:'partial',     notes:'VELOX_CHECK fails: "HUGEINT should only be used for DECIMAL128"' },
+
+  // Tier 2: Unsupported TypeKind values
+  { n:17, velox:'MAP',               tier:'Tier 2', tierN:2, kind:'MAP(31)',              cpp:'key+value children', cudf:'--',                 status:'unsupported', notes:'Commented out; cuDF has no native MAP type' },
+  { n:18, velox:'UNKNOWN',           tier:'Tier 2', tierN:2, kind:'UNKNOWN(33)',          cpp:'UnknownValue',       cudf:'--',                 status:'na',          notes:'All-null sentinel type; no cuDF equivalent' },
+  { n:19, velox:'FUNCTION',          tier:'Tier 2', tierN:2, kind:'FUNCTION(34)',         cpp:'args+return',        cudf:'--',                 status:'na',          notes:'Lambda type; not a data column type' },
+  { n:20, velox:'OPAQUE',            tier:'Tier 2', tierN:2, kind:'OPAQUE(35)',           cpp:'shared_ptr<void>',   cudf:'--',                 status:'na',          notes:'Opaque wrapper; not serializable to GPU' },
+  { n:21, velox:'INVALID',           tier:'Tier 2', tierN:2, kind:'INVALID(36)',          cpp:'void',               cudf:'--',                 status:'na',          notes:'Sentinel / error marker' },
+
+  // Tier 3: Logical types not in main switch
+  { n:22, velox:'INTERVAL_DAY_TIME',   tier:'Tier 3', tierN:3, kind:'BIGINT(4) logical',   cpp:'int64_t (ms)',       cudf:'(duration_ms)',      status:'partial',     notes:'Expression-layer only in AstUtils.h; not in veloxToCudfDataType' },
+  { n:23, velox:'INTERVAL_YEAR_MONTH', tier:'Tier 3', tierN:3, kind:'INTEGER(3) logical',  cpp:'int32_t (months)',   cudf:'--',                 status:'unsupported', notes:'TODO in veloxToCudfDataType; VELOX_FAIL in AstUtils.h' },
+  { n:24, velox:'TIME (milli)',        tier:'Tier 3', tierN:3, kind:'BIGINT(4) logical',   cpp:'int64_t (ms)',       cudf:'--',                 status:'unsupported', notes:'No mapping exists anywhere in cuDF bridge' },
+  { n:25, velox:'TIME_MICRO_UTC',      tier:'Tier 3', tierN:3, kind:'BIGINT(4) logical',   cpp:'int64_t (\u00b5s)',  cudf:'--',                 status:'unsupported', notes:'No mapping exists anywhere in cuDF bridge' },
+
+  // Tier 4: Presto Extension Types
+  { n:26, velox:'UUID',                tier:'Tier 4', tierN:4, kind:'HUGEINT ext',         cpp:'int128_t',           cudf:'--',                 status:'unsupported', notes:'Presto extension type; not mapped' },
+  { n:27, velox:'IPADDRESS',           tier:'Tier 4', tierN:4, kind:'HUGEINT ext',         cpp:'int128_t',           cudf:'--',                 status:'unsupported', notes:'Presto extension type; not mapped' },
+  { n:28, velox:'IPPREFIX',            tier:'Tier 4', tierN:4, kind:'ROW ext',             cpp:'ROW(int128+int8)',   cudf:'--',                 status:'unsupported', notes:'Presto extension type; ROW-based composite' },
+  { n:29, velox:'TIMESTAMP W/ TZ',     tier:'Tier 4', tierN:4, kind:'BIGINT ext',          cpp:'packed int64_t',     cudf:'--',                 status:'unsupported', notes:'Presto extension type; millis + zone key packed' },
+  { n:30, velox:'TIME W/ TZ',          tier:'Tier 4', tierN:4, kind:'BIGINT ext',          cpp:'packed int64_t',     cudf:'--',                 status:'unsupported', notes:'Presto extension type; not mapped' },
+  { n:31, velox:'BINGTILE',            tier:'Tier 4', tierN:4, kind:'BIGINT ext',          cpp:'packed int64_t',     cudf:'--',                 status:'unsupported', notes:'Presto extension type; not mapped' },
+  { n:32, velox:'BIGINT_ENUM',         tier:'Tier 4', tierN:4, kind:'BIGINT ext',          cpp:'int64_t + metadata', cudf:'--',                 status:'unsupported', notes:'Presto extension type; not mapped' },
+  { n:33, velox:'VARCHAR_ENUM',        tier:'Tier 4', tierN:4, kind:'VARCHAR ext',         cpp:'StringView',         cudf:'--',                 status:'unsupported', notes:'Presto extension type; not mapped' },
+  { n:34, velox:'JSON',                tier:'Tier 4', tierN:4, kind:'VARCHAR ext',         cpp:'StringView',         cudf:'--',                 status:'unsupported', notes:'Presto extension type; text JSON over VARCHAR' },
+  { n:35, velox:'HYPERLOGLOG',         tier:'Tier 4', tierN:4, kind:'VARBINARY ext',       cpp:'bytes',              cudf:'--',                 status:'unsupported', notes:'Presto sketch type; not mapped' },
+  { n:36, velox:'P4HYPERLOGLOG',       tier:'Tier 4', tierN:4, kind:'VARBINARY ext',       cpp:'bytes',              cudf:'--',                 status:'unsupported', notes:'Presto sketch type; not mapped' },
+  { n:37, velox:'KHYPERLOGLOG',        tier:'Tier 4', tierN:4, kind:'VARBINARY ext',       cpp:'bytes',              cudf:'--',                 status:'unsupported', notes:'Presto sketch type; not mapped' },
+  { n:38, velox:'SETDIGEST',           tier:'Tier 4', tierN:4, kind:'VARBINARY ext',       cpp:'bytes',              cudf:'--',                 status:'unsupported', notes:'Presto sketch type; not mapped' },
+  { n:39, velox:'QDIGEST',             tier:'Tier 4', tierN:4, kind:'VARBINARY ext',       cpp:'bytes',              cudf:'--',                 status:'unsupported', notes:'Presto sketch type; not mapped' },
+  { n:40, velox:'TDIGEST',             tier:'Tier 4', tierN:4, kind:'VARBINARY ext',       cpp:'bytes',              cudf:'--',                 status:'unsupported', notes:'Presto sketch type; not mapped' },
+  { n:41, velox:'SFMSKETCH',           tier:'Tier 4', tierN:4, kind:'VARBINARY ext',       cpp:'bytes',              cudf:'--',                 status:'unsupported', notes:'Presto sketch type; not mapped' },
+  { n:42, velox:'GEOMETRY',            tier:'Tier 4', tierN:4, kind:'VARBINARY ext',       cpp:'bytes',              cudf:'--',                 status:'unsupported', notes:'Presto extension type; not mapped' },
+  { n:43, velox:'SPHERICAL_GEO',       tier:'Tier 4', tierN:4, kind:'VARBINARY ext',       cpp:'bytes',              cudf:'--',                 status:'unsupported', notes:'Presto extension type; not mapped' },
+
+  // Tier 5: cuDF-Only types
+  { n:44, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'--',       cudf:'EMPTY',          status:'cudf-only', notes:'Sentinel / placeholder type' },
+  { n:45, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'uint8_t',  cudf:'UINT8',          status:'cudf-only', notes:'No unsigned integers in Velox' },
+  { n:46, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'uint16_t', cudf:'UINT16',         status:'cudf-only', notes:'No unsigned integers in Velox' },
+  { n:47, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'uint32_t', cudf:'UINT32',         status:'cudf-only', notes:'No unsigned integers in Velox' },
+  { n:48, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'uint64_t', cudf:'UINT64',         status:'cudf-only', notes:'No unsigned integers in Velox' },
+  { n:49, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'int64_t',  cudf:'TIMESTAMP_SEC',  status:'cudf-only', notes:'Velox bridge only maps to TIMESTAMP_NS' },
+  { n:50, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'int64_t',  cudf:'TIMESTAMP_MS',   status:'cudf-only', notes:'Velox bridge only maps to TIMESTAMP_NS' },
+  { n:51, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'int64_t',  cudf:'TIMESTAMP_US',   status:'cudf-only', notes:'Velox bridge only maps to TIMESTAMP_NS' },
+  { n:52, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'int32_t',  cudf:'DURATION_DAYS',  status:'cudf-only', notes:'Partial expression-layer support only' },
+  { n:53, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'int64_t',  cudf:'DURATION_SEC',   status:'cudf-only', notes:'No Velox mapping' },
+  { n:54, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'int64_t',  cudf:'DURATION_MS',    status:'cudf-only', notes:'INTERVAL_DAY_TIME uses this in expr layer only' },
+  { n:55, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'int64_t',  cudf:'DURATION_US',    status:'cudf-only', notes:'No Velox mapping' },
+  { n:56, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'int64_t',  cudf:'DURATION_NS',    status:'cudf-only', notes:'No Velox mapping' },
+  { n:57, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'int32_t',  cudf:'DICTIONARY32',   status:'cudf-only', notes:'Velox uses vector-level dict encoding instead' },
+  { n:58, velox:'--',   tier:'Tier 5', tierN:5, kind:'(cuDF only)', cpp:'int32_t',  cudf:'DECIMAL32',      status:'cudf-only', notes:'Velox only supports DECIMAL64 and DECIMAL128' },
+];
+
+// ── Render table ──
+const tbody = document.querySelector('#matrix tbody');
+const filterCountEl = document.getElementById('filterCount');
+let currentFilter = 'all';
+let sortCol = -1;
+let sortAsc = true;
+
+function tierClass(tierN) {
+  return 't' + tierN;
+}
+
+function statusLabel(s) {
+  const m = { mapped:'MAPPED', partial:'PARTIAL', unsupported:'UNSUPPORTED', na:'N/A', 'cudf-only':'cuDF-ONLY' };
+  return m[s] || s;
+}
+
+function render(data) {
+  tbody.innerHTML = '';
+  data.forEach(r => {
+    const tr = document.createElement('tr');
+    tr.dataset.status = r.status;
+    tr.innerHTML =
+      `<td style="color:var(--text2)">${r.n}</td>` +
+      `<td><strong>${r.velox}</strong></td>` +
+      `<td><span class="tier-tag ${tierClass(r.tierN)}">${r.tier}</span></td>` +
+      `<td>${r.kind}</td>` +
+      `<td><code>${r.cpp}</code></td>` +
+      `<td>${r.cudf}</td>` +
+      `<td><span class="badge ${r.status}">${statusLabel(r.status)}</span></td>` +
+      `<td style="color:var(--text2);white-space:normal;max-width:320px">${r.notes}</td>`;
+    tbody.appendChild(tr);
+  });
+  filterCountEl.textContent = `Showing ${data.length} of ${DATA.length}`;
+}
+
+function applyFilter() {
+  let d = DATA;
+  if (currentFilter !== 'all') d = DATA.filter(r => r.status === currentFilter);
+  if (sortCol >= 0) {
+    const keys = ['n','velox','tier','kind','cpp','cudf','status','notes'];
+    const k = keys[sortCol];
+    d = [...d].sort((a, b) => {
+      const va = String(a[k]).toLowerCase();
+      const vb = String(b[k]).toLowerCase();
+      return sortAsc
+        ? va.localeCompare(vb, undefined, { numeric: true })
+        : vb.localeCompare(va, undefined, { numeric: true });
+    });
+  }
+  render(d);
+}
+
+document.querySelectorAll('.filters button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentFilter = btn.dataset.filter;
+    applyFilter();
+  });
+});
+
+document.querySelectorAll('th').forEach(th => {
+  th.addEventListener('click', () => {
+    const col = parseInt(th.dataset.col);
+    document.querySelectorAll('th').forEach(h => h.classList.remove('sorted'));
+    if (sortCol === col) { sortAsc = !sortAsc; }
+    else { sortCol = col; sortAsc = true; }
+    th.classList.add('sorted');
+    th.querySelector('.sort-arrow').innerHTML = sortAsc ? '&#9650;' : '&#9660;';
+    applyFilter();
+  });
+});
+
+applyFilter();
+
+// ── Charts ──
+const chartFont = { family: "'DM Mono', monospace" };
+
+new Chart(document.getElementById('tierChart'), {
+  type: 'doughnut',
+  data: {
+    labels: [
+      'Tier 1: Mapped (15)',
+      'Tier 1: Partial (1)',
+      'Tier 2: Unsupported TypeKind (1)',
+      'Tier 2: N/A Internal (4)',
+      'Tier 3: Logical Gaps (4)',
+      'Tier 4: Extension Types (18)'
+    ],
+    datasets: [{
+      data: [15, 1, 1, 4, 4, 18],
+      backgroundColor: [
+        '#22c55e', '#eab308', '#ef4444',
+        '#4b5563', '#f97316', '#ec4899'
+      ],
+      borderColor: '#141820',
+      borderWidth: 2
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: true,
+    cutout: '55%',
+    plugins: {
+      legend: {
+        position: 'right',
+        labels: {
+          color: '#8890a0',
+          font: { ...chartFont, size: 10 },
+          padding: 8,
+          boxWidth: 12
+        }
+      }
+    }
+  }
+});
+
+new Chart(document.getElementById('cudfChart'), {
+  type: 'doughnut',
+  data: {
+    labels: [
+      'Used by Velox bridge (14)',
+      'cuDF-only / no Velox use (15)'
+    ],
+    datasets: [{
+      data: [14, 15],
+      backgroundColor: ['#3b82f6', '#4b5563'],
+      borderColor: '#141820',
+      borderWidth: 2
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: true,
+    cutout: '55%',
+    plugins: {
+      legend: {
+        position: 'right',
+        labels: {
+          color: '#8890a0',
+          font: { ...chartFont, size: 10 },
+          padding: 8,
+          boxWidth: 12
+        }
+      }
+    }
+  }
+});
+</script>
+
+</body>
+</html>

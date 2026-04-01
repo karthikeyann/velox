@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Velox CUDF Coverage Matrix</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0e14;
+  --surface: #111820;
+  --surface2: #1a2230;
+  --border: #2a3545;
+  --text: #c5cdd8;
+  --text-dim: #6b7a8d;
+  --accent: #3cefb0;
+  --accent2: #ff6b6b;
+  --accent3: #ffd93d;
+  --accent4: #6c5ce7;
+  --presto: #4fc3f7;
+  --spark: #ff8a65;
+  --covered: #3cefb0;
+  --glow: rgba(60, 239, 176, 0.15);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+
+.container {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 40px 32px;
+}
+
+.header {
+  margin-bottom: 48px;
+  position: relative;
+}
+
+.header::before {
+  content: '';
+  position: absolute;
+  top: -40px;
+  left: -40px;
+  width: 300px;
+  height: 300px;
+  background: radial-gradient(circle, var(--glow) 0%, transparent 70%);
+  pointer-events: none;
+}
+
+.header h1 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: -0.5px;
+  margin-bottom: 8px;
+}
+
+.header .subtitle {
+  font-size: 14px;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.header .tag {
+  display: inline-block;
+  padding: 3px 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 12px;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-bottom: 48px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  position: relative;
+  overflow: hidden;
+  transition: border-color 0.3s;
+}
+
+.card:hover { border-color: var(--accent); }
+
+.card .label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+
+.card .value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 36px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.card .value.accent { color: var(--accent); }
+.card .value.presto { color: var(--presto); }
+.card .value.spark { color: var(--spark); }
+.card .value.warn { color: var(--accent3); }
+
+.card .detail {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+.coverage-section { margin-bottom: 48px; }
+
+.section-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 20px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.coverage-bar-row {
+  display: flex;
+  align-items: center;
+  margin-bottom: 14px;
+  gap: 16px;
+}
+
+.coverage-bar-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: var(--text-dim);
+  width: 200px;
+  flex-shrink: 0;
+  text-align: right;
+}
+
+.coverage-bar-track {
+  flex: 1;
+  height: 28px;
+  background: var(--surface);
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+  border: 1px solid var(--border);
+}
+
+.coverage-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 1.2s cubic-bezier(0.22, 1, 0.36, 1);
+  position: relative;
+  min-width: 2px;
+}
+
+.coverage-bar-fill.presto {
+  background: linear-gradient(90deg, var(--presto), #81d4fa);
+}
+
+.coverage-bar-fill.spark {
+  background: linear-gradient(90deg, var(--spark), #ffab91);
+}
+
+.coverage-bar-text {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  width: 140px;
+  flex-shrink: 0;
+}
+
+.table-section { margin-bottom: 48px; }
+
+.filter-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.filter-btn {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  padding: 6px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.filter-btn:hover, .filter-btn.active {
+  background: var(--surface2);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 13px;
+}
+
+thead th {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  padding: 12px 16px;
+  text-align: left;
+  background: var(--surface);
+  border-bottom: 2px solid var(--border);
+  position: sticky;
+  top: 0;
+  cursor: pointer;
+  user-select: none;
+}
+
+thead th:hover { color: var(--accent); }
+thead th:first-child { border-radius: 8px 0 0 0; }
+thead th:last-child { border-radius: 0 8px 0 0; }
+
+tbody td {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+tbody tr { transition: background 0.15s; }
+tbody tr:hover { background: var(--surface); }
+
+.fn-name {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 500;
+  color: var(--accent);
+}
+
+.category-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.cat-string { background: #1a3a2a; color: #6dd69a; }
+.cat-math { background: #3a2a1a; color: #d6a56d; }
+.cat-datetime { background: #1a2a3a; color: #6da5d6; }
+.cat-array { background: #3a1a3a; color: #d66dd6; }
+.cat-conditional { background: #2a2a1a; color: #d6d66d; }
+.cat-comparison { background: #1a3a3a; color: #6dd6d6; }
+.cat-type { background: #2a1a3a; color: #a56dd6; }
+.cat-hash { background: #3a1a1a; color: #d66d6d; }
+.cat-aggregate { background: #1a2a2a; color: #6db5b5; }
+
+.match-yes { color: var(--accent); font-weight: 600; }
+.match-no { color: var(--accent2); }
+.match-partial { color: var(--accent3); }
+
+.engine-tag {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.engine-both { background: var(--surface2); color: var(--text); }
+.engine-spark { background: #2a1a10; color: var(--spark); }
+
+.unreg-card {
+  background: var(--surface);
+  border: 1px dashed var(--accent3);
+  border-radius: 8px;
+  padding: 16px 24px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+
+.unreg-card .fn-name { color: var(--accent3); }
+.unreg-card code {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--surface2);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+.operators-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  margin-bottom: 48px;
+}
+
+.operators-section h3 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+
+.op-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.op-chip {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  padding: 4px 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+}
+
+.footer {
+  margin-top: 48px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-in {
+  animation: fadeIn 0.5s ease-out forwards;
+  opacity: 0;
+}
+
+.stagger-1 { animation-delay: 0.05s; }
+.stagger-2 { animation-delay: 0.1s; }
+.stagger-3 { animation-delay: 0.15s; }
+.stagger-4 { animation-delay: 0.2s; }
+.stagger-5 { animation-delay: 0.25s; }
+.stagger-6 { animation-delay: 0.3s; }
+.stagger-7 { animation-delay: 0.35s; }
+.stagger-8 { animation-delay: 0.4s; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <div class="header animate-in">
+    <h1>Velox CUDF Function Coverage Matrix</h1>
+    <div class="subtitle">velox/experimental/cudf/ &mdash; GPU-accelerated function analysis</div>
+    <span class="tag">source: /home/knataraj/velox</span>
+  </div>
+
+  <div class="summary-grid">
+    <div class="card animate-in stagger-1">
+      <div class="label">Presto Functions</div>
+      <div class="value presto">489</div>
+      <div class="detail">400 scalar + 78 agg + 11 window</div>
+    </div>
+    <div class="card animate-in stagger-2">
+      <div class="label">Spark Functions</div>
+      <div class="value spark">350</div>
+      <div class="detail">342 scalar + 50 agg + 11 window</div>
+    </div>
+    <div class="card animate-in stagger-3">
+      <div class="label">CUDF GPU Functions</div>
+      <div class="value accent">23</div>
+      <div class="detail">17 scalar + 6 aggregate + 0 window</div>
+    </div>
+    <div class="card animate-in stagger-4">
+      <div class="label">AST GPU Operations</div>
+      <div class="value warn">16</div>
+      <div class="detail">13 binary + 2 unary + 4 special</div>
+    </div>
+    <div class="card animate-in stagger-5">
+      <div class="label">New (No Velox Match)</div>
+      <div class="value" style="color: var(--accent2)">0</div>
+      <div class="detail">All CUDF funcs map to Velox</div>
+    </div>
+    <div class="card animate-in stagger-6">
+      <div class="label">Unregistered Impls</div>
+      <div class="value warn">3</div>
+      <div class="detail">starts_with, ends_with, contains</div>
+    </div>
+  </div>
+
+  <div class="coverage-section animate-in stagger-3">
+    <div class="section-title">Coverage Bars</div>
+
+    <div class="coverage-bar-row">
+      <div class="coverage-bar-label">Presto Scalar</div>
+      <div class="coverage-bar-track"><div class="coverage-bar-fill presto" style="width: 0%" data-target="3.75"></div></div>
+      <div class="coverage-bar-text">15 / 400 &nbsp;(3.8%)</div>
+    </div>
+    <div class="coverage-bar-row">
+      <div class="coverage-bar-label">Presto Aggregate</div>
+      <div class="coverage-bar-track"><div class="coverage-bar-fill presto" style="width: 0%" data-target="7.69"></div></div>
+      <div class="coverage-bar-text">6 / 78 &nbsp;(7.7%)</div>
+    </div>
+    <div class="coverage-bar-row">
+      <div class="coverage-bar-label">Presto Window</div>
+      <div class="coverage-bar-track"><div class="coverage-bar-fill presto" style="width: 0%" data-target="0"></div></div>
+      <div class="coverage-bar-text">0 / 11 &nbsp;(0%)</div>
+    </div>
+    <div class="coverage-bar-row">
+      <div class="coverage-bar-label">Spark Scalar</div>
+      <div class="coverage-bar-track"><div class="coverage-bar-fill spark" style="width: 0%" data-target="5.55"></div></div>
+      <div class="coverage-bar-text">19 / 342 &nbsp;(5.6%)</div>
+    </div>
+    <div class="coverage-bar-row">
+      <div class="coverage-bar-label">Spark Aggregate</div>
+      <div class="coverage-bar-track"><div class="coverage-bar-fill spark" style="width: 0%" data-target="12"></div></div>
+      <div class="coverage-bar-text">6 / 50 &nbsp;(12%)</div>
+    </div>
+    <div class="coverage-bar-row">
+      <div class="coverage-bar-label">Spark Window</div>
+      <div class="coverage-bar-track"><div class="coverage-bar-fill spark" style="width: 0%" data-target="0"></div></div>
+      <div class="coverage-bar-text">0 / 11 &nbsp;(0%)</div>
+    </div>
+  </div>
+
+  <div class="table-section animate-in stagger-4">
+    <div class="section-title">CUDF Scalar Functions &mdash; 17 Implementations (21 Registered Names)</div>
+    <div class="filter-row">
+      <button class="filter-btn active" data-filter="all">All (17)</button>
+      <button class="filter-btn" data-filter="string">String (7)</button>
+      <button class="filter-btn" data-filter="math">Math (2)</button>
+      <button class="filter-btn" data-filter="datetime">DateTime (2)</button>
+      <button class="filter-btn" data-filter="conditional">Conditional (2)</button>
+      <button class="filter-btn" data-filter="comparison">Comparison (1)</button>
+      <button class="filter-btn" data-filter="type">Type Cast (1)</button>
+      <button class="filter-btn" data-filter="array">Array (1)</button>
+      <button class="filter-btn" data-filter="hash">Hash (1)</button>
+    </div>
+    <table id="scalarTable">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>CUDF Function</th>
+          <th>C++ Class</th>
+          <th>Category</th>
+          <th>Engine</th>
+          <th>Presto Match</th>
+          <th>Spark Match</th>
+          <th>Notes</th>
+        </tr>
+      </thead>
+      <tbody id="scalarBody"></tbody>
+    </table>
+  </div>
+
+  <div class="table-section animate-in stagger-5">
+    <div class="section-title">CUDF Aggregate Functions &mdash; 6 Implementations</div>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>CUDF Function</th>
+          <th>C++ Aggregator</th>
+          <th>Presto Match</th>
+          <th>Spark Match</th>
+          <th>Step Support</th>
+          <th>Limitations</th>
+        </tr>
+      </thead>
+      <tbody id="aggBody"></tbody>
+    </table>
+  </div>
+
+  <div class="table-section animate-in stagger-6">
+    <div class="section-title">AST Expression Path &mdash; Additional GPU-Accelerated Operations</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Operation</th>
+          <th>Presto Name</th>
+          <th>Spark Name</th>
+          <th>cudf AST Operator</th>
+          <th>Type</th>
+        </tr>
+      </thead>
+      <tbody id="astBody"></tbody>
+    </table>
+  </div>
+
+  <div class="operators-section animate-in stagger-7">
+    <h3>CUDF GPU Plan Operators (not functions, but GPU-accelerated execution nodes)</h3>
+    <div class="op-grid">
+      <span class="op-chip">CudfFilterProject</span>
+      <span class="op-chip">CudfHashAggregation</span>
+      <span class="op-chip">CudfHashJoin</span>
+      <span class="op-chip">CudfOrderBy</span>
+      <span class="op-chip">CudfTopN</span>
+      <span class="op-chip">CudfLimit</span>
+      <span class="op-chip">CudfAssignUniqueId</span>
+      <span class="op-chip">CudfLocalPartition</span>
+      <span class="op-chip">CudfBatchConcat</span>
+    </div>
+  </div>
+
+  <div class="table-section animate-in stagger-7">
+    <div class="section-title">Unregistered Implementations (Dead Code / Future Work)</div>
+    <div class="unreg-card">
+      <span class="fn-name">StartswithFunction</span>
+      <span style="color:var(--text-dim); margin: 0 8px;">&rarr;</span>
+      Presto: <code>starts_with</code>
+      <span style="color:var(--text-dim); margin: 0 12px;">|</span>
+      <span style="color:var(--text-dim)">Class at ExpressionEvaluator.cpp:667 &mdash; no registerCudfFunction call</span>
+    </div>
+    <div class="unreg-card">
+      <span class="fn-name">EndswithFunction</span>
+      <span style="color:var(--text-dim); margin: 0 8px;">&rarr;</span>
+      Presto: <code>ends_with</code>
+      <span style="color:var(--text-dim); margin: 0 12px;">|</span>
+      <span style="color:var(--text-dim)">Class at ExpressionEvaluator.cpp:692 &mdash; no registerCudfFunction call</span>
+    </div>
+    <div class="unreg-card">
+      <span class="fn-name">ContainsFunction</span>
+      <span style="color:var(--text-dim); margin: 0 8px;">&rarr;</span>
+      Presto: <code>contains</code>
+      <span style="color:var(--text-dim); margin: 0 12px;">|</span>
+      <span style="color:var(--text-dim)">Class at ExpressionEvaluator.cpp:717 &mdash; no registerCudfFunction call</span>
+    </div>
+  </div>
+
+  <div class="table-section animate-in stagger-8">
+    <div class="section-title">Known Limitations</div>
+    <table>
+      <thead>
+        <tr><th>Function / Area</th><th>Limitation</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><span class="fn-name">approx_distinct</span></td><td>Global aggregation only (no group-by support)</td></tr>
+        <tr><td><span class="fn-name">date_add</span></td><td>Spark 2-arg version only; Presto 3-arg version not supported</td></tr>
+        <tr><td><span class="fn-name">round</span></td><td>No decimal type support</td></tr>
+        <tr><td><span class="fn-name">registerPrestoFunctions()</span></td><td>Empty stub &mdash; no Presto-specific scalar functions registered</td></tr>
+        <tr><td>Window functions</td><td>No GPU window function implementations (0 of 11)</td></tr>
+        <tr><td>AST cast</td><td>Only supports cast to INTEGER, BIGINT, DOUBLE in pure AST path</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="footer animate-in stagger-8">
+    <span>Velox CUDF Coverage Matrix &mdash; Generated from source analysis</span>
+    <span>Data: velox/experimental/cudf/ | velox/functions/{prestosql,sparksql}/coverage/data/</span>
+  </div>
+
+</div>
+
+<script>
+const scalarFunctions = [
+  {num:1, name:'split', cpp:'SplitFunction', cat:'string', engine:'both', presto:'split', spark:'split', notes:'Exact match'},
+  {num:2, name:'cardinality', cpp:'CardinalityFunction', cat:'array', engine:'both', presto:'cardinality', spark:'cardinality', notes:'Exact match'},
+  {num:3, name:'substr / substring', cpp:'SubstrFunction', cat:'string', engine:'both', presto:'substr', spark:'substr, substring', notes:'2 registered aliases'},
+  {num:4, name:'coalesce', cpp:'CoalesceFunction', cat:'conditional', engine:'both', presto:'coalesce (special form)', spark:'coalesce', notes:'No prefix; special form'},
+  {num:5, name:'round', cpp:'RoundFunction', cat:'math', engine:'both', presto:'round', spark:'round', notes:'No decimal support yet'},
+  {num:6, name:'year', cpp:'YearFunction', cat:'datetime', engine:'both', presto:'year', spark:'year', notes:'Exact match'},
+  {num:7, name:'length', cpp:'LengthFunction', cat:'string', engine:'both', presto:'length', spark:'length', notes:'Exact match'},
+  {num:8, name:'lower', cpp:'LowerFunction', cat:'string', engine:'both', presto:'lower', spark:'lower', notes:'Exact match'},
+  {num:9, name:'upper', cpp:'UpperFunction', cat:'string', engine:'both', presto:'upper', spark:'upper', notes:'Exact match'},
+  {num:10, name:'like', cpp:'LikeFunction', cat:'string', engine:'both', presto:'like (special form)', spark:'like', notes:'Pattern matching'},
+  {num:11, name:'concat', cpp:'ConcatFunction', cat:'string', engine:'both', presto:'concat', spark:'concat', notes:'Exact match'},
+  {num:12, name:'greaterthan / gt', cpp:'BinaryFunction(GREATER)', cat:'comparison', engine:'both', presto:'gt (internal)', spark:'greaterthan (internal)', notes:'Binary operator; 2 aliases'},
+  {num:13, name:'divide', cpp:'BinaryFunction(DIV)', cat:'math', engine:'both', presto:'divide (internal)', spark:'divide (internal)', notes:'Binary operator'},
+  {num:14, name:'switch / if', cpp:'SwitchFunction', cat:'conditional', engine:'both', presto:'switch/if (special form)', spark:'if / when', notes:'No prefix; 2 aliases'},
+  {num:15, name:'cast / try_cast', cpp:'CastFunction', cat:'type', engine:'both', presto:'cast/try_cast (special form)', spark:'cast', notes:'No prefix; 2 aliases'},
+  {num:16, name:'hash_with_seed', cpp:'HashFunction', cat:'hash', engine:'spark', presto:'N/A', spark:'hash (murmurhash3)', notes:'Spark only'},
+  {num:17, name:'date_add', cpp:'DateAddFunction', cat:'datetime', engine:'spark', presto:'Different sig (3-arg)', spark:'date_add (2-arg)', notes:'Spark 2-arg version only'},
+];
+
+const aggFunctions = [
+  {num:1, name:'sum', cpp:'SumAggregator', presto:'sum', spark:'sum', steps:'Single, Partial, Intermediate, Final', notes:'Full step support'},
+  {num:2, name:'count', cpp:'CountAggregator', presto:'count', spark:'count', steps:'Single, Partial, Intermediate, Final', notes:'Full step support'},
+  {num:3, name:'min', cpp:'MinAggregator', presto:'min', spark:'min', steps:'Single, Partial, Intermediate, Final', notes:'Full step support'},
+  {num:4, name:'max', cpp:'MaxAggregator', presto:'max', spark:'max', steps:'Single, Partial, Intermediate, Final', notes:'Full step support'},
+  {num:5, name:'avg', cpp:'MeanAggregator', presto:'avg', spark:'avg', steps:'Single, Partial, Intermediate, Final', notes:'sum+count intermediate'},
+  {num:6, name:'approx_distinct', cpp:'ApproxDistinctAggregator', presto:'approx_distinct', spark:'approx_count_distinct', steps:'Single, Partial, Intermediate, Final', notes:'Global agg only (no group-by)'},
+];
+
+const astOps = [
+  {op:'Addition', presto:'plus', spark:'add', ast:'ADD', type:'Binary'},
+  {op:'Subtraction', presto:'minus', spark:'subtract', ast:'SUB', type:'Binary'},
+  {op:'Multiplication', presto:'multiply', spark:'multiply', ast:'MUL', type:'Binary'},
+  {op:'Division', presto:'divide', spark:'divide', ast:'DIV', type:'Binary'},
+  {op:'Equality', presto:'eq', spark:'equalto', ast:'EQUAL', type:'Binary'},
+  {op:'Not Equal', presto:'neq', spark:'\u2014', ast:'NOT_EQUAL', type:'Binary'},
+  {op:'Less Than', presto:'lt', spark:'lessthan', ast:'LESS', type:'Binary'},
+  {op:'Greater Than', presto:'gt', spark:'greaterthan', ast:'GREATER', type:'Binary'},
+  {op:'Less / Equal', presto:'lte', spark:'lessthanorequal', ast:'LESS_EQUAL', type:'Binary'},
+  {op:'Greater / Equal', presto:'gte', spark:'greaterthanorequal', ast:'GREATER_EQUAL', type:'Binary'},
+  {op:'Logical AND', presto:'and', spark:'and', ast:'NULL_LOGICAL_AND', type:'Binary'},
+  {op:'Logical OR', presto:'or', spark:'or', ast:'NULL_LOGICAL_OR', type:'Binary'},
+  {op:'Modulo', presto:'mod', spark:'mod', ast:'MOD', type:'Binary'},
+  {op:'Logical NOT', presto:'not', spark:'not', ast:'NOT', type:'Unary'},
+  {op:'Is Null', presto:'is_null', spark:'isnull', ast:'IS_NULL', type:'Unary'},
+  {op:'Is Not Null', presto:'isnotnull', spark:'isnotnull', ast:'IS_NULL + NOT', type:'Composite'},
+  {op:'Between', presto:'between', spark:'between', ast:'GTE + LTE + AND', type:'Composite'},
+  {op:'In', presto:'in', spark:'in', ast:'EQUAL + OR chain', type:'Composite'},
+  {op:'Cast to int/bigint', presto:'cast', spark:'cast', ast:'CAST_TO_INT64', type:'Composite'},
+  {op:'Cast to double', presto:'cast', spark:'cast', ast:'CAST_TO_FLOAT64', type:'Composite'},
+];
+
+function catClass(cat) { return 'cat-' + cat; }
+
+function catLabel(cat) {
+  const m = {string:'String',math:'Math',datetime:'DateTime',array:'Array',conditional:'Conditional',comparison:'Comparison',type:'Type Cast',hash:'Hash'};
+  return m[cat] || cat;
+}
+
+function renderScalarTable(filter) {
+  const tbody = document.getElementById('scalarBody');
+  tbody.innerHTML = '';
+  const data = filter === 'all' ? scalarFunctions : scalarFunctions.filter(f => f.cat === filter);
+  data.forEach(f => {
+    const prestoMatch = f.presto === 'N/A'
+      ? '<span class="match-no">N/A</span>'
+      : f.presto.includes('Different')
+        ? '<span class="match-partial">' + f.presto + '</span>'
+        : '<span class="match-yes">' + f.presto + '</span>';
+    const sparkMatch = f.spark === 'N/A'
+      ? '<span class="match-no">N/A</span>'
+      : '<span class="match-yes">' + f.spark + '</span>';
+    const engineTag = f.engine === 'both'
+      ? '<span class="engine-tag engine-both">Both</span>'
+      : '<span class="engine-tag engine-spark">Spark</span>';
+
+    const tr = document.createElement('tr');
+    tr.dataset.cat = f.cat;
+    tr.innerHTML =
+      '<td>' + f.num + '</td>' +
+      '<td><span class="fn-name">' + f.name + '</span></td>' +
+      '<td style="font-family:\'JetBrains Mono\',monospace;font-size:11px;color:var(--text-dim)">' + f.cpp + '</td>' +
+      '<td><span class="category-tag ' + catClass(f.cat) + '">' + catLabel(f.cat) + '</span></td>' +
+      '<td>' + engineTag + '</td>' +
+      '<td>' + prestoMatch + '</td>' +
+      '<td>' + sparkMatch + '</td>' +
+      '<td style="color:var(--text-dim);font-size:12px">' + f.notes + '</td>';
+    tbody.appendChild(tr);
+  });
+}
+
+function renderAggTable() {
+  const tbody = document.getElementById('aggBody');
+  tbody.innerHTML = '';
+  aggFunctions.forEach(f => {
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td>' + f.num + '</td>' +
+      '<td><span class="fn-name">' + f.name + '</span></td>' +
+      '<td style="font-family:\'JetBrains Mono\',monospace;font-size:11px;color:var(--text-dim)">' + f.cpp + '</td>' +
+      '<td><span class="match-yes">' + f.presto + '</span></td>' +
+      '<td><span class="match-yes">' + f.spark + '</span></td>' +
+      '<td style="font-size:12px;color:var(--text-dim)">' + f.steps + '</td>' +
+      '<td style="color:var(--text-dim);font-size:12px">' + f.notes + '</td>';
+    tbody.appendChild(tr);
+  });
+}
+
+function renderAstTable() {
+  const tbody = document.getElementById('astBody');
+  tbody.innerHTML = '';
+  astOps.forEach(f => {
+    const typeColor = f.type === 'Binary' ? 'var(--presto)'
+                    : f.type === 'Unary' ? 'var(--spark)'
+                    : 'var(--accent3)';
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td style="font-weight:500">' + f.op + '</td>' +
+      '<td><span class="fn-name" style="color:var(--presto)">' + f.presto + '</span></td>' +
+      '<td><span class="fn-name" style="color:var(--spark)">' + f.spark + '</span></td>' +
+      '<td style="font-family:\'JetBrains Mono\',monospace;font-size:12px">' + f.ast + '</td>' +
+      '<td style="color:' + typeColor + ';font-family:\'JetBrains Mono\',monospace;font-size:11px">' + f.type + '</td>';
+    tbody.appendChild(tr);
+  });
+}
+
+document.querySelectorAll('.filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    renderScalarTable(btn.dataset.filter);
+  });
+});
+
+renderScalarTable('all');
+renderAggTable();
+renderAstTable();
+
+setTimeout(() => {
+  document.querySelectorAll('.coverage-bar-fill').forEach(bar => {
+    const target = parseFloat(bar.dataset.target);
+    bar.style.width = Math.max(target, 0.5) + '%';
+  });
+}, 300);
+</script>
+</body>
+</html>

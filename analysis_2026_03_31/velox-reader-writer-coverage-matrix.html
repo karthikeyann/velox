@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Velox Reader/Writer Coverage Matrix</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface-2: #1c2128;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-muted: #8b949e;
+  --green: #3fb950;
+  --green-bg: rgba(63, 185, 80, 0.12);
+  --yellow: #d29922;
+  --yellow-bg: rgba(210, 153, 34, 0.12);
+  --red: #f85149;
+  --red-bg: rgba(248, 81, 73, 0.12);
+  --blue: #58a6ff;
+  --blue-bg: rgba(88, 166, 255, 0.12);
+  --purple: #bc8cff;
+  --purple-bg: rgba(188, 140, 255, 0.12);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: 'DM Sans', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  padding: 32px;
+  line-height: 1.5;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+h1 {
+  font-size: 1.7rem;
+  font-weight: 700;
+  margin-bottom: 6px;
+  background: linear-gradient(135deg, var(--blue), var(--purple));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.subtitle {
+  color: var(--text-muted);
+  font-size: 0.88rem;
+  margin-bottom: 28px;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 14px;
+  margin-bottom: 32px;
+}
+
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 20px;
+  transition: transform 0.15s;
+}
+.stat-card:hover { transform: translateY(-2px); }
+.stat-card .label { color: var(--text-muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+.stat-card .value { font-size: 2rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+.stat-card .detail { color: var(--text-muted); font-size: 0.75rem; margin-top: 4px; }
+.stat-card.green .value { color: var(--green); }
+.stat-card.blue .value { color: var(--blue); }
+.stat-card.purple .value { color: var(--purple); }
+.stat-card.yellow .value { color: var(--yellow); }
+.stat-card.red .value { color: var(--red); }
+
+section { margin-bottom: 32px; }
+section h2 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+section h2 .badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 20px;
+  font-weight: 600;
+}
+.badge-green { background: var(--green-bg); color: var(--green); }
+.badge-blue { background: var(--blue-bg); color: var(--blue); }
+.badge-purple { background: var(--purple-bg); color: var(--purple); }
+.badge-yellow { background: var(--yellow-bg); color: var(--yellow); }
+.badge-red { background: var(--red-bg); color: var(--red); }
+
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  background: var(--surface);
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+thead th {
+  background: var(--surface-2);
+  text-align: left;
+  padding: 12px 16px;
+  font-weight: 600;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+}
+tbody td {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: rgba(88, 166, 255, 0.04); }
+
+.chip {
+  display: inline-block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin: 1px 2px;
+}
+.chip-green { background: var(--green-bg); color: var(--green); }
+.chip-red { background: var(--red-bg); color: var(--red); }
+.chip-yellow { background: var(--yellow-bg); color: var(--yellow); }
+.chip-blue { background: var(--blue-bg); color: var(--blue); }
+.chip-purple { background: var(--purple-bg); color: var(--purple); }
+
+.path {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.coverage-bar {
+  height: 8px;
+  background: var(--surface-2);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-top: 4px;
+}
+.coverage-bar .fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.6s ease;
+}
+
+.note-box {
+  background: var(--surface);
+  border-left: 3px solid var(--yellow);
+  border-radius: 0 8px 8px 0;
+  padding: 12px 16px;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  margin-top: 16px;
+}
+.note-box strong { color: var(--yellow); }
+
+.legend {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+  font-size: 0.78rem;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+}
+</style>
+</head>
+<body>
+
+<h1>Velox Reader / Writer Coverage Matrix</h1>
+<p class="subtitle">velox/ &mdash; Core (dwio + connectors) vs experimental/cudf/ &mdash; GPU (libcudf)</p>
+
+<div class="stats-grid">
+  <div class="stat-card green">
+    <div class="label">Core Format Readers</div>
+    <div class="value">4</div>
+    <div class="detail">DWRF, ORC, Parquet, Text</div>
+  </div>
+  <div class="stat-card blue">
+    <div class="label">Core Format Writers</div>
+    <div class="value">3</div>
+    <div class="detail">DWRF, Parquet, Text</div>
+  </div>
+  <div class="stat-card purple">
+    <div class="label">Core Connector DataSources</div>
+    <div class="value">6</div>
+    <div class="detail">Hive, Iceberg, Paimon, TPCH, TPCDS, Fuzzer</div>
+  </div>
+  <div class="stat-card purple">
+    <div class="label">Core Connector DataSinks</div>
+    <div class="value">2</div>
+    <div class="detail">Hive, Iceberg</div>
+  </div>
+  <div class="stat-card yellow">
+    <div class="label">cuDF Readers</div>
+    <div class="value">1</div>
+    <div class="detail">CudfHiveDataSource (Parquet only)</div>
+  </div>
+  <div class="stat-card yellow">
+    <div class="label">cuDF Writers</div>
+    <div class="value">1</div>
+    <div class="detail">CudfHiveDataSink (Parquet, not wired)</div>
+  </div>
+</div>
+
+<!-- Table 1: Core dwio Format Readers -->
+<section>
+  <h2>Table 1 &mdash; Core Velox Format-Level Readers <span class="badge badge-green">dwio layer</span></h2>
+  <table>
+    <thead>
+      <tr><th>#</th><th>Format</th><th>Reader Factory</th><th>Reader Class</th><th>Path</th><th>cuDF GPU Equivalent?</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td><span class="chip chip-green">DWRF</span></td>
+        <td>DwrfReaderFactory</td>
+        <td>DwrfReader</td>
+        <td class="path">velox/dwio/dwrf/reader/DwrfReader.h</td>
+        <td><span class="chip chip-red">No</span></td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td><span class="chip chip-green">ORC</span></td>
+        <td>OrcReaderFactory</td>
+        <td>DwrfReader (delegated)</td>
+        <td class="path">velox/dwio/orc/reader/OrcReader.h</td>
+        <td><span class="chip chip-red">No</span></td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td><span class="chip chip-green">PARQUET</span></td>
+        <td>ParquetReaderFactory</td>
+        <td>ParquetReader</td>
+        <td class="path">velox/dwio/parquet/reader/ParquetReader.h</td>
+        <td><span class="chip chip-green">Yes</span> &mdash; CudfHiveDataSource</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td><span class="chip chip-green">TEXT</span></td>
+        <td>TextReaderFactory</td>
+        <td>TextReader</td>
+        <td class="path">velox/dwio/text/reader/TextReader.h</td>
+        <td><span class="chip chip-red">No</span></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- Table 2: Core dwio Format Writers -->
+<section>
+  <h2>Table 2 &mdash; Core Velox Format-Level Writers <span class="badge badge-blue">dwio layer</span></h2>
+  <table>
+    <thead>
+      <tr><th>#</th><th>Format</th><th>Writer Factory</th><th>Writer Class</th><th>Path</th><th>cuDF GPU Equivalent?</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td><span class="chip chip-blue">DWRF</span></td>
+        <td>DwrfWriterFactory</td>
+        <td>dwrf::Writer</td>
+        <td class="path">velox/dwio/dwrf/writer/Writer.h</td>
+        <td><span class="chip chip-red">No</span></td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td><span class="chip chip-blue">PARQUET</span></td>
+        <td>ParquetWriterFactory</td>
+        <td>parquet::Writer</td>
+        <td class="path">velox/dwio/parquet/writer/Writer.h</td>
+        <td><span class="chip chip-yellow">Partial</span> &mdash; CudfHiveDataSink exists but not wired</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td><span class="chip chip-blue">TEXT</span></td>
+        <td>TextWriterFactory</td>
+        <td>TextWriter</td>
+        <td class="path">velox/dwio/text/writer/TextWriter.h</td>
+        <td><span class="chip chip-red">No</span></td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="note-box"><strong>Note:</strong> No ORC writer exists in Velox. The ORC read path delegates to DwrfReader, but there is no separate ORC write path.</div>
+</section>
+
+<!-- Table 3: Core Connector DataSources -->
+<section>
+  <h2>Table 3 &mdash; Core Connector-Level DataSources (Readers) <span class="badge badge-purple">connector layer</span></h2>
+  <table>
+    <thead>
+      <tr><th>#</th><th>Connector</th><th>DataSource Class</th><th>Inherits</th><th>Uses Formats</th><th>Path</th><th>cuDF Equivalent?</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td>Hive</td>
+        <td>HiveDataSource</td>
+        <td>DataSource</td>
+        <td><span class="chip chip-green">DWRF</span> <span class="chip chip-green">ORC</span> <span class="chip chip-green">PARQUET</span> <span class="chip chip-green">TEXT</span></td>
+        <td class="path">velox/connectors/hive/HiveDataSource.h</td>
+        <td><span class="chip chip-green">Yes</span> &mdash; CudfHiveDataSource (Parquet only)</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td>Iceberg</td>
+        <td>IcebergDataSource</td>
+        <td>HiveDataSource</td>
+        <td><span class="chip chip-green">DWRF</span> <span class="chip chip-green">ORC</span> <span class="chip chip-green">PARQUET</span></td>
+        <td class="path">velox/connectors/hive/iceberg/IcebergDataSource.h</td>
+        <td><span class="chip chip-red">No</span></td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td>Paimon</td>
+        <td>PaimonDataSource</td>
+        <td>HiveDataSource</td>
+        <td><span class="chip chip-green">ORC</span> <span class="chip chip-green">PARQUET</span></td>
+        <td class="path">velox/connectors/hive/paimon/PaimonDataSource.h</td>
+        <td><span class="chip chip-red">No</span></td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td>TPCH</td>
+        <td>TpchDataSource</td>
+        <td>DataSource</td>
+        <td><span class="chip chip-purple">Generated</span></td>
+        <td class="path">velox/connectors/tpch/TpchConnector.h</td>
+        <td><span class="chip chip-purple">N/A</span></td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td>TPC-DS</td>
+        <td>TpcdsDataSource</td>
+        <td>DataSource</td>
+        <td><span class="chip chip-purple">Generated</span></td>
+        <td class="path">velox/connectors/tpcds/TpcdsConnector.h</td>
+        <td><span class="chip chip-purple">N/A</span></td>
+      </tr>
+      <tr>
+        <td>6</td>
+        <td>Fuzzer</td>
+        <td>FuzzerDataSource</td>
+        <td>DataSource</td>
+        <td><span class="chip chip-purple">Synthetic</span></td>
+        <td class="path">velox/connectors/fuzzer/FuzzerConnector.h</td>
+        <td><span class="chip chip-purple">N/A</span></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- Table 4: Core Connector DataSinks -->
+<section>
+  <h2>Table 4 &mdash; Core Connector-Level DataSinks (Writers) <span class="badge badge-purple">connector layer</span></h2>
+  <table>
+    <thead>
+      <tr><th>#</th><th>Connector</th><th>DataSink Class</th><th>Inherits</th><th>Writes Formats</th><th>Path</th><th>cuDF Equivalent?</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td>Hive</td>
+        <td>HiveDataSink</td>
+        <td>DataSink</td>
+        <td><span class="chip chip-blue">DWRF</span> <span class="chip chip-blue">PARQUET</span> <span class="chip chip-blue">TEXT</span></td>
+        <td class="path">velox/connectors/hive/HiveDataSink.h</td>
+        <td><span class="chip chip-yellow">Partial</span> &mdash; CudfHiveDataSink (Parquet, not wired)</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td>Iceberg</td>
+        <td>IcebergDataSink</td>
+        <td>HiveDataSink</td>
+        <td><span class="chip chip-blue">DWRF</span> <span class="chip chip-blue">PARQUET</span></td>
+        <td class="path">velox/connectors/hive/iceberg/IcebergDataSink.h</td>
+        <td><span class="chip chip-red">No</span></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- Table 5: cuDF Experimental -->
+<section>
+  <h2>Table 5 &mdash; cuDF Experimental Readers &amp; Writers <span class="badge badge-yellow">experimental/cudf</span></h2>
+  <table>
+    <thead>
+      <tr><th>#</th><th>Type</th><th>cuDF Class</th><th>Inherits</th><th>Format</th><th>libcudf Backend</th><th>Core Velox Counterpart</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td><span class="chip chip-green">Reader</span></td>
+        <td>CudfHiveDataSource</td>
+        <td>DataSource</td>
+        <td>Parquet</td>
+        <td>cudf::io::chunked_parquet_reader<br><span style="color:var(--text-muted);font-size:0.72rem">(+ hybrid_scan_reader optional)</span></td>
+        <td>HiveDataSource</td>
+        <td><span class="chip chip-green">Active</span></td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td><span class="chip chip-blue">Writer</span></td>
+        <td>CudfHiveDataSink</td>
+        <td>DataSink</td>
+        <td>Parquet</td>
+        <td>cudf::io::chunked_parquet_writer</td>
+        <td>HiveDataSink</td>
+        <td><span class="chip chip-yellow">Exists, not wired</span></td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="note-box"><strong>Key Finding:</strong> CudfHiveConnector only overrides <code>createDataSource()</code>. The <code>createDataSink()</code> is NOT overridden &mdash; there is a TODO: "Re-add data sink". The write test (<code>velox_cudf_table_write_test</code>) is also commented out in CMakeLists.txt.</div>
+</section>
+
+<!-- Table 6: Coverage Matrix -->
+<section>
+  <h2>Table 6 &mdash; Format Coverage Matrix: Core vs cuDF <span class="badge badge-purple">coverage</span></h2>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> Covered</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--yellow)"></div> Partial / Not Wired</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div> Not Covered</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--text-muted)"></div> N/A (no core impl)</div>
+  </div>
+  <table>
+    <thead>
+      <tr><th>Format</th><th>Core Reader</th><th>Core Writer</th><th>cuDF Reader</th><th>cuDF Writer</th><th>cuDF Read Coverage</th><th>cuDF Write Coverage</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>DWRF</strong></td>
+        <td><span class="chip chip-green">DwrfReader</span></td>
+        <td><span class="chip chip-green">dwrf::Writer</span></td>
+        <td><span class="chip chip-red">None</span></td>
+        <td><span class="chip chip-red">None</span></td>
+        <td>
+          <div style="font-size:0.75rem;color:var(--red)">0%</div>
+          <div class="coverage-bar"><div class="fill" style="width:0%;background:var(--red)"></div></div>
+        </td>
+        <td>
+          <div style="font-size:0.75rem;color:var(--red)">0%</div>
+          <div class="coverage-bar"><div class="fill" style="width:0%;background:var(--red)"></div></div>
+        </td>
+      </tr>
+      <tr>
+        <td><strong>ORC</strong></td>
+        <td><span class="chip chip-green">OrcReaderFactory &rarr; DwrfReader</span></td>
+        <td><span style="color:var(--text-muted);font-size:0.8rem">None (uses DWRF write)</span></td>
+        <td><span class="chip chip-red">None</span></td>
+        <td><span style="color:var(--text-muted);font-size:0.8rem">N/A</span></td>
+        <td>
+          <div style="font-size:0.75rem;color:var(--red)">0%</div>
+          <div class="coverage-bar"><div class="fill" style="width:0%;background:var(--red)"></div></div>
+        </td>
+        <td>
+          <div style="font-size:0.75rem;color:var(--text-muted)">N/A</div>
+          <div class="coverage-bar"><div class="fill" style="width:0%;background:var(--text-muted)"></div></div>
+        </td>
+      </tr>
+      <tr style="background:rgba(63,185,80,0.04)">
+        <td><strong>PARQUET</strong></td>
+        <td><span class="chip chip-green">ParquetReader</span></td>
+        <td><span class="chip chip-green">parquet::Writer</span></td>
+        <td><span class="chip chip-green">CudfHiveDataSource</span></td>
+        <td><span class="chip chip-yellow">CudfHiveDataSink</span></td>
+        <td>
+          <div style="font-size:0.75rem;color:var(--green)">100%</div>
+          <div class="coverage-bar"><div class="fill" style="width:100%;background:var(--green)"></div></div>
+        </td>
+        <td>
+          <div style="font-size:0.75rem;color:var(--yellow)">~50% (not wired into connector)</div>
+          <div class="coverage-bar"><div class="fill" style="width:50%;background:var(--yellow)"></div></div>
+        </td>
+      </tr>
+      <tr>
+        <td><strong>TEXT</strong></td>
+        <td><span class="chip chip-green">TextReader</span></td>
+        <td><span class="chip chip-green">TextWriter</span></td>
+        <td><span class="chip chip-red">None</span></td>
+        <td><span class="chip chip-red">None</span></td>
+        <td>
+          <div style="font-size:0.75rem;color:var(--red)">0%</div>
+          <div class="coverage-bar"><div class="fill" style="width:0%;background:var(--red)"></div></div>
+        </td>
+        <td>
+          <div style="font-size:0.75rem;color:var(--red)">0%</div>
+          <div class="coverage-bar"><div class="fill" style="width:0%;background:var(--red)"></div></div>
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- Table 7: Connector Coverage -->
+<section>
+  <h2>Table 7 &mdash; Connector-Level Coverage: Core vs cuDF <span class="badge badge-purple">connectors</span></h2>
+  <table>
+    <thead>
+      <tr><th>Connector</th><th>Core DataSource</th><th>Core DataSink</th><th>cuDF DataSource</th><th>cuDF DataSink</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr style="background:rgba(63,185,80,0.04)">
+        <td><strong>Hive</strong></td>
+        <td><span class="chip chip-green">HiveDataSource</span></td>
+        <td><span class="chip chip-green">HiveDataSink</span></td>
+        <td><span class="chip chip-green">CudfHiveDataSource</span></td>
+        <td><span class="chip chip-yellow">CudfHiveDataSink</span></td>
+        <td>Writer class exists, not wired into connector</td>
+      </tr>
+      <tr>
+        <td><strong>Iceberg</strong></td>
+        <td><span class="chip chip-green">IcebergDataSource</span></td>
+        <td><span class="chip chip-green">IcebergDataSink</span></td>
+        <td><span class="chip chip-red">None</span></td>
+        <td><span class="chip chip-red">None</span></td>
+        <td>No cuDF coverage</td>
+      </tr>
+      <tr>
+        <td><strong>Paimon</strong></td>
+        <td><span class="chip chip-green">PaimonDataSource</span></td>
+        <td><span style="color:var(--text-muted)">None</span></td>
+        <td><span class="chip chip-red">None</span></td>
+        <td><span style="color:var(--text-muted)">N/A</span></td>
+        <td>Read-only in core, no cuDF coverage</td>
+      </tr>
+      <tr>
+        <td><strong>TPCH</strong></td>
+        <td><span class="chip chip-purple">TpchDataSource</span></td>
+        <td><span style="color:var(--text-muted)">None</span></td>
+        <td><span class="chip chip-purple">N/A</span></td>
+        <td><span class="chip chip-purple">N/A</span></td>
+        <td>Generated data, not file-format based</td>
+      </tr>
+      <tr>
+        <td><strong>TPC-DS</strong></td>
+        <td><span class="chip chip-purple">TpcdsDataSource</span></td>
+        <td><span style="color:var(--text-muted)">None</span></td>
+        <td><span class="chip chip-purple">N/A</span></td>
+        <td><span class="chip chip-purple">N/A</span></td>
+        <td>Generated data, not file-format based</td>
+      </tr>
+      <tr>
+        <td><strong>Fuzzer</strong></td>
+        <td><span class="chip chip-purple">FuzzerDataSource</span></td>
+        <td><span style="color:var(--text-muted)">None</span></td>
+        <td><span class="chip chip-purple">N/A</span></td>
+        <td><span class="chip chip-purple">N/A</span></td>
+        <td>Synthetic test data</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<div style="margin-top:24px; padding:16px 20px; background:var(--surface); border:1px solid var(--border); border-radius:10px; font-size:0.82rem; color:var(--text-muted);">
+  <strong style="color:var(--text)">Source:</strong> /home/knataraj/velox &mdash; verified from registerReaderFactory/registerWriterFactory calls, class inheritance, and CMakeLists.txt
+</div>
+
+</body>
+</html>
