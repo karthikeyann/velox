@@ -1,0 +1,106 @@
+Here is the full analysis, verified against `registerReaderFactory`/`registerWriterFactory` calls, class declarations, and CMakeLists.txt in `/home/knataraj/velox`.
+
+---
+
+## Summary Counts
+
+| Metric | Count |
+|--------|-------|
+| **Core Velox format readers** (dwio registered factories) | **4** |
+| **Core Velox format writers** (dwio registered factories) | **3** |
+| **Core Velox connector DataSources** (readers) | **6** (3 file-format, 3 synthetic/generated) |
+| **Core Velox connector DataSinks** (writers) | **2** |
+| **cuDF readers** | **1** (CudfHiveDataSource) |
+| **cuDF writers** | **1** (CudfHiveDataSink, class exists but NOT wired into connector) |
+| **cuDF that correspond to core** | **2** (both map to Hive connector, Parquet only) |
+
+---
+
+## 1. Core Velox Format-Level Readers (4 total)
+
+These are registered via `registerReaderFactory()` in the `velox/dwio/` layer:
+
+| # | Format | Factory Class | Reader Class | Path |
+|---|--------|---------------|-------------|------|
+| 1 | **DWRF** | `DwrfReaderFactory` | `DwrfReader` | `velox/dwio/dwrf/reader/DwrfReader.h` |
+| 2 | **ORC** | `OrcReaderFactory` | `DwrfReader` (delegates) | `velox/dwio/orc/reader/OrcReader.h` |
+| 3 | **Parquet** | `ParquetReaderFactory` | `ParquetReader` | `velox/dwio/parquet/reader/ParquetReader.h` |
+| 4 | **Text** | `TextReaderFactory` | `TextReader` | `velox/dwio/text/reader/TextReader.h` |
+
+Note: ORC has its own factory but internally calls `DwrfReader::create()` -- no separate ORC reader implementation.
+
+## 2. Core Velox Format-Level Writers (3 total)
+
+Registered via `registerWriterFactory()`:
+
+| # | Format | Factory Class | Writer Class | Path |
+|---|--------|---------------|-------------|------|
+| 1 | **DWRF** | `DwrfWriterFactory` | `dwrf::Writer` | `velox/dwio/dwrf/writer/Writer.h` |
+| 2 | **Parquet** | `ParquetWriterFactory` | `parquet::Writer` | `velox/dwio/parquet/writer/Writer.h` |
+| 3 | **Text** | `TextWriterFactory` | `TextWriter` | `velox/dwio/text/writer/TextWriter.h` |
+
+Note: **No ORC writer** exists in Velox. ORC files can be *read* (via DWRF reader delegation), but not written as ORC format.
+
+## 3. Core Connector DataSources / DataSinks
+
+**DataSources (6 total):**
+
+| # | Connector | Class | Inherits | File Formats | Type |
+|---|-----------|-------|----------|-------------|------|
+| 1 | Hive | `HiveDataSource` | `DataSource` | DWRF, ORC, Parquet, Text | File I/O |
+| 2 | Iceberg | `IcebergDataSource` | `HiveDataSource` | DWRF, ORC, Parquet | File I/O |
+| 3 | Paimon | `PaimonDataSource` | `HiveDataSource` | ORC, Parquet | File I/O |
+| 4 | TPCH | `TpchDataSource` | `DataSource` | Generated | Synthetic |
+| 5 | TPC-DS | `TpcdsDataSource` | `DataSource` | Generated | Synthetic |
+| 6 | Fuzzer | `FuzzerDataSource` | `DataSource` | Synthetic | Synthetic |
+
+**DataSinks (2 total):**
+
+| # | Connector | Class | Inherits | File Formats |
+|---|-----------|-------|----------|-------------|
+| 1 | Hive | `HiveDataSink` | `DataSink` | DWRF, Parquet, Text |
+| 2 | Iceberg | `IcebergDataSink` | `HiveDataSink` | DWRF, Parquet |
+
+## 4. cuDF Experimental Readers/Writers (under `velox/experimental/cudf/`)
+
+| # | Type | cuDF Class | Inherits | Format | libcudf Backend | Core Counterpart | Status |
+|---|------|-----------|----------|--------|-----------------|-----------------|--------|
+| 1 | **Reader** | `CudfHiveDataSource` | `DataSource` | Parquet only | `cudf::io::chunked_parquet_reader` + optional `hybrid_scan_reader` | `HiveDataSource` | Active |
+| 2 | **Writer** | `CudfHiveDataSink` | `DataSink` | Parquet only | `cudf::io::chunked_parquet_writer` | `HiveDataSink` | Exists, **NOT wired** into connector |
+
+Key details:
+- `CudfHiveConnector` (line 54 in `CudfHiveConnector.h`) has `// TODO (dm): Re-add data sink` -- `createDataSink()` is not overridden
+- The write test `velox_cudf_table_write_test` is commented out in CMakeLists.txt
+- cuDF bypasses Velox's `dwio` layer entirely -- it uses libcudf's native Parquet I/O
+
+## 5. Coverage Matrix: Format x Layer
+
+| Format | Core Reader | Core Writer | cuDF Reader | cuDF Writer | cuDF Read % | cuDF Write % |
+|--------|:-----------:|:-----------:|:-----------:|:-----------:|:-----------:|:------------:|
+| **DWRF** | DwrfReader | dwrf::Writer | -- | -- | 0% | 0% |
+| **ORC** | OrcReader (via DWRF) | None | -- | N/A | 0% | N/A |
+| **Parquet** | ParquetReader | parquet::Writer | CudfHiveDataSource | CudfHiveDataSink | **100%** | **~50%** (not wired) |
+| **Text** | TextReader | TextWriter | -- | -- | 0% | 0% |
+
+## 6. Connector-Level Coverage
+
+| Connector | Core Source | Core Sink | cuDF Source | cuDF Sink | Notes |
+|-----------|:----------:|:---------:|:-----------:|:---------:|-------|
+| **Hive** | HiveDataSource | HiveDataSink | **CudfHiveDataSource** | CudfHiveDataSink (not wired) | Only Parquet covered on GPU |
+| **Iceberg** | IcebergDataSource | IcebergDataSink | -- | -- | No cuDF coverage |
+| **Paimon** | PaimonDataSource | None | -- | N/A | No cuDF coverage |
+| **TPCH** | TpchDataSource | None | N/A | N/A | Generated data |
+| **TPC-DS** | TpcdsDataSource | None | N/A | N/A | Generated data |
+| **Fuzzer** | FuzzerDataSource | None | N/A | N/A | Synthetic data |
+
+---
+
+## Key Takeaways
+
+1. **cuDF covers only 1 of 4 file formats** (Parquet) for reading, and that same 1 format partially for writing
+2. **cuDF covers only 1 of 3 file-format connectors** (Hive) -- Iceberg and Paimon have no GPU path
+3. The cuDF writer (`CudfHiveDataSink`) exists as a class but is **not connected** to `CudfHiveConnector` yet (TODO in source)
+4. cuDF bypasses the Velox `dwio` layer entirely, using `libcudf`'s native Parquet I/O instead
+5. DWRF, ORC, and Text formats have **zero** GPU coverage
+
+I also saved a styled HTML version of all these tables at `/home/knataraj/AGENT/velox-reader-writer-coverage-matrix.html` that you can open in a browser.
