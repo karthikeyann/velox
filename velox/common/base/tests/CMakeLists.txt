@@ -24,6 +24,7 @@ add_executable(
   FsTest.cpp
   IndexedPriorityQueueTest.cpp
   LazyCPUThreadPoolExecutorTest.cpp
+  NumaAwareExecutorTest.cpp
   RangeTest.cpp
   RuntimeMetricsTest.cpp
   ScopedLockTest.cpp
@@ -46,6 +47,7 @@ target_link_libraries(
     velox_caching
     velox_common_base
     velox_memory
+    velox_numa_aware_executor
     velox_time
     velox_status
     velox_exception

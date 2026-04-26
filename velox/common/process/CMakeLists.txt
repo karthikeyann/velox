@@ -14,12 +14,14 @@
 
 velox_add_library(
   velox_process
+  NumaConfig.cpp
   ProcessBase.cpp
   StackTrace.cpp
   ThreadDebugInfo.cpp
   TraceContext.cpp
   TraceHistory.cpp
   HEADERS
+  NumaConfig.h
   ProcessBase.h
   StackTrace.h
   ThreadDebugInfo.h

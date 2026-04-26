@@ -116,4 +116,11 @@ velox_add_library(velox_async_source INTERFACE HEADERS AsyncSource.h)
 
 velox_add_library(velox_lazy_cpu_thread_pool_executor INTERFACE HEADERS LazyCPUThreadPoolExecutor.h)
 
+velox_add_library(velox_numa_aware_executor NumaAwareExecutor.cpp HEADERS NumaAwareExecutor.h)
+velox_link_libraries(
+  velox_numa_aware_executor
+  PUBLIC velox_process Folly::folly
+  PRIVATE fmt::fmt glog::glog
+)
+
 velox_add_library(velox_exception_helper INTERFACE HEADERS ExceptionHelper.h)
