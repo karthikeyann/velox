@@ -55,7 +55,7 @@ velox_link_libraries(
     Boost::headers
     Folly::folly
     fmt::fmt
-  PRIVATE velox_encode
+  PRIVATE velox_encode velox_numa_aware_executor
 )
 
 velox_add_library(velox_query_config_provider QueryConfigProvider.cpp HEADERS QueryConfigProvider.h)

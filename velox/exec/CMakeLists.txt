@@ -243,6 +243,7 @@ velox_link_libraries(
   velox_connector_registry
   velox_expression
   velox_file
+  velox_numa_aware_executor
   velox_presto_serializer
   velox_trace
   velox_time

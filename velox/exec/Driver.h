@@ -240,6 +240,9 @@ struct DriverCtx {
   /// instance.
   const uint32_t partitionId;
 
+  /// Preferred NUMA node for this driver. -1 means no preference.
+  const int preferredNumaNode;
+
   std::shared_ptr<Task> task;
   Driver* driver{nullptr};
   facebook::velox::process::ThreadDebugInfo threadDebugInfo;
@@ -254,7 +257,8 @@ struct DriverCtx {
       int _driverId,
       int _pipelineId,
       uint32_t _splitGroupId,
-      uint32_t _partitionId);
+      uint32_t _partitionId,
+      int _preferredNumaNode = -1);
 
   const core::QueryConfig& queryConfig() const;
 

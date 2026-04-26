@@ -16,6 +16,7 @@
 
 #include "velox/core/QueryCtx.h"
 #include "velox/common/base/Exceptions.h"
+#include "velox/common/base/NumaAwareExecutor.h"
 #include "velox/common/base/SpillConfig.h"
 #include "velox/common/config/Config.h"
 
@@ -75,6 +76,7 @@ QueryCtx::QueryCtx(
     TraceCtxProvider traceCtxProvider)
     : queryId_(queryId),
       executor_(executor),
+      numaExecutor_(dynamic_cast<NumaAwareExecutor*>(executor)),
       spillExecutor_(spillExecutor),
       cache_(cache),
       connectorSessionProperties_(connectorSessionProperties),

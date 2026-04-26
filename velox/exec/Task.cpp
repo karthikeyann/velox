@@ -23,6 +23,7 @@
 #include "velox/common/base/Counters.h"
 #include "velox/common/base/StatsReporter.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/common/process/NumaConfig.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/common/time/Timer.h"
 #include "velox/exec/Exchange.h"
@@ -1382,6 +1383,10 @@ std::vector<std::shared_ptr<Driver>> Task::createDriversLocked(
     // execution, from the split group id.
     const uint32_t driverIdOffset =
         factory->numDrivers * (groupedExecutionDrivers ? splitGroupId : 0);
+    const auto& numaConfig = process::NumaConfig::instance();
+    const int numaNode = numaConfig.isAvailable()
+        ? numaConfig.assignNode(splitGroupId, pipeline)
+        : -1;
     auto filters = std::make_shared<PipelinePushdownFilters>();
     for (uint32_t partitionId = 0; partitionId < factory->numDrivers;
          ++partitionId) {
@@ -1391,7 +1396,8 @@ std::vector<std::shared_ptr<Driver>> Task::createDriversLocked(
               driverIdOffset + partitionId,
               pipeline,
               splitGroupId,
-              partitionId),
+              partitionId,
+              numaNode),
           getExchangeClientLocked(pipeline),
           filters,
           [self](size_t i) {

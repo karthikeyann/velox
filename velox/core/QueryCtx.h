@@ -30,6 +30,10 @@
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/VectorPool.h"
 
+namespace facebook::velox {
+class NumaAwareExecutor;
+} // namespace facebook::velox
+
 namespace facebook::velox::exec::trace {
 class TraceCtx;
 }
@@ -232,6 +236,13 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
 
   folly::Executor* executor() const {
     return executor_;
+  }
+
+  /// Returns the NUMA-aware executor if the supplied executor is one,
+  /// nullptr otherwise. Cached at build time to avoid dynamic_cast on the
+  /// driver enqueue hot path.
+  NumaAwareExecutor* numaExecutor() const {
+    return numaExecutor_;
   }
 
   bool isExecutorSupplied() const {
@@ -455,6 +466,7 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
 
   const std::string queryId_;
   folly::Executor* const executor_{nullptr};
+  NumaAwareExecutor* const numaExecutor_{nullptr};
   folly::Executor* const spillExecutor_{nullptr};
   cache::AsyncDataCache* const cache_;
 

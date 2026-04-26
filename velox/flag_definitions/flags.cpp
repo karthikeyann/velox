@@ -115,6 +115,12 @@ DEFINE_bool(
 
 DEFINE_bool(velox_memory_use_hugepages, true, "Use explicit huge pages");
 
+DEFINE_bool(
+    velox_numa_aware_scheduling,
+    false,
+    "Enable NUMA-aware driver thread scheduling. "
+    "Requires a multi-socket system. Falls back to a global pool if unavailable.");
+
 DEFINE_int32(
     cache_prefetch_min_pct,
     80,

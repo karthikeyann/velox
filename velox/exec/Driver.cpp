@@ -18,6 +18,7 @@
 
 #include <atomic>
 
+#include "velox/common/base/NumaAwareExecutor.h"
 #include "velox/common/process/TraceContext.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/OperatorType.h"
@@ -99,11 +100,13 @@ DriverCtx::DriverCtx(
     int _driverId,
     int _pipelineId,
     uint32_t _splitGroupId,
-    uint32_t _partitionId)
+    uint32_t _partitionId,
+    int _preferredNumaNode)
     : driverId(_driverId),
       pipelineId(_pipelineId),
       splitGroupId(_splitGroupId),
       partitionId(_partitionId),
+      preferredNumaNode(_preferredNumaNode),
       task(std::move(_task)),
       threadDebugInfo({task->queryCtx()->queryId(), task->taskId(), nullptr}) {}
 
@@ -299,8 +302,14 @@ void Driver::enqueue(std::shared_ptr<Driver> driver) {
   if (driver->closed_) {
     return;
   }
-  driver->task()->queryCtx()->executor()->add(
-      [driver]() { Driver::run(driver); });
+  const auto& queryCtx = driver->task()->queryCtx();
+  const int numaNode = driver->driverCtx()->preferredNumaNode;
+  auto* numaExec = queryCtx->numaExecutor();
+  if (numaNode >= 0 && numaExec != nullptr) {
+    numaExec->addOnNode([driver]() { Driver::run(driver); }, numaNode);
+  } else {
+    queryCtx->executor()->add([driver]() { Driver::run(driver); });
+  }
 }
 
 void Driver::init(
