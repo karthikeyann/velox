@@ -13,38 +13,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#pragma once
 
-#include "velox/experimental/cudf/expression/DecimalTypeCheck.h"
+#include "velox/experimental/cudf/expression/CommonFunctions.h"
+#include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+
+#include <memory>
 
 namespace facebook::velox::cudf_velox {
 
-bool isOfDecimalType(const std::shared_ptr<velox::exec::Expr>& expr) {
-  return expr && expr->type() && expr->type()->isDecimal();
-}
-
-bool containsDecimalType(
+std::shared_ptr<CudfFunction> makeArrayAccessFunction(
     const std::shared_ptr<velox::exec::Expr>& expr,
-    const bool deep) {
-  // check output type
-  if (isOfDecimalType(expr)) {
-    return true;
-  }
-  if (deep) {
-    // check recursively
-    for (const auto& input : expr->inputs()) {
-      if (containsDecimalType(input, true)) {
-        return true;
-      }
-    }
-  } else {
-    // only check immediate inputs
-    for (const auto& input : expr->inputs()) {
-      if (isOfDecimalType(input)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
+    ArrayAccessPolicy policy);
 
 } // namespace facebook::velox::cudf_velox
