@@ -738,8 +738,8 @@ void markGpuMemoryTrace(std::string_view name) noexcept {
   if (name.empty()) {
     return;
   }
+  gpu_memory_detail::recordActiveGpuMemoryCaptureMarker(name);
   const auto active = gpu_memory_detail::activeGpuMemoryOwner();
-  gpu_memory_detail::recordGpuMemoryCaptureMarker(active.ownerId, name);
   emitNvtxMark(name);
   if (!gpuMemoryTraceEnabled()) {
     return;
@@ -776,8 +776,7 @@ GpuMemoryOperatorCall::GpuMemoryOperatorCall(
   previousOwnerId_ = previous.ownerId;
   const auto current = gpu_memory_detail::activeGpuMemoryOwner();
   ownerId_ = current.ownerId;
-  captureCall_ =
-      gpu_memory_detail::beginGpuMemoryCaptureOperatorCall(ownerId_, callName);
+  captureCall_ = gpu_memory_detail::beginActiveGpuMemoryCaptureCall(callName);
   traceSliceStarted_ =
       gpu_memory_detail::beginGpuMemoryOperatorCall(ownerId_, callName);
 }
@@ -970,8 +969,6 @@ void resetGpuMemoryNvtxCounters() noexcept {
 }
 
 void emitGpuMemoryTraceOom(
-    uint64_t timestampNs,
-    uint64_t sourceSequence,
     uint64_t ownerId,
     std::size_t requestedBytes,
     uint64_t globalCurrentBytes,
@@ -981,18 +978,6 @@ void emitGpuMemoryTraceOom(
     std::size_t cudaFreeBytes,
     std::size_t cudaTotalBytes,
     std::string_view cudaStatus) noexcept {
-  recordGpuMemoryCaptureOom(
-      timestampNs,
-      sourceSequence,
-      ownerId,
-      requestedBytes,
-      globalCurrentBytes,
-      globalPeakBytes,
-      planNodeCurrentBytes,
-      ownerCurrentBytes,
-      cudaFreeBytes,
-      cudaTotalBytes,
-      cudaStatus);
   emitNvtxMark(
       "GPU allocation failed | owner=" + std::to_string(ownerId) +
       " | requested=" + std::to_string(requestedBytes) +

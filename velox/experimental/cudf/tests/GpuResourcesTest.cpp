@@ -917,7 +917,8 @@ TEST(GpuMemoryCaptureTest, ClipsOpenCallsAndMatchesUuidStrictly) {
               .id = "plan-a", .type = "TestPlanNode", .sourceIds = {}}},
           initial));
   ASSERT_TRUE(
-      gpu_memory_detail::beginGpuMemoryCaptureOperatorCall(1, "getOutput")
+      gpu_memory_detail::beginGpuMemoryCaptureOperatorCall(
+          ownerHandle.ownerId, ownerHandle.planNodeId, owner, "getOutput")
           .active);
 
   gpu_memory_detail::finishGpuMemoryCapture(
@@ -971,6 +972,8 @@ TEST(GpuMemoryCaptureTest, RetainsSourceAnchoredOomAfterTimelineOverflow) {
       timestamp + 2,
       22,
       handle.ownerId,
+      handle.planNodeId,
+      owner,
       4'096,
       20,
       20,
@@ -1061,7 +1064,244 @@ TEST(GpuMemoryCaptureTest, RetainsConcurrentTaskOwners) {
   EXPECT_EQ(capture["final_snapshot"]["owners"].size(), 2);
 }
 
-TEST(GpuMemoryCaptureTest, BoundsBoundarySnapshotsToLiveAndSelectedOwners) {
+TEST(GpuMemoryCaptureTest, RepublishesTransientConcurrentOwnerMetadata) {
+  stopGpuMemoryCapture();
+  const auto path = rawCapturePath("transient-concurrent-owner");
+  std::filesystem::remove(path);
+  auto cleanup = folly::makeGuard([&] {
+    stopGpuMemoryCapture();
+    std::filesystem::remove(path);
+  });
+
+  GpuMemoryCaptureConfig config;
+  config.pathPattern = path.string();
+  config.maxEvents = 16;
+  ASSERT_TRUE(startGpuMemoryCapture(config));
+
+  GpuMemoryAllocationTracker tracker;
+  const auto selectedOwner = makeOwner("selected-transient", "plan-a", 1, 2, 3);
+  const auto concurrentOwner =
+      makeOwner("concurrent-transient", "plan-b", 4, 5, 6);
+  tracker.registerOwner(selectedOwner);
+  const auto concurrentHandle = tracker.registerOwner(concurrentOwner);
+  const auto task = makeCaptureTask("selected-transient");
+  ASSERT_TRUE(tracker.tryBeginCapture(
+      task,
+      {GpuMemoryCapturePlanNode{
+          .id = "plan-a", .type = "TestPlanNode", .sourceIds = {}}}));
+
+  int allocation;
+  ASSERT_TRUE(tracker.recordAllocation(&allocation, 32, concurrentHandle));
+  ASSERT_TRUE(tracker.recordDeallocation(&allocation));
+  tracker.finishCapture(task.taskUuid, task.taskId, "finished", true);
+  stopGpuMemoryCapture();
+
+  const auto capture = readRawCapture(path);
+  EXPECT_TRUE(capture["integrity"]["exact_memory_timeline"].asBool());
+  EXPECT_THAT(
+      jsonIntColumn(capture["owners"], "owner_id"),
+      testing::ElementsAre(static_cast<int64_t>(concurrentHandle.ownerId)));
+  ASSERT_EQ(capture["memory_updates"].size(), 2);
+  EXPECT_EQ(
+      capture["memory_updates"][0]["owner_id"].asInt(),
+      concurrentHandle.ownerId);
+  EXPECT_EQ(
+      capture["memory_updates"][1]["owner_id"].asInt(),
+      concurrentHandle.ownerId);
+  EXPECT_TRUE(capture["initial_snapshot"]["owners"].empty());
+  EXPECT_TRUE(capture["final_snapshot"]["owners"].empty());
+}
+
+TEST(
+    GpuMemoryCaptureTest,
+    AtomicallyRetainsOwnerMetadataForFactsAfterCandidateChurn) {
+  stopGpuMemoryCapture();
+  const auto path = rawCapturePath("atomic-fact-metadata");
+  std::filesystem::remove(path);
+  auto cleanup = folly::makeGuard([&] {
+    stopGpuMemoryCapture();
+    std::filesystem::remove(path);
+  });
+
+  GpuMemoryCaptureConfig config;
+  config.pathPattern = path.string();
+  config.maxEvents = 4;
+  ASSERT_TRUE(startGpuMemoryCapture(config));
+
+  const auto task = makeCaptureTask("atomic-fact-metadata");
+  const GpuMemoryOwnerHandle selectedHandle{1, 1};
+  const auto selectedOwner =
+      makeOwner("atomic-fact-metadata", "plan-a", 1, 2, 3);
+  const auto snapshot = makeCaptureSnapshot(
+      0, 0, 0, {makeCaptureOwner(selectedHandle, selectedOwner, 0, 0)});
+  ASSERT_TRUE(gpu_memory_detail::tryBeginGpuMemoryCapture(task, {}, snapshot));
+
+  for (uint64_t ownerId = 2; ownerId < 258; ++ownerId) {
+    auto candidate = makeOwner(
+        "candidate-" + std::to_string(ownerId),
+        "plan-candidate",
+        4,
+        5,
+        static_cast<int32_t>(ownerId));
+    gpu_memory_detail::registerGpuMemoryCaptureOwner(
+        ownerId, ownerId, candidate);
+  }
+
+  const auto callOwner = makeOwner("call-fact", "plan-call", 6, 7, 8);
+  const auto call = gpu_memory_detail::beginGpuMemoryCaptureOperatorCall(
+      10'001, 10'001, callOwner, "getOutput");
+  ASSERT_TRUE(call.active);
+  gpu_memory_detail::endGpuMemoryCaptureOperatorCall(call);
+
+  const auto markerOwner = makeOwner("marker-fact", "plan-marker", 9, 10, 11);
+  gpu_memory_detail::recordGpuMemoryCaptureMarker(
+      10'002, 10'002, markerOwner, "candidate churn marker");
+
+  const auto oomOwner = makeOwner("oom-fact", "plan-oom", 12, 13, 14);
+  gpu_memory_detail::recordGpuMemoryCaptureOom(
+      gpu_memory_detail::gpuMemoryMonotonicTimeNs(),
+      0,
+      10'003,
+      10'003,
+      oomOwner,
+      4'096,
+      0,
+      0,
+      0,
+      0,
+      1'024,
+      8'192,
+      "cudaSuccess");
+
+  gpu_memory_detail::finishGpuMemoryCapture(
+      task.taskUuid, task.taskId, "finished", true, snapshot);
+  stopGpuMemoryCapture();
+
+  const auto capture = readRawCapture(path);
+  EXPECT_TRUE(capture["integrity"]["exact_timeline"].asBool());
+  EXPECT_FALSE(capture["integrity"]["capture_overflow"].asBool());
+  EXPECT_EQ(capture["integrity"]["internal_data_loss_events"].asInt(), 0);
+  EXPECT_THAT(
+      jsonIntColumn(capture["owners"], "owner_id"),
+      testing::UnorderedElementsAre(10'001, 10'002, 10'003));
+  ASSERT_EQ(capture["operator_calls"].size(), 1);
+  ASSERT_EQ(capture["markers"].size(), 1);
+  ASSERT_EQ(capture["oom_events"].size(), 1);
+}
+
+TEST(GpuMemoryCaptureTest, OmitsZeroFactSelectedOwnersAtFinalBoundary) {
+  stopGpuMemoryCapture();
+  const auto path = rawCapturePath("zero-fact-selected-owners");
+  std::filesystem::remove(path);
+  auto cleanup = folly::makeGuard([&] {
+    stopGpuMemoryCapture();
+    std::filesystem::remove(path);
+  });
+
+  GpuMemoryCaptureConfig config;
+  config.pathPattern = path.string();
+  config.maxEvents = 4;
+  ASSERT_TRUE(startGpuMemoryCapture(config));
+
+  GpuMemoryAllocationTracker tracker;
+  const auto task = makeCaptureTask("zero-fact-selected-owners");
+  ASSERT_TRUE(tracker.tryBeginCapture(task, {}));
+
+  GpuMemoryOwnerHandle retainedHandle;
+  for (int32_t operatorId = 1; operatorId <= 256; ++operatorId) {
+    retainedHandle = tracker.registerOwner(makeOwner(
+        "zero-fact-selected-owners", "plan-a", 1, operatorId, operatorId));
+  }
+  int allocation;
+  ASSERT_TRUE(tracker.recordAllocation(&allocation, 32, retainedHandle));
+  ASSERT_TRUE(tracker.recordDeallocation(&allocation));
+  tracker.finishCapture(task.taskUuid, task.taskId, "finished", true);
+  stopGpuMemoryCapture();
+
+  const auto capture = readRawCapture(path);
+  EXPECT_TRUE(capture["integrity"]["exact_timeline"].asBool());
+  EXPECT_FALSE(capture["integrity"]["capture_overflow"].asBool());
+  EXPECT_EQ(capture["integrity"]["internal_data_loss_events"].asInt(), 0);
+  EXPECT_THAT(
+      jsonIntColumn(capture["owners"], "owner_id"),
+      testing::ElementsAre(static_cast<int64_t>(retainedHandle.ownerId)));
+  EXPECT_TRUE(capture["initial_snapshot"]["owners"].empty());
+  EXPECT_TRUE(capture["final_snapshot"]["owners"].empty());
+}
+
+TEST(GpuMemoryCaptureTest, RetainsUnattributedCustomMarkerMetadata) {
+  stopGpuMemoryCapture();
+  const auto path = rawCapturePath("unattributed-marker");
+  std::filesystem::remove(path);
+  auto cleanup = folly::makeGuard([&] {
+    stopGpuMemoryCapture();
+    std::filesystem::remove(path);
+  });
+
+  GpuMemoryCaptureConfig config;
+  config.pathPattern = path.string();
+  config.maxEvents = 8;
+  ASSERT_TRUE(startGpuMemoryCapture(config));
+  const auto task = makeCaptureTask("unattributed-marker");
+  const auto initial = makeCaptureSnapshot(0, 0, 0, {});
+  ASSERT_TRUE(gpu_memory_detail::tryBeginGpuMemoryCapture(task, {}, initial));
+
+  markGpuMemoryProfile("outside operator");
+  gpu_memory_detail::finishGpuMemoryCapture(
+      task.taskUuid, task.taskId, "finished", true, initial);
+  stopGpuMemoryCapture();
+
+  const auto capture = readRawCapture(path);
+  ASSERT_EQ(capture["owners"].size(), 1);
+  EXPECT_EQ(capture["owners"][0]["owner_id"].asInt(), 0);
+  EXPECT_EQ(
+      capture["owners"][0]["identity"]["operator_type"].asString(),
+      "<unattributed>");
+  ASSERT_EQ(capture["markers"].size(), 1);
+  EXPECT_EQ(capture["markers"][0]["owner_id"].asInt(), 0);
+  EXPECT_EQ(capture["markers"][0]["name"].asString(), "outside operator");
+  EXPECT_TRUE(capture["integrity"]["exact_memory_timeline"].asBool());
+}
+
+TEST(GpuMemoryCaptureTest, ReportsCompromisedInitialLedgerBaseline) {
+  stopGpuMemoryCapture();
+  const auto path = rawCapturePath("compromised-baseline");
+  std::filesystem::remove(path);
+  auto cleanup = folly::makeGuard([&] {
+    stopGpuMemoryCapture();
+    std::filesystem::remove(path);
+  });
+
+  GpuMemoryCaptureConfig config;
+  config.pathPattern = path.string();
+  config.maxEvents = 8;
+  ASSERT_TRUE(startGpuMemoryCapture(config));
+
+  GpuMemoryAllocationTracker tracker;
+  int unknownAllocation;
+  EXPECT_FALSE(tracker.recordDeallocation(&unknownAllocation));
+  const auto owner = makeOwner("compromised-baseline", "plan-a", 1, 2, 3);
+  tracker.registerOwner(owner);
+  const auto task = makeCaptureTask("compromised-baseline");
+  ASSERT_TRUE(tracker.tryBeginCapture(
+      task,
+      {GpuMemoryCapturePlanNode{
+          .id = "plan-a", .type = "TestPlanNode", .sourceIds = {}}}));
+  tracker.finishCapture(task.taskUuid, task.taskId, "finished", true);
+  stopGpuMemoryCapture();
+
+  const auto capture = readRawCapture(path);
+  EXPECT_FALSE(capture["integrity"]["exact_memory_timeline"].asBool());
+  EXPECT_FALSE(capture["summary"]["capture_local_peak_exact"].asBool());
+  EXPECT_EQ(capture["integrity"]["internal_data_loss_events"].asInt(), 1);
+  EXPECT_EQ(capture["initial_snapshot"]["source_data_loss_events"].asInt(), 1);
+  ASSERT_EQ(capture["data_loss_events"].size(), 1);
+  EXPECT_EQ(
+      capture["data_loss_events"][0]["reason"].asString(),
+      "source ledger baseline was compromised before capture");
+}
+
+TEST(GpuMemoryCaptureTest, BoundsBoundarySnapshotsToLiveOwners) {
   stopGpuMemoryCapture();
   const auto path = rawCapturePath("bounded-snapshot");
   std::filesystem::remove(path);
@@ -1078,8 +1318,7 @@ TEST(GpuMemoryCaptureTest, BoundsBoundarySnapshotsToLiveAndSelectedOwners) {
   GpuMemoryAllocationTracker tracker;
   const auto historicalHandle =
       tracker.registerOwner(makeOwner("historical", "plan-old", 1, 1, 1));
-  const auto selectedHandle =
-      tracker.registerOwner(makeOwner("selected-bounded", "plan-a", 2, 2, 2));
+  tracker.registerOwner(makeOwner("selected-bounded", "plan-a", 2, 2, 2));
   const auto concurrentHandle =
       tracker.registerOwner(makeOwner("concurrent", "plan-b", 3, 3, 3));
   int historicalAllocation;
@@ -1101,9 +1340,7 @@ TEST(GpuMemoryCaptureTest, BoundsBoundarySnapshotsToLiveAndSelectedOwners) {
   const auto capture = readRawCapture(path);
   EXPECT_THAT(
       jsonIntColumn(capture["owners"], "owner_id"),
-      testing::UnorderedElementsAre(
-          static_cast<int64_t>(selectedHandle.ownerId),
-          static_cast<int64_t>(concurrentHandle.ownerId)));
+      testing::ElementsAre(static_cast<int64_t>(concurrentHandle.ownerId)));
   EXPECT_EQ(capture["initial_snapshot"]["current_bytes"].asInt(), 20);
   EXPECT_EQ(capture["initial_snapshot"]["current_allocations"].asInt(), 1);
   EXPECT_FALSE(
@@ -1111,11 +1348,42 @@ TEST(GpuMemoryCaptureTest, BoundsBoundarySnapshotsToLiveAndSelectedOwners) {
   EXPECT_TRUE(capture["initial_snapshot"]["allocations"].empty());
   EXPECT_THAT(
       jsonIntColumn(capture["initial_snapshot"]["owners"], "owner_id"),
-      testing::UnorderedElementsAre(
-          static_cast<int64_t>(selectedHandle.ownerId),
-          static_cast<int64_t>(concurrentHandle.ownerId)));
+      testing::ElementsAre(static_cast<int64_t>(concurrentHandle.ownerId)));
 
   ASSERT_TRUE(tracker.recordDeallocation(&concurrentAllocation));
+}
+
+TEST(GpuMemoryCaptureTest, StopDiscardsCaptureWithoutTerminalWatermark) {
+  stopGpuMemoryCapture();
+  const auto path = rawCapturePath("stop-without-watermark");
+  std::filesystem::remove(path);
+  auto cleanup = folly::makeGuard([&] {
+    stopGpuMemoryCapture();
+    std::filesystem::remove(path);
+  });
+
+  GpuMemoryCaptureConfig config;
+  config.pathPattern = path.string();
+  config.maxEvents = 4;
+  ASSERT_TRUE(startGpuMemoryCapture(config));
+  const auto task = makeCaptureTask("stop-without-watermark");
+  const GpuMemoryOwnerHandle handle{1, 1};
+  const auto owner = makeOwner("stop-without-watermark", "plan-a", 1, 2, 3);
+  const auto initial =
+      makeCaptureSnapshot(0, 0, 10, {makeCaptureOwner(handle, owner, 0, 0)});
+  ASSERT_TRUE(gpu_memory_detail::tryBeginGpuMemoryCapture(task, {}, initial));
+  gpu_memory_detail::recordGpuMemoryCaptureUpdate(makeCaptureUpdate(
+      11,
+      gpu_memory_detail::gpuMemoryMonotonicTimeNs(),
+      handle,
+      10,
+      10,
+      10,
+      10));
+
+  stopGpuMemoryCapture();
+
+  EXPECT_FALSE(std::filesystem::exists(path));
 }
 
 TEST(GpuMemoryCaptureTest, DisabledAndFinishedOperationsAreIdempotent) {
@@ -1136,8 +1404,10 @@ TEST(GpuMemoryCaptureTest, DisabledAndFinishedOperationsAreIdempotent) {
       .globalPeakBytes = 1,
       .deltaBytes = 1};
   gpu_memory_detail::recordGpuMemoryCaptureUpdate(ignoredUpdate);
+  const auto ignoredOwner = makeOwner("ignored", "ignored", 0, 0, 0);
   EXPECT_FALSE(
-      gpu_memory_detail::beginGpuMemoryCaptureOperatorCall(1, "ignored")
+      gpu_memory_detail::beginGpuMemoryCaptureOperatorCall(
+          1, 1, ignoredOwner, "ignored")
           .active);
   gpu_memory_detail::finishGpuMemoryCapture(
       "missing-uuid", "missing-task", "finished", true, {});

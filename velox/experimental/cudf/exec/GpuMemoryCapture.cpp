@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -31,6 +32,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -111,6 +113,7 @@ struct CaptureData {
   GpuMemorySnapshot initialSnapshot;
   GpuMemorySnapshot finalSnapshot;
   std::map<uint64_t, CapturedOwner> owners;
+  std::set<uint64_t> requiredOwnerIds;
   std::vector<CapturedMemoryUpdate> memoryUpdates;
   std::vector<CapturedCallSpan> operatorCalls;
   std::vector<CapturedMarker> markers;
@@ -135,6 +138,7 @@ struct CaptureData {
   uint64_t observedPeakEventSequence{0};
   uint64_t observedPeakSourceSequence{0};
   std::size_t maxEvents{0};
+  std::size_t ownerMetadataCapacity{0};
   std::size_t memoryUpdateCapacity{0};
   std::size_t operatorCallCapacity{0};
   std::string taskState;
@@ -143,6 +147,7 @@ struct CaptureData {
   bool memoryUpdateOverflow{false};
   bool operatorCallOverflow{false};
   bool sourceSequenceGap{false};
+  bool ownerMetadataComplete{true};
   bool complete{false};
   bool cleanupComplete{false};
 };
@@ -208,6 +213,19 @@ bool taskMatches(const GpuMemoryCaptureTask& task, std::string_view filter) {
   return filter.empty() || task.queryId.find(filter) != std::string::npos ||
       task.taskId.find(filter) != std::string::npos ||
       task.taskUuid.find(filter) != std::string::npos;
+}
+
+GpuMemoryOwner capturedUnattributedOwner() {
+  return GpuMemoryOwner{
+      "<unattributed>",
+      "<unattributed>",
+      "<unattributed>",
+      "<unattributed>",
+      "<unattributed>",
+      -1,
+      -1,
+      -1,
+      "<unattributed>"};
 }
 
 folly::dynamic ownerIdentity(const GpuMemoryOwner& owner) {
@@ -282,14 +300,6 @@ std::set<uint64_t> relevantOwnerIds(const CaptureData& capture) {
   includeSnapshot(capture.initialSnapshot);
   includeSnapshot(capture.finalSnapshot);
 
-  for (const auto& [ownerId, owner] : capture.owners) {
-    const bool matchesSelectedTask = capture.task.taskUuid.empty()
-        ? owner.owner.taskId == capture.task.taskId
-        : owner.owner.taskUuid == capture.task.taskUuid;
-    if (matchesSelectedTask) {
-      result.insert(ownerId);
-    }
-  }
   for (const auto& event : capture.memoryUpdates) {
     result.insert(event.update.ownerId);
   }
@@ -417,9 +427,11 @@ folly::dynamic captureJson(const CaptureData& capture) {
           capture.initialSnapshot.dataLossEvents
       : 0;
   const bool exactMemoryTimeline = capture.complete &&
+      capture.initialSnapshot.dataLossEvents == 0 &&
       !capture.memoryUpdateOverflow && capture.internalDataLossEvents == 0 &&
       sourceDataLossEvents == 0 && hasCompleteSourceSequence(capture);
   const bool captureLocalPeakExact = capture.complete &&
+      capture.initialSnapshot.dataLossEvents == 0 &&
       capture.finalSnapshot.sequence >= capture.initialSnapshot.sequence &&
       capture.internalDataLossEvents == 0 && sourceDataLossEvents == 0 &&
       !capture.sourceSequenceGap &&
@@ -554,17 +566,12 @@ class GpuMemoryCaptureController {
       {
         std::lock_guard<std::mutex> lock(mutex_);
         enabled_ = false;
+        activeCapture_.store(false, std::memory_order_release);
         if (active_ != nullptr) {
-          active_->complete = false;
-          active_->cleanupComplete = false;
-          active_->endReason = "capture_service_stopped";
-          active_->taskState = "unknown";
-          active_->endTimestampNs =
-              gpu_memory_detail::gpuMemoryMonotonicTimeNs();
-          active_->endUnixNs = gpu_memory_detail::gpuMemoryUnixTimeNs();
-          active_->finalSnapshot = active_->initialSnapshot;
-          clipOpenCalls(*active_, active_->endTimestampNs);
-          pending_.push_back(std::move(active_));
+          LOG(WARNING)
+              << "Discarding active GPU-memory capture because no terminal "
+                 "ledger watermark is available";
+          active_.reset();
         }
         stopping_ = true;
       }
@@ -585,6 +592,10 @@ class GpuMemoryCaptureController {
   bool enabled() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     return enabled_ && !taskSelected_;
+  }
+
+  bool active() const noexcept {
+    return activeCapture_.load(std::memory_order_acquire);
   }
 
   std::string lastPath() const {
@@ -611,6 +622,18 @@ class GpuMemoryCaptureController {
       capture->startTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
       capture->startUnixNs = gpu_memory_detail::gpuMemoryUnixTimeNs();
       capture->maxEvents = config_.maxEvents;
+      constexpr auto kOwnerMetadataSlack =
+          kMarkerCapacity + 2 * kCriticalEventCapacity;
+      const auto maximumSize = std::numeric_limits<std::size_t>::max();
+      capture->ownerMetadataCapacity = capture->initialSnapshot.owners.size();
+      const auto additionalCapacity =
+          config_.maxEvents > maximumSize - kOwnerMetadataSlack
+          ? maximumSize
+          : config_.maxEvents + kOwnerMetadataSlack;
+      capture->ownerMetadataCapacity =
+          capture->ownerMetadataCapacity > maximumSize - additionalCapacity
+          ? maximumSize
+          : capture->ownerMetadataCapacity + additionalCapacity;
       capture->operatorCallCapacity = config_.maxEvents / 4;
       capture->memoryUpdateCapacity =
           config_.maxEvents - capture->operatorCallCapacity;
@@ -631,8 +654,21 @@ class GpuMemoryCaptureController {
       capture->observedPeakTimestampNs = capture->startTimestampNs;
       capture->observedPeakSourceSequence = capture->initialSnapshot.sequence;
       capture->lastObservedSourceSequence = capture->initialSnapshot.sequence;
+      retainOwnerMetadata(
+          *capture, CapturedOwner{0, 0, capturedUnattributedOwner()}, true);
       mergeSnapshotOwners(*capture, capture->initialSnapshot);
+      if (capture->initialSnapshot.dataLossEvents > 0) {
+        ++capture->internalDataLossEvents;
+        const auto eventSequence = retainEvent(*capture);
+        capture->dataLossEvents.push_back(
+            CapturedDataLoss{
+                eventSequence,
+                capture->startTimestampNs,
+                capture->initialSnapshot.sequence,
+                "source ledger baseline was compromised before capture"});
+      }
       active_ = std::move(capture);
+      activeCapture_.store(true, std::memory_order_release);
       taskSelected_ = true;
       LOG(INFO) << "GPU-memory capture selected query " << task.queryId
                 << ", task " << task.taskId;
@@ -660,8 +696,10 @@ class GpuMemoryCaptureController {
       if (!matchesTask) {
         return;
       }
+      activeCapture_.store(false, std::memory_order_release);
       active_->finalSnapshot = std::move(finalSnapshot);
       mergeSnapshotOwners(*active_, active_->finalSnapshot);
+      verifyRequiredOwnerMetadata(*active_);
       active_->endTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
       active_->endUnixNs = gpu_memory_detail::gpuMemoryUnixTimeNs();
       active_->taskState = boundedString(taskState, 64);
@@ -684,8 +722,10 @@ class GpuMemoryCaptureController {
       if (active_ == nullptr) {
         return;
       }
+      activeCapture_.store(false, std::memory_order_release);
       active_->finalSnapshot = std::move(finalSnapshot);
       mergeSnapshotOwners(*active_, active_->finalSnapshot);
+      verifyRequiredOwnerMetadata(*active_);
       active_->endTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
       active_->endUnixNs = gpu_memory_detail::gpuMemoryUnixTimeNs();
       active_->taskState = "aborted";
@@ -709,14 +749,27 @@ class GpuMemoryCaptureController {
       if (active_ == nullptr) {
         return;
       }
-      active_->owners.try_emplace(
-          ownerId, CapturedOwner{ownerId, planNodeId, owner});
+      retainOwnerMetadata(
+          *active_, CapturedOwner{ownerId, planNodeId, owner}, false);
     } catch (...) {
       noteInternalDataLoss("owner metadata capture exception", 0);
     }
   }
 
   void recordUpdate(const GpuMemoryTraceUpdate& update) noexcept {
+    recordUpdate(update, nullptr);
+  }
+
+  void recordUpdate(
+      const GpuMemoryTraceUpdate& update,
+      const GpuMemoryOwner& owner) noexcept {
+    recordUpdate(update, &owner);
+  }
+
+ private:
+  void recordUpdate(
+      const GpuMemoryTraceUpdate& update,
+      const GpuMemoryOwner* owner) noexcept {
     try {
       std::lock_guard<std::mutex> lock(mutex_);
       if (active_ == nullptr ||
@@ -741,6 +794,17 @@ class GpuMemoryCaptureController {
         noteOverflow(*active_);
         return;
       }
+      const bool hasOwnerMetadata = owner == nullptr
+          ? requireExistingOwnerMetadata(*active_, update.ownerId)
+          : retainOwnerMetadata(
+                *active_,
+                CapturedOwner{update.ownerId, update.planNodeId, *owner},
+                true);
+      if (!hasOwnerMetadata) {
+        active_->memoryUpdateOverflow = true;
+        noteMissingOwnerMetadata(*active_);
+        return;
+      }
       const auto eventSequence = retainEvent(*active_);
       active_->memoryUpdates.push_back(
           CapturedMemoryUpdate{eventSequence, update});
@@ -752,8 +816,11 @@ class GpuMemoryCaptureController {
     }
   }
 
+ public:
   GpuMemoryCaptureCallHandle beginCall(
       uint64_t ownerId,
+      uint64_t planNodeId,
+      const GpuMemoryOwner& owner,
       std::string_view callName) noexcept {
     try {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -765,6 +832,11 @@ class GpuMemoryCaptureController {
           active_->freeCallSlots.empty()) {
         active_->operatorCallOverflow = true;
         noteOverflow(*active_);
+        return {};
+      }
+      if (!retainOwnerMetadata(
+              *active_, CapturedOwner{ownerId, planNodeId, owner}, true)) {
+        noteMissingOwnerMetadata(*active_);
         return {};
       }
       GpuMemoryCaptureCallHandle handle;
@@ -826,7 +898,11 @@ class GpuMemoryCaptureController {
     }
   }
 
-  void recordMarker(uint64_t ownerId, std::string_view name) noexcept {
+  void recordMarker(
+      uint64_t ownerId,
+      uint64_t planNodeId,
+      const GpuMemoryOwner& owner,
+      std::string_view name) noexcept {
     try {
       std::lock_guard<std::mutex> lock(mutex_);
       if (active_ == nullptr) {
@@ -834,6 +910,11 @@ class GpuMemoryCaptureController {
       }
       if (active_->markers.size() >= kMarkerCapacity) {
         noteOverflow(*active_);
+        return;
+      }
+      if (!retainOwnerMetadata(
+              *active_, CapturedOwner{ownerId, planNodeId, owner}, true)) {
+        noteMissingOwnerMetadata(*active_);
         return;
       }
       const auto eventSequence = retainEvent(*active_);
@@ -852,6 +933,8 @@ class GpuMemoryCaptureController {
       uint64_t timestampNs,
       uint64_t sourceSequence,
       uint64_t ownerId,
+      uint64_t planNodeId,
+      const GpuMemoryOwner& owner,
       std::size_t requestedBytes,
       uint64_t globalCurrentBytes,
       uint64_t globalPeakBytes,
@@ -867,6 +950,11 @@ class GpuMemoryCaptureController {
       }
       if (active_->oomEvents.size() >= kCriticalEventCapacity) {
         noteCriticalEventLoss(*active_);
+        return;
+      }
+      if (!retainOwnerMetadata(
+              *active_, CapturedOwner{ownerId, planNodeId, owner}, true)) {
+        noteMissingOwnerMetadata(*active_);
         return;
       }
       const auto eventSequence = retainEvent(*active_);
@@ -918,16 +1006,86 @@ class GpuMemoryCaptureController {
       CaptureData& capture,
       const GpuMemorySnapshot& snapshot) {
     for (const auto& owner : snapshot.owners) {
-      capture.owners.try_emplace(
-          owner.handle.ownerId,
-          CapturedOwner{
-              owner.handle.ownerId, owner.handle.planNodeId, owner.owner});
+      if (!retainOwnerMetadata(
+              capture,
+              CapturedOwner{
+                  owner.handle.ownerId, owner.handle.planNodeId, owner.owner},
+              true)) {
+        noteMissingOwnerMetadata(capture);
+      }
     }
+  }
+
+  static bool requireExistingOwnerMetadata(
+      CaptureData& capture,
+      uint64_t ownerId) {
+    if (!capture.owners.contains(ownerId)) {
+      return false;
+    }
+    capture.requiredOwnerIds.insert(ownerId);
+    return true;
+  }
+
+  static bool retainOwnerMetadata(
+      CaptureData& capture,
+      CapturedOwner owner,
+      bool required) {
+    if (auto existing = capture.owners.find(owner.ownerId);
+        existing != capture.owners.end()) {
+      if (existing->second.owner.planNodeType.empty() &&
+          !owner.owner.planNodeType.empty()) {
+        existing->second = std::move(owner);
+      }
+      if (required) {
+        capture.requiredOwnerIds.insert(existing->first);
+      }
+      return true;
+    }
+
+    if (capture.owners.size() >= capture.ownerMetadataCapacity) {
+      const auto unused = std::find_if(
+          capture.owners.begin(),
+          capture.owners.end(),
+          [&capture](const auto& entry) {
+            return !capture.requiredOwnerIds.contains(entry.first);
+          });
+      if (unused == capture.owners.end()) {
+        return false;
+      }
+      capture.owners.erase(unused);
+    }
+    const auto ownerId = owner.ownerId;
+    capture.owners.emplace(ownerId, std::move(owner));
+    if (required) {
+      capture.requiredOwnerIds.insert(ownerId);
+    }
+    return true;
+  }
+
+  static void verifyRequiredOwnerMetadata(CaptureData& capture) {
+    const bool complete = std::all_of(
+        capture.requiredOwnerIds.begin(),
+        capture.requiredOwnerIds.end(),
+        [&capture](uint64_t ownerId) {
+          return capture.owners.contains(ownerId);
+        });
+    if (complete) {
+      return;
+    }
+    capture.ownerMetadataComplete = false;
+    ++capture.internalDataLossEvents;
+    noteOverflow(capture);
   }
 
   static void noteOverflow(CaptureData& capture) {
     capture.captureOverflow = true;
     ++capture.droppedEvents;
+  }
+
+  static void noteMissingOwnerMetadata(CaptureData& capture) {
+    capture.ownerMetadataComplete = false;
+    ++capture.internalDataLossEvents;
+    noteOverflow(capture);
   }
 
   static void noteCriticalEventLoss(CaptureData& capture) {
@@ -1014,6 +1172,11 @@ class GpuMemoryCaptureController {
       }
 
       try {
+        if (!capture->ownerMetadataComplete) {
+          LOG(ERROR) << "Discarding GPU-memory capture because bounded owner "
+                        "metadata could not describe every retained fact";
+          continue;
+        }
         const auto path = resolvePath(config.pathPattern, capture->task);
         const auto document = folly::toJson(captureJson(*capture));
         std::string error;
@@ -1043,6 +1206,7 @@ class GpuMemoryCaptureController {
   std::string lastPath_;
   uint64_t nextCaptureId_{0};
   uint64_t nextCallId_{0};
+  std::atomic<bool> activeCapture_{false};
   bool enabled_{false};
   bool stopping_{false};
   bool taskSelected_{false};
@@ -1080,6 +1244,10 @@ void markGpuMemoryProfile(std::string_view name) noexcept {
 }
 
 namespace gpu_memory_detail {
+
+bool gpuMemoryCaptureActive() noexcept {
+  return captureController().active();
+}
 
 uint64_t gpuMemoryMonotonicTimeNs() noexcept {
   return static_cast<uint64_t>(
@@ -1130,10 +1298,18 @@ void recordGpuMemoryCaptureUpdate(const GpuMemoryTraceUpdate& update) noexcept {
   captureController().recordUpdate(update);
 }
 
+void recordGpuMemoryCaptureUpdate(
+    const GpuMemoryTraceUpdate& update,
+    const GpuMemoryOwner& owner) noexcept {
+  captureController().recordUpdate(update, owner);
+}
+
 GpuMemoryCaptureCallHandle beginGpuMemoryCaptureOperatorCall(
     uint64_t ownerId,
+    uint64_t planNodeId,
+    const GpuMemoryOwner& owner,
     std::string_view callName) noexcept {
-  return captureController().beginCall(ownerId, callName);
+  return captureController().beginCall(ownerId, planNodeId, owner, callName);
 }
 
 void endGpuMemoryCaptureOperatorCall(
@@ -1145,6 +1321,8 @@ void recordGpuMemoryCaptureOom(
     uint64_t timestampNs,
     uint64_t sourceSequence,
     uint64_t ownerId,
+    uint64_t planNodeId,
+    const GpuMemoryOwner& owner,
     std::size_t requestedBytes,
     uint64_t globalCurrentBytes,
     uint64_t globalPeakBytes,
@@ -1157,6 +1335,8 @@ void recordGpuMemoryCaptureOom(
       timestampNs,
       sourceSequence,
       ownerId,
+      planNodeId,
+      owner,
       requestedBytes,
       globalCurrentBytes,
       globalPeakBytes,
@@ -1175,8 +1355,10 @@ void recordGpuMemoryCaptureDataLoss(
 
 void recordGpuMemoryCaptureMarker(
     uint64_t ownerId,
+    uint64_t planNodeId,
+    const GpuMemoryOwner& owner,
     std::string_view name) noexcept {
-  captureController().recordMarker(ownerId, name);
+  captureController().recordMarker(ownerId, planNodeId, owner, name);
 }
 
 } // namespace gpu_memory_detail

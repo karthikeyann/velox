@@ -115,6 +115,22 @@ class GpuMemoryAllocationTracker {
   /// Registers an operator, resolving display metadata only for a new owner.
   GpuMemoryOwnerHandle registerOperator(exec::Operator* op);
 
+  /// Atomically records a call begin with canonical owner metadata.
+  GpuMemoryCaptureCallHandle beginCaptureCall(
+      uint64_t ownerId,
+      std::string_view callName) noexcept;
+
+  /// Atomically records a custom marker with canonical owner metadata.
+  void recordCaptureMarker(uint64_t ownerId, std::string_view name) noexcept;
+
+  /// Atomically records an allocation failure with canonical owner metadata.
+  void recordCaptureOom(
+      const GpuMemoryTraceUpdate& state,
+      std::size_t requestedBytes,
+      std::size_t cudaFreeBytes,
+      std::size_t cudaTotalBytes,
+      std::string_view cudaStatus) noexcept;
+
   /// Records a successful allocation.
   ///
   /// Returns the fully ordered counter transition, or no value for a null
@@ -213,6 +229,13 @@ GpuMemoryActiveOwner activateGpuMemoryOperator(exec::Operator* op) noexcept;
 
 /// Returns the active thread-local attribution.
 GpuMemoryActiveOwner activeGpuMemoryOwner() noexcept;
+
+/// Begins a capture call with canonical metadata for the active owner.
+GpuMemoryCaptureCallHandle beginActiveGpuMemoryCaptureCall(
+    std::string_view callName) noexcept;
+
+/// Records a marker with canonical metadata for the active owner.
+void recordActiveGpuMemoryCaptureMarker(std::string_view name) noexcept;
 
 /// Restores a previously active thread-local owner.
 void restoreGpuMemoryOwner(GpuMemoryActiveOwner owner) noexcept;

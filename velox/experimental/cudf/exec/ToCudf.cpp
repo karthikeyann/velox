@@ -339,21 +339,16 @@ bool CompileState::compile(bool allowCpuFallback) {
   }
 
   if (debugEnabled) {
-    // Print before/after together for easy comparison.
+    // Print the stable descriptions captured before operator replacement.
     LOG(INFO) << "Operators " << "before adapting for cuDF" << ": count ["
               << beforeOperators.size() << "]";
     for (const auto& [id, desc] : beforeOperators) {
       LOG(INFO) << "  Operator: ID " << id << ": " << desc;
     }
     LOG(INFO) << "allowCpuFallback = " << allowCpuFallback;
-
-    operators = driver_.operators();
-    LOG(INFO) << "Operators " << "after adapting for cuDF" << ": count ["
-              << operators.size() << "]";
-    for (const auto& op : operators) {
-      LOG(INFO) << "  Operator: ID " << op->operatorId() << ": "
-                << op->toString();
-    }
+    LOG(INFO)
+        << "Post-adaptation operators are not dereferenced because replacement "
+           "invalidates the original driver pointers";
   }
 
   return replacementsMade;
@@ -371,11 +366,16 @@ struct CudfDriverAdapter {
       return false;
     }
     auto state = CompileState(factory, driver);
+    const auto originalOperators = driver.operators();
+    const bool hadGpuOperator = std::any_of(
+        originalOperators.begin(), originalOperators.end(), [](const auto* op) {
+          return isAnyOf<CudfOperator, CudfOperatorBase>(op);
+        });
     const auto replacementsMade = state.compile(allowCpuFallback_);
     if (CudfConfig::getInstance().gpuMemoryTrackingEnabled()) {
       // Avoid inspecting driver operators here because compilation replaces
       // them and invalidates pointers cached by the original driver.
-      if (replacementsMade && gpuMemoryCaptureEnabled()) {
+      if ((hadGpuOperator || replacementsMade) && gpuMemoryCaptureEnabled()) {
         const auto& task = driver.driverCtx()->task;
         tryBeginGpuMemoryCaptureForTask(
             GpuMemoryCaptureTask{

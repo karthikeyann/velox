@@ -96,6 +96,9 @@ void markGpuMemoryProfile(std::string_view name) noexcept;
 
 namespace gpu_memory_detail {
 
+/// Returns true while one task capture is actively recording.
+bool gpuMemoryCaptureActive() noexcept;
+
 /// Returns monotonic nanoseconds independent of a visualization backend.
 uint64_t gpuMemoryMonotonicTimeNs() noexcept;
 
@@ -130,9 +133,16 @@ void registerGpuMemoryCaptureOwner(
 /// Records one process-wide logical-memory transition.
 void recordGpuMemoryCaptureUpdate(const GpuMemoryTraceUpdate& update) noexcept;
 
+/// Atomically records owner metadata with its logical-memory transition.
+void recordGpuMemoryCaptureUpdate(
+    const GpuMemoryTraceUpdate& update,
+    const GpuMemoryOwner& owner) noexcept;
+
 /// Records an operator-call begin and returns its allocation-free handle.
 GpuMemoryCaptureCallHandle beginGpuMemoryCaptureOperatorCall(
     uint64_t ownerId,
+    uint64_t planNodeId,
+    const GpuMemoryOwner& owner,
     std::string_view callName) noexcept;
 
 /// Records a completed operator-call span.
@@ -144,6 +154,8 @@ void recordGpuMemoryCaptureOom(
     uint64_t timestampNs,
     uint64_t sourceSequence,
     uint64_t ownerId,
+    uint64_t planNodeId,
+    const GpuMemoryOwner& owner,
     std::size_t requestedBytes,
     uint64_t globalCurrentBytes,
     uint64_t globalPeakBytes,
@@ -161,6 +173,8 @@ void recordGpuMemoryCaptureDataLoss(
 /// Records a user-defined analysis marker.
 void recordGpuMemoryCaptureMarker(
     uint64_t ownerId,
+    uint64_t planNodeId,
+    const GpuMemoryOwner& owner,
     std::string_view name) noexcept;
 
 } // namespace gpu_memory_detail

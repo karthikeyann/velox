@@ -140,8 +140,6 @@ void resetGpuMemoryNvtxCounters() noexcept;
 
 /// Emits a factual allocation-failure marker and current logical state.
 void emitGpuMemoryTraceOom(
-    uint64_t timestampNs,
-    uint64_t sourceSequence,
     uint64_t ownerId,
     std::size_t requestedBytes,
     uint64_t globalCurrentBytes,

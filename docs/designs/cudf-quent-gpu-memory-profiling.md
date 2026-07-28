@@ -149,14 +149,18 @@ Metadata is interned outside the allocation path and referenced by numeric IDs:
 - Custom marker names carried by marker records.
 
 An owner registration is idempotent. Metadata must be available for every owner
-referenced by a retained event or snapshot.
+referenced by a retained event or snapshot. Registration supplies an evictable
+candidate; every memory transition, call, marker, and allocation failure
+retains canonical owner metadata under the same recorder lock as its fact. This
+also covers an operator scope that began before the selected capture. The
+reserved unattributed owner is pinned for facts outside an operator scope.
 
 ### Beginning snapshot
 
 The beginning snapshot is a consistent ledger snapshot containing:
 
 - Global current logical bytes.
-- Current bytes for every live owner and every selected-Task owner.
+- Current bytes for every live owner.
 - Owner metadata required by non-zero values.
 - Live allocation count and source data-loss count.
 - The beginning source sequence.
@@ -260,6 +264,10 @@ balanced call spans.
 
 The Task listener must not perform Quent replay, blocking file writes, or Rust
 FFI. It only seals and transfers ownership of an immutable capture.
+Worker cleanup supplies a final ledger snapshot before aborting an active
+capture. Stopping the recorder without such a snapshot discards the active
+capture because reusing the beginning snapshot as the ending watermark would
+create a self-contradictory artifact.
 
 ## Bounded recorder
 
@@ -271,10 +279,19 @@ data-loss facts use small, fixed out-of-band budgets so an exhausted ordinary
 timeline cannot hide the reason a query failed. No storage grows on an
 allocation callback.
 
-Boundary snapshots use intrusive live-owner and Task-owner indexes, so they do
-not scan or copy every owner accumulated over a long-lived worker. Their size
-is proportional to currently live owners plus the selected Task's owners, not
-the number of allocations or historical queries.
+Boundary snapshots use an intrusive live-owner index, so they do not scan or
+copy every owner accumulated over a long-lived worker. Their size is
+proportional to currently live owners, not the number of allocations,
+historical queries, drivers, or zero-fact operators. The separate typed plan
+and retained owner-bearing facts provide selected-Task structure.
+
+Owner metadata uses a separate bounded table. Metadata referenced by an event
+or boundary snapshot becomes protected; unused registration candidates remain
+evictable. Its capacity is the beginning-snapshot owner count plus the ordinary
+event budget and fixed critical-event budgets. A fact and its canonical owner
+metadata are accepted atomically under the recorder lock. If required metadata
+cannot fit, the recorder rejects that fact, marks integrity incomplete, and
+emits an inspectable artifact without unresolved IDs.
 
 When capacity is exhausted:
 
@@ -382,7 +399,7 @@ it is not loaded into Velox.
 
 A capture is exact only when all of the following hold:
 
-1. No source-ledger data loss occurred during its interval.
+1. No source-ledger data loss occurred before or during its interval.
 2. The recorder did not overflow or reject an event.
 3. Memory source sequences are unique and contiguous from `B + 1` through `E`.
 4. Memory timestamps are monotonically increasing in source order.
@@ -409,6 +426,11 @@ Telemetry follows a fail-open policy:
 - A temporary output is atomically renamed only after successful conversion.
 - Partial output retains an explicit incomplete status or is removed.
 
+A non-zero data-loss count in the beginning snapshot means the absolute
+baseline may already be wrong. The producer emits an explicit data-loss fact
+and marks both the memory timeline and capture-local peak inexact even if no
+additional loss occurs during the selected task.
+
 ## Validation
 
 ### Unit tests
@@ -417,9 +439,17 @@ Telemetry follows a fail-open policy:
 - Delayed publication at the beginning and ending boundaries.
 - Bounded capacity and visible overflow.
 - Disabled and repeated-finish behavior.
+- Recorder stop without a terminal watermark.
 - Baseline memory and capture-local peak reconstruction.
 - Process-wide concurrent holders during one selected Task.
 - Owner metadata deduplication.
+- Atomic metadata retention for a pre-registered concurrent owner that becomes
+  transiently live during the selected capture.
+- Atomic call, marker, and OOM metadata after bounded candidate churn.
+- Omission of zero-live, zero-fact selected owners at both boundaries.
+- Active-owner marker attribution for an operator scope spanning capture start.
+- Unattributed custom-marker metadata.
+- A compromised beginning ledger baseline.
 - Cross-thread free attribution.
 - Balanced and truncated operator calls.
 - Adapter failure isolation.
