@@ -263,6 +263,14 @@ CudfHashJoinBuild::CudfHashJoinBuild(
 void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
   // Queue inputs, process all at once.
   if (input->size() > 0) {
+    if (memoryTrackingEnabled()) {
+      addRuntimeStat(
+          "gpuHashJoinBuildInputBytes",
+          RuntimeCounter(
+              saturateCast(input->estimateFlatSize()),
+              RuntimeCounter::Unit::kBytes));
+      addRuntimeStat("gpuHashJoinBuildInputBatches", RuntimeCounter(1));
+    }
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     VELOX_CHECK_NOT_NULL(cudfInput);
     // Count nulls in join key columns
@@ -341,6 +349,24 @@ void CudfHashJoinBuild::doNoMoreInput() {
 
   for (auto const& tbl : tbls) {
     VELOX_CHECK_NOT_NULL(tbl);
+  }
+  if (memoryTrackingEnabled()) {
+    uint64_t builtTableBytes{0};
+    uint64_t builtTableRows{0};
+    for (const auto& tbl : tbls) {
+      builtTableBytes += tbl->alloc_size();
+      builtTableRows += tbl->num_rows();
+    }
+    addRuntimeStat(
+        "gpuHashJoinBuiltTableBytes",
+        RuntimeCounter(
+            saturateCast(builtTableBytes), RuntimeCounter::Unit::kBytes));
+    addRuntimeStat(
+        "gpuHashJoinBuiltTableRows",
+        RuntimeCounter(saturateCast(builtTableRows)));
+    addRuntimeStat(
+        "gpuHashJoinBuiltTableBatches",
+        RuntimeCounter(saturateCast(tbls.size())));
   }
   if (CudfConfig::getInstance().debugEnabled && !tbls.empty()) {
     VLOG(1) << "Build table number of columns: " << tbls[0]->num_columns();

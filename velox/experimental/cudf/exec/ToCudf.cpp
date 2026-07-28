@@ -32,8 +32,11 @@
 #include "velox/experimental/cudf/expression/JitExpression.h"
 
 #include "folly/Conv.h"
+#include "folly/ScopeGuard.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
+#include "velox/exec/PlanNodeStats.h"
+#include "velox/exec/Task.h"
 #include "velox/exec/Values.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
@@ -41,13 +44,99 @@
 
 #include <cuda.h>
 
+#include <exception>
 #include <iostream>
+#include <vector>
 
 static const std::string kCudfAdapterName = "cuDF";
 
 namespace facebook::velox::cudf_velox {
 
 namespace {
+
+std::string exceptionText(const std::exception_ptr& error) {
+  if (error == nullptr) {
+    return "<none>";
+  }
+
+  try {
+    std::rethrow_exception(error);
+  } catch (const std::exception& exception) {
+    return exception.what();
+  } catch (...) {
+    return "<unknown>";
+  }
+}
+
+void logTaskCompletion(
+    const std::string& taskUuid,
+    const std::string& taskId,
+    exec::TaskState state,
+    const std::exception_ptr& error) {
+  LOG(INFO) << "GPU_MEMORY_TASK task_uuid=" << taskUuid << " task_id=" << taskId
+            << " state=" << exec::taskStateString(state)
+            << " exception=" << exceptionText(error);
+  logGpuMemorySnapshot(fmt::format(
+      "task_uuid={} task_id={} state={}",
+      taskUuid,
+      taskId,
+      exec::taskStateString(state)));
+}
+
+class CudfTaskListener final : public exec::TaskListener {
+ public:
+  void onTaskCompletion(
+      const std::string& taskUuid,
+      const std::string& taskId,
+      exec::TaskState state,
+      std::exception_ptr error,
+      exec::TaskStats /*stats*/) override {
+    auto retirementGuard =
+        folly::makeGuard([&] { retireGpuMemoryTask(taskUuid); });
+    logTaskCompletion(taskUuid, taskId, state, error);
+  }
+
+  void onTaskCompletion(
+      const std::string& taskUuid,
+      const std::string& taskId,
+      exec::TaskState state,
+      std::exception_ptr error,
+      const exec::TaskStats& stats,
+      const core::PlanFragment& fragment,
+      const std::unordered_map<
+          core::PlanNodeId,
+          std::shared_ptr<exec::ExchangeClient>>& /*exchangeClientMap*/)
+      override {
+    auto retirementGuard =
+        folly::makeGuard([&] { retireGpuMemoryTask(taskUuid); });
+    logTaskCompletion(taskUuid, taskId, state, error);
+    if (fragment.planNode != nullptr) {
+      LOG(INFO) << "GPU_MEMORY_TASK_PLAN task_uuid=" << taskUuid
+                << " task_id=" << taskId << '\n'
+                << exec::printPlanWithStats(*fragment.planNode, stats, true);
+    }
+  }
+};
+
+std::shared_ptr<exec::TaskListener> cudfTaskListener;
+std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
+    previousCudfMemoryResource;
+bool gpuMemoryDiagnosticsInstalled{false};
+
+struct RetiredGpuMemoryDiagnosticResource {
+  std::optional<GpuMemoryResourcePair> resources;
+  RetiredGpuMemoryDiagnosticResource* next{nullptr};
+};
+
+RetiredGpuMemoryDiagnosticResource*& retiredGpuMemoryDiagnosticResources() {
+  // Output buffers keep non-owning resource refs beyond unregister. The leaked
+  // stable nodes also avoid relocation and static-destruction ordering hazards.
+  static RetiredGpuMemoryDiagnosticResource* resources{nullptr};
+  return resources;
+}
+
+RetiredGpuMemoryDiagnosticResource* installedGpuMemoryDiagnosticRetirementSlot{
+    nullptr};
 
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
@@ -316,18 +405,34 @@ void registerCudf() {
   cudaFree(nullptr); // Initialize CUDA context at startup
 
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
-  auto mr = cudf_velox::createMemoryResource(
+  auto mainMr = cudf_velox::createMemoryResource(
       mrMode, CudfConfig::getInstance().memoryPercent);
-  cudf::set_current_device_resource(mr);
-  mr_ = std::move(mr);
 
   const auto& outputMrMode = CudfConfig::getInstance().outputMemoryResource;
+  auto outputMr = mainMr;
   if (!outputMrMode.empty() && outputMrMode != mrMode) {
-    output_mr_ = cudf_velox::createMemoryResource(
+    outputMr = cudf_velox::createMemoryResource(
         outputMrMode, CudfConfig::getInstance().memoryPercent);
-  } else {
-    output_mr_ = mr_;
   }
+
+  if (CudfConfig::getInstance().memoryTrackingEnabled) {
+    auto* retirementSlot = new RetiredGpuMemoryDiagnosticResource;
+    retirementSlot->next = retiredGpuMemoryDiagnosticResources();
+    retiredGpuMemoryDiagnosticResources() = retirementSlot;
+    installedGpuMemoryDiagnosticRetirementSlot = retirementSlot;
+    auto trackedResources = createGpuMemoryTrackingResources(
+        std::move(mainMr), std::move(outputMr));
+    mr_ = std::move(trackedResources.main);
+    output_mr_ = std::move(trackedResources.output);
+    gpuMemoryDiagnosticsInstalled = true;
+  } else {
+    gpuMemoryDiagnosticsInstalled = false;
+    installedGpuMemoryDiagnosticRetirementSlot = nullptr;
+    resetGpuMemoryTracking();
+    mr_ = std::move(mainMr);
+    output_mr_ = std::move(outputMr);
+  }
+  previousCudfMemoryResource = cudf::set_current_device_resource(mr_.value());
 
   exec::Operator::registerOperator(
       std::make_unique<CudfHashJoinBridgeTranslator>());
@@ -345,12 +450,46 @@ void registerCudf() {
     registerJitEvaluator(CudfConfig::getInstance().jitExpressionPriority);
   }
 
+  if (CudfConfig::getInstance().memoryTrackingEnabled) {
+    cudfTaskListener = std::make_shared<CudfTaskListener>();
+    VELOX_CHECK(
+        exec::registerTaskListener(cudfTaskListener),
+        "Failed to register cuDF task listener");
+  }
+
   isCudfRegistered = true;
 }
 
 void unregisterCudf() {
+  if (cudfTaskListener != nullptr) {
+    if (!exec::unregisterTaskListener(cudfTaskListener)) {
+      LOG(WARNING) << "cuDF task listener was not registered during cleanup";
+    }
+    cudfTaskListener.reset();
+  }
+  // Keeps the replaced wrapper alive while its other owning copies are reset.
+  [[maybe_unused]] std::optional<
+      cuda::mr::any_resource<cuda::mr::device_accessible>>
+      installedCudfMemoryResource;
+  if (previousCudfMemoryResource.has_value()) {
+    installedCudfMemoryResource = cudf::set_current_device_resource(
+        std::move(*previousCudfMemoryResource));
+    previousCudfMemoryResource.reset();
+  }
+  if (gpuMemoryDiagnosticsInstalled) {
+    VELOX_CHECK(
+        installedCudfMemoryResource.has_value() && output_mr_.has_value() &&
+            installedGpuMemoryDiagnosticRetirementSlot != nullptr,
+        "Tracked cuDF resource owners are missing during cleanup");
+    installedGpuMemoryDiagnosticRetirementSlot->resources =
+        GpuMemoryResourcePair{
+            std::move(*installedCudfMemoryResource), std::move(*output_mr_)};
+    installedGpuMemoryDiagnosticRetirementSlot = nullptr;
+    gpuMemoryDiagnosticsInstalled = false;
+  }
   output_mr_.reset();
   mr_.reset();
+  resetGpuMemoryTracking();
   exec::DriverFactory::adapters.erase(
       std::remove_if(
           exec::DriverFactory::adapters.begin(),
@@ -375,6 +514,9 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfDebugEnabled) != config.end()) {
     debugEnabled = folly::to<bool>(config[kCudfDebugEnabled]);
+  }
+  if (config.find(kCudfMemoryTrackingEnabled) != config.end()) {
+    memoryTrackingEnabled = folly::to<bool>(config[kCudfMemoryTrackingEnabled]);
   }
   if (config.find(kCudfMemoryResource) != config.end()) {
     memoryResource = config[kCudfMemoryResource];
