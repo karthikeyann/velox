@@ -30,6 +30,8 @@ struct CudfConfig {
   static constexpr const char* kCudfDebugEnabled{"cudf.debug_enabled"};
   static constexpr const char* kCudfMemoryTrackingEnabled{
       "cudf.memory_tracking_enabled"};
+  static constexpr const char* kCudfPerfettoMemoryTracePath{
+      "cudf.perfetto_memory_trace_path"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
@@ -69,8 +71,19 @@ struct CudfConfig {
   /// Enable debug printing.
   bool debugEnabled{false};
 
-  /// Enables diagnostic GPU allocation ownership and OOM logging.
+  /// Enables diagnostic GPU allocation ownership without a trace file.
   bool memoryTrackingEnabled{false};
+
+  /// Streams logical GPU-memory events to this Perfetto trace path.
+  ///
+  /// `%p` is replaced with the worker process ID. A non-empty path also
+  /// enables allocation tracking.
+  std::string perfettoMemoryTracePath;
+
+  /// Returns whether either snapshot or Perfetto diagnostics are requested.
+  bool gpuMemoryTrackingEnabled() const {
+    return memoryTrackingEnabled || !perfettoMemoryTracePath.empty();
+  }
 
   /// Allow fallback to CPU operators if GPU operator replacement fails.
   bool allowCpuFallback{true};

@@ -17,15 +17,16 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/DebugUtil.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTrace.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 
-#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/common/base/SpillConfig.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Operator.h"
 
 #include <glog/logging.h>
 
+#include <optional>
 #include <type_traits>
 
 namespace facebook::velox::cudf_velox {
@@ -126,38 +127,36 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
         className_(operatorName),
         nvtxMethods_(nvtxMethods),
         memoryTrackingEnabled_(
-            CudfConfig::getInstance().memoryTrackingEnabled) {}
+            CudfConfig::getInstance().gpuMemoryTrackingEnabled()) {}
 
   void addInput(RowVectorPtr input) final {
+    std::optional<GpuMemoryOperatorCall> memoryCall;
+    if (memoryTrackingEnabled_) {
+      memoryCall.emplace(this, "addInput");
+    }
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kAddInput, className_);
-    if (memoryTrackingEnabled_) {
-      addRuntimeStat(
-          "gpuInputBytes",
-          RuntimeCounter(
-              saturateCast(input->estimateFlatSize()),
-              RuntimeCounter::Unit::kBytes));
-    }
     doAddInput(std::move(input));
     checkCudaErrorInDebug();
   }
 
   RowVectorPtr getOutput() final {
+    std::optional<GpuMemoryOperatorCall> memoryCall;
+    if (memoryTrackingEnabled_) {
+      memoryCall.emplace(this, "getOutput");
+    }
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kGetOutput, className_);
     auto result = doGetOutput();
     checkCudaErrorInDebug();
-    if (memoryTrackingEnabled_ && result != nullptr) {
-      addRuntimeStat(
-          "gpuOutputBytes",
-          RuntimeCounter(
-              saturateCast(result->estimateFlatSize()),
-              RuntimeCounter::Unit::kBytes));
-    }
     return result;
   }
 
   void noMoreInput() final {
+    std::optional<GpuMemoryOperatorCall> memoryCall;
+    if (memoryTrackingEnabled_) {
+      memoryCall.emplace(this, "noMoreInput");
+    }
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kNoMoreInput, className_);
     doNoMoreInput();
@@ -165,15 +164,10 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
   void close() final {
-    if (!memoryTrackingEnabled_) {
-      VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
-          nvtxMethods_ & NvtxMethodFlag::kClose, className_);
-      doClose();
-      checkCudaErrorInDebug();
-      return;
+    std::optional<GpuMemoryOperatorCall> memoryCall;
+    if (memoryTrackingEnabled_) {
+      memoryCall.emplace(this, "close");
     }
-
-    RuntimeStatWriterScopeGuard statsWriterGuard(this);
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kClose, className_);
     doClose();
@@ -181,11 +175,6 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
  protected:
-  /// Returns whether diagnostic GPU memory tracking was enabled at creation.
-  [[nodiscard]] bool memoryTrackingEnabled() const {
-    return memoryTrackingEnabled_;
-  }
-
   virtual void doAddInput(RowVectorPtr input) = 0;
 
   virtual RowVectorPtr doGetOutput() = 0;

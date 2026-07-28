@@ -111,9 +111,6 @@ class CudfGroupby : public CudfOperatorBase {
   void computeFinalGroupbyStreaming(CudfVectorPtr tbl);
   void computeSingleGroupbyStreaming(CudfVectorPtr tbl);
 
-  /// Replaces the current buffered-result byte gauge.
-  void updateBufferedResultBytesMetric();
-
   std::vector<column_index_t> groupingKeyInputChannels_;
   std::vector<column_index_t> groupingKeyOutputChannels_;
   std::vector<column_index_t> aggregationInputChannels_;

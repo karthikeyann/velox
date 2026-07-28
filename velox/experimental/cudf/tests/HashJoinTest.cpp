@@ -81,42 +81,6 @@ class MultiThreadedHashJoinTest
   }
 };
 
-TEST_F(HashJoinTest, memoryInstrumentationDisabled) {
-  ASSERT_FALSE(cudf_velox::CudfConfig::getInstance().memoryTrackingEnabled);
-
-  auto probe = makeRowVector({"k"}, {makeFlatVector<int32_t>({1, 2, 3})});
-  auto build = makeRowVector({"u_k"}, {makeFlatVector<int32_t>({2, 3, 4})});
-  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
-  core::PlanNodeId joinNodeId;
-  auto plan =
-      PlanBuilder(planNodeIdGenerator)
-          .values({probe})
-          .hashJoin(
-              {"k"},
-              {"u_k"},
-              PlanBuilder(planNodeIdGenerator).values({build}).planNode(),
-              "",
-              {"k"},
-              core::JoinType::kInner)
-          .capturePlanNodeId(joinNodeId)
-          .planNode();
-  auto expected = makeRowVector({makeFlatVector<int32_t>({2, 3})});
-  auto task = AssertQueryBuilder(plan).assertResults(expected);
-
-  const auto planStats = toPlanStats(task->taskStats());
-  const auto& joinStats = planStats.at(joinNodeId);
-  ASSERT_EQ(joinStats.operatorStats.count("CudfHashJoinBuild"), 1);
-  ASSERT_EQ(joinStats.operatorStats.count("CudfHashJoinProbe"), 1);
-  const auto& customStats = joinStats.customStats;
-  EXPECT_EQ(customStats.count("gpuInputBytes"), 0);
-  EXPECT_EQ(customStats.count("gpuOutputBytes"), 0);
-  EXPECT_EQ(customStats.count("gpuHashJoinBuildInputBytes"), 0);
-  EXPECT_EQ(customStats.count("gpuHashJoinBuildInputBatches"), 0);
-  EXPECT_EQ(customStats.count("gpuHashJoinBuiltTableBytes"), 0);
-  EXPECT_EQ(customStats.count("gpuHashJoinBuiltTableRows"), 0);
-  EXPECT_EQ(customStats.count("gpuHashJoinBuiltTableBatches"), 0);
-}
-
 core::PlanNodePtr countStarOverZeroColumnHashJoinPlan(
     const RowVectorPtr& probe,
     const RowVectorPtr& build,

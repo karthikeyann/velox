@@ -23,6 +23,8 @@ namespace facebook::velox::cudf_velox::test {
 TEST(ConfigTest, MemoryTrackingDisabledByDefault) {
   CudfConfig config;
   EXPECT_FALSE(config.memoryTrackingEnabled);
+  EXPECT_TRUE(config.perfettoMemoryTracePath.empty());
+  EXPECT_FALSE(config.gpuMemoryTrackingEnabled());
 }
 
 TEST(ConfigTest, CudfConfig) {
@@ -30,6 +32,7 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfEnabled, "false"},
       {CudfConfig::kCudfDebugEnabled, "true"},
       {CudfConfig::kCudfMemoryTrackingEnabled, "true"},
+      {CudfConfig::kCudfPerfettoMemoryTracePath, "/tmp/gpu-memory-%p.pftrace"},
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
@@ -37,12 +40,23 @@ TEST(ConfigTest, CudfConfig) {
 
   CudfConfig config;
   config.initialize(std::move(options));
-  ASSERT_EQ(config.enabled, false);
-  ASSERT_EQ(config.debugEnabled, true);
-  ASSERT_EQ(config.memoryTrackingEnabled, true);
-  ASSERT_EQ(config.memoryResource, "arena");
-  ASSERT_EQ(config.memoryPercent, 25);
-  ASSERT_EQ(config.functionNamePrefix, "presto");
-  ASSERT_EQ(config.allowCpuFallback, false);
+  EXPECT_FALSE(config.enabled);
+  EXPECT_TRUE(config.debugEnabled);
+  EXPECT_TRUE(config.memoryTrackingEnabled);
+  EXPECT_EQ(config.perfettoMemoryTracePath, "/tmp/gpu-memory-%p.pftrace");
+  EXPECT_TRUE(config.gpuMemoryTrackingEnabled());
+  EXPECT_EQ(config.memoryResource, "arena");
+  EXPECT_EQ(config.memoryPercent, 25);
+  EXPECT_EQ(config.functionNamePrefix, "presto");
+  EXPECT_FALSE(config.allowCpuFallback);
 }
+
+TEST(ConfigTest, PerfettoPathEnablesTracking) {
+  CudfConfig config;
+  config.initialize(
+      {{CudfConfig::kCudfPerfettoMemoryTracePath, "/tmp/gpu.pftrace"}});
+  EXPECT_FALSE(config.memoryTrackingEnabled);
+  EXPECT_TRUE(config.gpuMemoryTrackingEnabled());
+}
+
 } // namespace facebook::velox::cudf_velox::test

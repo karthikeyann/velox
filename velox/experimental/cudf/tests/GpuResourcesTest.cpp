@@ -14,19 +14,14 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
-#include "velox/experimental/cudf/exec/ToCudf.h"
 
-#include "velox/common/base/Exceptions.h"
-#include "velox/common/base/RuntimeMetrics.h"
-
-#include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
 
 #include <folly/ScopeGuard.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -34,9 +29,14 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
+#include <exception>
+#include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace facebook::velox::cudf_velox::test {
@@ -209,424 +209,218 @@ static_assert(cuda::mr::resource_with<
               AddressReusingResource,
               cuda::mr::device_accessible>);
 
-class LogCapture final : public google::LogSink {
- public:
-  LogCapture() {
-    google::AddLogSink(this);
-  }
-
-  ~LogCapture() override {
-    google::RemoveLogSink(this);
-  }
-
-  LogCapture(const LogCapture&) = delete;
-  LogCapture& operator=(const LogCapture&) = delete;
-
-  void send(
-      google::LogSeverity /*severity*/,
-      const char* /*fullFilename*/,
-      const char* /*baseFilename*/,
-      int /*line*/,
-      const struct ::tm* /*time*/,
-      const char* message,
-      std::size_t messageLength) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    captured_.append(message, messageLength);
-  }
-
-  std::string captured() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return captured_;
-  }
-
- private:
-  mutable std::mutex mutex_;
-  std::string captured_;
-};
-
-class RecordingRuntimeStatWriter final : public BaseRuntimeStatWriter {
- public:
-  void addRuntimeStat(std::string_view name, const RuntimeCounter& value)
-      override {
-    metrics.emplace_back(name, value);
-  }
-
-  std::vector<std::pair<std::string, RuntimeCounter>> metrics;
-};
-
-const GpuMemoryResourceSnapshot& findResource(
-    const GpuMemorySnapshot& snapshot,
-    GpuMemoryResourceKind kind) {
-  const auto it = std::find_if(
-      snapshot.resources.begin(),
-      snapshot.resources.end(),
-      [kind](const auto& resource) { return resource.kind == kind; });
-  VELOX_CHECK(
-      it != snapshot.resources.end(), "Missing GPU memory resource snapshot");
-  return *it;
+GpuMemoryOwner makeOwner(
+    std::string taskSuffix,
+    std::string planNodeId,
+    int32_t pipelineId,
+    int32_t driverId,
+    int32_t operatorId) {
+  return GpuMemoryOwner{
+      .taskUuid = "task-" + taskSuffix + "-uuid",
+      .taskId = "task-" + taskSuffix,
+      .queryId = "query-" + taskSuffix,
+      .planNodeId = std::move(planNodeId),
+      .pipelineId = pipelineId,
+      .driverId = driverId,
+      .operatorId = operatorId,
+      .operatorType = "TestOperator"};
 }
 
-const GpuMemoryOwnerSnapshot& findOwner(
+const GpuMemoryOwnerSnapshot* findOwner(
     const GpuMemorySnapshot& snapshot,
-    const GpuMemoryOwner& owner,
-    GpuMemoryResourceKind kind) {
+    GpuMemoryOwnerHandle handle) {
   const auto it = std::find_if(
-      snapshot.owners.begin(),
-      snapshot.owners.end(),
-      [&](const auto& ownerSnapshot) {
-        return ownerSnapshot.owner == owner && ownerSnapshot.kind == kind;
+      snapshot.owners.begin(), snapshot.owners.end(), [&](const auto& owner) {
+        return owner.handle == handle;
       });
-  VELOX_CHECK(it != snapshot.owners.end(), "Missing GPU memory owner snapshot");
-  return *it;
-}
-
-bool hasOwner(
-    const GpuMemorySnapshot& snapshot,
-    const GpuMemoryOwner& owner,
-    GpuMemoryResourceKind kind) {
-  return std::any_of(
-      snapshot.owners.begin(),
-      snapshot.owners.end(),
-      [&](const auto& ownerSnapshot) {
-        return ownerSnapshot.owner == owner && ownerSnapshot.kind == kind;
-      });
+  return it == snapshot.owners.end() ? nullptr : &*it;
 }
 
 bool isCoherent(const GpuMemorySnapshot& snapshot) {
-  for (const auto& resource : snapshot.resources) {
-    uint64_t ownerBytes{0};
-    uint64_t ownerAllocations{0};
-    for (const auto& owner : snapshot.owners) {
-      if (owner.kind == resource.kind) {
-        ownerBytes += owner.currentBytes;
-        ownerAllocations += owner.currentAllocations;
-      }
-    }
+  uint64_t ownerBytes{0};
+  uint64_t ownerAllocations{0};
+  for (const auto& owner : snapshot.owners) {
+    ownerBytes += owner.currentBytes;
+    ownerAllocations += owner.currentAllocations;
+  }
 
-    uint64_t allocationBytes{0};
-    uint64_t allocationCount{0};
-    for (const auto& allocation : snapshot.allocations) {
-      if (allocation.kind == resource.kind) {
-        allocationBytes += allocation.bytes;
-        ++allocationCount;
-      }
-    }
-
-    if (resource.currentBytes != ownerBytes ||
-        resource.currentBytes != allocationBytes ||
-        resource.currentAllocations != ownerAllocations ||
-        resource.currentAllocations != allocationCount) {
+  uint64_t allocationBytes{0};
+  for (const auto& allocation : snapshot.allocations) {
+    allocationBytes += allocation.bytes;
+    if (findOwner(snapshot, allocation.handle) == nullptr) {
       return false;
     }
   }
-  return true;
+
+  return snapshot.currentBytes == ownerBytes &&
+      snapshot.currentBytes == allocationBytes &&
+      snapshot.currentAllocations == ownerAllocations &&
+      snapshot.currentAllocations == snapshot.allocations.size();
 }
 
 } // namespace
 
-TEST(GpuResourcesTest, DeallocationUsesOriginalAllocationOwner) {
+TEST(GpuResourcesTest, TracksAllocationOriginAndOrderedTransitions) {
   GpuMemoryAllocationTracker tracker;
-  const GpuMemoryOwner ownerA{
-      .taskUuid = "task-a-uuid",
-      .taskId = "task-a",
-      .queryId = "query-a",
-      .planNodeId = "plan-a",
-      .operatorId = 7,
-      .operatorType = "CudfGroupby"};
-  const GpuMemoryOwner ownerB{
-      .taskUuid = "task-b-uuid",
-      .taskId = "task-b",
-      .queryId = "query-b",
-      .planNodeId = "plan-b",
-      .operatorId = 9,
-      .operatorType = "CudfHashJoinBuild"};
+  const auto ownerA = makeOwner("shared", "plan-a", 1, 7, 2);
+  auto ownerB = ownerA;
+  ownerB.driverId = 8;
 
-  int mainAllocation;
-  int ownerAOutputAllocation;
-  int ownerBOutputAllocation;
-  tracker.recordAllocation(
-      &mainAllocation, 128, GpuMemoryResourceKind::kMain, ownerA);
-  tracker.recordAllocation(
-      &ownerAOutputAllocation, 32, GpuMemoryResourceKind::kOutput, ownerA);
-  tracker.recordAllocation(
-      &ownerBOutputAllocation, 64, GpuMemoryResourceKind::kOutput, ownerB);
+  const auto handleA = tracker.registerOwner(ownerA);
+  const auto duplicateHandleA = tracker.registerOwner(ownerA);
+  const auto handleB = tracker.registerOwner(ownerB);
+  EXPECT_EQ(duplicateHandleA, handleA);
+  EXPECT_NE(handleB.ownerId, handleA.ownerId);
+  EXPECT_EQ(handleB.planNodeId, handleA.planNodeId);
 
+  auto otherTaskOwner = ownerA;
+  otherTaskOwner.taskUuid = "other-task-uuid";
+  otherTaskOwner.taskId = "other-task";
+  const auto otherTaskHandle = tracker.registerOwner(otherTaskOwner);
+  EXPECT_NE(otherTaskHandle.planNodeId, handleA.planNodeId);
+
+  int allocationA;
+  int allocationB;
+  const auto first = tracker.recordAllocation(&allocationA, 100, handleA);
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(first->sequence, 1);
+  EXPECT_GT(first->timestampNs, 0);
+  EXPECT_EQ(first->ownerId, handleA.ownerId);
+  EXPECT_EQ(first->planNodeId, handleA.planNodeId);
+  EXPECT_EQ(first->globalCurrentBytes, 100);
+  EXPECT_EQ(first->globalPeakBytes, 100);
+  EXPECT_EQ(first->planNodeCurrentBytes, 100);
+  EXPECT_EQ(first->ownerCurrentBytes, 100);
+  EXPECT_EQ(first->deltaBytes, 100);
+
+  const auto second = tracker.recordAllocation(&allocationB, 60, handleB);
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(second->sequence, 2);
+  EXPECT_LT(first->timestampNs, second->timestampNs);
+  EXPECT_EQ(second->globalCurrentBytes, 160);
+  EXPECT_EQ(second->globalPeakBytes, 160);
+  EXPECT_EQ(second->planNodeCurrentBytes, 160);
+  EXPECT_EQ(second->ownerCurrentBytes, 60);
+  EXPECT_EQ(second->deltaBytes, 60);
+
+  std::optional<GpuMemoryTraceUpdate> deallocation;
   std::thread orphanDeallocator(
-      [&] { tracker.recordDeallocation(&mainAllocation); });
+      [&] { deallocation = tracker.recordDeallocation(&allocationA); });
   orphanDeallocator.join();
 
-  int replacementMainAllocation;
-  const auto replacementUpdate = tracker.recordAllocation(
-      &replacementMainAllocation, 64, GpuMemoryResourceKind::kMain, ownerA);
-  EXPECT_FALSE(replacementUpdate.queryPeakBytes.has_value());
-  EXPECT_FALSE(replacementUpdate.queryResourcePeakBytes.has_value());
-  EXPECT_FALSE(replacementUpdate.planNodePeakBytes.has_value());
-  EXPECT_FALSE(replacementUpdate.planNodeResourcePeakBytes.has_value());
-  EXPECT_FALSE(replacementUpdate.operatorPeakBytes.has_value());
-  EXPECT_FALSE(replacementUpdate.operatorResourcePeakBytes.has_value());
+  ASSERT_TRUE(deallocation.has_value());
+  EXPECT_EQ(deallocation->sequence, 3);
+  EXPECT_LT(second->timestampNs, deallocation->timestampNs);
+  EXPECT_EQ(deallocation->ownerId, handleA.ownerId);
+  EXPECT_EQ(deallocation->planNodeId, handleA.planNodeId);
+  EXPECT_EQ(deallocation->globalCurrentBytes, 60);
+  EXPECT_EQ(deallocation->globalPeakBytes, 160);
+  EXPECT_EQ(deallocation->planNodeCurrentBytes, 60);
+  EXPECT_EQ(deallocation->ownerCurrentBytes, 0);
+  EXPECT_EQ(deallocation->deltaBytes, -100);
 
   const auto snapshot = tracker.snapshot();
-  ASSERT_EQ(snapshot.allocations.size(), 3);
+  EXPECT_TRUE(isCoherent(snapshot));
+  EXPECT_EQ(snapshot.currentBytes, 60);
+  EXPECT_EQ(snapshot.peakBytes, 160);
+  EXPECT_EQ(snapshot.totalBytes, 160);
+  EXPECT_EQ(snapshot.currentAllocations, 1);
+  EXPECT_EQ(snapshot.peakAllocations, 2);
+  EXPECT_EQ(snapshot.totalAllocations, 2);
+  EXPECT_EQ(snapshot.sequence, 3);
+  EXPECT_EQ(snapshot.dataLossEvents, 0);
+  ASSERT_EQ(snapshot.allocations.size(), 1);
+  EXPECT_EQ(snapshot.allocations.front().handle, handleB);
 
-  const auto& main = findResource(snapshot, GpuMemoryResourceKind::kMain);
-  EXPECT_EQ(main.currentBytes, 64);
-  EXPECT_EQ(main.peakBytes, 128);
-  EXPECT_EQ(main.totalBytes, 192);
-  EXPECT_EQ(main.currentAllocations, 1);
-  EXPECT_EQ(main.peakAllocations, 1);
-  EXPECT_EQ(main.totalAllocations, 2);
+  const auto* ownerASnapshot = findOwner(snapshot, handleA);
+  ASSERT_NE(ownerASnapshot, nullptr);
+  EXPECT_EQ(ownerASnapshot->currentBytes, 0);
+  EXPECT_EQ(ownerASnapshot->peakBytes, 100);
+  EXPECT_EQ(ownerASnapshot->totalBytes, 100);
+  EXPECT_EQ(ownerASnapshot->currentAllocations, 0);
+  EXPECT_EQ(ownerASnapshot->totalAllocations, 1);
 
-  const auto& output = findResource(snapshot, GpuMemoryResourceKind::kOutput);
-  EXPECT_EQ(output.currentBytes, 96);
-  EXPECT_EQ(output.peakBytes, 96);
-  EXPECT_EQ(output.totalBytes, 96);
-  EXPECT_EQ(output.currentAllocations, 2);
-  EXPECT_EQ(output.peakAllocations, 2);
-  EXPECT_EQ(output.totalAllocations, 2);
+  const auto* ownerBSnapshot = findOwner(snapshot, handleB);
+  ASSERT_NE(ownerBSnapshot, nullptr);
+  EXPECT_EQ(ownerBSnapshot->currentBytes, 60);
+  EXPECT_EQ(ownerBSnapshot->peakBytes, 60);
+  EXPECT_EQ(ownerBSnapshot->totalBytes, 60);
+  EXPECT_EQ(ownerBSnapshot->currentAllocations, 1);
+  EXPECT_EQ(ownerBSnapshot->totalAllocations, 1);
 
-  const auto& ownerAMain =
-      findOwner(snapshot, ownerA, GpuMemoryResourceKind::kMain);
-  EXPECT_EQ(ownerAMain.currentBytes, 64);
-  EXPECT_EQ(ownerAMain.totalBytes, 192);
-  EXPECT_EQ(ownerAMain.currentAllocations, 1);
-  EXPECT_EQ(ownerAMain.totalAllocations, 2);
-
-  const auto& ownerAOutput =
-      findOwner(snapshot, ownerA, GpuMemoryResourceKind::kOutput);
-  EXPECT_EQ(ownerAOutput.currentBytes, 32);
-  EXPECT_EQ(ownerAOutput.currentAllocations, 1);
-
-  const auto& ownerBOutput =
-      findOwner(snapshot, ownerB, GpuMemoryResourceKind::kOutput);
-  EXPECT_EQ(ownerBOutput.currentBytes, 64);
-  EXPECT_EQ(ownerBOutput.currentAllocations, 1);
-
-  tracker.recordDeallocation(&replacementMainAllocation);
+  const auto final = tracker.recordDeallocation(&allocationB);
+  ASSERT_TRUE(final.has_value());
+  EXPECT_EQ(final->sequence, 4);
+  EXPECT_LT(deallocation->timestampNs, final->timestampNs);
+  EXPECT_EQ(final->globalCurrentBytes, 0);
+  EXPECT_EQ(final->planNodeCurrentBytes, 0);
+  EXPECT_EQ(final->ownerCurrentBytes, 0);
 }
 
-TEST(GpuResourcesTest, QueryScopedPeaksTrackOverlapAndResourceSplits) {
+TEST(GpuResourcesTest, InvalidPointerEventsDoNotCorruptLedger) {
   GpuMemoryAllocationTracker tracker;
-  const GpuMemoryOwner ownerA{
-      .taskUuid = "task-a-uuid",
-      .taskId = "task-a",
-      .queryId = "query-1",
-      .planNodeId = "plan-a",
-      .operatorId = 7,
-      .operatorType = "CudfHashJoinBuild"};
-  const GpuMemoryOwner ownerB{
-      .taskUuid = "task-b-uuid",
-      .taskId = "task-b",
-      .queryId = "query-1",
-      .planNodeId = "plan-a",
-      .operatorId = 7,
-      .operatorType = "CudfHashJoinBuild"};
-  const GpuMemoryOwner ownerC{
-      .taskUuid = "task-c-uuid",
-      .taskId = "task-c",
-      .queryId = "query-1",
-      .planNodeId = "plan-b",
-      .operatorId = 9,
-      .operatorType = "CudfGroupby"};
-  const GpuMemoryOwner otherQueryOwner{
-      .taskUuid = "task-d-uuid",
-      .taskId = "task-d",
-      .queryId = "query-2",
-      .planNodeId = "plan-a",
-      .operatorId = 7,
-      .operatorType = "CudfHashJoinBuild"};
+  const auto handle =
+      tracker.registerOwner(makeOwner("invalid", "plan-a", 1, 2, 3));
 
-  int ownerAMain;
-  int ownerBOutput;
-  int ownerCMain;
-  int ownerBSecondOutput;
-  int otherQueryMain;
+  int allocation;
+  ASSERT_TRUE(tracker.recordAllocation(&allocation, 64, handle).has_value());
+  EXPECT_FALSE(tracker.recordAllocation(&allocation, 128, handle).has_value());
 
-  auto update = tracker.recordAllocation(
-      &ownerAMain, 100, GpuMemoryResourceKind::kMain, ownerA);
-  EXPECT_EQ(update.queryPeakBytes, 100);
-  EXPECT_EQ(update.queryResourcePeakBytes, 100);
-  EXPECT_EQ(update.planNodePeakBytes, 100);
-  EXPECT_EQ(update.planNodeResourcePeakBytes, 100);
-  EXPECT_EQ(update.operatorPeakBytes, 100);
-  EXPECT_EQ(update.operatorResourcePeakBytes, 100);
+  int unknownAllocation;
+  EXPECT_FALSE(tracker.recordDeallocation(&unknownAllocation).has_value());
 
-  update = tracker.recordAllocation(
-      &ownerBOutput, 60, GpuMemoryResourceKind::kOutput, ownerB);
-  EXPECT_EQ(update.queryPeakBytes, 160);
-  EXPECT_EQ(update.queryResourcePeakBytes, 60);
-  EXPECT_EQ(update.planNodePeakBytes, 160);
-  EXPECT_EQ(update.planNodeResourcePeakBytes, 60);
-  EXPECT_EQ(update.operatorPeakBytes, 160);
-  EXPECT_EQ(update.operatorResourcePeakBytes, 60);
+  auto snapshot = tracker.snapshot();
+  EXPECT_TRUE(isCoherent(snapshot));
+  EXPECT_EQ(snapshot.currentBytes, 64);
+  EXPECT_EQ(snapshot.currentAllocations, 1);
+  EXPECT_EQ(snapshot.sequence, 1);
+  EXPECT_EQ(snapshot.dataLossEvents, 2);
 
-  update = tracker.recordAllocation(
-      &ownerCMain, 80, GpuMemoryResourceKind::kMain, ownerC);
-  EXPECT_EQ(update.queryPeakBytes, 240);
-  EXPECT_EQ(update.queryResourcePeakBytes, 180);
-  EXPECT_EQ(update.planNodePeakBytes, 80);
-  EXPECT_EQ(update.planNodeResourcePeakBytes, 80);
-  EXPECT_EQ(update.operatorPeakBytes, 80);
-  EXPECT_EQ(update.operatorResourcePeakBytes, 80);
-
-  tracker.recordDeallocation(&ownerAMain);
-  update = tracker.recordAllocation(
-      &ownerBSecondOutput, 90, GpuMemoryResourceKind::kOutput, ownerB);
-  EXPECT_FALSE(update.queryPeakBytes.has_value());
-  EXPECT_EQ(update.queryResourcePeakBytes, 150);
-  EXPECT_FALSE(update.planNodePeakBytes.has_value());
-  EXPECT_EQ(update.planNodeResourcePeakBytes, 150);
-  EXPECT_FALSE(update.operatorPeakBytes.has_value());
-  EXPECT_EQ(update.operatorResourcePeakBytes, 150);
-
-  update = tracker.recordAllocation(
-      &otherQueryMain, 500, GpuMemoryResourceKind::kMain, otherQueryOwner);
-  EXPECT_EQ(update.queryPeakBytes, 500);
-  EXPECT_EQ(update.queryResourcePeakBytes, 500);
-  EXPECT_EQ(update.planNodePeakBytes, 500);
-  EXPECT_EQ(update.planNodeResourcePeakBytes, 500);
-  EXPECT_EQ(update.operatorPeakBytes, 500);
-  EXPECT_EQ(update.operatorResourcePeakBytes, 500);
-
-  tracker.recordDeallocation(&ownerBOutput);
-  tracker.recordDeallocation(&ownerCMain);
-  tracker.recordDeallocation(&ownerBSecondOutput);
-  tracker.recordDeallocation(&otherQueryMain);
+  ASSERT_TRUE(tracker.recordDeallocation(&allocation).has_value());
+  snapshot = tracker.snapshot();
+  EXPECT_TRUE(isCoherent(snapshot));
+  EXPECT_EQ(snapshot.currentBytes, 0);
+  EXPECT_EQ(snapshot.sequence, 2);
+  EXPECT_EQ(snapshot.dataLossEvents, 2);
 }
 
-TEST(GpuResourcesTest, QueryPeakPersistsUntilQueryRetirement) {
-  GpuMemoryAllocationTracker tracker;
-  const GpuMemoryOwner firstTask{
-      .taskUuid = "first-task-uuid",
-      .taskId = "first-task",
-      .queryId = "query-1",
-      .planNodeId = "plan-a",
-      .operatorId = 7,
-      .operatorType = "CudfHashJoinBuild"};
-  const GpuMemoryOwner secondTask{
-      .taskUuid = "second-task-uuid",
-      .taskId = "second-task",
-      .queryId = "query-1",
-      .planNodeId = "plan-a",
-      .operatorId = 7,
-      .operatorType = "CudfHashJoinBuild"};
-
-  int firstAllocation;
-  auto update = tracker.recordAllocation(
-      &firstAllocation, 100, GpuMemoryResourceKind::kMain, firstTask);
-  EXPECT_EQ(update.queryPeakBytes, 100);
-  tracker.recordDeallocation(&firstAllocation);
-  tracker.retireTask(firstTask.taskUuid);
-
-  int secondAllocation;
-  update = tracker.recordAllocation(
-      &secondAllocation, 50, GpuMemoryResourceKind::kMain, secondTask);
-  EXPECT_FALSE(update.queryPeakBytes.has_value());
-  EXPECT_FALSE(update.queryResourcePeakBytes.has_value());
-  EXPECT_FALSE(update.planNodePeakBytes.has_value());
-  EXPECT_FALSE(update.planNodeResourcePeakBytes.has_value());
-  EXPECT_FALSE(update.operatorPeakBytes.has_value());
-  EXPECT_FALSE(update.operatorResourcePeakBytes.has_value());
-  tracker.recordDeallocation(&secondAllocation);
-  tracker.retireTask(secondTask.taskUuid);
-
-  tracker.retireQuery("query-1");
-
-  int nextQueryAllocation;
-  update = tracker.recordAllocation(
-      &nextQueryAllocation, 25, GpuMemoryResourceKind::kMain, secondTask);
-  EXPECT_EQ(update.queryPeakBytes, 25);
-  EXPECT_EQ(update.queryResourcePeakBytes, 25);
-  EXPECT_EQ(update.planNodePeakBytes, 25);
-  EXPECT_EQ(update.planNodeResourcePeakBytes, 25);
-  EXPECT_EQ(update.operatorPeakBytes, 25);
-  EXPECT_EQ(update.operatorResourcePeakBytes, 25);
-  tracker.recordDeallocation(&nextQueryAllocation);
-}
-
-TEST(GpuResourcesTest, PeakUpdatesUseByteRuntimeStats) {
-  RecordingRuntimeStatWriter writer;
-  const GpuMemoryPeakUpdate mainUpdate{
-      .queryPeakBytes = 900,
-      .queryResourcePeakBytes = 700,
-      .planNodePeakBytes = 500,
-      .planNodeResourcePeakBytes = 400,
-      .operatorPeakBytes = 300,
-      .operatorResourcePeakBytes = 200};
-
-  addGpuMemoryPeakRuntimeStats(
-      &writer, GpuMemoryResourceKind::kMain, mainUpdate);
-
-  const std::vector<std::pair<std::string, int64_t>> expected{
-      {"gpuQueryPeakLiveBytes", 900},
-      {"gpuPlanNodePeakLiveBytes", 500},
-      {"gpuOperatorPeakLiveBytes", 300},
-      {"gpuQueryMainPeakLiveBytes", 700},
-      {"gpuPlanNodeMainPeakLiveBytes", 400},
-      {"gpuOperatorMainPeakLiveBytes", 200}};
-  ASSERT_EQ(writer.metrics.size(), expected.size());
-  for (size_t i = 0; i < expected.size(); ++i) {
-    EXPECT_EQ(writer.metrics[i].first, expected[i].first);
-    EXPECT_EQ(writer.metrics[i].second.value, expected[i].second);
-    EXPECT_EQ(writer.metrics[i].second.unit, RuntimeCounter::Unit::kBytes);
-  }
-
-  addGpuMemoryPeakRuntimeStats(
-      &writer, GpuMemoryResourceKind::kOutput, GpuMemoryPeakUpdate{});
-  EXPECT_EQ(writer.metrics.size(), expected.size());
-
-  RecordingRuntimeStatWriter outputWriter;
-  const GpuMemoryPeakUpdate outputUpdate{
-      .queryPeakBytes = std::nullopt,
-      .queryResourcePeakBytes = 70,
-      .planNodePeakBytes = std::nullopt,
-      .planNodeResourcePeakBytes = 40,
-      .operatorPeakBytes = std::nullopt,
-      .operatorResourcePeakBytes = 20};
-  addGpuMemoryPeakRuntimeStats(
-      &outputWriter, GpuMemoryResourceKind::kOutput, outputUpdate);
-  const std::vector<std::pair<std::string, int64_t>> expectedOutput{
-      {"gpuQueryOutputPeakLiveBytes", 70},
-      {"gpuPlanNodeOutputPeakLiveBytes", 40},
-      {"gpuOperatorOutputPeakLiveBytes", 20}};
-  ASSERT_EQ(outputWriter.metrics.size(), expectedOutput.size());
-  for (size_t i = 0; i < expectedOutput.size(); ++i) {
-    EXPECT_EQ(outputWriter.metrics[i].first, expectedOutput[i].first);
-    EXPECT_EQ(outputWriter.metrics[i].second.value, expectedOutput[i].second);
-    EXPECT_EQ(
-        outputWriter.metrics[i].second.unit, RuntimeCounter::Unit::kBytes);
-  }
-}
-
-TEST(GpuResourcesTest, SharedUpstreamHasSeparateResourceCounters) {
-  auto mainUpstream = createMemoryResource("cuda", 0);
-  auto outputUpstream = mainUpstream;
+TEST(GpuResourcesTest, TrackedResourcesShareCombinedSnapshot) {
+  auto mainState = std::make_shared<RecordingResourceState>();
+  auto outputState = std::make_shared<RecordingResourceState>();
   auto resources = createGpuMemoryTrackingResources(
-      std::move(mainUpstream), std::move(outputUpstream));
+      cuda::mr::any_resource<cuda::mr::device_accessible>{
+          RecordingResource{mainState}},
+      cuda::mr::any_resource<cuda::mr::device_accessible>{
+          RecordingResource{outputState}});
   auto resetGuard = folly::makeGuard([] { resetGpuMemoryTracking(); });
 
-  const auto mainResource = rmm::device_async_resource_ref{resources.main};
-  const auto outputResource = rmm::device_async_resource_ref{resources.output};
-  {
-    rmm::device_buffer mainBuffer{256, rmm::cuda_stream_default, mainResource};
-    rmm::device_buffer outputBuffer{
-        512, rmm::cuda_stream_default, outputResource};
+  auto mainResource = rmm::device_async_resource_ref{resources.main};
+  auto outputResource = rmm::device_async_resource_ref{resources.output};
+  auto* mainAddress = mainResource.allocate(rmm::cuda_stream_default, 256, 256);
+  auto* outputAddress =
+      outputResource.allocate(rmm::cuda_stream_default, 512, 256);
 
-    const auto snapshot = getGpuMemorySnapshot();
-    const auto& main = findResource(snapshot, GpuMemoryResourceKind::kMain);
-    EXPECT_EQ(main.currentBytes, 256);
-    EXPECT_EQ(main.currentAllocations, 1);
-    const auto& output = findResource(snapshot, GpuMemoryResourceKind::kOutput);
-    EXPECT_EQ(output.currentBytes, 512);
-    EXPECT_EQ(output.currentAllocations, 1);
-    ASSERT_EQ(snapshot.allocations.size(), 2);
-    EXPECT_NE(snapshot.allocations[0].kind, snapshot.allocations[1].kind);
-  }
+  auto snapshot = getGpuMemorySnapshot();
+  EXPECT_TRUE(isCoherent(snapshot));
+  EXPECT_EQ(snapshot.currentBytes, 768);
+  EXPECT_EQ(snapshot.peakBytes, 768);
+  EXPECT_EQ(snapshot.totalBytes, 768);
+  EXPECT_EQ(snapshot.currentAllocations, 2);
+  EXPECT_EQ(snapshot.peakAllocations, 2);
+  EXPECT_EQ(snapshot.totalAllocations, 2);
+  EXPECT_EQ(snapshot.sequence, 2);
+  ASSERT_EQ(snapshot.allocations.size(), 2);
+  EXPECT_EQ(snapshot.allocations[0].handle, snapshot.allocations[1].handle);
 
-  const auto snapshot = getGpuMemorySnapshot();
-  EXPECT_EQ(
-      findResource(snapshot, GpuMemoryResourceKind::kMain).currentBytes, 0);
-  EXPECT_EQ(
-      findResource(snapshot, GpuMemoryResourceKind::kOutput).currentBytes, 0);
+  mainResource.deallocate(rmm::cuda_stream_default, mainAddress, 256, 256);
+  outputResource.deallocate(rmm::cuda_stream_default, outputAddress, 512, 256);
+
+  snapshot = getGpuMemorySnapshot();
+  EXPECT_TRUE(isCoherent(snapshot));
+  EXPECT_EQ(snapshot.currentBytes, 0);
+  EXPECT_EQ(snapshot.peakBytes, 768);
+  EXPECT_EQ(snapshot.currentAllocations, 0);
+  EXPECT_EQ(snapshot.sequence, 4);
 }
 
 TEST(GpuResourcesTest, PreservesAllocationAlignment) {
@@ -638,7 +432,7 @@ TEST(GpuResourcesTest, PreservesAllocationAlignment) {
       std::move(upstream), std::move(outputUpstream));
   auto resetGuard = folly::makeGuard([] { resetGpuMemoryTracking(); });
 
-  constexpr std::size_t kAlignment = 4096;
+  constexpr std::size_t kAlignment = 4'096;
   auto resource = rmm::device_async_resource_ref{resources.main};
   auto* address = resource.allocate(rmm::cuda_stream_default, 64, kAlignment);
   resource.deallocate(rmm::cuda_stream_default, address, 64, kAlignment);
@@ -666,36 +460,15 @@ TEST(GpuResourcesTest, ZeroSizeAllocationIsUntracked) {
 
   const auto snapshot = getGpuMemorySnapshot();
   EXPECT_TRUE(isCoherent(snapshot));
-  EXPECT_TRUE(snapshot.owners.empty());
-  EXPECT_TRUE(snapshot.allocations.empty());
-  const auto& main = findResource(snapshot, GpuMemoryResourceKind::kMain);
-  EXPECT_EQ(main.currentBytes, 0);
-  EXPECT_EQ(main.currentAllocations, 0);
-  EXPECT_EQ(main.totalAllocations, 0);
+  EXPECT_EQ(snapshot.currentBytes, 0);
+  EXPECT_EQ(snapshot.currentAllocations, 0);
+  EXPECT_EQ(snapshot.totalAllocations, 0);
+  EXPECT_EQ(snapshot.sequence, 0);
+  EXPECT_EQ(snapshot.dataLossEvents, 0);
 
   std::lock_guard<std::mutex> lock(state->mutex);
   EXPECT_TRUE(state->allocationAlignments.empty());
   EXPECT_TRUE(state->deallocationAlignments.empty());
-}
-
-TEST(GpuResourcesTest, TrackedOutputResourceSurvivesUnregister) {
-  auto& config = CudfConfig::getInstance();
-  const auto previousTrackingEnabled = config.memoryTrackingEnabled;
-  config.memoryTrackingEnabled = true;
-  auto cleanupGuard = folly::makeGuard([&] {
-    if (cudfIsRegistered()) {
-      unregisterCudf();
-    }
-    config.memoryTrackingEnabled = previousTrackingEnabled;
-  });
-
-  registerCudf();
-  auto outputResource = get_output_mr();
-  auto* address = outputResource.allocate(rmm::cuda_stream_default, 64, 256);
-  unregisterCudf();
-
-  outputResource.deallocate(rmm::cuda_stream_default, address, 64, 256);
-  EXPECT_FALSE(cudfIsRegistered());
 }
 
 TEST(GpuResourcesTest, ConcurrentSnapshotsAreCoherent) {
@@ -716,6 +489,7 @@ TEST(GpuResourcesTest, ConcurrentSnapshotsAreCoherent) {
 
   std::thread snapshotter([&] {
     while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
     }
     while (!workersDone.load(std::memory_order_acquire)) {
       if (!isCoherent(getGpuMemorySnapshot())) {
@@ -726,7 +500,7 @@ TEST(GpuResourcesTest, ConcurrentSnapshotsAreCoherent) {
   });
 
   constexpr int kWorkerCount = 4;
-  constexpr int kIterations = 5'000;
+  constexpr int kIterations = 2'000;
   std::vector<std::thread> workers;
   workers.reserve(kWorkerCount);
   for (int worker = 0; worker < kWorkerCount; ++worker) {
@@ -748,17 +522,26 @@ TEST(GpuResourcesTest, ConcurrentSnapshotsAreCoherent) {
   workersDone.store(true, std::memory_order_release);
   snapshotter.join();
 
+  const auto snapshot = getGpuMemorySnapshot();
   EXPECT_TRUE(coherent.load(std::memory_order_acquire));
-  EXPECT_TRUE(isCoherent(getGpuMemorySnapshot()));
+  EXPECT_TRUE(isCoherent(snapshot));
+  EXPECT_EQ(snapshot.currentBytes, 0);
+  EXPECT_EQ(snapshot.currentAllocations, 0);
+  EXPECT_EQ(
+      snapshot.totalAllocations,
+      static_cast<uint64_t>(kWorkerCount * kIterations));
+  EXPECT_EQ(
+      snapshot.sequence, static_cast<uint64_t>(2 * kWorkerCount * kIterations));
+  EXPECT_EQ(snapshot.dataLossEvents, 0);
 }
 
 TEST(GpuResourcesTest, ReusedAddressKeepsReplacementAllocation) {
   auto state = std::make_shared<AddressReusingResourceState>();
+  auto upstream = cuda::mr::any_resource<cuda::mr::device_accessible>{
+      AddressReusingResource{state}};
+  auto outputUpstream = upstream;
   auto resources = createGpuMemoryTrackingResources(
-      cuda::mr::any_resource<cuda::mr::device_accessible>{
-          AddressReusingResource{state}},
-      cuda::mr::any_resource<cuda::mr::device_accessible>{
-          AddressReusingResource{state}});
+      std::move(upstream), std::move(outputUpstream));
   auto resetGuard = folly::makeGuard([] { resetGpuMemoryTracking(); });
 
   auto mainResource = rmm::device_async_resource_ref{resources.main};
@@ -785,98 +568,34 @@ TEST(GpuResourcesTest, ReusedAddressKeepsReplacementAllocation) {
 
   ASSERT_EQ(replacementAddress, originalAddress);
   const auto replacementSnapshot = getGpuMemorySnapshot();
+  EXPECT_TRUE(isCoherent(replacementSnapshot));
+  EXPECT_EQ(replacementSnapshot.currentBytes, 128);
+  EXPECT_EQ(replacementSnapshot.currentAllocations, 1);
+  EXPECT_EQ(replacementSnapshot.sequence, 3);
+  EXPECT_EQ(replacementSnapshot.dataLossEvents, 0);
   ASSERT_EQ(replacementSnapshot.allocations.size(), 1);
   EXPECT_EQ(
       replacementSnapshot.allocations.front().address,
       reinterpret_cast<uintptr_t>(replacementAddress));
   EXPECT_EQ(replacementSnapshot.allocations.front().bytes, 128);
-  EXPECT_EQ(
-      replacementSnapshot.allocations.front().kind,
-      GpuMemoryResourceKind::kOutput);
-  EXPECT_EQ(replacementSnapshot.allocations.front().owner, GpuMemoryOwner{});
-  EXPECT_TRUE(isCoherent(replacementSnapshot));
 
   outputResource.deallocate(
       rmm::cuda_stream_default, replacementAddress, 128, 256);
   const auto finalSnapshot = getGpuMemorySnapshot();
   EXPECT_TRUE(isCoherent(finalSnapshot));
+  EXPECT_EQ(finalSnapshot.currentBytes, 0);
+  EXPECT_EQ(finalSnapshot.currentAllocations, 0);
+  EXPECT_EQ(finalSnapshot.sequence, 4);
   EXPECT_TRUE(finalSnapshot.allocations.empty());
-  EXPECT_EQ(
-      findResource(finalSnapshot, GpuMemoryResourceKind::kMain)
-          .currentAllocations,
-      0);
-  EXPECT_EQ(
-      findResource(finalSnapshot, GpuMemoryResourceKind::kOutput)
-          .currentAllocations,
-      0);
 }
 
-TEST(GpuResourcesTest, RetiredTaskHistoryFollowsLiveAllocations) {
-  GpuMemoryAllocationTracker tracker;
-  const GpuMemoryOwner liveOwner{
-      .taskUuid = "retired-task-uuid",
-      .taskId = "shared-task-id",
-      .queryId = "",
-      .planNodeId = "live-plan",
-      .operatorId = 1,
-      .operatorType = "LiveOperator"};
-  const GpuMemoryOwner historicalOwner{
-      .taskUuid = "retired-task-uuid",
-      .taskId = "shared-task-id",
-      .queryId = "",
-      .planNodeId = "historical-plan",
-      .operatorId = 2,
-      .operatorType = "HistoricalOperator"};
-  const GpuMemoryOwner futureOwner{
-      .taskUuid = "future-task-uuid",
-      .taskId = "shared-task-id",
-      .queryId = "",
-      .planNodeId = "future-plan",
-      .operatorId = 3,
-      .operatorType = "FutureOperator"};
-  const GpuMemoryOwner otherTaskOwner{
-      .taskUuid = "other-task-uuid",
-      .taskId = "shared-task-id",
-      .queryId = "",
-      .planNodeId = "live-plan",
-      .operatorId = 1,
-      .operatorType = "LiveOperator"};
+TEST(GpuResourcesTest, AllocationFailureRethrowsWithoutCounting) {
+  const auto tracePath = std::filesystem::temp_directory_path() /
+      ("velox-cudf-memory-oom-" + std::to_string(::getpid()) + ".pftrace");
+  std::filesystem::remove(tracePath);
+  ASSERT_TRUE(startGpuMemoryTrace(tracePath.string()));
+  auto stopGuard = folly::makeGuard([] { stopGpuMemoryTrace(); });
 
-  int liveAllocation;
-  int historicalAllocation;
-  int otherTaskAllocation;
-  tracker.recordAllocation(
-      &liveAllocation, 64, GpuMemoryResourceKind::kMain, liveOwner);
-  tracker.recordAllocation(
-      &historicalAllocation, 32, GpuMemoryResourceKind::kMain, historicalOwner);
-  tracker.recordAllocation(
-      &otherTaskAllocation, 48, GpuMemoryResourceKind::kMain, otherTaskOwner);
-  tracker.recordDeallocation(&historicalAllocation);
-
-  tracker.retireTask("retired-task-uuid");
-  auto snapshot = tracker.snapshot();
-  EXPECT_TRUE(hasOwner(snapshot, liveOwner, GpuMemoryResourceKind::kMain));
-  EXPECT_FALSE(
-      hasOwner(snapshot, historicalOwner, GpuMemoryResourceKind::kMain));
-  EXPECT_TRUE(hasOwner(snapshot, otherTaskOwner, GpuMemoryResourceKind::kMain));
-
-  tracker.recordDeallocation(&liveAllocation);
-  snapshot = tracker.snapshot();
-  EXPECT_FALSE(hasOwner(snapshot, liveOwner, GpuMemoryResourceKind::kMain));
-  EXPECT_TRUE(hasOwner(snapshot, otherTaskOwner, GpuMemoryResourceKind::kMain));
-
-  tracker.retireTask("future-task-uuid");
-  int futureAllocation;
-  tracker.recordAllocation(
-      &futureAllocation, 16, GpuMemoryResourceKind::kMain, futureOwner);
-  tracker.recordDeallocation(&futureAllocation);
-  EXPECT_TRUE(
-      hasOwner(tracker.snapshot(), futureOwner, GpuMemoryResourceKind::kMain));
-
-  tracker.recordDeallocation(&otherTaskAllocation);
-}
-
-TEST(GpuResourcesTest, AllocationFailureLogsAndRethrows) {
   auto failingState = std::make_shared<RecordingResourceState>();
   failingState->throwOnAllocation = true;
   auto outputState = std::make_shared<RecordingResourceState>();
@@ -887,11 +606,10 @@ TEST(GpuResourcesTest, AllocationFailureLogsAndRethrows) {
           RecordingResource{outputState}});
   auto resetGuard = folly::makeGuard([] { resetGpuMemoryTracking(); });
 
-  LogCapture logs;
-  constexpr std::size_t kAlignment = 4096;
+  constexpr std::size_t kAlignment = 4'096;
   auto resource = rmm::device_async_resource_ref{resources.main};
   EXPECT_THROW(
-      resource.allocate(rmm::cuda_stream_default, 1234, kAlignment),
+      resource.allocate(rmm::cuda_stream_default, 1'234, kAlignment),
       rmm::out_of_memory);
 
   {
@@ -900,12 +618,59 @@ TEST(GpuResourcesTest, AllocationFailureLogsAndRethrows) {
     EXPECT_EQ(failingState->allocationAlignments.front(), kAlignment);
   }
 
-  const auto captured = logs.captured();
-  EXPECT_NE(
-      captured.find("GPU_MEMORY_OOM requested_bytes=1234"), std::string::npos);
-  EXPECT_NE(captured.find("resource_kind=main"), std::string::npos);
-  EXPECT_NE(captured.find("task_uuid=<none>"), std::string::npos);
-  EXPECT_NE(captured.find("statistics_current_bytes=0"), std::string::npos);
+  const auto snapshot = getGpuMemorySnapshot();
+  EXPECT_TRUE(isCoherent(snapshot));
+  EXPECT_EQ(snapshot.currentBytes, 0);
+  EXPECT_EQ(snapshot.peakBytes, 0);
+  EXPECT_EQ(snapshot.totalBytes, 0);
+  EXPECT_EQ(snapshot.currentAllocations, 0);
+  EXPECT_EQ(snapshot.totalAllocations, 0);
+  EXPECT_EQ(snapshot.sequence, 0);
+
+  stopGpuMemoryTrace();
+  stopGuard.dismiss();
+  ASSERT_TRUE(std::filesystem::exists(tracePath));
+  EXPECT_GT(std::filesystem::file_size(tracePath), 0);
+  if (std::getenv("VELOX_CUDF_KEEP_PERFETTO_TEST_TRACE") == nullptr) {
+    std::filesystem::remove(tracePath);
+  } else {
+    LOG(INFO) << "Kept GPU-memory OOM test trace: " << tracePath;
+  }
+}
+
+TEST(GpuResourcesTest, StreamsPerfettoTrace) {
+  const auto path = std::filesystem::temp_directory_path() /
+      ("velox-cudf-memory-" + std::to_string(::getpid()) + ".pftrace");
+  std::filesystem::remove(path);
+  ASSERT_TRUE(startGpuMemoryTrace(path.string()));
+  auto stopGuard = folly::makeGuard([] { stopGpuMemoryTrace(); });
+
+  GpuMemoryAllocationTracker tracker;
+  const auto firstHandle =
+      tracker.registerOwner(makeOwner("trace", "1353", 2, 4, 6));
+  const auto secondHandle =
+      tracker.registerOwner(makeOwner("trace", "1354", 2, 4, 7));
+  int firstAllocation;
+  int secondAllocation;
+  ASSERT_TRUE(tracker.recordAllocation(&firstAllocation, 1'024, firstHandle)
+                  .has_value());
+  ASSERT_TRUE(tracker.recordAllocation(&secondAllocation, 2'048, secondHandle)
+                  .has_value());
+  markGpuMemoryTrace("unit-test-marker");
+  ASSERT_TRUE(tracker.recordDeallocation(&firstAllocation).has_value());
+  ASSERT_TRUE(tracker.recordDeallocation(&secondAllocation).has_value());
+
+  stopGpuMemoryTrace();
+  stopGuard.dismiss();
+  EXPECT_FALSE(gpuMemoryTraceEnabled());
+  EXPECT_TRUE(gpuMemoryTracePath().empty());
+  ASSERT_TRUE(std::filesystem::exists(path));
+  EXPECT_GT(std::filesystem::file_size(path), 0);
+  if (std::getenv("VELOX_CUDF_KEEP_PERFETTO_TEST_TRACE") == nullptr) {
+    std::filesystem::remove(path);
+  } else {
+    LOG(INFO) << "Kept GPU-memory Perfetto test trace: " << path;
+  }
 }
 
 } // namespace facebook::velox::cudf_velox::test

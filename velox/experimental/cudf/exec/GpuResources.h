@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/exec/GpuMemoryTrace.h"
+
 #include <cudf/detail/utilities/stream_pool.hpp>
 
 #include <rmm/resource_ref.hpp>
@@ -26,180 +28,123 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <string>
 #include <string_view>
 #include <vector>
 
-namespace facebook::velox {
-class BaseRuntimeStatWriter;
-}
-
 namespace facebook::velox::cudf_velox {
 
-/// Identifies the logical purpose of a tracked GPU memory resource.
-enum class GpuMemoryResourceKind {
-  /// Identifies the main resource used for temporary allocations.
-  kMain,
-  /// Identifies the resource passed explicitly for output allocations.
-  kOutput,
+/// Refers to stable owner and PlanNode records in the allocation ledger.
+struct GpuMemoryOwnerHandle {
+  /// Identifies one concrete operator instance.
+  uint64_t ownerId{0};
+  /// Identifies the task-local PlanNode aggregate.
+  uint64_t planNodeId{0};
+
+  bool operator==(const GpuMemoryOwnerHandle&) const = default;
 };
 
-/// Identifies the operator that was active when an allocation succeeded.
-struct GpuMemoryOwner {
-  /// Universally unique Velox task identifier captured at allocation time.
-  std::string taskUuid;
-  /// Velox task identifier captured at allocation time.
-  std::string taskId;
-  /// Velox query identifier captured at allocation time.
-  std::string queryId;
-  /// Velox plan node identifier captured at allocation time.
-  std::string planNodeId;
-  /// Velox operator identifier captured at allocation time.
-  int32_t operatorId{-1};
-  /// Velox operator type captured at allocation time.
-  std::string operatorType;
-
-  /// Returns true when all stable owner fields match.
-  bool operator==(const GpuMemoryOwner&) const = default;
-};
-
-/// Reports query-scoped high-water marks raised by one allocation.
-struct GpuMemoryPeakUpdate {
-  /// New combined query peak, or no value if the peak did not increase.
-  std::optional<uint64_t> queryPeakBytes;
-  /// New query peak for the allocation's resource kind.
-  std::optional<uint64_t> queryResourcePeakBytes;
-  /// New combined PlanNode peak, or no value if the peak did not increase.
-  std::optional<uint64_t> planNodePeakBytes;
-  /// New PlanNode peak for the allocation's resource kind.
-  std::optional<uint64_t> planNodeResourcePeakBytes;
-  /// New combined operator peak, or no value if the peak did not increase.
-  std::optional<uint64_t> operatorPeakBytes;
-  /// New operator peak for the allocation's resource kind.
-  std::optional<uint64_t> operatorResourcePeakBytes;
-};
-
-/// Writes newly raised query-scoped peaks as byte-valued RuntimeStats.
-///
-/// A null writer and absent peak values are ignored.
-void addGpuMemoryPeakRuntimeStats(
-    BaseRuntimeStatWriter* writer,
-    GpuMemoryResourceKind kind,
-    const GpuMemoryPeakUpdate& update) noexcept;
-
-/// Reports current and cumulative counters for one logical resource.
-struct GpuMemoryResourceSnapshot {
-  /// Logical resource represented by these counters.
-  GpuMemoryResourceKind kind;
-  /// Bytes held by live allocations.
-  uint64_t currentBytes;
-  /// Highest number of simultaneously live bytes.
-  uint64_t peakBytes;
-  /// Bytes allocated successfully over the resource lifetime.
-  uint64_t totalBytes;
-  /// Number of live allocations.
-  uint64_t currentAllocations;
-  /// Highest number of simultaneously live allocations.
-  uint64_t peakAllocations;
-  /// Number of successful allocations over the resource lifetime.
-  uint64_t totalAllocations;
-};
-
-/// Reports allocation counters for one owner and logical resource.
+/// Reports logical requested-byte counters for one allocation owner.
 struct GpuMemoryOwnerSnapshot {
-  /// Stable allocation owner.
+  /// Stable registered owner handle.
+  GpuMemoryOwnerHandle handle;
+  /// Full operator identity captured during registration.
   GpuMemoryOwner owner;
-  /// Logical resource used by the owner.
-  GpuMemoryResourceKind kind;
-  /// Bytes currently owned by live allocations.
-  uint64_t currentBytes;
-  /// Highest number of simultaneously owned bytes.
-  uint64_t peakBytes;
-  /// Bytes successfully allocated over the tracked lifetime.
-  uint64_t totalBytes;
-  /// Number of allocations currently owned.
-  uint64_t currentAllocations;
-  /// Highest number of simultaneously owned allocations.
-  uint64_t peakAllocations;
+  /// Bytes held by live allocations.
+  uint64_t currentBytes{0};
+  /// Highest number of simultaneously live bytes.
+  uint64_t peakBytes{0};
+  /// Bytes allocated successfully over the tracked lifetime.
+  uint64_t totalBytes{0};
+  /// Number of live allocations.
+  uint64_t currentAllocations{0};
   /// Number of successful allocations over the tracked lifetime.
-  uint64_t totalAllocations;
+  uint64_t totalAllocations{0};
 };
 
-/// Describes one live GPU allocation.
+/// Describes one live allocation and its allocation-time owner.
 struct GpuMemoryAllocationSnapshot {
   /// Allocation address represented as an integer for stable copying.
-  uintptr_t address;
+  uintptr_t address{0};
   /// Requested allocation size in bytes.
-  uint64_t bytes;
-  /// Logical resource that owns the allocation.
-  GpuMemoryResourceKind kind;
-  /// Stable owner captured when the allocation succeeded.
-  GpuMemoryOwner owner;
+  uint64_t bytes{0};
+  /// Stable allocation-time owner.
+  GpuMemoryOwnerHandle handle;
 };
 
-/// Contains a point-in-time view of tracked GPU memory.
+/// Contains a consistent process-wide logical-memory snapshot.
 struct GpuMemorySnapshot {
-  /// Per-resource statistics.
-  std::vector<GpuMemoryResourceSnapshot> resources;
-  /// Per-owner statistics.
+  /// Bytes held by all live tracked allocations.
+  uint64_t currentBytes{0};
+  /// Process-wide high-water mark.
+  uint64_t peakBytes{0};
+  /// Bytes allocated successfully over the tracked lifetime.
+  uint64_t totalBytes{0};
+  /// Number of live allocations.
+  uint64_t currentAllocations{0};
+  /// Highest number of simultaneously live allocations.
+  uint64_t peakAllocations{0};
+  /// Number of successful allocations over the tracked lifetime.
+  uint64_t totalAllocations{0};
+  /// Number of serialized allocation and deallocation transitions.
+  uint64_t sequence{0};
+  /// Number of accounting events that could not be represented.
+  uint64_t dataLossEvents{0};
+  /// Per-owner counters.
   std::vector<GpuMemoryOwnerSnapshot> owners;
   /// Live allocations.
   std::vector<GpuMemoryAllocationSnapshot> allocations;
 };
 
-/// Thread-safe allocation state used by the diagnostic resource wrappers.
+/// Serializes pointer ownership and process, PlanNode, and owner counters.
 class GpuMemoryAllocationTracker {
  public:
-  /// Creates an empty tracker.
+  /// Creates an empty tracker with an explicit unattributed owner.
   GpuMemoryAllocationTracker();
 
   /// Releases tracker state.
   ~GpuMemoryAllocationTracker();
 
-  /// Prevents copying tracker state and its synchronization primitive.
   GpuMemoryAllocationTracker(const GpuMemoryAllocationTracker&) = delete;
-
-  /// Prevents replacing tracker state by copy assignment.
   GpuMemoryAllocationTracker& operator=(const GpuMemoryAllocationTracker&) =
       delete;
 
-  /// Records a successful allocation and returns newly raised owner peaks.
-  GpuMemoryPeakUpdate recordAllocation(
+  /// Registers an owner and returns its stable handle.
+  GpuMemoryOwnerHandle registerOwner(const GpuMemoryOwner& owner);
+
+  /// Records a successful allocation.
+  ///
+  /// Returns the fully ordered counter transition, or no value for a null
+  /// address. Duplicate live addresses are reported as diagnostic data loss.
+  std::optional<GpuMemoryTraceUpdate> recordAllocation(
       void* address,
       std::size_t bytes,
-      GpuMemoryResourceKind kind,
-      const GpuMemoryOwner& owner) noexcept;
+      GpuMemoryOwnerHandle handle) noexcept;
 
   /// Removes a live allocation from its allocation-time owner.
-  void recordDeallocation(void* address) noexcept;
-
-  /// Retires zero-live owner history for a completed task UUID.
   ///
-  /// Owners that still have live allocations are removed by their final
-  /// deallocation.
-  void retireTask(std::string_view taskUuid);
+  /// Returns the fully ordered counter transition. Unknown addresses are
+  /// reported as diagnostic data loss.
+  std::optional<GpuMemoryTraceUpdate> recordDeallocation(
+      void* address) noexcept;
 
-  /// Retires query aggregates after the owning QueryCtx is destroyed.
-  ///
-  /// Aggregates with live allocations remain until final deallocation.
-  void retireQuery(const std::string& queryId);
+  /// Returns current counters for an allocation failure marker.
+  GpuMemoryTraceUpdate currentState(GpuMemoryOwnerHandle handle) const noexcept;
 
-  /// Returns a consistent snapshot of resource, owner, and allocation state.
+  /// Returns a consistent point-in-time view of the ledger.
   [[nodiscard]] GpuMemorySnapshot snapshot() const;
 
  private:
-  /// Holds synchronized implementation state.
   class Impl;
-
-  /// Owns the synchronized implementation.
   std::unique_ptr<Impl> impl_;
 };
 
-/// Owns the two diagnostic resource wrapper chains.
+/// Owns tracked wrappers for the default and explicit output resources.
+///
+/// Both wrappers feed one ledger. The distinction is intentionally absent
+/// from the MVP trace because simultaneous logical ownership is the useful
+/// OOM-debugging signal.
 struct GpuMemoryResourcePair {
-  /// Main resource wrapper used as the cuDF default resource.
   cuda::mr::any_resource<cuda::mr::device_accessible> main;
-  /// Separate output wrapper, even when both wrappers share one upstream.
   cuda::mr::any_resource<cuda::mr::device_accessible> output;
 };
 
@@ -210,32 +155,35 @@ extern std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
 /// Returns the memory resource designated for output vector allocations.
 rmm::device_async_resource_ref get_output_mr();
 
-/// Returns a stable name for a logical GPU memory resource.
-std::string_view gpuMemoryResourceKindString(GpuMemoryResourceKind kind);
-
-/// Creates separate tracked main and output wrappers and activates snapshots.
-///
-/// The returned wrappers own all callback state. The caller must retain them
-/// while GPU allocations can use either resource.
+/// Creates two wrappers backed by one allocation-ownership ledger.
 [[nodiscard]] GpuMemoryResourcePair createGpuMemoryTrackingResources(
     cuda::mr::any_resource<cuda::mr::device_accessible> mainUpstream,
     cuda::mr::any_resource<cuda::mr::device_accessible> outputUpstream);
 
-/// Clears the globally exposed diagnostic snapshot state.
+/// Clears the globally exposed tracker.
 void resetGpuMemoryTracking();
 
 /// Returns the current global diagnostic state or an empty snapshot.
 [[nodiscard]] GpuMemorySnapshot getGpuMemorySnapshot();
 
-/// Retires zero-live owner history for a completed task UUID.
-///
-/// Owners with live allocations remain visible until final deallocation.
-void retireGpuMemoryTask(std::string_view taskUuid);
+namespace gpu_memory_detail {
 
-/// Logs global counters and the largest live owners and allocations.
-void logGpuMemorySnapshot(
-    std::string_view context,
-    std::size_t maxEntries = 10);
+/// Holds the thread-local attribution state replaced by an operator scope.
+struct GpuMemoryActiveOwner {
+  const void* tracker{nullptr};
+  uint64_t ownerId{0};
+};
+
+/// Activates an operator and returns the previous thread-local owner.
+GpuMemoryActiveOwner activateGpuMemoryOperator(exec::Operator* op) noexcept;
+
+/// Returns the active thread-local attribution.
+GpuMemoryActiveOwner activeGpuMemoryOwner() noexcept;
+
+/// Restores a previously active thread-local owner.
+void restoreGpuMemoryOwner(GpuMemoryActiveOwner owner) noexcept;
+
+} // namespace gpu_memory_detail
 
 /**
  * @brief Creates a memory resource based on the given mode.
@@ -247,9 +195,7 @@ void logGpuMemorySnapshot(
 [[nodiscard]] cuda::mr::any_resource<cuda::mr::device_accessible>
 createMemoryResource(std::string_view mode, int percent);
 
-/**
- * @brief Returns the global CUDA stream pool used by cudf.
- */
+/// Returns the global CUDA stream pool used by cuDF.
 [[nodiscard]] cudf::detail::cuda_stream_pool& cudfGlobalStreamPool();
 
 } // namespace facebook::velox::cudf_velox

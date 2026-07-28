@@ -342,6 +342,7 @@ void Driver::initializeOperators() {
   }
   operatorsInitialized_ = true;
   for (auto& op : operators_) {
+    RuntimeStatWriterScopeGuard statsWriterGuard(op.get());
     op->initialize();
   }
 }

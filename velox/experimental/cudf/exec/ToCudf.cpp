@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTrace.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
@@ -32,11 +33,8 @@
 #include "velox/experimental/cudf/expression/JitExpression.h"
 
 #include "folly/Conv.h"
-#include "folly/ScopeGuard.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
-#include "velox/exec/PlanNodeStats.h"
-#include "velox/exec/Task.h"
 #include "velox/exec/Values.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
@@ -44,7 +42,6 @@
 
 #include <cuda.h>
 
-#include <exception>
 #include <iostream>
 #include <vector>
 
@@ -54,71 +51,6 @@ namespace facebook::velox::cudf_velox {
 
 namespace {
 
-std::string exceptionText(const std::exception_ptr& error) {
-  if (error == nullptr) {
-    return "<none>";
-  }
-
-  try {
-    std::rethrow_exception(error);
-  } catch (const std::exception& exception) {
-    return exception.what();
-  } catch (...) {
-    return "<unknown>";
-  }
-}
-
-void logTaskCompletion(
-    const std::string& taskUuid,
-    const std::string& taskId,
-    exec::TaskState state,
-    const std::exception_ptr& error) {
-  LOG(INFO) << "GPU_MEMORY_TASK task_uuid=" << taskUuid << " task_id=" << taskId
-            << " state=" << exec::taskStateString(state)
-            << " exception=" << exceptionText(error);
-  logGpuMemorySnapshot(fmt::format(
-      "task_uuid={} task_id={} state={}",
-      taskUuid,
-      taskId,
-      exec::taskStateString(state)));
-}
-
-class CudfTaskListener final : public exec::TaskListener {
- public:
-  void onTaskCompletion(
-      const std::string& taskUuid,
-      const std::string& taskId,
-      exec::TaskState state,
-      std::exception_ptr error,
-      exec::TaskStats /*stats*/) override {
-    auto retirementGuard =
-        folly::makeGuard([&] { retireGpuMemoryTask(taskUuid); });
-    logTaskCompletion(taskUuid, taskId, state, error);
-  }
-
-  void onTaskCompletion(
-      const std::string& taskUuid,
-      const std::string& taskId,
-      exec::TaskState state,
-      std::exception_ptr error,
-      const exec::TaskStats& stats,
-      const core::PlanFragment& fragment,
-      const std::unordered_map<
-          core::PlanNodeId,
-          std::shared_ptr<exec::ExchangeClient>>& /*exchangeClientMap*/)
-      override {
-    auto retirementGuard =
-        folly::makeGuard([&] { retireGpuMemoryTask(taskUuid); });
-    logTaskCompletion(taskUuid, taskId, state, error);
-    if (fragment.planNode != nullptr) {
-      LOG(INFO) << "GPU_MEMORY_TASK_PLAN task_uuid=" << taskUuid
-                << " task_id=" << taskId << '\n'
-                << exec::printPlanWithStats(*fragment.planNode, stats, true);
-    }
-  }
-};
-
-std::shared_ptr<exec::TaskListener> cudfTaskListener;
 std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
     previousCudfMemoryResource;
 bool gpuMemoryDiagnosticsInstalled{false};
@@ -344,16 +276,16 @@ bool CompileState::compile(bool allowCpuFallback) {
 
   if (debugEnabled) {
     // Print before/after together for easy comparison.
-    LOG(INFO) << "Operators " << "before adapting for cuDF"
-              << ": count [" << beforeOperators.size() << "]";
+    LOG(INFO) << "Operators " << "before adapting for cuDF" << ": count ["
+              << beforeOperators.size() << "]";
     for (const auto& [id, desc] : beforeOperators) {
       LOG(INFO) << "  Operator: ID " << id << ": " << desc;
     }
     LOG(INFO) << "allowCpuFallback = " << allowCpuFallback;
 
     operators = driver_.operators();
-    LOG(INFO) << "Operators " << "after adapting for cuDF"
-              << ": count [" << operators.size() << "]";
+    LOG(INFO) << "Operators " << "after adapting for cuDF" << ": count ["
+              << operators.size() << "]";
     for (const auto& op : operators) {
       LOG(INFO) << "  Operator: ID " << op->operatorId() << ": "
                 << op->toString();
@@ -415,7 +347,13 @@ void registerCudf() {
         outputMrMode, CudfConfig::getInstance().memoryPercent);
   }
 
-  if (CudfConfig::getInstance().memoryTrackingEnabled) {
+  const auto& cudfConfig = CudfConfig::getInstance();
+  if (cudfConfig.gpuMemoryTrackingEnabled()) {
+    if (!cudfConfig.perfettoMemoryTracePath.empty() &&
+        !startGpuMemoryTrace(cudfConfig.perfettoMemoryTracePath)) {
+      LOG(ERROR) << "GPU-memory tracking will continue without a Perfetto "
+                    "trace file";
+    }
     auto* retirementSlot = new RetiredGpuMemoryDiagnosticResource;
     retirementSlot->next = retiredGpuMemoryDiagnosticResources();
     retiredGpuMemoryDiagnosticResources() = retirementSlot;
@@ -450,23 +388,10 @@ void registerCudf() {
     registerJitEvaluator(CudfConfig::getInstance().jitExpressionPriority);
   }
 
-  if (CudfConfig::getInstance().memoryTrackingEnabled) {
-    cudfTaskListener = std::make_shared<CudfTaskListener>();
-    VELOX_CHECK(
-        exec::registerTaskListener(cudfTaskListener),
-        "Failed to register cuDF task listener");
-  }
-
   isCudfRegistered = true;
 }
 
 void unregisterCudf() {
-  if (cudfTaskListener != nullptr) {
-    if (!exec::unregisterTaskListener(cudfTaskListener)) {
-      LOG(WARNING) << "cuDF task listener was not registered during cleanup";
-    }
-    cudfTaskListener.reset();
-  }
   // Keeps the replaced wrapper alive while its other owning copies are reset.
   [[maybe_unused]] std::optional<
       cuda::mr::any_resource<cuda::mr::device_accessible>>
@@ -490,6 +415,7 @@ void unregisterCudf() {
   output_mr_.reset();
   mr_.reset();
   resetGpuMemoryTracking();
+  stopGpuMemoryTrace();
   exec::DriverFactory::adapters.erase(
       std::remove_if(
           exec::DriverFactory::adapters.begin(),
@@ -517,6 +443,9 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfMemoryTrackingEnabled) != config.end()) {
     memoryTrackingEnabled = folly::to<bool>(config[kCudfMemoryTrackingEnabled]);
+  }
+  if (config.find(kCudfPerfettoMemoryTracePath) != config.end()) {
+    perfettoMemoryTracePath = config[kCudfPerfettoMemoryTracePath];
   }
   if (config.find(kCudfMemoryResource) != config.end()) {
     memoryResource = config[kCudfMemoryResource];

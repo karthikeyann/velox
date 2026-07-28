@@ -26,7 +26,6 @@
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/type/Timestamp.h"
 
-#include <algorithm>
 #include <cmath>
 
 namespace facebook::velox::exec::test {
@@ -224,38 +223,6 @@ class AggregationTest : public OperatorTestBase {
            DOUBLE(),
            VARCHAR()})};
 };
-
-TEST_F(AggregationTest, memoryInstrumentationDisabled) {
-  ASSERT_FALSE(cudf_velox::CudfConfig::getInstance().memoryTrackingEnabled);
-
-  auto input = makeRowVector(
-      {makeFlatVector<int64_t>({1, 1, 2, 2}),
-       makeFlatVector<int64_t>({10, 20, 30, 40})});
-  createDuckDbTable({input});
-
-  core::PlanNodeId aggregationNodeId;
-  auto task = AssertQueryBuilder(duckDbQueryRunner_)
-                  .plan(PlanBuilder()
-                            .values({input})
-                            .singleAggregation({"c0"}, {"sum(c1)"})
-                            .capturePlanNodeId(aggregationNodeId)
-                            .planNode())
-                  .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
-
-  const auto planStats = toPlanStats(task->taskStats());
-  const auto& aggregationStats = planStats.at(aggregationNodeId);
-  ASSERT_TRUE(std::any_of(
-      aggregationStats.operatorStats.begin(),
-      aggregationStats.operatorStats.end(),
-      [](const auto& entry) {
-        return entry.first.starts_with("CudfGroupby");
-      }));
-  const auto& customStats = aggregationStats.customStats;
-  EXPECT_EQ(customStats.count("gpuInputBytes"), 0);
-  EXPECT_EQ(customStats.count("gpuOutputBytes"), 0);
-  EXPECT_EQ(customStats.count("gpuGroupbyInputBatchBytes"), 0);
-  EXPECT_EQ(customStats.count("gpuGroupbyBufferedResultBytes"), 0);
-}
 
 TEST_F(AggregationTest, global) {
   auto vectors = makeVectors(rowType_, 10, 100);

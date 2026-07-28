@@ -1019,7 +1019,6 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
     // This means we're storing the stream from the first batch.
     bufferedResult_ = groupbyOnInput;
   }
-  updateBufferedResultBytesMetric();
 }
 
 void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
@@ -1039,7 +1038,6 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
       return;
     }
     bufferedResult_ = groupbyOnInput;
-    updateBufferedResultBytesMetric();
     return;
   }
 
@@ -1063,7 +1061,6 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
       finalStream,
       get_output_mr());
   bufferedResult_ = compactedOutput;
-  updateBufferedResultBytesMetric();
 }
 
 void CudfGroupby::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
@@ -1100,19 +1097,11 @@ void CudfGroupby::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
   } else {
     bufferedResult_ = groupbyOnInput;
   }
-  updateBufferedResultBytesMetric();
 }
 
 void CudfGroupby::doAddInput(RowVectorPtr input) {
   if (input->size() == 0) {
     return;
-  }
-  if (memoryTrackingEnabled()) {
-    addRuntimeStat(
-        "gpuGroupbyInputBatchBytes",
-        RuntimeCounter(
-            saturateCast(input->estimateFlatSize()),
-            RuntimeCounter::Unit::kBytes));
   }
   numInputRows_ += input->size();
 
@@ -1188,17 +1177,6 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
       pool(), outputType, numRows, std::move(resultTable), stream);
 }
 
-void CudfGroupby::updateBufferedResultBytesMetric() {
-  if (!memoryTrackingEnabled()) {
-    return;
-  }
-  const auto bytes =
-      bufferedResult_ == nullptr ? 0 : bufferedResult_->estimateFlatSize();
-  setRuntimeStat(
-      "gpuGroupbyBufferedResultBytes",
-      RuntimeMetric(saturateCast(bytes), RuntimeCounter::Unit::kBytes));
-}
-
 CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
   auto numOutputRows = bufferedResult_->size();
   const double aggregationPct =
@@ -1218,9 +1196,7 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
   numInputRows_ = 0;
   // We're moving bufferedResult_ to the caller because we want it to be null
   // after this call.
-  auto result = std::move(bufferedResult_);
-  updateBufferedResultBytesMetric();
-  return result;
+  return std::move(bufferedResult_);
 }
 
 RowVectorPtr CudfGroupby::doGetOutput() {
@@ -1272,7 +1248,6 @@ RowVectorPtr CudfGroupby::doGetOutput() {
         get_output_mr());
     stream.synchronize();
     bufferedResult_.reset();
-    updateBufferedResultBytesMetric();
     return result;
   }
 
