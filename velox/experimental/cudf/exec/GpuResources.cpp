@@ -721,6 +721,8 @@ void logAndTraceAllocationFailure(
     gpu_memory_detail::registerGpuMemoryTraceOwner(0, 0, unattributedOwner());
   }
   gpu_memory_detail::emitGpuMemoryTraceOom(
+      state.timestampNs,
+      state.sequence,
       state.ownerId,
       bytes,
       state.globalCurrentBytes,

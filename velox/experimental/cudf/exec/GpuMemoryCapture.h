@@ -35,7 +35,7 @@ struct GpuMemoryCaptureConfig {
   std::string pathPattern;
   /// Selects a task whose query ID, task ID, or UUID contains this text.
   std::string queryFilter;
-  /// Bounds all timeline events retained for one capture.
+  /// Bounds high-volume memory updates and operator calls retained per capture.
   std::size_t maxEvents{250'000};
   /// Loads an optional post-query Quent replay adapter from this shared object.
   std::string adapterPath;
@@ -75,6 +75,8 @@ struct GpuMemoryCaptureCallHandle {
   uint64_t startTimestampNs{0};
   /// Identifies the source thread without exposing an operating-system handle.
   uint64_t threadId{0};
+  /// Identifies the preallocated active-call slot owned by this handle.
+  uint32_t openSlot{0};
   /// Stores the bounded call name without allocating on the execution path.
   std::array<char, 32> callName{};
   /// Indicates that the begin event belongs to the active capture.
@@ -143,6 +145,8 @@ void endGpuMemoryCaptureOperatorCall(
 
 /// Records a factual allocation-failure event.
 void recordGpuMemoryCaptureOom(
+    uint64_t timestampNs,
+    uint64_t sourceSequence,
     uint64_t ownerId,
     std::size_t requestedBytes,
     uint64_t globalCurrentBytes,

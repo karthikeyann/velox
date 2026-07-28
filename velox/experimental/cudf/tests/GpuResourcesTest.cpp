@@ -781,12 +781,18 @@ TEST(GpuMemoryCaptureTest, BoundedCapacityReportsOverflow) {
   const auto capture = readRawCapture(path);
   EXPECT_TRUE(capture["integrity"]["capture_overflow"].asBool());
   EXPECT_FALSE(capture["integrity"]["exact_timeline"].asBool());
+  EXPECT_FALSE(capture["integrity"]["exact_memory_timeline"].asBool());
   EXPECT_EQ(capture["integrity"]["retained_events"].asInt(), 2);
   EXPECT_EQ(capture["integrity"]["dropped_events"].asInt(), 1);
   EXPECT_EQ(capture["integrity"]["max_events"].asInt(), 2);
   EXPECT_THAT(
       jsonIntColumn(capture["memory_updates"], "source_sequence"),
       testing::ElementsAre(11, 12));
+  EXPECT_EQ(capture["summary"]["capture_local_peak_bytes"].asInt(), 30);
+  EXPECT_EQ(
+      capture["summary"]["capture_local_peak_source_sequence"].asInt(), 13);
+  EXPECT_EQ(capture["summary"]["capture_local_peak_event_sequence"].asInt(), 0);
+  EXPECT_TRUE(capture["summary"]["capture_local_peak_exact"].asBool());
 }
 
 TEST(GpuMemoryCaptureTest, FiltersStartWatermarkAndUsesCaptureLocalPeak) {
@@ -843,6 +849,149 @@ TEST(GpuMemoryCaptureTest, FiltersStartWatermarkAndUsesCaptureLocalPeak) {
   EXPECT_TRUE(capture["integrity"]["exact_timeline"].asBool());
   EXPECT_EQ(capture["integrity"]["start_source_sequence"].asInt(), 10);
   EXPECT_EQ(capture["integrity"]["end_source_sequence"].asInt(), 12);
+}
+
+TEST(GpuMemoryCaptureTest, RejectsSequenceGapsForExactMemoryTimeline) {
+  stopGpuMemoryCapture();
+  const auto path = rawCapturePath("sequence-gap");
+  std::filesystem::remove(path);
+  auto cleanup = folly::makeGuard([&] {
+    stopGpuMemoryCapture();
+    std::filesystem::remove(path);
+  });
+
+  GpuMemoryCaptureConfig config;
+  config.pathPattern = path.string();
+  config.maxEvents = 8;
+  ASSERT_TRUE(startGpuMemoryCapture(config));
+  const auto task = makeCaptureTask("sequence-gap");
+  const GpuMemoryOwnerHandle handle{1, 1};
+  const auto owner = makeOwner("sequence-gap", "plan-a", 1, 2, 3);
+  const auto initial =
+      makeCaptureSnapshot(0, 0, 10, {makeCaptureOwner(handle, owner, 0, 0)});
+  ASSERT_TRUE(
+      gpu_memory_detail::tryBeginGpuMemoryCapture(
+          task,
+          {GpuMemoryCapturePlanNode{
+              .id = "plan-a", .type = "TestPlanNode", .sourceIds = {}}},
+          initial));
+
+  const auto timestamp = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
+  gpu_memory_detail::recordGpuMemoryCaptureUpdate(
+      makeCaptureUpdate(12, timestamp, handle, 10, 10, 10, 10));
+  const auto final = makeCaptureSnapshot(
+      10, 10, 12, {makeCaptureOwner(handle, owner, 10, 10)});
+  gpu_memory_detail::finishGpuMemoryCapture(
+      task.taskUuid, task.taskId, "finished", true, final);
+  stopGpuMemoryCapture();
+
+  const auto capture = readRawCapture(path);
+  EXPECT_FALSE(capture["integrity"]["exact_memory_timeline"].asBool());
+  EXPECT_FALSE(capture["integrity"]["exact_timeline"].asBool());
+  EXPECT_FALSE(capture["integrity"]["capture_overflow"].asBool());
+  EXPECT_FALSE(capture["summary"]["capture_local_peak_exact"].asBool());
+}
+
+TEST(GpuMemoryCaptureTest, ClipsOpenCallsAndMatchesUuidStrictly) {
+  stopGpuMemoryCapture();
+  const auto path = rawCapturePath("open-call");
+  std::filesystem::remove(path);
+  auto cleanup = folly::makeGuard([&] {
+    stopGpuMemoryCapture();
+    std::filesystem::remove(path);
+  });
+
+  GpuMemoryCaptureConfig config;
+  config.pathPattern = path.string();
+  config.maxEvents = 8;
+  ASSERT_TRUE(startGpuMemoryCapture(config));
+  const auto task = makeCaptureTask("open-call");
+  const GpuMemoryOwnerHandle ownerHandle{1, 1};
+  const auto owner = makeOwner("open-call", "plan-a", 1, 2, 3);
+  const auto initial = makeCaptureSnapshot(
+      0, 0, 10, {makeCaptureOwner(ownerHandle, owner, 0, 0)});
+  ASSERT_TRUE(
+      gpu_memory_detail::tryBeginGpuMemoryCapture(
+          task,
+          {GpuMemoryCapturePlanNode{
+              .id = "plan-a", .type = "TestPlanNode", .sourceIds = {}}},
+          initial));
+  ASSERT_TRUE(
+      gpu_memory_detail::beginGpuMemoryCaptureOperatorCall(1, "getOutput")
+          .active);
+
+  gpu_memory_detail::finishGpuMemoryCapture(
+      "different-uuid", task.taskId, "failed", false, initial);
+  const auto timestamp = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
+  gpu_memory_detail::recordGpuMemoryCaptureUpdate(
+      makeCaptureUpdate(11, timestamp, ownerHandle, 10, 10, 10, 10));
+  const auto final = makeCaptureSnapshot(
+      10, 10, 11, {makeCaptureOwner(ownerHandle, owner, 10, 10)});
+  gpu_memory_detail::finishGpuMemoryCapture(
+      task.taskUuid, task.taskId, "finished", true, final);
+  stopGpuMemoryCapture();
+
+  const auto capture = readRawCapture(path);
+  EXPECT_EQ(capture["capture"]["task_state"].asString(), "finished");
+  EXPECT_TRUE(capture["integrity"]["exact_memory_timeline"].asBool());
+  EXPECT_FALSE(capture["integrity"]["operator_calls_complete"].asBool());
+  EXPECT_FALSE(capture["integrity"]["exact_timeline"].asBool());
+  EXPECT_EQ(capture["integrity"]["open_operator_calls_at_end"].asInt(), 1);
+  ASSERT_EQ(capture["operator_calls"].size(), 1);
+  EXPECT_EQ(capture["operator_calls"][0]["call_name"].asString(), "getOutput");
+  EXPECT_TRUE(capture["operator_calls"][0]["truncated"].asBool());
+}
+
+TEST(GpuMemoryCaptureTest, RetainsSourceAnchoredOomAfterTimelineOverflow) {
+  stopGpuMemoryCapture();
+  const auto path = rawCapturePath("oom-anchor");
+  std::filesystem::remove(path);
+  auto cleanup = folly::makeGuard([&] {
+    stopGpuMemoryCapture();
+    std::filesystem::remove(path);
+  });
+
+  GpuMemoryCaptureConfig config;
+  config.pathPattern = path.string();
+  config.maxEvents = 1;
+  ASSERT_TRUE(startGpuMemoryCapture(config));
+  const auto task = makeCaptureTask("oom-anchor");
+  const GpuMemoryOwnerHandle handle{1, 1};
+  const auto owner = makeOwner("oom-anchor", "plan-a", 1, 2, 3);
+  const auto initial =
+      makeCaptureSnapshot(0, 0, 20, {makeCaptureOwner(handle, owner, 0, 0)});
+  ASSERT_TRUE(gpu_memory_detail::tryBeginGpuMemoryCapture(task, {}, initial));
+
+  const auto timestamp = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
+  gpu_memory_detail::recordGpuMemoryCaptureUpdate(
+      makeCaptureUpdate(21, timestamp, handle, 10, 10, 10, 10));
+  gpu_memory_detail::recordGpuMemoryCaptureUpdate(
+      makeCaptureUpdate(22, timestamp + 1, handle, 20, 20, 20, 10));
+  gpu_memory_detail::recordGpuMemoryCaptureOom(
+      timestamp + 2,
+      22,
+      handle.ownerId,
+      4'096,
+      20,
+      20,
+      20,
+      20,
+      1'024,
+      8'192,
+      "cudaSuccess");
+  const auto final = makeCaptureSnapshot(
+      20, 20, 22, {makeCaptureOwner(handle, owner, 20, 20)});
+  gpu_memory_detail::finishGpuMemoryCapture(
+      task.taskUuid, task.taskId, "failed", true, final);
+  stopGpuMemoryCapture();
+
+  const auto capture = readRawCapture(path);
+  EXPECT_TRUE(capture["integrity"]["memory_update_overflow"].asBool());
+  EXPECT_GT(capture["integrity"]["retained_events"].asInt(), 1);
+  ASSERT_EQ(capture["oom_events"].size(), 1);
+  EXPECT_EQ(capture["oom_events"][0]["timestamp_ns"].asInt(), timestamp + 2);
+  EXPECT_EQ(capture["oom_events"][0]["source_sequence"].asInt(), 22);
+  EXPECT_EQ(capture["oom_events"][0]["requested_bytes"].asInt(), 4'096);
 }
 
 TEST(GpuMemoryCaptureTest, RetainsConcurrentTaskOwners) {

@@ -970,6 +970,8 @@ void resetGpuMemoryNvtxCounters() noexcept {
 }
 
 void emitGpuMemoryTraceOom(
+    uint64_t timestampNs,
+    uint64_t sourceSequence,
     uint64_t ownerId,
     std::size_t requestedBytes,
     uint64_t globalCurrentBytes,
@@ -980,6 +982,8 @@ void emitGpuMemoryTraceOom(
     std::size_t cudaTotalBytes,
     std::string_view cudaStatus) noexcept {
   recordGpuMemoryCaptureOom(
+      timestampNs,
+      sourceSequence,
       ownerId,
       requestedBytes,
       globalCurrentBytes,

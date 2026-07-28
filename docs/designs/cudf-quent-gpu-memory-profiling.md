@@ -177,13 +177,15 @@ Capture v1 supports:
    - Owner and PlanNode IDs.
    - Signed requested-byte delta.
    - Global, query, Task, PlanNode, and owner current bytes after the delta.
-2. **Completed operator call span**
+2. **Operator call span**
    - Stable call ID.
    - Owner ID.
    - Bounded method name.
    - Source thread ID.
    - Begin and end source timestamps.
+   - A truncation flag when Task termination clipped an in-flight call.
 3. **Allocation failure**
+   - Source timestamp and ledger sequence of the reported logical state.
    - Owner ID and requested bytes.
    - Current logical state.
    - Best-effort CUDA free/total bytes and CUDA status.
@@ -259,18 +261,27 @@ FFI. It only seals and transfers ownership of an immutable capture.
 
 ## Bounded recorder
 
-The recorder reserves a configured number of fixed-size events before capture.
-It never grows storage on an allocation callback.
+The recorder splits the configured high-volume event budget between memory
+transitions and operator-call spans, then reserves both vectors before capture.
+The combined reservation does not exceed the configured budget. Active calls
+use a small fixed set of preallocated slots. Markers, allocation failures, and
+data-loss facts use small, fixed out-of-band budgets so an exhausted ordinary
+timeline cannot hide the reason a query failed. No storage grows on an
+allocation callback.
 
 When capacity is exhausted:
 
 - Existing events are not overwritten.
 - The source ledger continues exact accounting.
 - The recorder increments an out-of-band rejected-event count.
-- The completed capture is marked inexact.
+- The affected timeline coverage is marked inexact.
 - The ending snapshot is still retained.
-- The Quent UI must display an incomplete-capture warning and must not label its
-  peak or threshold results exact.
+- The producer continues updating a constant-space global peak tuple before
+  rejecting an event.
+- The Quent UI must display an incomplete-timeline warning. It may label the
+  global peak exact only when the independent peak-integrity flag is true, but
+  cannot claim exact holder context or threshold crossings across missing
+  transitions.
 
 Disabled recording is a fast no-op. Finishing a capture is idempotent. Recorder
 or adapter exceptions are contained and cannot alter an allocation, free, OOM,
@@ -287,13 +298,21 @@ Lifetime ledger peaks cannot be displayed as selected-capture peaks. An earlier
 query can establish a larger lifetime value whose timestamp is outside this
 capture.
 
-The adapter reconstructs the capture-local global series as a step function:
+For a complete timeline, the adapter reconstructs the capture-local global
+series as a step function:
 
 1. Start with the beginning snapshot's global current bytes.
 2. Order memory transitions by source sequence.
 3. Use each transition's global current bytes as the next value.
-4. Choose the maximum of the beginning value and all retained values.
+4. Verify the producer's constant-space peak tuple against the reconstructed
+   maximum.
 5. Associate the peak with capture start or the exact triggering transition.
+
+The producer observes every source transition even after ordinary storage
+overflows. It therefore retains the global peak bytes, timestamp, and source
+sequence in constant space. If the triggering transition itself was dropped,
+its capture-local event ordinal is zero. The peak can remain exact while the
+timeline and concurrent-holder context are explicitly incomplete.
 
 PlanNode and owner peaks follow the same rule using their beginning values and
 subsequent current values. The lifetime peak may be retained as diagnostic

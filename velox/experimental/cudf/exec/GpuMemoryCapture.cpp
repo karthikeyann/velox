@@ -36,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -47,6 +48,9 @@ namespace {
 constexpr std::string_view kCaptureFormat{"velox-cudf-gpu-memory-capture"};
 constexpr uint64_t kCaptureVersion{1};
 constexpr std::size_t kMaximumErrorLength{1'024};
+constexpr std::size_t kMaximumActiveCalls{4'096};
+constexpr std::size_t kMarkerCapacity{64};
+constexpr std::size_t kCriticalEventCapacity{64};
 
 struct CapturedOwner {
   uint64_t ownerId{0};
@@ -67,6 +71,12 @@ struct CapturedCallSpan {
   uint64_t startTimestampNs{0};
   uint64_t endTimestampNs{0};
   std::array<char, 32> callName{};
+  bool truncated{false};
+};
+
+struct ActiveCallSlot {
+  GpuMemoryCaptureCallHandle handle;
+  bool active{false};
 };
 
 struct CapturedMarker {
@@ -79,6 +89,7 @@ struct CapturedMarker {
 struct CapturedOom {
   uint64_t eventSequence{0};
   uint64_t timestampNs{0};
+  uint64_t sourceSequence{0};
   uint64_t ownerId{0};
   uint64_t requestedBytes{0};
   uint64_t globalCurrentBytes{0};
@@ -109,6 +120,8 @@ struct CaptureData {
   std::vector<CapturedMarker> markers;
   std::vector<CapturedOom> oomEvents;
   std::vector<CapturedDataLoss> dataLossEvents;
+  std::vector<ActiveCallSlot> activeCallSlots;
+  std::vector<uint32_t> freeCallSlots;
   uint64_t startTimestampNs{0};
   uint64_t startUnixNs{0};
   uint64_t endTimestampNs{0};
@@ -116,12 +129,24 @@ struct CaptureData {
   uint64_t nextEventSequence{0};
   uint64_t retainedEvents{0};
   uint64_t droppedEvents{0};
+  uint64_t internalDataLossEvents{0};
+  uint64_t observedMemoryUpdates{0};
+  uint64_t lastObservedSourceSequence{0};
   uint64_t activeCalls{0};
   uint64_t openCallsAtEnd{0};
+  uint64_t observedPeakBytes{0};
+  uint64_t observedPeakTimestampNs{0};
+  uint64_t observedPeakEventSequence{0};
+  uint64_t observedPeakSourceSequence{0};
   std::size_t maxEvents{0};
+  std::size_t memoryUpdateCapacity{0};
+  std::size_t operatorCallCapacity{0};
   std::string taskState;
   std::string endReason;
   bool captureOverflow{false};
+  bool memoryUpdateOverflow{false};
+  bool operatorCallOverflow{false};
+  bool sourceSequenceGap{false};
   bool complete{false};
   bool cleanupComplete{false};
 };
@@ -207,14 +232,21 @@ folly::dynamic ownerCounters(const GpuMemoryOwnerSnapshot& owner) {
       "source_lifetime_total_allocations", owner.totalAllocations);
 }
 
-folly::dynamic snapshotJson(const GpuMemorySnapshot& snapshot) {
+folly::dynamic snapshotJson(
+    const GpuMemorySnapshot& snapshot,
+    const std::set<uint64_t>& relevantOwnerIds) {
   auto owners = folly::dynamic::array();
   for (const auto& owner : snapshot.owners) {
-    owners.push_back(ownerCounters(owner));
+    if (relevantOwnerIds.contains(owner.handle.ownerId)) {
+      owners.push_back(ownerCounters(owner));
+    }
   }
 
   auto allocations = folly::dynamic::array();
   for (const auto& allocation : snapshot.allocations) {
+    if (!relevantOwnerIds.contains(allocation.handle.ownerId)) {
+      continue;
+    }
     std::ostringstream address;
     address << "0x" << std::hex << allocation.address;
     allocations.push_back(
@@ -238,23 +270,75 @@ struct CapturePeak {
   uint64_t bytes{0};
   uint64_t timestampNs{0};
   uint64_t eventSequence{0};
+  uint64_t sourceSequence{0};
 };
 
 CapturePeak calculateCapturePeak(const CaptureData& capture) {
-  CapturePeak peak{
-      capture.initialSnapshot.currentBytes, capture.startTimestampNs, 0};
-  for (const auto& event : capture.memoryUpdates) {
-    if (event.update.globalCurrentBytes > peak.bytes) {
-      peak = CapturePeak{
-          event.update.globalCurrentBytes,
-          event.update.timestampNs,
-          event.eventSequence};
+  return CapturePeak{
+      capture.observedPeakBytes,
+      capture.observedPeakTimestampNs,
+      capture.observedPeakEventSequence,
+      capture.observedPeakSourceSequence};
+}
+
+std::set<uint64_t> relevantOwnerIds(const CaptureData& capture) {
+  std::set<uint64_t> result;
+  const auto includeSnapshot = [&result](const GpuMemorySnapshot& snapshot) {
+    for (const auto& owner : snapshot.owners) {
+      if (owner.currentBytes > 0 || owner.currentAllocations > 0) {
+        result.insert(owner.handle.ownerId);
+      }
+    }
+    for (const auto& allocation : snapshot.allocations) {
+      result.insert(allocation.handle.ownerId);
+    }
+  };
+  includeSnapshot(capture.initialSnapshot);
+  includeSnapshot(capture.finalSnapshot);
+
+  for (const auto& [ownerId, owner] : capture.owners) {
+    const bool matchesSelectedTask = capture.task.taskUuid.empty()
+        ? owner.owner.taskId == capture.task.taskId
+        : owner.owner.taskUuid == capture.task.taskUuid;
+    if (matchesSelectedTask) {
+      result.insert(ownerId);
     }
   }
-  return peak;
+  for (const auto& event : capture.memoryUpdates) {
+    result.insert(event.update.ownerId);
+  }
+  for (const auto& call : capture.operatorCalls) {
+    result.insert(call.ownerId);
+  }
+  for (const auto& marker : capture.markers) {
+    result.insert(marker.ownerId);
+  }
+  for (const auto& oom : capture.oomEvents) {
+    result.insert(oom.ownerId);
+  }
+  return result;
+}
+
+bool hasCompleteSourceSequence(const CaptureData& capture) {
+  if (capture.finalSnapshot.sequence < capture.initialSnapshot.sequence) {
+    return false;
+  }
+  const auto expectedUpdates =
+      capture.finalSnapshot.sequence - capture.initialSnapshot.sequence;
+  if (capture.memoryUpdates.size() != expectedUpdates) {
+    return false;
+  }
+  uint64_t expectedSequence = capture.initialSnapshot.sequence;
+  for (const auto& event : capture.memoryUpdates) {
+    if (event.update.sequence != ++expectedSequence) {
+      return false;
+    }
+  }
+  return expectedSequence == capture.finalSnapshot.sequence;
 }
 
 folly::dynamic captureJson(const CaptureData& capture) {
+  const auto relevantOwners = relevantOwnerIds(capture);
   auto planNodes = folly::dynamic::array();
   for (const auto& node : capture.planNodes) {
     auto sources = folly::dynamic::array();
@@ -267,7 +351,10 @@ folly::dynamic captureJson(const CaptureData& capture) {
   }
 
   auto owners = folly::dynamic::array();
-  for (const auto& [_, owner] : capture.owners) {
+  for (const auto& [ownerId, owner] : capture.owners) {
+    if (!relevantOwners.contains(ownerId)) {
+      continue;
+    }
     owners.push_back(
         folly::dynamic::object("owner_id", owner.ownerId)(
             "plan_node_track_id", owner.planNodeId)(
@@ -299,7 +386,8 @@ folly::dynamic captureJson(const CaptureData& capture) {
             "thread_id", call.threadId)(
             "start_timestamp_ns", call.startTimestampNs)(
             "end_timestamp_ns", call.endTimestampNs)(
-            "call_name", fixedString(call.callName)));
+            "call_name", fixedString(call.callName))(
+            "truncated", call.truncated));
   }
 
   auto markers = folly::dynamic::array();
@@ -315,6 +403,7 @@ folly::dynamic captureJson(const CaptureData& capture) {
     oomEvents.push_back(
         folly::dynamic::object("event_sequence", oom.eventSequence)(
             "timestamp_ns", oom.timestampNs)("owner_id", oom.ownerId)(
+            "source_sequence", oom.sourceSequence)(
             "requested_bytes", oom.requestedBytes)(
             "global_current_bytes", oom.globalCurrentBytes)(
             "source_lifetime_global_peak_bytes",
@@ -341,8 +430,21 @@ folly::dynamic captureJson(const CaptureData& capture) {
       ? capture.finalSnapshot.dataLossEvents -
           capture.initialSnapshot.dataLossEvents
       : 0;
+  const bool exactMemoryTimeline = capture.complete &&
+      !capture.memoryUpdateOverflow && capture.internalDataLossEvents == 0 &&
+      sourceDataLossEvents == 0 && hasCompleteSourceSequence(capture);
+  const bool captureLocalPeakExact = capture.complete &&
+      capture.finalSnapshot.sequence >= capture.initialSnapshot.sequence &&
+      capture.internalDataLossEvents == 0 && sourceDataLossEvents == 0 &&
+      !capture.sourceSequenceGap &&
+      capture.observedMemoryUpdates ==
+          capture.finalSnapshot.sequence - capture.initialSnapshot.sequence &&
+      capture.lastObservedSourceSequence == capture.finalSnapshot.sequence;
+  const bool operatorCallsComplete = capture.complete &&
+      capture.cleanupComplete && !capture.operatorCallOverflow &&
+      capture.openCallsAtEnd == 0 && capture.internalDataLossEvents == 0;
   const bool exactTimeline =
-      !capture.captureOverflow && sourceDataLossEvents == 0;
+      exactMemoryTimeline && operatorCallsComplete && !capture.captureOverflow;
 
   return folly::dynamic::object("format", kCaptureFormat)(
       "version", kCaptureVersion)(
@@ -362,24 +464,33 @@ folly::dynamic captureJson(const CaptureData& capture) {
           "replay_formula",
           "start_unix_ns + (timestamp_ns - start_timestamp_ns)"))(
       "plan_nodes", std::move(planNodes))("owners", std::move(owners))(
-      "initial_snapshot", snapshotJson(capture.initialSnapshot))(
+      "initial_snapshot",
+      snapshotJson(capture.initialSnapshot, relevantOwners))(
       "memory_updates", std::move(updates))("operator_calls", std::move(calls))(
       "markers", std::move(markers))("oom_events", std::move(oomEvents))(
       "data_loss_events", std::move(dataLossEvents))(
-      "final_snapshot", snapshotJson(capture.finalSnapshot))(
+      "final_snapshot", snapshotJson(capture.finalSnapshot, relevantOwners))(
       "summary",
       folly::dynamic::object("capture_local_peak_bytes", peak.bytes)(
           "capture_local_peak_timestamp_ns", peak.timestampNs)(
-          "capture_local_peak_event_sequence", peak.eventSequence))(
+          "capture_local_peak_event_sequence", peak.eventSequence)(
+          "capture_local_peak_source_sequence", peak.sourceSequence)(
+          "capture_local_peak_exact", captureLocalPeakExact))(
       "integrity",
       folly::dynamic::object("exact_timeline", exactTimeline)(
-          "exact_memory_timeline", exactTimeline)(
-          "operator_calls_complete",
-          capture.openCallsAtEnd == 0 && capture.cleanupComplete)(
+          "exact_memory_timeline", exactMemoryTimeline)(
+          "operator_calls_complete", operatorCallsComplete)(
           "capture_overflow", capture.captureOverflow)(
+          "memory_update_overflow", capture.memoryUpdateOverflow)(
+          "operator_call_overflow", capture.operatorCallOverflow)(
           "retained_events", capture.retainedEvents)(
           "dropped_events", capture.droppedEvents)(
+          "internal_data_loss_events", capture.internalDataLossEvents)(
+          "observed_memory_updates", capture.observedMemoryUpdates)(
           "max_events", capture.maxEvents)(
+          "memory_update_capacity", capture.memoryUpdateCapacity)(
+          "operator_call_capacity", capture.operatorCallCapacity)(
+          "critical_event_capacity", kCriticalEventCapacity)(
           "open_operator_calls_at_end", capture.openCallsAtEnd)(
           "start_source_sequence", capture.initialSnapshot.sequence)(
           "end_source_sequence", capture.finalSnapshot.sequence)(
@@ -507,7 +618,7 @@ class GpuMemoryCaptureController {
               gpu_memory_detail::gpuMemoryMonotonicTimeNs();
           active_->endUnixNs = gpu_memory_detail::gpuMemoryUnixTimeNs();
           active_->finalSnapshot = active_->initialSnapshot;
-          active_->openCallsAtEnd = active_->activeCalls;
+          clipOpenCalls(*active_, active_->endTimestampNs);
           pending_.push_back(std::move(active_));
         }
         stopping_ = true;
@@ -556,12 +667,26 @@ class GpuMemoryCaptureController {
       capture->startTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
       capture->startUnixNs = gpu_memory_detail::gpuMemoryUnixTimeNs();
       capture->maxEvents = config_.maxEvents;
-
-      capture->memoryUpdates.reserve(config_.maxEvents);
-      capture->operatorCalls.reserve(config_.maxEvents);
-      capture->markers.reserve(64);
-      capture->oomEvents.reserve(16);
-      capture->dataLossEvents.reserve(16);
+      capture->operatorCallCapacity = config_.maxEvents / 4;
+      capture->memoryUpdateCapacity =
+          config_.maxEvents - capture->operatorCallCapacity;
+      capture->memoryUpdates.reserve(capture->memoryUpdateCapacity);
+      capture->operatorCalls.reserve(capture->operatorCallCapacity);
+      capture->markers.reserve(kMarkerCapacity);
+      capture->oomEvents.reserve(kCriticalEventCapacity);
+      capture->dataLossEvents.reserve(kCriticalEventCapacity);
+      const auto activeCallCapacity =
+          std::min(capture->operatorCallCapacity, kMaximumActiveCalls);
+      capture->activeCallSlots.resize(activeCallCapacity);
+      capture->freeCallSlots.reserve(activeCallCapacity);
+      for (uint32_t slot = 0; slot < activeCallCapacity; ++slot) {
+        capture->freeCallSlots.push_back(
+            static_cast<uint32_t>(activeCallCapacity - slot - 1));
+      }
+      capture->observedPeakBytes = initialSnapshot.currentBytes;
+      capture->observedPeakTimestampNs = capture->startTimestampNs;
+      capture->observedPeakSourceSequence = initialSnapshot.sequence;
+      capture->lastObservedSourceSequence = initialSnapshot.sequence;
       mergeSnapshotOwners(*capture, initialSnapshot);
       active_ = std::move(capture);
       taskSelected_ = true;
@@ -582,9 +707,13 @@ class GpuMemoryCaptureController {
       const GpuMemorySnapshot& finalSnapshot) noexcept {
     try {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (active_ == nullptr ||
-          (active_->task.taskUuid != taskUuid &&
-           active_->task.taskId != taskId)) {
+      if (active_ == nullptr) {
+        return;
+      }
+      const bool matchesTask = active_->task.taskUuid.empty()
+          ? active_->task.taskId == taskId
+          : active_->task.taskUuid == taskUuid;
+      if (!matchesTask) {
         return;
       }
       active_->finalSnapshot = finalSnapshot;
@@ -595,7 +724,7 @@ class GpuMemoryCaptureController {
       active_->endReason = "task_terminal";
       active_->complete = true;
       active_->cleanupComplete = cleanupComplete;
-      active_->openCallsAtEnd = active_->activeCalls;
+      clipOpenCalls(*active_, active_->endTimestampNs);
       pending_.push_back(std::move(active_));
       condition_.notify_one();
     } catch (...) {
@@ -619,7 +748,7 @@ class GpuMemoryCaptureController {
       active_->endReason = boundedString(reason, 128);
       active_->complete = false;
       active_->cleanupComplete = false;
-      active_->openCallsAtEnd = active_->activeCalls;
+      clipOpenCalls(*active_, active_->endTimestampNs);
       pending_.push_back(std::move(active_));
       condition_.notify_one();
     } catch (...) {
@@ -650,11 +779,30 @@ class GpuMemoryCaptureController {
           update.sequence <= active_->initialSnapshot.sequence) {
         return;
       }
-      if (!retainEvent(*active_)) {
+      if (update.sequence != active_->lastObservedSourceSequence + 1) {
+        active_->sourceSequenceGap = true;
+      }
+      active_->lastObservedSourceSequence = update.sequence;
+      ++active_->observedMemoryUpdates;
+      const bool establishesPeak =
+          update.globalCurrentBytes > active_->observedPeakBytes;
+      if (establishesPeak) {
+        active_->observedPeakBytes = update.globalCurrentBytes;
+        active_->observedPeakTimestampNs = update.timestampNs;
+        active_->observedPeakEventSequence = 0;
+        active_->observedPeakSourceSequence = update.sequence;
+      }
+      if (active_->memoryUpdates.size() >= active_->memoryUpdateCapacity) {
+        active_->memoryUpdateOverflow = true;
+        noteOverflow(*active_);
         return;
       }
+      const auto eventSequence = retainEvent(*active_);
       active_->memoryUpdates.push_back(
-          CapturedMemoryUpdate{active_->nextEventSequence, update});
+          CapturedMemoryUpdate{eventSequence, update});
+      if (establishesPeak) {
+        active_->observedPeakEventSequence = eventSequence;
+      }
     } catch (...) {
       noteInternalDataLoss("memory update capture exception", update.sequence);
     }
@@ -665,12 +813,14 @@ class GpuMemoryCaptureController {
       std::string_view callName) noexcept {
     try {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (active_ == nullptr ||
-          active_->retainedEvents + active_->activeCalls >=
-              active_->maxEvents) {
-        if (active_ != nullptr) {
-          noteOverflow(*active_);
-        }
+      if (active_ == nullptr) {
+        return {};
+      }
+      if (active_->operatorCalls.size() + active_->activeCalls >=
+              active_->operatorCallCapacity ||
+          active_->freeCallSlots.empty()) {
+        active_->operatorCallOverflow = true;
+        noteOverflow(*active_);
         return {};
       }
       GpuMemoryCaptureCallHandle handle;
@@ -681,10 +831,15 @@ class GpuMemoryCaptureController {
       handle.threadId =
           std::hash<std::thread::id>{}(std::this_thread::get_id());
       copyBounded(handle.callName, callName);
+      handle.openSlot = active_->freeCallSlots.back();
+      active_->freeCallSlots.pop_back();
       handle.active = true;
+      active_->activeCallSlots.at(handle.openSlot) =
+          ActiveCallSlot{handle, true};
       ++active_->activeCalls;
       return handle;
     } catch (...) {
+      noteInternalDataLoss("operator call begin exception", 0);
       return {};
     }
   }
@@ -699,21 +854,29 @@ class GpuMemoryCaptureController {
       if (active_ == nullptr || active_->captureId != handle.captureId) {
         return;
       }
-      if (active_->activeCalls > 0) {
-        --active_->activeCalls;
-      }
-      if (!retainEvent(*active_)) {
+      if (handle.openSlot >= active_->activeCallSlots.size()) {
+        ++active_->internalDataLossEvents;
         return;
       }
+      auto& slot = active_->activeCallSlots.at(handle.openSlot);
+      if (!slot.active || slot.handle.callId != handle.callId) {
+        ++active_->internalDataLossEvents;
+        return;
+      }
+      slot.active = false;
+      active_->freeCallSlots.push_back(handle.openSlot);
+      --active_->activeCalls;
+      const auto eventSequence = retainEvent(*active_);
       active_->operatorCalls.push_back(
           CapturedCallSpan{
-              active_->nextEventSequence,
+              eventSequence,
               handle.callId,
               handle.ownerId,
               handle.threadId,
               handle.startTimestampNs,
               std::max(endTimestampNs, handle.startTimestampNs),
-              handle.callName});
+              handle.callName,
+              false});
     } catch (...) {
       noteInternalDataLoss("operator call capture exception", 0);
     }
@@ -722,12 +885,17 @@ class GpuMemoryCaptureController {
   void recordMarker(uint64_t ownerId, std::string_view name) noexcept {
     try {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (active_ == nullptr || !retainEvent(*active_)) {
+      if (active_ == nullptr) {
         return;
       }
+      if (active_->markers.size() >= kMarkerCapacity) {
+        noteOverflow(*active_);
+        return;
+      }
+      const auto eventSequence = retainEvent(*active_);
       active_->markers.push_back(
           CapturedMarker{
-              active_->nextEventSequence,
+              eventSequence,
               gpu_memory_detail::gpuMemoryMonotonicTimeNs(),
               ownerId,
               boundedString(name, 256)});
@@ -737,6 +905,8 @@ class GpuMemoryCaptureController {
   }
 
   void recordOom(
+      uint64_t timestampNs,
+      uint64_t sourceSequence,
       uint64_t ownerId,
       std::size_t requestedBytes,
       uint64_t globalCurrentBytes,
@@ -748,13 +918,19 @@ class GpuMemoryCaptureController {
       std::string_view cudaStatus) noexcept {
     try {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (active_ == nullptr || !retainEvent(*active_)) {
+      if (active_ == nullptr) {
         return;
       }
+      if (active_->oomEvents.size() >= kCriticalEventCapacity) {
+        noteCriticalEventLoss(*active_);
+        return;
+      }
+      const auto eventSequence = retainEvent(*active_);
       active_->oomEvents.push_back(
           CapturedOom{
-              active_->nextEventSequence,
-              gpu_memory_detail::gpuMemoryMonotonicTimeNs(),
+              eventSequence,
+              timestampNs,
+              sourceSequence,
               ownerId,
               static_cast<uint64_t>(requestedBytes),
               globalCurrentBytes,
@@ -774,12 +950,17 @@ class GpuMemoryCaptureController {
       uint64_t sourceSequence) noexcept {
     try {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (active_ == nullptr || !retainEvent(*active_)) {
+      if (active_ == nullptr) {
         return;
       }
+      if (active_->dataLossEvents.size() >= kCriticalEventCapacity) {
+        noteCriticalEventLoss(*active_);
+        return;
+      }
+      const auto eventSequence = retainEvent(*active_);
       active_->dataLossEvents.push_back(
           CapturedDataLoss{
-              active_->nextEventSequence,
+              eventSequence,
               gpu_memory_detail::gpuMemoryMonotonicTimeNs(),
               sourceSequence,
               boundedString(reason, 256)});
@@ -805,14 +986,43 @@ class GpuMemoryCaptureController {
     ++capture.droppedEvents;
   }
 
-  static bool retainEvent(CaptureData& capture) {
-    if (capture.retainedEvents >= capture.maxEvents) {
-      noteOverflow(capture);
-      return false;
-    }
+  static void noteCriticalEventLoss(CaptureData& capture) {
+    ++capture.internalDataLossEvents;
+    noteOverflow(capture);
+  }
+
+  static uint64_t retainEvent(CaptureData& capture) {
     ++capture.retainedEvents;
-    ++capture.nextEventSequence;
-    return true;
+    return ++capture.nextEventSequence;
+  }
+
+  static void clipOpenCalls(CaptureData& capture, uint64_t endTimestampNs) {
+    capture.openCallsAtEnd = capture.activeCalls;
+    for (auto& slot : capture.activeCallSlots) {
+      if (!slot.active) {
+        continue;
+      }
+      if (capture.operatorCalls.size() >= capture.operatorCallCapacity) {
+        capture.operatorCallOverflow = true;
+        noteCriticalEventLoss(capture);
+        slot.active = false;
+        continue;
+      }
+      const auto eventSequence = retainEvent(capture);
+      const auto& handle = slot.handle;
+      capture.operatorCalls.push_back(
+          CapturedCallSpan{
+              eventSequence,
+              handle.callId,
+              handle.ownerId,
+              handle.threadId,
+              handle.startTimestampNs,
+              std::max(endTimestampNs, handle.startTimestampNs),
+              handle.callName,
+              true});
+      slot.active = false;
+    }
+    capture.activeCalls = 0;
   }
 
   void noteInternalDataLoss(
@@ -823,12 +1033,15 @@ class GpuMemoryCaptureController {
       if (active_ == nullptr) {
         return;
       }
-      if (!retainEvent(*active_)) {
+      ++active_->internalDataLossEvents;
+      if (active_->dataLossEvents.size() >= kCriticalEventCapacity) {
+        noteOverflow(*active_);
         return;
       }
+      const auto eventSequence = retainEvent(*active_);
       active_->dataLossEvents.push_back(
           CapturedDataLoss{
-              active_->nextEventSequence,
+              eventSequence,
               gpu_memory_detail::gpuMemoryMonotonicTimeNs(),
               sourceSequence,
               boundedString(reason, 256)});
@@ -985,6 +1198,8 @@ void endGpuMemoryCaptureOperatorCall(
 }
 
 void recordGpuMemoryCaptureOom(
+    uint64_t timestampNs,
+    uint64_t sourceSequence,
     uint64_t ownerId,
     std::size_t requestedBytes,
     uint64_t globalCurrentBytes,
@@ -995,6 +1210,8 @@ void recordGpuMemoryCaptureOom(
     std::size_t cudaTotalBytes,
     std::string_view cudaStatus) noexcept {
   captureController().recordOom(
+      timestampNs,
+      sourceSequence,
       ownerId,
       requestedBytes,
       globalCurrentBytes,
