@@ -51,6 +51,7 @@ add_library(
   DecimalAggregationDevice.cu
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp
+  GpuMemoryCapture.cpp
   GpuMemoryTrace.cpp
   GpuResources.cpp
   OperatorAdapters.cpp
@@ -76,6 +77,7 @@ target_link_libraries(
     velox_exception
     velox_exec
     velox_test_util
+    ${CMAKE_DL_LIBS}
 )
 
 target_compile_options(velox_cudf_exec PRIVATE -Wno-missing-field-initializers)

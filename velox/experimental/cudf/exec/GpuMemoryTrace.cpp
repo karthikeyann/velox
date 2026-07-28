@@ -738,6 +738,8 @@ void markGpuMemoryTrace(std::string_view name) noexcept {
   if (name.empty()) {
     return;
   }
+  const auto active = gpu_memory_detail::activeGpuMemoryOwner();
+  gpu_memory_detail::recordGpuMemoryCaptureMarker(active.ownerId, name);
   emitNvtxMark(name);
   if (!gpuMemoryTraceEnabled()) {
     return;
@@ -747,7 +749,6 @@ void markGpuMemoryTrace(std::string_view name) noexcept {
   try {
     std::optional<perfetto::NamedTrack> track;
     track.emplace(markerTrack());
-    const auto active = gpu_memory_detail::activeGpuMemoryOwner();
     {
       auto& state = traceState();
       std::lock_guard<std::mutex> lock(state.mutex);
@@ -775,11 +776,14 @@ GpuMemoryOperatorCall::GpuMemoryOperatorCall(
   previousOwnerId_ = previous.ownerId;
   const auto current = gpu_memory_detail::activeGpuMemoryOwner();
   ownerId_ = current.ownerId;
+  captureCall_ =
+      gpu_memory_detail::beginGpuMemoryCaptureOperatorCall(ownerId_, callName);
   traceSliceStarted_ =
       gpu_memory_detail::beginGpuMemoryOperatorCall(ownerId_, callName);
 }
 
 GpuMemoryOperatorCall::~GpuMemoryOperatorCall() {
+  gpu_memory_detail::endGpuMemoryCaptureOperatorCall(captureCall_);
   if (traceSliceStarted_) {
     gpu_memory_detail::endGpuMemoryOperatorCall(ownerId_);
   }
@@ -791,13 +795,14 @@ GpuMemoryOperatorCall::~GpuMemoryOperatorCall() {
 namespace gpu_memory_detail {
 
 uint64_t gpuMemoryTraceNowNs() noexcept {
-  return velox_cudf_trace::TrackEvent::GetTraceTimeNs();
+  return gpuMemoryMonotonicTimeNs();
 }
 
 void registerGpuMemoryTraceOwner(
     uint64_t ownerId,
     uint64_t planNodeId,
     const GpuMemoryOwner& owner) noexcept {
+  registerGpuMemoryCaptureOwner(ownerId, planNodeId, owner);
   registerNvtxCounterOwner(ownerId, planNodeId, owner);
   if (!gpuMemoryTraceEnabled()) {
     return;
@@ -896,28 +901,30 @@ void emitGpuMemoryTraceUpdate(const GpuMemoryTraceUpdate& update) noexcept {
       ownerCounter.emplace(owner->counter);
     }
 
+    const auto traceTimestampNs =
+        velox_cudf_trace::TrackEvent::GetTraceTimeNs();
     TRACE_COUNTER(
         "velox.cudf.memory",
         globalTrack(),
-        update.timestampNs,
+        traceTimestampNs,
         static_cast<int64_t>(update.globalCurrentBytes));
     if (update.deltaBytes > 0 &&
         update.globalCurrentBytes == update.globalPeakBytes) {
       TRACE_COUNTER(
           "velox.cudf.memory",
           globalPeakTrack(),
-          update.timestampNs,
+          traceTimestampNs,
           static_cast<int64_t>(update.globalPeakBytes));
     }
     TRACE_COUNTER(
         "velox.cudf.memory",
         *planCounter,
-        update.timestampNs,
+        traceTimestampNs,
         static_cast<int64_t>(update.planNodeCurrentBytes));
     TRACE_COUNTER(
         "velox.cudf.memory",
         *ownerCounter,
-        update.timestampNs,
+        traceTimestampNs,
         static_cast<int64_t>(update.ownerCurrentBytes));
     sealGpuMemoryTraceThread();
   } catch (...) {
@@ -972,6 +979,16 @@ void emitGpuMemoryTraceOom(
     std::size_t cudaFreeBytes,
     std::size_t cudaTotalBytes,
     std::string_view cudaStatus) noexcept {
+  recordGpuMemoryCaptureOom(
+      ownerId,
+      requestedBytes,
+      globalCurrentBytes,
+      globalPeakBytes,
+      planNodeCurrentBytes,
+      ownerCurrentBytes,
+      cudaFreeBytes,
+      cudaTotalBytes,
+      cudaStatus);
   emitNvtxMark(
       "GPU allocation failed | owner=" + std::to_string(ownerId) +
       " | requested=" + std::to_string(requestedBytes) +
@@ -1024,6 +1041,7 @@ void emitGpuMemoryTraceOom(
 void emitGpuMemoryTraceDataLoss(
     std::string_view reason,
     uint64_t sequence) noexcept {
+  recordGpuMemoryCaptureDataLoss(reason, sequence);
   emitNvtxMark(
       "GPU memory trace data loss | sequence=" + std::to_string(sequence) +
       " | reason=" + std::string{reason});

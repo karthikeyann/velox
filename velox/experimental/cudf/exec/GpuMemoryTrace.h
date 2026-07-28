@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/exec/GpuMemoryCapture.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -115,12 +117,13 @@ class GpuMemoryOperatorCall {
   const void* previousTracker_{nullptr};
   uint64_t ownerId_{0};
   uint64_t previousOwnerId_{0};
+  GpuMemoryCaptureCallHandle captureCall_;
   bool traceSliceStarted_{false};
 };
 
 namespace gpu_memory_detail {
 
-/// Returns a timestamp in Perfetto's trace clock domain.
+/// Returns the transport-neutral source monotonic timestamp.
 uint64_t gpuMemoryTraceNowNs() noexcept;
 
 /// Registers stable hierarchy and metadata for one allocation owner.

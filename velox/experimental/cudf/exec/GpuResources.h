@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -136,6 +137,21 @@ class GpuMemoryAllocationTracker {
   /// Returns a consistent point-in-time view of the ledger.
   [[nodiscard]] GpuMemorySnapshot snapshot() const;
 
+  /// Selects a task capture at the same sequence watermark as its snapshot.
+  bool tryBeginCapture(
+      const GpuMemoryCaptureTask& task,
+      const std::vector<GpuMemoryCapturePlanNode>& planNodes);
+
+  /// Seals the matching task at the same sequence watermark as its snapshot.
+  void finishCapture(
+      const std::string& taskUuid,
+      const std::string& taskId,
+      std::string_view taskState,
+      bool cleanupComplete);
+
+  /// Seals any selected task as incomplete during worker shutdown.
+  void abortCapture(std::string_view reason);
+
  private:
   class Impl;
   std::unique_ptr<Impl> impl_;
@@ -168,6 +184,21 @@ void resetGpuMemoryTracking();
 
 /// Returns the current global diagnostic state or an empty snapshot.
 [[nodiscard]] GpuMemorySnapshot getGpuMemorySnapshot();
+
+/// Selects a task for capture if no other task is currently selected.
+bool tryBeginGpuMemoryCaptureForTask(
+    const GpuMemoryCaptureTask& task,
+    const std::vector<GpuMemoryCapturePlanNode>& planNodes) noexcept;
+
+/// Seals a selected task at its terminal ledger sequence watermark.
+void finishGpuMemoryCaptureForTask(
+    const std::string& taskUuid,
+    const std::string& taskId,
+    std::string_view taskState,
+    bool cleanupComplete) noexcept;
+
+/// Seals a selected task as incomplete before resource shutdown.
+void abortActiveGpuMemoryCapture(std::string_view reason) noexcept;
 
 namespace gpu_memory_detail {
 

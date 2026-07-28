@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
+#include "velox/experimental/cudf/exec/GpuMemoryCapture.h"
 #include "velox/experimental/cudf/exec/GpuMemoryTrace.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
@@ -36,6 +37,7 @@
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/TableScan.h"
+#include "velox/exec/Task.h"
 #include "velox/exec/Values.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
@@ -44,6 +46,8 @@
 #include <cuda.h>
 
 #include <iostream>
+#include <memory>
+#include <unordered_set>
 #include <vector>
 
 static const std::string kCudfAdapterName = "cuDF";
@@ -70,6 +74,66 @@ RetiredGpuMemoryDiagnosticResource*& retiredGpuMemoryDiagnosticResources() {
 
 RetiredGpuMemoryDiagnosticResource* installedGpuMemoryDiagnosticRetirementSlot{
     nullptr};
+std::shared_ptr<exec::TaskListener> gpuMemoryCaptureTaskListener;
+
+void collectPlanNodes(
+    const core::PlanNode* node,
+    std::unordered_set<std::string>& visited,
+    std::vector<GpuMemoryCapturePlanNode>& nodes) {
+  if (node == nullptr || !visited.insert(node->id()).second) {
+    return;
+  }
+
+  GpuMemoryCapturePlanNode capturedNode;
+  capturedNode.id = node->id();
+  capturedNode.type = node->name();
+  if (!capturedNode.type.ends_with("Node")) {
+    capturedNode.type += "Node";
+  }
+  capturedNode.sourceIds.reserve(node->sources().size());
+  for (const auto& source : node->sources()) {
+    capturedNode.sourceIds.push_back(source->id());
+  }
+  nodes.push_back(std::move(capturedNode));
+  for (const auto& source : node->sources()) {
+    collectPlanNodes(source.get(), visited, nodes);
+  }
+}
+
+std::vector<GpuMemoryCapturePlanNode> capturePlanNodes(
+    const core::PlanFragment& fragment) {
+  std::vector<GpuMemoryCapturePlanNode> nodes;
+  std::unordered_set<std::string> visited;
+  collectPlanNodes(fragment.planNode.get(), visited, nodes);
+  return nodes;
+}
+
+class GpuMemoryCaptureTaskListener final : public exec::TaskListener {
+ public:
+  void onTaskCompletion(
+      const std::string&,
+      const std::string&,
+      exec::TaskState,
+      std::exception_ptr,
+      exec::TaskStats) override {}
+
+  void onTaskCompletion(
+      const std::string& taskUuid,
+      const std::string& taskId,
+      exec::TaskState state,
+      std::exception_ptr,
+      const exec::TaskStats&,
+      const core::PlanFragment&,
+      const std::unordered_map<
+          core::PlanNodeId,
+          std::shared_ptr<exec::ExchangeClient>>&) override {
+    finishGpuMemoryCaptureForTask(
+        taskUuid,
+        taskId,
+        exec::taskStateString(state),
+        state == exec::TaskState::kFinished);
+  }
+};
 
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
@@ -310,6 +374,19 @@ struct CudfDriverAdapter {
     auto state = CompileState(factory, driver);
     const auto replacementsMade = state.compile(allowCpuFallback_);
     if (CudfConfig::getInstance().gpuMemoryTrackingEnabled()) {
+      const bool hasGpuOperator = std::any_of(
+          driver.operators().begin(),
+          driver.operators().end(),
+          [](const auto* op) {
+            return dynamic_cast<const CudfOperatorBase*>(op) != nullptr;
+          });
+      if ((replacementsMade || hasGpuOperator) && gpuMemoryCaptureEnabled()) {
+        const auto& task = driver.driverCtx()->task;
+        tryBeginGpuMemoryCaptureForTask(
+            GpuMemoryCaptureTask{
+                task->uuid(), task->taskId(), task->queryCtx()->queryId()},
+            capturePlanNodes(task->planFragment()));
+      }
       for (auto* op : driver.operators()) {
         if (dynamic_cast<CudfOperatorBase*>(op) != nullptr ||
             dynamic_cast<exec::TableScan*>(op) != nullptr) {
@@ -358,6 +435,26 @@ void registerCudf() {
 
   const auto& cudfConfig = CudfConfig::getInstance();
   if (cudfConfig.gpuMemoryTrackingEnabled()) {
+    if (!cudfConfig.quentMemoryProfilePath.empty()) {
+      if (startGpuMemoryCapture(
+              GpuMemoryCaptureConfig{
+                  cudfConfig.quentMemoryProfilePath,
+                  cudfConfig.quentQueryFilter,
+                  cudfConfig.quentMaxEvents,
+                  cudfConfig.quentAdapterPath,
+                  cudfConfig.quentOutputPath})) {
+        gpuMemoryCaptureTaskListener =
+            std::make_shared<GpuMemoryCaptureTaskListener>();
+        if (!exec::registerTaskListener(gpuMemoryCaptureTaskListener)) {
+          LOG(ERROR) << "Cannot register the GPU-memory capture task listener";
+          gpuMemoryCaptureTaskListener.reset();
+          stopGpuMemoryCapture();
+        }
+      } else {
+        LOG(ERROR) << "GPU-memory tracking will continue without a raw Quent "
+                      "profile";
+      }
+    }
     if (!cudfConfig.perfettoMemoryTracePath.empty() &&
         !startGpuMemoryTrace(cudfConfig.perfettoMemoryTracePath)) {
       LOG(ERROR) << "GPU-memory tracking will continue without a Perfetto "
@@ -401,6 +498,12 @@ void registerCudf() {
 }
 
 void unregisterCudf() {
+  if (gpuMemoryCaptureTaskListener != nullptr) {
+    exec::unregisterTaskListener(gpuMemoryCaptureTaskListener);
+    gpuMemoryCaptureTaskListener.reset();
+  }
+  abortActiveGpuMemoryCapture("cudf_unregistered");
+
   // Keeps the replaced wrapper alive while its other owning copies are reset.
   [[maybe_unused]] std::optional<
       cuda::mr::any_resource<cuda::mr::device_accessible>>
@@ -424,6 +527,7 @@ void unregisterCudf() {
   output_mr_.reset();
   mr_.reset();
   resetGpuMemoryTracking();
+  stopGpuMemoryCapture();
   stopGpuMemoryTrace();
   exec::DriverFactory::adapters.erase(
       std::remove_if(
@@ -455,6 +559,25 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfPerfettoMemoryTracePath) != config.end()) {
     perfettoMemoryTracePath = config[kCudfPerfettoMemoryTracePath];
+  }
+  if (config.find(kCudfQuentMemoryProfilePath) != config.end()) {
+    quentMemoryProfilePath = config[kCudfQuentMemoryProfilePath];
+  }
+  if (config.find(kCudfQuentQueryFilter) != config.end()) {
+    quentQueryFilter = config[kCudfQuentQueryFilter];
+  }
+  if (config.find(kCudfQuentMaxEvents) != config.end()) {
+    quentMaxEvents = folly::to<std::size_t>(config[kCudfQuentMaxEvents]);
+    VELOX_USER_CHECK_GT(
+        quentMaxEvents,
+        0,
+        "Quent GPU-memory maximum event count must be positive");
+  }
+  if (config.find(kCudfQuentAdapterPath) != config.end()) {
+    quentAdapterPath = config[kCudfQuentAdapterPath];
+  }
+  if (config.find(kCudfQuentOutputPath) != config.end()) {
+    quentOutputPath = config[kCudfQuentOutputPath];
   }
   if (config.find(kCudfMemoryResource) != config.end()) {
     memoryResource = config[kCudfMemoryResource];

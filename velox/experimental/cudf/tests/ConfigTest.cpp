@@ -24,6 +24,8 @@ TEST(ConfigTest, MemoryTrackingDisabledByDefault) {
   CudfConfig config;
   EXPECT_FALSE(config.memoryTrackingEnabled);
   EXPECT_TRUE(config.perfettoMemoryTracePath.empty());
+  EXPECT_TRUE(config.quentMemoryProfilePath.empty());
+  EXPECT_EQ(config.quentMaxEvents, 250'000);
   EXPECT_FALSE(config.gpuMemoryTrackingEnabled());
 }
 
@@ -33,6 +35,11 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfDebugEnabled, "true"},
       {CudfConfig::kCudfMemoryTrackingEnabled, "true"},
       {CudfConfig::kCudfPerfettoMemoryTracePath, "/tmp/gpu-memory-%p.pftrace"},
+      {CudfConfig::kCudfQuentMemoryProfilePath, "/tmp/gpu-memory-%q-%t.json"},
+      {CudfConfig::kCudfQuentQueryFilter, "query-42"},
+      {CudfConfig::kCudfQuentMaxEvents, "250000"},
+      {CudfConfig::kCudfQuentAdapterPath, "/opt/quent/lib/libquent.so"},
+      {CudfConfig::kCudfQuentOutputPath, "/tmp/quent-%q"},
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
@@ -44,6 +51,11 @@ TEST(ConfigTest, CudfConfig) {
   EXPECT_TRUE(config.debugEnabled);
   EXPECT_TRUE(config.memoryTrackingEnabled);
   EXPECT_EQ(config.perfettoMemoryTracePath, "/tmp/gpu-memory-%p.pftrace");
+  EXPECT_EQ(config.quentMemoryProfilePath, "/tmp/gpu-memory-%q-%t.json");
+  EXPECT_EQ(config.quentQueryFilter, "query-42");
+  EXPECT_EQ(config.quentMaxEvents, 250'000);
+  EXPECT_EQ(config.quentAdapterPath, "/opt/quent/lib/libquent.so");
+  EXPECT_EQ(config.quentOutputPath, "/tmp/quent-%q");
   EXPECT_TRUE(config.gpuMemoryTrackingEnabled());
   EXPECT_EQ(config.memoryResource, "arena");
   EXPECT_EQ(config.memoryPercent, 25);
@@ -55,6 +67,14 @@ TEST(ConfigTest, PerfettoPathEnablesTracking) {
   CudfConfig config;
   config.initialize(
       {{CudfConfig::kCudfPerfettoMemoryTracePath, "/tmp/gpu.pftrace"}});
+  EXPECT_FALSE(config.memoryTrackingEnabled);
+  EXPECT_TRUE(config.gpuMemoryTrackingEnabled());
+}
+
+TEST(ConfigTest, QuentPathEnablesTracking) {
+  CudfConfig config;
+  config.initialize(
+      {{CudfConfig::kCudfQuentMemoryProfilePath, "/tmp/gpu.json"}});
   EXPECT_FALSE(config.memoryTrackingEnabled);
   EXPECT_TRUE(config.gpuMemoryTrackingEnabled());
 }
