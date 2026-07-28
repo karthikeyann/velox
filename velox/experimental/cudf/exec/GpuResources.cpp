@@ -960,24 +960,6 @@ GpuMemoryActiveOwner activateGpuMemoryOperator(exec::Operator* op) noexcept {
   return previous;
 }
 
-void registerGpuMemoryOperator(exec::Operator* op) noexcept {
-  std::shared_ptr<GpuMemoryAllocationTracker> tracker;
-  {
-    std::lock_guard<std::mutex> lock(diagnosticsMutex);
-    tracker = diagnostics;
-  }
-
-  if (tracker == nullptr) {
-    return;
-  }
-
-  try {
-    tracker->registerOperator(op);
-  } catch (...) {
-    // Operator registration is diagnostics only.
-  }
-}
-
 GpuMemoryActiveOwner activeGpuMemoryOwner() noexcept {
   return activeOwner;
 }

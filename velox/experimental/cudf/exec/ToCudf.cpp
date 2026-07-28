@@ -36,7 +36,6 @@
 #include "folly/Conv.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
-#include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/Values.h"
 
@@ -374,24 +373,14 @@ struct CudfDriverAdapter {
     auto state = CompileState(factory, driver);
     const auto replacementsMade = state.compile(allowCpuFallback_);
     if (CudfConfig::getInstance().gpuMemoryTrackingEnabled()) {
-      const bool hasGpuOperator = std::any_of(
-          driver.operators().begin(),
-          driver.operators().end(),
-          [](const auto* op) {
-            return dynamic_cast<const CudfOperatorBase*>(op) != nullptr;
-          });
-      if ((replacementsMade || hasGpuOperator) && gpuMemoryCaptureEnabled()) {
+      // Avoid inspecting driver operators here because compilation replaces
+      // them and invalidates pointers cached by the original driver.
+      if (replacementsMade && gpuMemoryCaptureEnabled()) {
         const auto& task = driver.driverCtx()->task;
         tryBeginGpuMemoryCaptureForTask(
             GpuMemoryCaptureTask{
                 task->uuid(), task->taskId(), task->queryCtx()->queryId()},
             capturePlanNodes(task->planFragment()));
-      }
-      for (auto* op : driver.operators()) {
-        if (dynamic_cast<CudfOperatorBase*>(op) != nullptr ||
-            dynamic_cast<exec::TableScan*>(op) != nullptr) {
-          gpu_memory_detail::registerGpuMemoryOperator(op);
-        }
       }
     }
     return replacementsMade;
