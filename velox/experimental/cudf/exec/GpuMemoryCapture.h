@@ -69,8 +69,8 @@ struct GpuMemoryCaptureCallHandle {
   uint64_t ownerId{0};
   /// Uses the source monotonic clock shared by memory transitions.
   uint64_t startTimestampNs{0};
-  /// Identifies the source thread without exposing an operating-system handle.
-  uint64_t threadId{0};
+  /// Records the operating-system thread ID for profiler correlation.
+  int64_t threadId{0};
   /// Identifies the preallocated active-call slot owned by this handle.
   uint32_t openSlot{0};
   /// Stores the bounded call name without allocating on the execution path.

@@ -940,6 +940,7 @@ TEST(GpuMemoryCaptureTest, ClipsOpenCallsAndMatchesUuidStrictly) {
   EXPECT_EQ(capture["integrity"]["open_operator_calls_at_end"].asInt(), 1);
   ASSERT_EQ(capture["operator_calls"].size(), 1);
   EXPECT_EQ(capture["operator_calls"][0]["call_name"].asString(), "getOutput");
+  EXPECT_GT(capture["operator_calls"][0]["thread_id"].asInt(), 0);
   EXPECT_TRUE(capture["operator_calls"][0]["truncated"].asBool());
 }
 

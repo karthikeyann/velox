@@ -19,6 +19,7 @@
 
 #include <folly/dynamic.h>
 #include <folly/json.h>
+#include <folly/system/ThreadId.h>
 #include <glog/logging.h>
 #include <unistd.h>
 
@@ -31,7 +32,6 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
-#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -65,7 +65,7 @@ struct CapturedCallSpan {
   uint64_t eventSequence{0};
   uint64_t callId{0};
   uint64_t ownerId{0};
-  uint64_t threadId{0};
+  int64_t threadId{0};
   uint64_t startTimestampNs{0};
   uint64_t endTimestampNs{0};
   std::array<char, 32> callName{};
@@ -844,8 +844,7 @@ class GpuMemoryCaptureController {
       handle.callId = ++nextCallId_;
       handle.ownerId = ownerId;
       handle.startTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
-      handle.threadId =
-          std::hash<std::thread::id>{}(std::this_thread::get_id());
+      handle.threadId = static_cast<int64_t>(folly::getOSThreadID());
       copyBounded(handle.callName, callName);
       handle.openSlot = active_->freeCallSlots.back();
       active_->freeCallSlots.pop_back();
