@@ -726,6 +726,7 @@ GpuMemoryOwnerHandle GpuMemoryAllocationTracker::registerOperator(
     }
   }
   if (planNode != nullptr) {
+    owner.planNodeId = planNodeId;
     owner.planNodeType = planNode->name();
     if (!owner.planNodeType.ends_with("Node")) {
       owner.planNodeType += "Node";
