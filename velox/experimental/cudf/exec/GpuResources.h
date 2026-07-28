@@ -111,6 +111,9 @@ class GpuMemoryAllocationTracker {
   /// Registers an owner and returns its stable handle.
   GpuMemoryOwnerHandle registerOwner(const GpuMemoryOwner& owner);
 
+  /// Registers an operator, resolving display metadata only for a new owner.
+  GpuMemoryOwnerHandle registerOperator(exec::Operator* op);
+
   /// Records a successful allocation.
   ///
   /// Returns the fully ordered counter transition, or no value for a null

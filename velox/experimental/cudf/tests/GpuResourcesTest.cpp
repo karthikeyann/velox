@@ -18,8 +18,14 @@
 
 #include <rmm/error.hpp>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#include <perfetto.h>
+#pragma GCC diagnostic pop
+
 #include <folly/ScopeGuard.h>
 #include <glog/logging.h>
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <unistd.h>
 
@@ -31,6 +37,8 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -220,6 +228,7 @@ GpuMemoryOwner makeOwner(
       .taskId = "task-" + taskSuffix,
       .queryId = "query-" + taskSuffix,
       .planNodeId = std::move(planNodeId),
+      .planNodeType = "TestPlanNode",
       .pipelineId = pipelineId,
       .driverId = driverId,
       .operatorId = operatorId,
@@ -271,6 +280,9 @@ TEST(GpuResourcesTest, TracksAllocationOriginAndOrderedTransitions) {
   const auto handleB = tracker.registerOwner(ownerB);
   EXPECT_EQ(duplicateHandleA, handleA);
   EXPECT_NE(handleB.ownerId, handleA.ownerId);
+  auto relabeledOwnerA = ownerA;
+  relabeledOwnerA.planNodeType = "RelabeledPlanNode";
+  EXPECT_EQ(tracker.registerOwner(relabeledOwnerA), handleA);
   EXPECT_EQ(handleB.planNodeId, handleA.planNodeId);
 
   auto otherTaskOwner = ownerA;
@@ -670,6 +682,76 @@ TEST(GpuResourcesTest, StreamsPerfettoTrace) {
     std::filesystem::remove(path);
   } else {
     LOG(INFO) << "Kept GPU-memory Perfetto test trace: " << path;
+  }
+}
+
+TEST(GpuResourcesTest, SealsFinishedProducerThread) {
+  const auto path = std::filesystem::temp_directory_path() /
+      ("velox-cudf-memory-producer-" + std::to_string(::getpid()) + ".pftrace");
+  std::filesystem::remove(path);
+  ASSERT_TRUE(startGpuMemoryTrace(path.string()));
+  auto stopGuard = folly::makeGuard([] { stopGpuMemoryTrace(); });
+
+  std::thread producer([] {
+    GpuMemoryAllocationTracker tracker;
+    const auto handle =
+        tracker.registerOwner(makeOwner("producer", "2468", 1, 3, 5));
+    int allocation;
+    EXPECT_TRUE(
+        tracker.recordAllocation(&allocation, 4'096, handle).has_value());
+    EXPECT_TRUE(tracker.recordDeallocation(&allocation).has_value());
+    EXPECT_TRUE(
+        gpu_memory_detail::beginGpuMemoryOperatorCall(
+            handle.ownerId, "producer-call"));
+    gpu_memory_detail::endGpuMemoryOperatorCall(handle.ownerId);
+  });
+  producer.join();
+
+  stopGpuMemoryTrace();
+  stopGuard.dismiss();
+  ASSERT_TRUE(std::filesystem::exists(path));
+  std::ifstream input(path, std::ios::binary);
+  const std::string trace{
+      std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+  EXPECT_NE(trace.find("query-producer"), std::string::npos);
+  EXPECT_NE(trace.find("TestPlanNode | 2468"), std::string::npos);
+
+  std::vector<int64_t> counterValues;
+  size_t numSliceBegins{0};
+  size_t numSliceEnds{0};
+  const perfetto::protos::pbzero::Trace::Decoder traceDecoder{trace};
+  for (auto packetIterator = traceDecoder.packet(); packetIterator;
+       ++packetIterator) {
+    const perfetto::protos::pbzero::TracePacket::Decoder packet{
+        *packetIterator};
+    if (!packet.has_track_event()) {
+      continue;
+    }
+    const perfetto::protos::pbzero::TrackEvent::Decoder trackEvent{
+        packet.track_event()};
+    if (trackEvent.has_counter_value()) {
+      counterValues.push_back(trackEvent.counter_value());
+    }
+    if (trackEvent.has_type() &&
+        trackEvent.type() ==
+            perfetto::protos::pbzero::TrackEvent::TYPE_SLICE_BEGIN) {
+      ++numSliceBegins;
+    }
+    if (trackEvent.has_type() &&
+        trackEvent.type() ==
+            perfetto::protos::pbzero::TrackEvent::TYPE_SLICE_END) {
+      ++numSliceEnds;
+    }
+  }
+  EXPECT_THAT(
+      counterValues,
+      testing::UnorderedElementsAre(0, 0, 0, 4'096, 4'096, 4'096, 4'096));
+  EXPECT_EQ(numSliceBegins, 1);
+  EXPECT_EQ(numSliceEnds, 1);
+  if (std::getenv("VELOX_CUDF_KEEP_PERFETTO_TEST_TRACE") == nullptr) {
+    std::filesystem::remove(path);
+  } else {
+    LOG(INFO) << "Kept GPU-memory producer-thread trace: " << path;
   }
 }
 

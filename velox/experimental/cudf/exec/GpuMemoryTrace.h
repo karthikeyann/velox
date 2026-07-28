@@ -37,6 +37,8 @@ struct GpuMemoryOwner {
   std::string queryId;
   /// Velox plan node identifier.
   std::string planNodeId;
+  /// Display-only Velox PlanNode type. Does not affect attribution identity.
+  std::string planNodeType;
   /// Pipeline containing the operator instance.
   int32_t pipelineId{-1};
   /// Driver executing the operator instance.
@@ -46,7 +48,13 @@ struct GpuMemoryOwner {
   /// User-visible operator implementation name.
   std::string operatorType;
 
-  bool operator==(const GpuMemoryOwner&) const = default;
+  /// Compares stable allocation identity and ignores display-only metadata.
+  bool operator==(const GpuMemoryOwner& other) const {
+    return taskUuid == other.taskUuid && taskId == other.taskId &&
+        queryId == other.queryId && planNodeId == other.planNodeId &&
+        pipelineId == other.pipelineId && driverId == other.driverId &&
+        operatorId == other.operatorId && operatorType == other.operatorType;
+  }
 };
 
 /// Describes one fully ordered logical-memory transition.

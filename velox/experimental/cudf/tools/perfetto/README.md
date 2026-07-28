@@ -20,6 +20,28 @@ The analysis is exact if capture obeys these invariants:
 6. Count only successful allocations. An allocation failure is a separate
    factual OOM instant event and does not change the counters.
 
+Trace startup emits no synthetic owner event. Concrete owners are registered
+when first used, and the `unattributed` owner is registered lazily only for an
+actual fallback allocation, allocation failure, or fallback call. PlanNode
+tracks use the resolved concrete type in their display label, for example
+`TableScanNode | 0`; `planNodeId` remains the stable attribution identity.
+
+## Capture one selected benchmark query
+
+Use an explicit scale factor and skip the statistics check in addition to
+selecting one query and one iteration:
+
+```bash
+./scripts/run_benchmark.sh \
+  -b tpch -s sf100_v2_float -q 1 -i 1 -m \
+  --scale-factor 100 --skip-analyze-check --skip-drop-cache
+```
+
+Without `--scale-factor`, `velox-testing` discovers schema and scale metadata
+with preliminary SQL such as `SHOW TABLES` and `SHOW CREATE TABLE`. Those
+queries precede the selected benchmark query and appear in the process-wide
+trace. `--skip-analyze-check` suppresses the separate statistics query.
+
 ## Perfetto UI
 
 1. Open the trace and run `00_setup.sql`.
@@ -34,7 +56,11 @@ The analysis is exact if capture obeys these invariants:
    `WHERE owner_kind = 'operator'` or `plan` when only one attribution view is
    wanted. File 06 gives the equivalent complete holder snapshot at every
    analysis-time threshold crossing.
-6. Rerun `90_validate_capture.sql`; every row should be `PASS`.
+6. Rerun `90_validate_capture.sql`; every row should be `PASS`. For a clean
+   isolated capture, its terminal checks also require the final global,
+   PlanNode, and operator totals to reconcile at zero. A non-zero terminal
+   value usually means that the worker did not finish trace shutdown and the
+   file is incomplete.
 
 Threshold comparison is strictly greater-than. Change `>` to `>=` in files
 02, 03, and 06 if equality should count.

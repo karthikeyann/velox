@@ -94,6 +94,9 @@ operatorType
 `taskUuid` prevents reuse of human-readable task IDs from merging unrelated
 instances. Pipeline, driver, and operator IDs keep concurrent instances
 separate. PlanNode totals group owners by `{queryId, taskUuid, planNodeId}`.
+The resolved concrete PlanNode type is display-only metadata: Perfetto labels
+the group as, for example, `TableScanNode | 0`, while `planNodeId` remains the
+stable identity used for attribution and reconciliation.
 
 The primary scopes cover `addInput`, `getOutput`, `noMoreInput`, and `close`.
 Construction or initialization is scoped where the driver has an operator
@@ -115,7 +118,7 @@ Velox-cuDF GPU memory
 ├── Markers and allocation failures
 └── Query
     └── Task
-        └── PlanNode
+        └── ConcretePlanNodeType | planNodeId
             ├── PlanNode logical live bytes
             └── Operator instance (type, pipeline, driver, operator)
                 ├── Operator logical live bytes
@@ -140,11 +143,21 @@ than retaining the entire query history in memory.
 
 The lifecycle contract is deliberately simple: start tracing once before
 creating the tracked resources or registering owners, and stop only after
-operator execution has quiesced. Restarting a trace while retaining the same
-live tracker is unsupported in the MVP. `registerCudf()`/`unregisterCudf()`
-enforce this ordering for the Presto worker. Counter reconciliation is the
-capture acceptance criterion; the final host-call slice tail remains
-best-effort during process shutdown.
+operator execution has quiesced. Starting the worker emits no synthetic owner
+event, so the trace begins with real query activity rather than worker startup.
+The `Unattributed` owner is registered lazily only when an actual fallback
+allocation, allocation failure, or fallback call needs it. Restarting a trace
+while retaining the same live tracker is unsupported in the MVP.
+`registerCudf()`/`unregisterCudf()` enforce this ordering for the Presto worker.
+Counter reconciliation is the capture acceptance criterion; the final
+host-call slice tail remains best-effort during process shutdown.
+
+Perfetto buffers TrackEvent packets per producer thread. After each complete
+logical counter transition and host-call slice end, the emitter appends an empty
+packet on that same thread. This lets the service safely scrape the preceding
+event without an IPC flush on every allocation or operator call. Shutdown also
+requests a blocking session flush before stopping. The empty packets are
+Perfetto's thread-pool producer workaround and are not logical trace events.
 
 ### Allocation failure and OOM
 
@@ -246,6 +259,20 @@ Verify:
 ### Presto integration
 
 Build Velox and Presto with the same binaries used by `velox-testing`, then run:
+
+```bash
+./scripts/run_benchmark.sh \
+  -b tpch -s sf100_v2_float -q 1 -i 1 -m \
+  --scale-factor 100 --skip-analyze-check --skip-drop-cache
+```
+
+For a trace containing only one selected benchmark query, all three controls
+are required: select one query with `-q`, run one iteration with `-i 1`, and
+supply both `--scale-factor` and `--skip-analyze-check`. Without an explicit
+scale factor, the harness discovers schema and scale metadata with preliminary
+SQL such as `SHOW TABLES` and `SHOW CREATE TABLE`; those metadata queries also
+appear in the process-wide trace. `--skip-analyze-check` prevents the separate
+statistics check.
 
 - SF1: TPC-H Q1-Q22 once, checking available reference results.
 - SF10: Q1, Q8, Q9, Q18, and Q21.

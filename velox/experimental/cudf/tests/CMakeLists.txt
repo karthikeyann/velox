@@ -110,7 +110,7 @@ velox_add_cudf_test(
 velox_add_cudf_test(
   NAME velox_cudf_gpu_resources_test
   SOURCES Main.cpp GpuResourcesTest.cpp
-  LIBS ${CUDF_TEST_DEFAULT_LIBS} rmm::rmm
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} rmm::rmm velox_cudf_perfetto GTest::gmock
 )
 
 velox_add_cudf_test(

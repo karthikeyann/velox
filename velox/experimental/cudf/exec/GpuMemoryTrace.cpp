@@ -84,6 +84,21 @@ std::string displayField(std::string_view value) {
   return value.empty() ? "<none>" : std::string{value};
 }
 
+std::string displayPlanNodeType(const GpuMemoryOwner& owner) {
+  return owner.planNodeType.empty() ? "PlanNode" : owner.planNodeType;
+}
+
+void sealGpuMemoryTraceThread() noexcept {
+  try {
+    velox_cudf_trace::TrackEvent::Trace(
+        [](velox_cudf_trace::TrackEvent::TraceContext context) {
+          context.AddEmptyTracePacket();
+        });
+  } catch (...) {
+    // Trace transport must not alter query execution.
+  }
+}
+
 struct QueryTrace {
   explicit QueryTrace(const GpuMemoryOwner& owner)
       : name("Query | " + displayField(owner.queryId)),
@@ -118,12 +133,15 @@ struct PlanNodeTrace {
       uint64_t id,
       const GpuMemoryOwner& owner,
       perfetto::NamedTrack taskTrack)
-      : name("PlanNode | " + displayField(owner.planNodeId)),
+      : name(
+            displayPlanNodeType(owner) + " | " +
+            displayField(owner.planNodeId)),
         counterName(
             "PlanNode RMM logical live bytes | query=" +
             displayField(owner.queryId) +
             " | task=" + displayField(owner.taskUuid) +
-            " | plan=" + displayField(owner.planNodeId)),
+            " | plan=" + displayField(owner.planNodeId) +
+            " | type=" + displayPlanNodeType(owner)),
         track(perfetto::DynamicString{name}, id, taskTrack),
         counter(
             perfetto::CounterTrack(perfetto::DynamicString{counterName}, track)
@@ -282,6 +300,8 @@ void emitOwnerMetadata(const OwnerTrace& ownerTrace) noexcept {
         owner.taskId,
         "plan_node_id",
         owner.planNodeId,
+        "plan_node_type",
+        owner.planNodeType,
         "pipeline_id",
         owner.pipelineId,
         "driver_id",
@@ -290,6 +310,7 @@ void emitOwnerMetadata(const OwnerTrace& ownerTrace) noexcept {
         owner.operatorId,
         "operator_type",
         owner.operatorType);
+    sealGpuMemoryTraceThread();
   } catch (...) {
     // Trace metadata is best-effort and must not alter query execution.
   }
@@ -391,6 +412,9 @@ void stopGpuMemoryTrace() noexcept {
     }
     if (session != nullptr) {
       velox_cudf_trace::TrackEvent::Flush();
+      if (!session->FlushBlocking()) {
+        LOG(WARNING) << "GPU-memory Perfetto session flush timed out";
+      }
       session->StopBlocking();
     }
     if (fileDescriptor >= 0) {
@@ -444,6 +468,7 @@ void markGpuMemoryTrace(std::string_view name) noexcept {
         *track,
         "owner_id",
         active.ownerId);
+    velox_cudf_trace::TrackEvent::Flush();
   } catch (...) {
     // Custom markers are diagnostics only.
   }
@@ -599,6 +624,7 @@ void emitGpuMemoryTraceUpdate(const GpuMemoryTraceUpdate& update) noexcept {
         *ownerCounter,
         update.timestampNs,
         static_cast<int64_t>(update.ownerCurrentBytes));
+    sealGpuMemoryTraceThread();
   } catch (...) {
     emitGpuMemoryTraceDataLoss(
         "counter trace emission exception", update.sequence);
@@ -653,6 +679,7 @@ void emitGpuMemoryTraceOom(
         cudaTotalBytes,
         "cuda_status",
         cudaStatusText);
+    velox_cudf_trace::TrackEvent::Flush();
   } catch (...) {
     // An allocation failure must be rethrown regardless of tracing health.
   }
@@ -675,6 +702,7 @@ void emitGpuMemoryTraceDataLoss(
         std::string{reason},
         "last_complete_sequence",
         sequence);
+    velox_cudf_trace::TrackEvent::Flush();
   } catch (...) {
     // No additional recovery is possible for a failed diagnostic event.
   }
@@ -729,6 +757,7 @@ void endGpuMemoryOperatorCall(uint64_t ownerId) noexcept {
       calls.emplace(owner->calls);
     }
     TRACE_EVENT_END("velox.cudf.operator", *calls);
+    sealGpuMemoryTraceThread();
   } catch (...) {
     // Operator execution must not depend on trace slice closure.
   }

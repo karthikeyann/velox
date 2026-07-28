@@ -47,6 +47,39 @@ source_data_loss_markers AS (
   FROM slice
   WHERE name = 'GPU memory trace data loss'
 ),
+latest_samples AS (
+  SELECT
+    owner_kind,
+    value,
+    ROW_NUMBER() OVER (
+      PARTITION BY track_id
+      ORDER BY ts DESC, id DESC
+    ) AS sample_rank
+  FROM vgm_samples
+),
+final_totals AS (
+  SELECT
+    owner_kind,
+    COALESCE(SUM(value), 0) AS actual
+  FROM latest_samples
+  WHERE sample_rank = 1
+  GROUP BY owner_kind
+),
+final_values AS (
+  SELECT
+    COALESCE(
+      (SELECT actual FROM final_totals WHERE owner_kind = 'global'),
+      0
+    ) AS global_bytes,
+    COALESCE(
+      (SELECT actual FROM final_totals WHERE owner_kind = 'plan'),
+      0
+    ) AS plan_bytes,
+    COALESCE(
+      (SELECT actual FROM final_totals WHERE owner_kind = 'operator'),
+      0
+    ) AS operator_bytes
+),
 checks AS (
   SELECT
     'exactly one global track' AS check_name,
@@ -105,6 +138,30 @@ checks AS (
     actual,
     CASE WHEN actual = 0 THEN 'PASS' ELSE 'FAIL' END
   FROM source_data_loss_markers
+  UNION ALL
+  SELECT
+    'final global logical live bytes',
+    global_bytes,
+    CASE WHEN ABS(global_bytes) <= 0.5 THEN 'PASS' ELSE 'FAIL' END
+  FROM final_values
+  UNION ALL
+  SELECT
+    'final PlanNode aggregate mismatch',
+    ABS(plan_bytes - global_bytes),
+    CASE
+      WHEN ABS(plan_bytes - global_bytes) <= 0.5 THEN 'PASS'
+      ELSE 'FAIL'
+    END
+  FROM final_values
+  UNION ALL
+  SELECT
+    'final operator aggregate mismatch',
+    ABS(operator_bytes - global_bytes),
+    CASE
+      WHEN ABS(operator_bytes - global_bytes) <= 0.5 THEN 'PASS'
+      ELSE 'FAIL'
+    END
+  FROM final_values
 )
 SELECT status, check_name, actual
 FROM checks

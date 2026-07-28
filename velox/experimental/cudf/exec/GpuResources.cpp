@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include "velox/common/base/RuntimeMetrics.h"
+#include "velox/core/PlanNode.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/Task.h"
@@ -109,6 +110,7 @@ GpuMemoryOwner unattributedOwner() {
       "<unattributed>",
       "<unattributed>",
       "<unattributed>",
+      "<unattributed>",
       -1,
       -1,
       -1,
@@ -179,6 +181,20 @@ class GpuMemoryAllocationTracker::Impl {
     return handle;
   }
 
+  std::optional<GpuMemoryOwnerHandle> findOwner(
+      const GpuMemoryOwner& owner) const {
+    if (isEmptyOwner(owner)) {
+      return std::nullopt;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto existing = ownerIds_.find(owner);
+    if (existing == ownerIds_.end()) {
+      return std::nullopt;
+    }
+    return owners_.at(existing->second).snapshot.handle;
+  }
+
   std::optional<GpuMemoryTraceUpdate> recordAllocation(
       void* address,
       std::size_t bytes,
@@ -227,6 +243,10 @@ class GpuMemoryAllocationTracker::Impl {
             plan.current,
             ownerSnapshot.currentBytes,
             static_cast<int64_t>(byteCount));
+      }
+      if (update.ownerId == 0) {
+        gpu_memory_detail::registerGpuMemoryTraceOwner(
+            0, 0, unattributedOwner());
       }
       gpu_memory_detail::emitGpuMemoryTraceUpdate(update);
       return update;
@@ -414,14 +434,62 @@ class GpuMemoryAllocationTracker::Impl {
 };
 
 GpuMemoryAllocationTracker::GpuMemoryAllocationTracker()
-    : impl_(std::make_unique<Impl>()) {
-  gpu_memory_detail::registerGpuMemoryTraceOwner(0, 0, unattributedOwner());
-}
+    : impl_(std::make_unique<Impl>()) {}
 
 GpuMemoryAllocationTracker::~GpuMemoryAllocationTracker() = default;
 
 GpuMemoryOwnerHandle GpuMemoryAllocationTracker::registerOwner(
     const GpuMemoryOwner& owner) {
+  return impl_->registerOwner(owner);
+}
+
+GpuMemoryOwnerHandle GpuMemoryAllocationTracker::registerOperator(
+    exec::Operator* op) {
+  if (op == nullptr) {
+    return {};
+  }
+
+  const auto* driverCtx = op->operatorCtx()->driverCtx();
+  GpuMemoryOwner owner{
+      op->operatorCtx()->task()->uuid(),
+      op->taskId(),
+      op->operatorCtx()->task()->queryCtx()->queryId(),
+      op->planNodeId(),
+      "",
+      driverCtx->pipelineId,
+      driverCtx->driverId,
+      op->operatorId(),
+      op->operatorType()};
+  if (const auto existing = impl_->findOwner(owner)) {
+    return *existing;
+  }
+
+  const auto& task = *op->operatorCtx()->task();
+  const auto* planRoot = task.planFragment().planNode.get();
+  auto planNodeId = std::string_view{op->planNodeId()};
+  const auto findPlanNode = [&](std::string_view id) {
+    return planRoot == nullptr
+        ? nullptr
+        : core::PlanNode::findNodeById(planRoot, core::PlanNodeId{id});
+  };
+  const auto* planNode = findPlanNode(planNodeId);
+  if (planNode == nullptr) {
+    // Resolve synthetic conversion operators through their source PlanNode.
+    for (const auto suffix :
+         {std::string_view{"-from-velox"}, std::string_view{"-to-velox"}}) {
+      if (planNodeId.ends_with(suffix)) {
+        planNodeId.remove_suffix(suffix.size());
+        planNode = findPlanNode(planNodeId);
+        break;
+      }
+    }
+  }
+  if (planNode != nullptr) {
+    owner.planNodeType = planNode->name();
+    if (!owner.planNodeType.ends_with("Node")) {
+      owner.planNodeType += "Node";
+    }
+  }
   return impl_->registerOwner(owner);
 }
 
@@ -457,23 +525,6 @@ exec::Operator* runtimeOperator() {
   return dynamic_cast<exec::Operator*>(getThreadLocalRunTimeStatWriter());
 }
 
-GpuMemoryOwner captureOwner(exec::Operator* op) {
-  if (op == nullptr) {
-    return {};
-  }
-
-  const auto* driverCtx = op->operatorCtx()->driverCtx();
-  return GpuMemoryOwner{
-      op->operatorCtx()->task()->uuid(),
-      op->taskId(),
-      op->operatorCtx()->task()->queryCtx()->queryId(),
-      op->planNodeId(),
-      driverCtx->pipelineId,
-      driverCtx->driverId,
-      op->operatorId(),
-      op->operatorType()};
-}
-
 GpuMemoryOwnerHandle resolveOwner(
     const std::shared_ptr<GpuMemoryAllocationTracker>& tracker) noexcept {
   if (activeOwner.tracker == tracker.get()) {
@@ -483,7 +534,7 @@ GpuMemoryOwnerHandle resolveOwner(
   try {
     auto* op = runtimeOperator();
     if (op != nullptr) {
-      return tracker->registerOwner(captureOwner(op));
+      return tracker->registerOperator(op);
     }
   } catch (...) {
     // Fall through to the explicit unattributed owner.
@@ -585,6 +636,9 @@ void logAndTraceAllocationFailure(
   const auto cudaStatus = cudaMemGetInfo(&freeBytes, &totalBytes);
   const std::string_view cudaStatusName{cudaGetErrorName(cudaStatus)};
 
+  if (state.ownerId == 0) {
+    gpu_memory_detail::registerGpuMemoryTraceOwner(0, 0, unattributedOwner());
+  }
   gpu_memory_detail::emitGpuMemoryTraceOom(
       state.ownerId,
       bytes,
@@ -668,9 +722,12 @@ GpuMemoryActiveOwner activateGpuMemoryOperator(exec::Operator* op) noexcept {
 
   uint64_t ownerId{0};
   try {
-    ownerId = tracker->registerOwner(captureOwner(op)).ownerId;
+    ownerId = tracker->registerOperator(op).ownerId;
   } catch (...) {
     // Attribute to the explicit fallback owner if registration fails.
+  }
+  if (ownerId == 0) {
+    gpu_memory_detail::registerGpuMemoryTraceOwner(0, 0, unattributedOwner());
   }
   activeOwner = GpuMemoryActiveOwner{tracker.get(), ownerId};
   return previous;
