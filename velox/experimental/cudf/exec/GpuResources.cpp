@@ -134,6 +134,8 @@ class GpuMemoryAllocationTracker::Impl {
         0,
         OwnerRecord{GpuMemoryOwnerSnapshot{
             handle, unattributedOwner(), 0, 0, 0, 0, 0}});
+    queries_.emplace("<unattributed>", LiveBytes{});
+    tasks_.emplace("<unattributed>", LiveBytes{});
     plans_.emplace(0, LiveBytes{});
   }
 
@@ -171,6 +173,8 @@ class GpuMemoryAllocationTracker::Impl {
           handle.ownerId,
           OwnerRecord{GpuMemoryOwnerSnapshot{handle, owner, 0, 0, 0, 0, 0}});
       ownerIds_.emplace(owner, handle.ownerId);
+      queries_.try_emplace(owner.queryId, LiveBytes{});
+      tasks_.try_emplace(owner.taskUuid, LiveBytes{});
       inserted = true;
     }
 
@@ -235,11 +239,17 @@ class GpuMemoryAllocationTracker::Impl {
         ++ownerSnapshot.currentAllocations;
         ++ownerSnapshot.totalAllocations;
 
+        auto& query = queries_.at(ownerSnapshot.owner.queryId);
+        addBytes(query, byteCount);
+        auto& task = tasks_.at(ownerSnapshot.owner.taskUuid);
+        addBytes(task, byteCount);
         auto& plan = plans_.at(handle.planNodeId);
         addBytes(plan, byteCount);
 
         update = makeUpdateLocked(
             handle,
+            query.current,
+            task.current,
             plan.current,
             ownerSnapshot.currentBytes,
             static_cast<int64_t>(byteCount));
@@ -275,17 +285,23 @@ class GpuMemoryAllocationTracker::Impl {
         const auto bytes = allocation->second.bytes;
         const auto handle = allocation->second.handle;
         auto& ownerSnapshot = owners_.at(handle.ownerId).snapshot;
+        auto& query = queries_.at(ownerSnapshot.owner.queryId);
+        auto& task = tasks_.at(ownerSnapshot.owner.taskUuid);
         auto& plan = plans_.at(handle.planNodeId);
 
         global_.current -= bytes;
         --currentAllocations_;
         ownerSnapshot.currentBytes -= bytes;
         --ownerSnapshot.currentAllocations;
+        query.current -= bytes;
+        task.current -= bytes;
         plan.current -= bytes;
         allocations_.erase(allocation);
 
         update = makeUpdateLocked(
             handle,
+            query.current,
+            task.current,
             plan.current,
             ownerSnapshot.currentBytes,
             -static_cast<int64_t>(bytes));
@@ -307,6 +323,8 @@ class GpuMemoryAllocationTracker::Impl {
         owner = owners_.find(0);
       }
       handle = owner->second.snapshot.handle;
+      const auto& query = queries_.at(owner->second.snapshot.owner.queryId);
+      const auto& task = tasks_.at(owner->second.snapshot.owner.taskUuid);
       const auto& plan = plans_.at(handle.planNodeId);
       return GpuMemoryTraceUpdate{
           gpu_memory_detail::gpuMemoryTraceNowNs(),
@@ -315,6 +333,8 @@ class GpuMemoryAllocationTracker::Impl {
           handle.planNodeId,
           global_.current,
           global_.peak,
+          query.current,
+          task.current,
           plan.current,
           owner->second.snapshot.currentBytes,
           0};
@@ -381,6 +401,8 @@ class GpuMemoryAllocationTracker::Impl {
 
   GpuMemoryTraceUpdate makeUpdateLocked(
       GpuMemoryOwnerHandle handle,
+      uint64_t queryCurrentBytes,
+      uint64_t taskCurrentBytes,
       uint64_t planNodeCurrentBytes,
       uint64_t ownerCurrentBytes,
       int64_t deltaBytes) {
@@ -397,6 +419,8 @@ class GpuMemoryAllocationTracker::Impl {
         handle.planNodeId,
         global_.current,
         global_.peak,
+        queryCurrentBytes,
+        taskCurrentBytes,
         planNodeCurrentBytes,
         ownerCurrentBytes,
         deltaBytes};
@@ -428,6 +452,8 @@ class GpuMemoryAllocationTracker::Impl {
   uint64_t nextPlanNodeId_{1};
   std::unordered_map<GpuMemoryOwner, uint64_t, GpuMemoryOwnerHash> ownerIds_;
   std::unordered_map<uint64_t, OwnerRecord> owners_;
+  std::unordered_map<std::string, LiveBytes> queries_;
+  std::unordered_map<std::string, LiveBytes> tasks_;
   std::unordered_map<PlanNodeKey, uint64_t, PlanNodeKeyHash> planNodeIds_;
   std::unordered_map<uint64_t, LiveBytes> plans_;
   std::unordered_map<void*, AllocationRecord> allocations_;
@@ -692,8 +718,11 @@ GpuMemoryResourcePair createGpuMemoryTrackingResources(
 }
 
 void resetGpuMemoryTracking() {
-  std::lock_guard<std::mutex> lock(diagnosticsMutex);
-  diagnostics.reset();
+  {
+    std::lock_guard<std::mutex> lock(diagnosticsMutex);
+    diagnostics.reset();
+  }
+  gpu_memory_detail::resetGpuMemoryNvtxCounters();
 }
 
 GpuMemorySnapshot getGpuMemorySnapshot() {
@@ -731,6 +760,24 @@ GpuMemoryActiveOwner activateGpuMemoryOperator(exec::Operator* op) noexcept {
   }
   activeOwner = GpuMemoryActiveOwner{tracker.get(), ownerId};
   return previous;
+}
+
+void registerGpuMemoryOperator(exec::Operator* op) noexcept {
+  std::shared_ptr<GpuMemoryAllocationTracker> tracker;
+  {
+    std::lock_guard<std::mutex> lock(diagnosticsMutex);
+    tracker = diagnostics;
+  }
+
+  if (tracker == nullptr) {
+    return;
+  }
+
+  try {
+    tracker->registerOperator(op);
+  } catch (...) {
+    // Operator registration is diagnostics only.
+  }
 }
 
 GpuMemoryActiveOwner activeGpuMemoryOwner() noexcept {

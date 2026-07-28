@@ -35,6 +35,7 @@
 #include "folly/Conv.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
+#include "velox/exec/TableScan.h"
 #include "velox/exec/Values.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
@@ -307,8 +308,16 @@ struct CudfDriverAdapter {
       return false;
     }
     auto state = CompileState(factory, driver);
-    auto res = state.compile(allowCpuFallback_);
-    return res;
+    const auto replacementsMade = state.compile(allowCpuFallback_);
+    if (CudfConfig::getInstance().gpuMemoryTrackingEnabled()) {
+      for (auto* op : driver.operators()) {
+        if (dynamic_cast<CudfOperatorBase*>(op) != nullptr ||
+            dynamic_cast<exec::TableScan*>(op) != nullptr) {
+          gpu_memory_detail::registerGpuMemoryOperator(op);
+        }
+      }
+    }
+    return replacementsMade;
   }
 
  private:

@@ -71,6 +71,10 @@ struct GpuMemoryTraceUpdate {
   uint64_t globalCurrentBytes{0};
   /// Process-wide high-water mark after this transition.
   uint64_t globalPeakBytes{0};
+  /// Query live logical bytes after this transition.
+  uint64_t queryCurrentBytes{0};
+  /// Task, or PlanFragment instance, live logical bytes after this transition.
+  uint64_t taskCurrentBytes{0};
   /// PlanNode live logical bytes after this transition.
   uint64_t planNodeCurrentBytes{0};
   /// Operator-instance live logical bytes after this transition.
@@ -125,8 +129,11 @@ void registerGpuMemoryTraceOwner(
     uint64_t planNodeId,
     const GpuMemoryOwner& owner) noexcept;
 
-/// Emits synchronized global, PlanNode, and operator counter samples.
+/// Emits synchronized process, query, task, PlanNode, and operator samples.
 void emitGpuMemoryTraceUpdate(const GpuMemoryTraceUpdate& update) noexcept;
+
+/// Ends and clears the native NVTX counter hierarchy.
+void resetGpuMemoryNvtxCounters() noexcept;
 
 /// Emits a factual allocation-failure marker and current logical state.
 void emitGpuMemoryTraceOom(

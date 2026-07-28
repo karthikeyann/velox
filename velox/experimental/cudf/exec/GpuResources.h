@@ -180,6 +180,9 @@ struct GpuMemoryActiveOwner {
 /// Activates an operator and returns the previous thread-local owner.
 GpuMemoryActiveOwner activateGpuMemoryOperator(exec::Operator* op) noexcept;
 
+/// Registers an operator without changing thread-local attribution.
+void registerGpuMemoryOperator(exec::Operator* op) noexcept;
+
 /// Returns the active thread-local attribution.
 GpuMemoryActiveOwner activeGpuMemoryOwner() noexcept;
 
