@@ -479,6 +479,7 @@ class GpuMemoryCaptureController {
         config_.maxEvents = std::max<std::size_t>(1, config.maxEvents);
         stopping_ = false;
         enabled_ = true;
+        taskSelected_ = false;
       }
       worker_ = std::thread([this] { exportLoop(); });
       return true;
@@ -519,6 +520,7 @@ class GpuMemoryCaptureController {
       pending_.clear();
       stopping_ = false;
       config_ = {};
+      taskSelected_ = false;
     } catch (...) {
       // Profiling cleanup must not alter worker shutdown.
     }
@@ -526,7 +528,7 @@ class GpuMemoryCaptureController {
 
   bool enabled() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    return enabled_ && active_ == nullptr;
+    return enabled_ && !taskSelected_;
   }
 
   std::string lastPath() const {
@@ -540,7 +542,7 @@ class GpuMemoryCaptureController {
       const GpuMemorySnapshot& initialSnapshot) noexcept {
     try {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (!enabled_ || active_ != nullptr ||
+      if (!enabled_ || taskSelected_ || active_ != nullptr ||
           !taskMatches(task, config_.queryFilter)) {
         return false;
       }
@@ -562,6 +564,7 @@ class GpuMemoryCaptureController {
       capture->dataLossEvents.reserve(16);
       mergeSnapshotOwners(*capture, initialSnapshot);
       active_ = std::move(capture);
+      taskSelected_ = true;
       LOG(INFO) << "GPU-memory capture selected query " << task.queryId
                 << ", task " << task.taskId;
       return true;
@@ -886,6 +889,7 @@ class GpuMemoryCaptureController {
   uint64_t nextCallId_{0};
   bool enabled_{false};
   bool stopping_{false};
+  bool taskSelected_{false};
 };
 
 GpuMemoryCaptureController& captureController() {

@@ -103,6 +103,10 @@ The MVP presents one selected Task in full detail, but the underlying ledger is
 process-wide. During the selected interval the recorder retains every observed
 allocation transition, including transitions owned by other Tasks.
 
+One worker process selects at most one matching Task. Repeated benchmark cases
+restart the worker, which keeps task selection deterministic and prevents a
+later stage or query from overwriting the first artifact.
+
 This distinction is required for OOM analysis:
 
 - The selected Task receives a complete typed plan and operator-call view.
