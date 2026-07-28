@@ -440,9 +440,7 @@ void registerCudf() {
               GpuMemoryCaptureConfig{
                   cudfConfig.quentMemoryProfilePath,
                   cudfConfig.quentQueryFilter,
-                  cudfConfig.quentMaxEvents,
-                  cudfConfig.quentAdapterPath,
-                  cudfConfig.quentOutputPath})) {
+                  cudfConfig.quentMaxEvents})) {
         gpuMemoryCaptureTaskListener =
             std::make_shared<GpuMemoryCaptureTaskListener>();
         if (!exec::registerTaskListener(gpuMemoryCaptureTaskListener)) {
@@ -572,12 +570,6 @@ void CudfConfig::initialize(
         quentMaxEvents,
         0,
         "Quent GPU-memory maximum event count must be positive");
-  }
-  if (config.find(kCudfQuentAdapterPath) != config.end()) {
-    quentAdapterPath = config[kCudfQuentAdapterPath];
-  }
-  if (config.find(kCudfQuentOutputPath) != config.end()) {
-    quentOutputPath = config[kCudfQuentOutputPath];
   }
   if (config.find(kCudfMemoryResource) != config.end()) {
     memoryResource = config[kCudfMemoryResource];

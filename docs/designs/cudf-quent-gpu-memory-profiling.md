@@ -54,7 +54,7 @@ cuDF operator scopes              wrapped RMM resources
                  selected Task completes
                           |
                           v
-              optional Quent adapter/replay
+               Quent companion replay
                           |
                           v
            Velox-specific Quent model and UI
@@ -64,12 +64,11 @@ Velox owns the source facts, bounded recorder, and capture-integrity status.
 The Quent integration owns model-specific event construction, analysis, and UI
 behavior. Perfetto and NVTX remain optional independent validation sinks.
 
-The Quent adapter must not appear in public Velox execution headers. A build
-that does not enable the adapter has no Quent link dependency and requires no
-Rust toolchain. An enabled production build consumes a pinned, prebuilt adapter
-library. Building that adapter may require Rust because current Quent model
-generation and analysis are implemented in Rust; running the default Velox
-worker does not.
+Velox does not load Quent into the worker process. It atomically exports the
+versioned capture, and a companion command validates, replays, and opens it.
+Consequently, building and running the worker has no Quent or Rust dependency.
+Building the companion currently requires Rust because Quent model generation
+and analysis are implemented in Rust.
 
 ## Attribution model
 
@@ -123,7 +122,7 @@ Silently filtering other Tasks would make the displayed overall peak false.
 
 Capture v1 is a versioned JSON document written atomically by Velox. The
 top-level `format` is `velox-cudf-gpu-memory-capture` and `version` is `1`.
-Schema changes require a new version; the Quent adapter rejects unknown
+Schema changes require a new version; the Quent companion rejects unknown
 formats and versions.
 
 ### Capture header
@@ -157,13 +156,16 @@ referenced by a retained event or snapshot.
 The beginning snapshot is a consistent ledger snapshot containing:
 
 - Global current logical bytes.
-- Current bytes for every registered owner.
+- Current bytes for every live owner and every selected-Task owner.
 - Owner metadata required by non-zero values.
 - Live allocation count and source data-loss count.
 - The beginning source sequence.
 
 The beginning snapshot is the value at the left edge of the chart. It also
-preserves memory that was allocated before the selected Task began.
+preserves memory that was allocated before the selected Task began. Capture
+snapshots deliberately omit pointer addresses: pointer identity remains inside
+the ledger for correct deallocation, but copying an arbitrarily large live
+allocation map would make starting the profiler itself an OOM risk.
 
 ### Raw events
 
@@ -230,7 +232,7 @@ snapshot from being counted twice.
 
 The ending operation takes a consistent snapshot and establishes `E`. It must
 wait until all already-issued transitions through `E` are published before
-handing the immutable capture to the adapter. Events after `E` belong to later
+handing the immutable capture to the exporter. Events after `E` belong to later
 process activity and are excluded.
 
 The MVP uses a non-allocating append into Velox-owned, preallocated recorder
@@ -269,6 +271,11 @@ data-loss facts use small, fixed out-of-band budgets so an exhausted ordinary
 timeline cannot hide the reason a query failed. No storage grows on an
 allocation callback.
 
+Boundary snapshots use intrusive live-owner and Task-owner indexes, so they do
+not scan or copy every owner accumulated over a long-lived worker. Their size
+is proportional to currently live owners plus the selected Task's owners, not
+the number of allocations or historical queries.
+
 When capacity is exhausted:
 
 - Existing events are not overwritten.
@@ -283,9 +290,9 @@ When capacity is exhausted:
   cannot claim exact holder context or threshold crossings across missing
   transitions.
 
-Disabled recording is a fast no-op. Finishing a capture is idempotent. Recorder
-or adapter exceptions are contained and cannot alter an allocation, free, OOM,
-operator call, or Task state.
+Disabled recording is a fast no-op. Finishing a capture is idempotent.
+Recorder, export, or replay exceptions are contained and cannot alter an
+allocation, free, OOM, operator call, or Task state.
 
 The first implementation may use one process recorder because memory
 transitions are already serialized by the ledger. If operator-call contention
@@ -298,7 +305,7 @@ Lifetime ledger peaks cannot be displayed as selected-capture peaks. An earlier
 query can establish a larger lifetime value whose timestamp is outside this
 capture.
 
-For a complete timeline, the adapter reconstructs the capture-local global
+For a complete timeline, the companion reconstructs the capture-local global
 series as a step function:
 
 1. Start with the beginning snapshot's global current bytes.
@@ -350,25 +357,26 @@ The initial UI provides:
 - Plan-to-timeline cross-highlighting.
 - Visible incomplete-capture and retained-memory status.
 
-The Quent adapter sorts source facts by their source timestamp and ordinal. It
+The Quent companion sorts source facts by their source timestamp and ordinal. It
 must not substitute replay time for execution time.
 
-## Optional adapter and build boundary
+## Companion replay boundary
 
 The raw recorder is useful and testable without Quent. Quent support is enabled
-with a separate build option and consumes an explicitly supplied adapter
-prefix. The default is disabled.
+only by setting the raw output path; a separate command consumes completed
+artifacts.
 
 The boundary must provide:
 
-- A narrow C or generated CXX entry point for consuming an immutable capture.
 - No Quent-generated types in Velox public headers.
-- A pinned Quent revision and lockfile for reproducible adapter builds.
+- A pinned Quent revision and lockfile for reproducible companion builds.
 - Failure reporting that leaves the raw capture available for diagnosis.
 
-The worker can either invoke the prebuilt adapter asynchronously after capture
-or write the versioned raw artifact for a companion converter. Both preserve
-the same v1 source contract; neither routes through Perfetto.
+The MVP always writes the versioned raw artifact for the companion converter.
+This prevents foreign analyzer code from blocking Task completion or worker
+shutdown, and it preserves the direct source contract without routing through
+Perfetto. A stable C ABI can remain available for other external launchers, but
+it is not loaded into Velox.
 
 ## Integrity and failure semantics
 
@@ -397,7 +405,7 @@ Telemetry follows a fail-open policy:
 
 - Allocation and deallocation always reach their upstream resource.
 - A failed allocation is rethrown unchanged.
-- A recorder, adapter, or output-path failure never changes query results.
+- A recorder, export, replay, or output-path failure never changes query results.
 - A temporary output is atomically renamed only after successful conversion.
 - Partial output retains an explicit incomplete status or is removed.
 

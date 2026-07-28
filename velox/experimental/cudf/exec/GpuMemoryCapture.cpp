@@ -17,7 +17,6 @@
 #include "velox/experimental/cudf/exec/GpuMemoryCapture.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
-#include <dlfcn.h>
 #include <folly/dynamic.h>
 #include <folly/json.h>
 #include <glog/logging.h>
@@ -32,12 +31,10 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
-#include <iomanip>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -47,7 +44,6 @@ namespace {
 
 constexpr std::string_view kCaptureFormat{"velox-cudf-gpu-memory-capture"};
 constexpr uint64_t kCaptureVersion{1};
-constexpr std::size_t kMaximumErrorLength{1'024};
 constexpr std::size_t kMaximumActiveCalls{4'096};
 constexpr std::size_t kMarkerCapacity{64};
 constexpr std::size_t kCriticalEventCapacity{64};
@@ -243,17 +239,6 @@ folly::dynamic snapshotJson(
   }
 
   auto allocations = folly::dynamic::array();
-  for (const auto& allocation : snapshot.allocations) {
-    if (!relevantOwnerIds.contains(allocation.handle.ownerId)) {
-      continue;
-    }
-    std::ostringstream address;
-    address << "0x" << std::hex << allocation.address;
-    allocations.push_back(
-        folly::dynamic::object("address", address.str())(
-            "bytes", allocation.bytes)("owner_id", allocation.handle.ownerId)(
-            "plan_node_track_id", allocation.handle.planNodeId));
-  }
 
   return folly::dynamic::object("current_bytes", snapshot.currentBytes)(
       "source_lifetime_peak_bytes", snapshot.peakBytes)(
@@ -263,7 +248,8 @@ folly::dynamic snapshotJson(
       "source_lifetime_total_allocations", snapshot.totalAllocations)(
       "source_sequence", snapshot.sequence)(
       "source_data_loss_events", snapshot.dataLossEvents)(
-      "owners", std::move(owners))("allocations", std::move(allocations));
+      "allocation_details_complete", false)("owners", std::move(owners))(
+      "allocations", std::move(allocations));
 }
 
 struct CapturePeak {
@@ -534,47 +520,6 @@ bool writeAtomically(
   }
 }
 
-using QuentReplayFunction = int (*)(
-    const char* capturePath,
-    const char* outputPath,
-    char* error,
-    std::size_t errorLength);
-
-void replayIntoQuent(
-    const GpuMemoryCaptureConfig& config,
-    const GpuMemoryCaptureTask& task,
-    const std::string& capturePath) {
-  if (config.adapterPath.empty()) {
-    return;
-  }
-
-  void* library = dlopen(config.adapterPath.c_str(), RTLD_NOW | RTLD_LOCAL);
-  if (library == nullptr) {
-    LOG(ERROR) << "Cannot load Quent Velox replay adapter: " << dlerror();
-    return;
-  }
-
-  dlerror();
-  auto* replay = reinterpret_cast<QuentReplayFunction>(
-      dlsym(library, "quent_velox_replay_v1"));
-  if (const char* symbolError = dlerror()) {
-    LOG(ERROR) << "Cannot resolve quent_velox_replay_v1: " << symbolError;
-    dlclose(library);
-    return;
-  }
-
-  std::array<char, kMaximumErrorLength> error{};
-  const auto outputPath = resolvePath(config.adapterOutputPath, task);
-  const int result = replay(
-      capturePath.c_str(), outputPath.c_str(), error.data(), error.size());
-  if (result != 0) {
-    LOG(ERROR) << "Quent Velox replay failed: " << error.data();
-  } else {
-    LOG(INFO) << "Quent Velox profile written to " << outputPath;
-  }
-  dlclose(library);
-}
-
 class GpuMemoryCaptureController {
  public:
   bool start(const GpuMemoryCaptureConfig& config) {
@@ -650,7 +595,7 @@ class GpuMemoryCaptureController {
   bool tryBegin(
       const GpuMemoryCaptureTask& task,
       const std::vector<GpuMemoryCapturePlanNode>& planNodes,
-      const GpuMemorySnapshot& initialSnapshot) noexcept {
+      GpuMemorySnapshot initialSnapshot) noexcept {
     try {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!enabled_ || taskSelected_ || active_ != nullptr ||
@@ -662,8 +607,7 @@ class GpuMemoryCaptureController {
       capture->captureId = ++nextCaptureId_;
       capture->task = task;
       capture->planNodes = planNodes;
-      capture->initialSnapshot = initialSnapshot;
-      capture->finalSnapshot = initialSnapshot;
+      capture->initialSnapshot = std::move(initialSnapshot);
       capture->startTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
       capture->startUnixNs = gpu_memory_detail::gpuMemoryUnixTimeNs();
       capture->maxEvents = config_.maxEvents;
@@ -683,11 +627,11 @@ class GpuMemoryCaptureController {
         capture->freeCallSlots.push_back(
             static_cast<uint32_t>(activeCallCapacity - slot - 1));
       }
-      capture->observedPeakBytes = initialSnapshot.currentBytes;
+      capture->observedPeakBytes = capture->initialSnapshot.currentBytes;
       capture->observedPeakTimestampNs = capture->startTimestampNs;
-      capture->observedPeakSourceSequence = initialSnapshot.sequence;
-      capture->lastObservedSourceSequence = initialSnapshot.sequence;
-      mergeSnapshotOwners(*capture, initialSnapshot);
+      capture->observedPeakSourceSequence = capture->initialSnapshot.sequence;
+      capture->lastObservedSourceSequence = capture->initialSnapshot.sequence;
+      mergeSnapshotOwners(*capture, capture->initialSnapshot);
       active_ = std::move(capture);
       taskSelected_ = true;
       LOG(INFO) << "GPU-memory capture selected query " << task.queryId
@@ -704,7 +648,7 @@ class GpuMemoryCaptureController {
       const std::string& taskId,
       std::string_view taskState,
       bool cleanupComplete,
-      const GpuMemorySnapshot& finalSnapshot) noexcept {
+      GpuMemorySnapshot finalSnapshot) noexcept {
     try {
       std::lock_guard<std::mutex> lock(mutex_);
       if (active_ == nullptr) {
@@ -716,8 +660,8 @@ class GpuMemoryCaptureController {
       if (!matchesTask) {
         return;
       }
-      active_->finalSnapshot = finalSnapshot;
-      mergeSnapshotOwners(*active_, finalSnapshot);
+      active_->finalSnapshot = std::move(finalSnapshot);
+      mergeSnapshotOwners(*active_, active_->finalSnapshot);
       active_->endTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
       active_->endUnixNs = gpu_memory_detail::gpuMemoryUnixTimeNs();
       active_->taskState = boundedString(taskState, 64);
@@ -734,14 +678,14 @@ class GpuMemoryCaptureController {
 
   void abort(
       std::string_view reason,
-      const GpuMemorySnapshot& finalSnapshot) noexcept {
+      GpuMemorySnapshot finalSnapshot) noexcept {
     try {
       std::lock_guard<std::mutex> lock(mutex_);
       if (active_ == nullptr) {
         return;
       }
-      active_->finalSnapshot = finalSnapshot;
-      mergeSnapshotOwners(*active_, finalSnapshot);
+      active_->finalSnapshot = std::move(finalSnapshot);
+      mergeSnapshotOwners(*active_, active_->finalSnapshot);
       active_->endTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
       active_->endUnixNs = gpu_memory_detail::gpuMemoryUnixTimeNs();
       active_->taskState = "aborted";
@@ -1084,7 +1028,6 @@ class GpuMemoryCaptureController {
         LOG(INFO) << "GPU-memory capture written to " << path << " with "
                   << capture->retainedEvents << " retained events and "
                   << capture->droppedEvents << " dropped events";
-        replayIntoQuent(config, capture->task, path);
       } catch (const std::exception& exception) {
         LOG(ERROR) << "GPU-memory capture export failed: " << exception.what();
       }
@@ -1155,8 +1098,9 @@ uint64_t gpuMemoryUnixTimeNs() noexcept {
 bool tryBeginGpuMemoryCapture(
     const GpuMemoryCaptureTask& task,
     const std::vector<GpuMemoryCapturePlanNode>& planNodes,
-    const GpuMemorySnapshot& initialSnapshot) noexcept {
-  return captureController().tryBegin(task, planNodes, initialSnapshot);
+    GpuMemorySnapshot initialSnapshot) noexcept {
+  return captureController().tryBegin(
+      task, planNodes, std::move(initialSnapshot));
 }
 
 void finishGpuMemoryCapture(
@@ -1164,15 +1108,15 @@ void finishGpuMemoryCapture(
     const std::string& taskId,
     std::string_view taskState,
     bool cleanupComplete,
-    const GpuMemorySnapshot& finalSnapshot) noexcept {
+    GpuMemorySnapshot finalSnapshot) noexcept {
   captureController().finish(
-      taskUuid, taskId, taskState, cleanupComplete, finalSnapshot);
+      taskUuid, taskId, taskState, cleanupComplete, std::move(finalSnapshot));
 }
 
 void abortGpuMemoryCapture(
     std::string_view reason,
-    const GpuMemorySnapshot& finalSnapshot) noexcept {
-  captureController().abort(reason, finalSnapshot);
+    GpuMemorySnapshot finalSnapshot) noexcept {
+  captureController().abort(reason, std::move(finalSnapshot));
 }
 
 void registerGpuMemoryCaptureOwner(

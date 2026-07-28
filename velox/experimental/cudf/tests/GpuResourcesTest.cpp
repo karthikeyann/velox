@@ -1061,6 +1061,63 @@ TEST(GpuMemoryCaptureTest, RetainsConcurrentTaskOwners) {
   EXPECT_EQ(capture["final_snapshot"]["owners"].size(), 2);
 }
 
+TEST(GpuMemoryCaptureTest, BoundsBoundarySnapshotsToLiveAndSelectedOwners) {
+  stopGpuMemoryCapture();
+  const auto path = rawCapturePath("bounded-snapshot");
+  std::filesystem::remove(path);
+  auto cleanup = folly::makeGuard([&] {
+    stopGpuMemoryCapture();
+    std::filesystem::remove(path);
+  });
+
+  GpuMemoryCaptureConfig config;
+  config.pathPattern = path.string();
+  config.maxEvents = 16;
+  ASSERT_TRUE(startGpuMemoryCapture(config));
+
+  GpuMemoryAllocationTracker tracker;
+  const auto historicalHandle =
+      tracker.registerOwner(makeOwner("historical", "plan-old", 1, 1, 1));
+  const auto selectedHandle =
+      tracker.registerOwner(makeOwner("selected-bounded", "plan-a", 2, 2, 2));
+  const auto concurrentHandle =
+      tracker.registerOwner(makeOwner("concurrent", "plan-b", 3, 3, 3));
+  int historicalAllocation;
+  int concurrentAllocation;
+  ASSERT_TRUE(
+      tracker.recordAllocation(&historicalAllocation, 10, historicalHandle));
+  ASSERT_TRUE(tracker.recordDeallocation(&historicalAllocation));
+  ASSERT_TRUE(
+      tracker.recordAllocation(&concurrentAllocation, 20, concurrentHandle));
+
+  const auto task = makeCaptureTask("selected-bounded");
+  ASSERT_TRUE(tracker.tryBeginCapture(
+      task,
+      {GpuMemoryCapturePlanNode{
+          .id = "plan-a", .type = "TestPlanNode", .sourceIds = {}}}));
+  tracker.finishCapture(task.taskUuid, task.taskId, "finished", true);
+  stopGpuMemoryCapture();
+
+  const auto capture = readRawCapture(path);
+  EXPECT_THAT(
+      jsonIntColumn(capture["owners"], "owner_id"),
+      testing::UnorderedElementsAre(
+          static_cast<int64_t>(selectedHandle.ownerId),
+          static_cast<int64_t>(concurrentHandle.ownerId)));
+  EXPECT_EQ(capture["initial_snapshot"]["current_bytes"].asInt(), 20);
+  EXPECT_EQ(capture["initial_snapshot"]["current_allocations"].asInt(), 1);
+  EXPECT_FALSE(
+      capture["initial_snapshot"]["allocation_details_complete"].asBool());
+  EXPECT_TRUE(capture["initial_snapshot"]["allocations"].empty());
+  EXPECT_THAT(
+      jsonIntColumn(capture["initial_snapshot"]["owners"], "owner_id"),
+      testing::UnorderedElementsAre(
+          static_cast<int64_t>(selectedHandle.ownerId),
+          static_cast<int64_t>(concurrentHandle.ownerId)));
+
+  ASSERT_TRUE(tracker.recordDeallocation(&concurrentAllocation));
+}
+
 TEST(GpuMemoryCaptureTest, DisabledAndFinishedOperationsAreIdempotent) {
   stopGpuMemoryCapture();
   const auto path = rawCapturePath("idempotent");

@@ -38,8 +38,6 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfQuentMemoryProfilePath, "/tmp/gpu-memory-%q-%t.json"},
       {CudfConfig::kCudfQuentQueryFilter, "query-42"},
       {CudfConfig::kCudfQuentMaxEvents, "250000"},
-      {CudfConfig::kCudfQuentAdapterPath, "/opt/quent/lib/libquent.so"},
-      {CudfConfig::kCudfQuentOutputPath, "/tmp/quent-%q"},
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
@@ -54,8 +52,6 @@ TEST(ConfigTest, CudfConfig) {
   EXPECT_EQ(config.quentMemoryProfilePath, "/tmp/gpu-memory-%q-%t.json");
   EXPECT_EQ(config.quentQueryFilter, "query-42");
   EXPECT_EQ(config.quentMaxEvents, 250'000);
-  EXPECT_EQ(config.quentAdapterPath, "/opt/quent/lib/libquent.so");
-  EXPECT_EQ(config.quentOutputPath, "/tmp/quent-%q");
   EXPECT_TRUE(config.gpuMemoryTrackingEnabled());
   EXPECT_EQ(config.memoryResource, "arena");
   EXPECT_EQ(config.memoryPercent, 25);

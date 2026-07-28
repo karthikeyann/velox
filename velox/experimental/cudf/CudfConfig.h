@@ -37,8 +37,6 @@ struct CudfConfig {
       "cudf.quent_memory_profile_path"};
   static constexpr const char* kCudfQuentQueryFilter{"cudf.quent_query_filter"};
   static constexpr const char* kCudfQuentMaxEvents{"cudf.quent_max_events"};
-  static constexpr const char* kCudfQuentAdapterPath{"cudf.quent_adapter_path"};
-  static constexpr const char* kCudfQuentOutputPath{"cudf.quent_output_path"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
@@ -95,14 +93,8 @@ struct CudfConfig {
   /// Selects the first GPU task whose query, task, or UUID contains this text.
   std::string quentQueryFilter;
 
-  /// Bounds retained memory, call, marker, OOM, and data-loss events.
+  /// Bounds retained memory transitions and operator-call spans.
   std::size_t quentMaxEvents{250'000};
-
-  /// Optionally replays a completed profile through this prebuilt adapter.
-  std::string quentAdapterPath;
-
-  /// Supplies the optional adapter's output path with the same placeholders.
-  std::string quentOutputPath;
 
   /// Returns whether snapshot, Perfetto, or Quent diagnostics are requested.
   bool gpuMemoryTrackingEnabled() const {

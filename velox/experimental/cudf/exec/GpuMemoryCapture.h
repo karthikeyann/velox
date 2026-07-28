@@ -37,10 +37,6 @@ struct GpuMemoryCaptureConfig {
   std::string queryFilter;
   /// Bounds high-volume memory updates and operator calls retained per capture.
   std::size_t maxEvents{250'000};
-  /// Loads an optional post-query Quent replay adapter from this shared object.
-  std::string adapterPath;
-  /// Passes this output path to the optional Quent replay adapter.
-  std::string adapterOutputPath;
 };
 
 /// Identifies the Velox task selected for a capture.
@@ -110,7 +106,7 @@ uint64_t gpuMemoryUnixTimeNs() noexcept;
 bool tryBeginGpuMemoryCapture(
     const GpuMemoryCaptureTask& task,
     const std::vector<GpuMemoryCapturePlanNode>& planNodes,
-    const GpuMemorySnapshot& initialSnapshot) noexcept;
+    GpuMemorySnapshot initialSnapshot) noexcept;
 
 /// Seals the matching task at its terminal ledger sequence watermark.
 void finishGpuMemoryCapture(
@@ -118,12 +114,12 @@ void finishGpuMemoryCapture(
     const std::string& taskId,
     std::string_view taskState,
     bool cleanupComplete,
-    const GpuMemorySnapshot& finalSnapshot) noexcept;
+    GpuMemorySnapshot finalSnapshot) noexcept;
 
 /// Seals an active capture as incomplete during worker shutdown.
 void abortGpuMemoryCapture(
     std::string_view reason,
-    const GpuMemorySnapshot& finalSnapshot) noexcept;
+    GpuMemorySnapshot finalSnapshot) noexcept;
 
 /// Registers owner metadata used by updates and call spans.
 void registerGpuMemoryCaptureOwner(
