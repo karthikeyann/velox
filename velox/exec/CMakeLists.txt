@@ -28,6 +28,7 @@ velox_add_library(
   ContainerRowSerde.cpp
   DistinctAggregations.cpp
   Driver.cpp
+  DriverListener.cpp
   EnforceSingleRow.cpp
   Exchange.cpp
   ExchangeClient.cpp
@@ -127,6 +128,7 @@ velox_add_library(
   ContainerRowSerde.h
   DistinctAggregations.h
   Driver.h
+  DriverListener.h
   DriverStats.h
   EnforceDistinct.h
   EnforceSingleRow.h

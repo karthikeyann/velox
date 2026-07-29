@@ -217,6 +217,7 @@ endif()
 add_executable(
   velox_exec_infra_test
   AssertQueryBuilderTest.cpp
+  DriverListenerTest.cpp
   DriverTest.cpp
   FunctionSignatureBuilderTest.cpp
   GroupedExecutionTest.cpp

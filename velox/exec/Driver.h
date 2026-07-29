@@ -31,6 +31,7 @@
 #include "velox/common/time/CpuWallTimer.h"
 #include "velox/core/PlanFragment.h"
 #include "velox/exec/BlockingReason.h"
+#include "velox/exec/DriverListener.h"
 #include "velox/exec/PartitionedOutputFactory.h"
 #include "velox/exec/trace/TraceCtx.h"
 
@@ -290,6 +291,8 @@ struct DriverCtx {
 };
 
 constexpr const char* kOpMethodNone = "";
+constexpr const char* kOpMethodInitialize = "initialize";
+constexpr const char* kOpMethodClose = "close";
 constexpr const char* kOpMethodIsBlocked = "isBlocked";
 constexpr const char* kOpMethodNeedsInput = "needsInput";
 constexpr const char* kOpMethodGetOutput = "getOutput";
@@ -734,6 +737,16 @@ class Driver : public std::enable_shared_from_this<Driver> {
   // Atomic because closeByTask() may access it from a different thread
   // than the one running the onThreadTimeGuard scope guard in runInternal.
   std::atomic<uint64_t> onThreadStartUs_{0};
+
+  // Listeners observing this Driver, or nullptr when nothing observes the Task.
+  // Owned by the Task, which outlives every Driver, and fixed at Task
+  // construction. Null means the per-call notification is skipped entirely.
+  const std::vector<std::shared_ptr<DriverListener>>* driverListeners_{nullptr};
+
+  // Operator that reported the reason the Driver last went off thread, or
+  // nullptr when it is not blocked. Used to pair onDriverUnblocked with
+  // onDriverBlocked.
+  Operator* blockedListenerOperator_{nullptr};
 
   // Id (index in the vector) of the current operator to run (or the 1st one if
   // we haven't started yet). Used to determine which operator's queueTime we

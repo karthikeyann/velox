@@ -32,6 +32,42 @@ Driver::~Driver() = default;
 
 namespace {
 
+// Brackets one Operator method invocation with the Task's DriverListener
+// callbacks. Notifies nothing when 'listeners' is null, which is the case
+// whenever no factory accepted the Task.
+class DriverListenerCallGuard {
+ public:
+  DriverListenerCallGuard(
+      const std::vector<std::shared_ptr<DriverListener>>* listeners,
+      const Operator* op,
+      std::string_view callName)
+      : listeners_(listeners), op_(op), callName_(callName) {
+    if (listeners_ == nullptr) {
+      return;
+    }
+    for (const auto& listener : *listeners_) {
+      listener->onOperatorCallBegin(*op_, callName_);
+    }
+  }
+
+  ~DriverListenerCallGuard() {
+    if (listeners_ == nullptr) {
+      return;
+    }
+    for (const auto& listener : *listeners_) {
+      listener->onOperatorCallEnd(*op_, callName_);
+    }
+  }
+
+  DriverListenerCallGuard(const DriverListenerCallGuard&) = delete;
+  DriverListenerCallGuard& operator=(const DriverListenerCallGuard&) = delete;
+
+ private:
+  const std::vector<std::shared_ptr<DriverListener>>* const listeners_;
+  const Operator* const op_;
+  const std::string_view callName_;
+};
+
 /// Returns current time in microseconds using high_resolution_clock.
 /// Used for driver-level lifecycle timing to match BlockingState::sinceUs_.
 inline uint64_t currentTimeMicrosHires() {
@@ -334,6 +370,8 @@ void Driver::init(
   operators_ = std::move(operators);
   curOperatorId_ = operators_.size() - 1;
   trackOperatorCpuUsage_ = ctx_->queryConfig().operatorTrackCpuUsage();
+  const auto& listeners = task()->driverListeners();
+  driverListeners_ = listeners.empty() ? nullptr : &listeners;
 }
 
 void Driver::initializeOperators() {
@@ -342,6 +380,8 @@ void Driver::initializeOperators() {
   }
   operatorsInitialized_ = true;
   for (auto& op : operators_) {
+    DriverListenerCallGuard listenerGuard(
+        driverListeners_, op.get(), kOpMethodInitialize);
     op->initialize();
   }
 }
@@ -398,6 +438,8 @@ void Driver::enqueueInternal() {
   try {                                                                    \
     Operator::NonReclaimableSectionGuard nonReclaimableGuard(operatorPtr); \
     RuntimeStatWriterScopeGuard statsWriterGuard(operatorPtr);             \
+    DriverListenerCallGuard listenerGuard(                                 \
+        driverListeners_, operatorPtr, operatorMethod);                    \
     threadNumVeloxThrow() = 0;                                             \
     opCallStatus_.start(operatorId, operatorMethod);                       \
     ExceptionContextSetter exceptionContext(                               \
@@ -591,6 +633,13 @@ StopReason Driver::runInternal(
   });
 
   try {
+    if (blockedListenerOperator_ != nullptr) {
+      auto* unblockedOp = std::exchange(blockedListenerOperator_, nullptr);
+      for (const auto& listener : *driverListeners_) {
+        listener->onDriverUnblocked(*unblockedOp);
+      }
+    }
+
     // Invoked to initialize the operators once before driver starts execution.
     initializeOperators();
     int32_t startingOperator = getStartingOperator();
@@ -929,6 +978,8 @@ void Driver::initializeOperatorStats(std::vector<OperatorStats>& stats) {
 void Driver::closeOperators() {
   // Close operators.
   for (auto& op : operators_) {
+    DriverListenerCallGuard listenerGuard(
+        driverListeners_, op.get(), kOpMethodClose);
     op->close();
   }
 
@@ -1423,6 +1474,12 @@ StopReason Driver::blockDriver(
     recordYieldCount();
   }
   blockedOperatorId_ = blockedOperatorId;
+  if (driverListeners_ != nullptr) {
+    blockedListenerOperator_ = op;
+    for (const auto& listener : *driverListeners_) {
+      listener->onDriverBlocked(*op, blockingReason_);
+    }
+  }
   blockingState = std::make_shared<BlockingState>(
       self, std::move(future), op, blockingReason_);
   guard.notThrown();

@@ -21,6 +21,7 @@
 #include "velox/core/PlanFragment.h"
 #include "velox/core/QueryCtx.h"
 #include "velox/exec/Driver.h"
+#include "velox/exec/DriverListener.h"
 #include "velox/exec/LocalPartition.h"
 #include "velox/exec/MemoryReclaimer.h"
 #include "velox/exec/MergeSource.h"
@@ -661,6 +662,12 @@ class Task : public std::enable_shared_from_this<Task> {
   /// Adds per driver statistics.  Called from Drivers upon their closure.
   void addDriverStats(int pipelineId, DriverStats stats);
 
+  /// Returns the listeners observing this Task's Drivers. Empty when nothing is
+  /// observing it. Fixed at construction, so a Driver may cache the address.
+  const std::vector<std::shared_ptr<DriverListener>>& driverListeners() const {
+    return driverListeners_;
+  }
+
   /// Accumulates driver lifecycle timing (queued, on-thread, blocked) for gap
   /// analysis. Same-index drivers across split groups are summed together.
   /// Called from Driver::closeOperators() upon driver closure.
@@ -1212,6 +1219,8 @@ class Task : public std::enable_shared_from_this<Task> {
 
   void initSplitListeners();
 
+  void initDriverListeners();
+
   /// Checks if the task supports barrier processing. Barrier processing is
   /// supported when the task is under single threaded execution mode and all
   /// its plan nodes support barrier processing.
@@ -1545,6 +1554,12 @@ class Task : public std::enable_shared_from_this<Task> {
   folly::CancellationSource cancellationSource_;
 
   std::vector<std::unique_ptr<SplitListener>> splitListeners_;
+
+  // Listeners observing this Task's Drivers, one for each registered
+  // DriverListenerFactory that accepted this Task. Empty when no factory is
+  // registered or all of them declined. Immutable after construction, so
+  // Drivers may read it without synchronization.
+  std::vector<std::shared_ptr<DriverListener>> driverListeners_;
 };
 
 /// Listener invoked on task completion.

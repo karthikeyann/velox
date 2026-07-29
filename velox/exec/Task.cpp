@@ -449,6 +449,12 @@ Task::Task(
   maybeInitTrace();
 
   initSplitListeners();
+  initDriverListeners();
+}
+
+void Task::initDriverListeners() {
+  driverListeners_ =
+      detail::createDriverListeners(taskId_, uuid_, queryCtx_->queryConfig());
 }
 
 void Task::initSplitListeners() {
