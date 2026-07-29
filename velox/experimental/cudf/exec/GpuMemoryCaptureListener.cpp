@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/GpuMemoryCapture.h"
 #include "velox/experimental/cudf/exec/GpuMemoryCaptureListener.h"
+#include "velox/experimental/cudf/exec/GpuMemoryOwner.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include "velox/exec/Operator.h"
@@ -66,9 +67,8 @@ class GpuMemoryCaptureDriverListener : public exec::DriverListener {
     }
   }
 
-  void onOperatorCallEnd(
-      const exec::Operator& /* op */,
-      std::string_view /* callName */) override {
+  void onOperatorCallEnd(const exec::Operator& op, std::string_view callName)
+      override {
     auto& calls = activeCalls();
     if (calls.empty()) {
       return;
@@ -76,7 +76,38 @@ class GpuMemoryCaptureDriverListener : public exec::DriverListener {
     const auto call = calls.back();
     calls.pop_back();
     gpu_memory_detail::endGpuMemoryCaptureOperatorCall(call.handle);
+    if (callName == exec::kOpMethodClose) {
+      recordCounts(op);
+    }
     gpu_memory_detail::restoreGpuMemoryOwner(call.previousOwner);
+  }
+
+ private:
+  /// Reads what Velox already counted for this operator, once, as it closes.
+  ///
+  /// Taken at close because the counts are cumulative: sampling per call would
+  /// lock the stats on the hot path to learn nothing a final reading does not
+  /// already say. The owner is still active here, so the capture resolves the
+  /// canonical metadata the same way it does for a call span.
+  static void recordCounts(const exec::Operator& op) {
+    GpuMemoryOperatorCounts counts;
+    {
+      auto locked = const_cast<exec::Operator&>(op).stats().rlock();
+      counts.inputRows = locked->inputPositions;
+      counts.inputBytes = locked->inputBytes;
+      counts.inputBatches = locked->inputVectors;
+      counts.outputRows = locked->outputPositions;
+      counts.outputBytes = locked->outputBytes;
+      counts.outputBatches = locked->outputVectors;
+      counts.rawInputRows = locked->rawInputPositions;
+      counts.rawInputBytes = locked->rawInputBytes;
+      counts.blockedWallNanos = locked->blockedWallNanos;
+      counts.cpuNanos = locked->addInputTiming.cpuNanos +
+          locked->getOutputTiming.cpuNanos + locked->finishTiming.cpuNanos;
+      counts.wallNanos = locked->addInputTiming.wallNanos +
+          locked->getOutputTiming.wallNanos + locked->finishTiming.wallNanos;
+    }
+    gpu_memory_detail::recordActiveGpuMemoryCaptureOperatorCounts(counts);
   }
 };
 

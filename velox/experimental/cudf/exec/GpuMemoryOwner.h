@@ -51,6 +51,37 @@ struct GpuMemoryOwner {
   }
 };
 
+/// Row, byte and batch counts Velox already tracks for one operator instance.
+///
+/// Read once, when the operator closes, so the capture carries what moved
+/// through an operator beside what it allocated. Peak bytes alone cannot say
+/// whether an operator is large because it read a lot or because it held on to
+/// what it read.
+struct GpuMemoryOperatorCounts {
+  /// Rows the operator received.
+  uint64_t inputRows{0};
+  /// Bytes the operator received.
+  uint64_t inputBytes{0};
+  /// Vectors the operator received.
+  uint64_t inputBatches{0};
+  /// Rows the operator produced.
+  uint64_t outputRows{0};
+  /// Bytes the operator produced.
+  uint64_t outputBytes{0};
+  /// Vectors the operator produced.
+  uint64_t outputBatches{0};
+  /// Rows read from storage, which only a source operator reports.
+  uint64_t rawInputRows{0};
+  /// Bytes read from storage, which only a source operator reports.
+  uint64_t rawInputBytes{0};
+  /// Wall nanoseconds the operator spent off thread waiting.
+  uint64_t blockedWallNanos{0};
+  /// CPU nanoseconds across addInput, getOutput and finish.
+  uint64_t cpuNanos{0};
+  /// Wall nanoseconds across addInput, getOutput and finish.
+  uint64_t wallNanos{0};
+};
+
 /// Describes one fully ordered logical-memory transition.
 struct GpuMemoryTraceUpdate {
   /// Strictly increasing timestamp shared by all counters for this transition.

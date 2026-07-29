@@ -125,6 +125,11 @@ class GpuMemoryAllocationTracker {
       uint64_t ownerId,
       std::string_view callName) noexcept;
 
+  /// Atomically records finished operator counts with canonical owner metadata.
+  void recordCaptureOperatorCounts(
+      uint64_t ownerId,
+      const GpuMemoryOperatorCounts& counts) noexcept;
+
   /// Atomically records an allocation failure with canonical owner metadata.
   void recordCaptureOom(
       const GpuMemoryTraceUpdate& state,
@@ -228,6 +233,10 @@ struct GpuMemoryActiveOwner {
 
 /// Activates an operator and returns the previous thread-local owner.
 GpuMemoryActiveOwner activateGpuMemoryOperator(exec::Operator* op) noexcept;
+
+/// Records operator counts with canonical metadata for the active owner.
+void recordActiveGpuMemoryCaptureOperatorCounts(
+    const GpuMemoryOperatorCounts& counts) noexcept;
 
 /// Begins a capture call with canonical metadata for the active owner.
 GpuMemoryCaptureCallHandle beginActiveGpuMemoryCaptureCall(

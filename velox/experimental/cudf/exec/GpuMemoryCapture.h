@@ -26,6 +26,7 @@
 namespace facebook::velox::cudf_velox {
 
 struct GpuMemoryOwner;
+struct GpuMemoryOperatorCounts;
 struct GpuMemorySnapshot;
 struct GpuMemoryTraceUpdate;
 
@@ -139,6 +140,13 @@ GpuMemoryCaptureCallHandle beginGpuMemoryCaptureOperatorCall(
 /// Records a completed operator-call span.
 void endGpuMemoryCaptureOperatorCall(
     const GpuMemoryCaptureCallHandle& handle) noexcept;
+
+/// Records the row, byte and batch counts one operator instance finished with.
+void recordGpuMemoryCaptureOperatorCounts(
+    uint64_t ownerId,
+    uint64_t planNodeId,
+    const GpuMemoryOwner& owner,
+    const GpuMemoryOperatorCounts& counts) noexcept;
 
 /// Records a factual allocation-failure event.
 void recordGpuMemoryCaptureOom(

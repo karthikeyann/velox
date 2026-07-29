@@ -221,6 +221,29 @@ class GpuMemoryAllocationTracker::Impl {
     return snapshot.handle;
   }
 
+  void recordCaptureOperatorCounts(
+      uint64_t ownerId,
+      const GpuMemoryOperatorCounts& counts) noexcept {
+    if (!gpu_memory_detail::gpuMemoryCaptureActive()) {
+      return;
+    }
+    try {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto owner = owners_.find(ownerId);
+      if (owner == owners_.end()) {
+        return;
+      }
+      const auto& snapshot = owner->second.snapshot;
+      gpu_memory_detail::recordGpuMemoryCaptureOperatorCounts(
+          snapshot.handle.ownerId,
+          snapshot.handle.planNodeId,
+          snapshot.owner,
+          counts);
+    } catch (...) {
+      // Profiling must not alter an operator call.
+    }
+  }
+
   GpuMemoryCaptureCallHandle beginCaptureCall(
       uint64_t ownerId,
       std::string_view callName) noexcept {
@@ -722,6 +745,12 @@ GpuMemoryCaptureCallHandle GpuMemoryAllocationTracker::beginCaptureCall(
   return impl_->beginCaptureCall(ownerId, callName);
 }
 
+void GpuMemoryAllocationTracker::recordCaptureOperatorCounts(
+    uint64_t ownerId,
+    const GpuMemoryOperatorCounts& counts) noexcept {
+  impl_->recordCaptureOperatorCounts(ownerId, counts);
+}
+
 void GpuMemoryAllocationTracker::recordCaptureOom(
     const GpuMemoryTraceUpdate& state,
     std::size_t requestedBytes,
@@ -1034,6 +1063,28 @@ GpuMemoryActiveOwner activateGpuMemoryOperator(exec::Operator* op) noexcept {
   }
   activeOwner = GpuMemoryActiveOwner{tracker.get(), ownerId};
   return previous;
+}
+
+void recordActiveGpuMemoryCaptureOperatorCounts(
+    const GpuMemoryOperatorCounts& counts) noexcept {
+  if (!gpuMemoryCaptureActive()) {
+    return;
+  }
+  try {
+    std::shared_ptr<GpuMemoryAllocationTracker> tracker;
+    {
+      std::lock_guard<std::mutex> lock(diagnosticsMutex);
+      tracker = diagnostics;
+    }
+    if (tracker == nullptr) {
+      return;
+    }
+    const auto ownerId =
+        activeOwner.tracker == tracker.get() ? activeOwner.ownerId : 0;
+    tracker->recordCaptureOperatorCounts(ownerId, counts);
+  } catch (...) {
+    // Profiling must not alter an operator call.
+  }
 }
 
 GpuMemoryCaptureCallHandle beginActiveGpuMemoryCaptureCall(

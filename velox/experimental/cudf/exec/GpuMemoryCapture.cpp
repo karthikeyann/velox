@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/exec/GpuMemoryCapture.h"
+#include "velox/experimental/cudf/exec/GpuMemoryOwner.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxGpuMemoryCounters.h"
 
@@ -115,6 +116,7 @@ struct CaptureData {
   std::set<uint64_t> requiredOwnerIds;
   std::vector<CapturedMemoryUpdate> memoryUpdates;
   std::vector<CapturedCallSpan> operatorCalls;
+  std::map<uint64_t, GpuMemoryOperatorCounts> operatorCounts;
   std::vector<CapturedOom> oomEvents;
   std::vector<CapturedDataLoss> dataLossEvents;
   std::vector<ActiveCallSlot> activeCallSlots;
@@ -378,6 +380,21 @@ folly::dynamic captureJson(const CaptureData& capture) {
             "truncated", call.truncated));
   }
 
+  auto operatorCounts = folly::dynamic::array();
+  for (const auto& [ownerId, counts] : capture.operatorCounts) {
+    operatorCounts.push_back(
+        folly::dynamic::object("owner_id", ownerId)(
+            "input_rows", counts.inputRows)("input_bytes", counts.inputBytes)(
+            "input_batches", counts.inputBatches)(
+            "output_rows", counts.outputRows)(
+            "output_bytes", counts.outputBytes)(
+            "output_batches", counts.outputBatches)(
+            "raw_input_rows", counts.rawInputRows)(
+            "raw_input_bytes", counts.rawInputBytes)(
+            "blocked_wall_nanos", counts.blockedWallNanos)(
+            "cpu_nanos", counts.cpuNanos)("wall_nanos", counts.wallNanos));
+  }
+
   auto oomEvents = folly::dynamic::array();
   for (const auto& oom : capture.oomEvents) {
     oomEvents.push_back(
@@ -449,6 +466,7 @@ folly::dynamic captureJson(const CaptureData& capture) {
       "initial_snapshot",
       snapshotJson(capture.initialSnapshot, relevantOwners))(
       "memory_updates", std::move(updates))("operator_calls", std::move(calls))(
+      "operator_counts", std::move(operatorCounts))(
       "oom_events", std::move(oomEvents))(
       "data_loss_events", std::move(dataLossEvents))(
       "final_snapshot", snapshotJson(capture.finalSnapshot, relevantOwners))(
@@ -879,6 +897,29 @@ class GpuMemoryCaptureController {
     }
   }
 
+  void recordOperatorCounts(
+      uint64_t ownerId,
+      uint64_t planNodeId,
+      const GpuMemoryOwner& owner,
+      const GpuMemoryOperatorCounts& counts) noexcept {
+    try {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (active_ == nullptr) {
+        return;
+      }
+      if (!retainOwnerMetadata(
+              *active_, CapturedOwner{ownerId, planNodeId, owner}, true)) {
+        noteMissingOwnerMetadata(*active_);
+        return;
+      }
+      // Counts are cumulative, so a later close simply replaces the earlier
+      // reading rather than consuming another event slot.
+      active_->operatorCounts[ownerId] = counts;
+    } catch (...) {
+      noteInternalDataLoss("operator counts capture exception", 0);
+    }
+  }
+
   void recordOom(
       uint64_t timestampNs,
       uint64_t sourceSequence,
@@ -1287,6 +1328,14 @@ void recordGpuMemoryCaptureOom(
       cudaFreeBytes,
       cudaTotalBytes,
       cudaStatus);
+}
+
+void recordGpuMemoryCaptureOperatorCounts(
+    uint64_t ownerId,
+    uint64_t planNodeId,
+    const GpuMemoryOwner& owner,
+    const GpuMemoryOperatorCounts& counts) noexcept {
+  captureController().recordOperatorCounts(ownerId, planNodeId, owner, counts);
 }
 
 void recordGpuMemoryCaptureDataLoss(
