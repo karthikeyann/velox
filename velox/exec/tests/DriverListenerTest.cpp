@@ -30,25 +30,26 @@ namespace {
 // Counts begin/end callbacks keyed by "<operatorType>::<callName>".
 class CountingDriverListener : public DriverListener {
  public:
-  void onOperatorCallBegin(const Operator& op, std::string_view callName)
-      override {
+  void onOperatorCallBegin(
+      const Operator& op,
+      std::string_view callName) noexcept override {
     std::lock_guard<std::mutex> l(mutex_);
     ++begins_[key(op, callName)];
   }
 
-  void onOperatorCallEnd(const Operator& op, std::string_view callName)
+  void onOperatorCallEnd(const Operator& op, std::string_view callName) noexcept
       override {
     std::lock_guard<std::mutex> l(mutex_);
     ++ends_[key(op, callName)];
   }
 
-  void onDriverBlocked(const Operator& /* op */, BlockingReason reason)
+  void onDriverBlocked(const Operator& /* op */, BlockingReason reason) noexcept
       override {
     std::lock_guard<std::mutex> l(mutex_);
     ++blocked_[reason];
   }
 
-  void onDriverUnblocked(const Operator& /* op */) override {
+  void onDriverUnblocked(const Operator& /* op */) noexcept override {
     std::lock_guard<std::mutex> l(mutex_);
     ++unblocked_;
   }

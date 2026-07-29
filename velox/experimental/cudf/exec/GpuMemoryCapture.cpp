@@ -506,6 +506,7 @@ folly::dynamic captureJson(const CaptureData& capture) {
       "integrity",
       folly::dynamic::object("exact_timeline", exactTimeline)(
           "exact_memory_timeline", exactMemoryTimeline)(
+          "owner_metadata_complete", capture.ownerMetadataComplete)(
           "operator_calls_complete", operatorCallsComplete)(
           "capture_overflow", capture.captureOverflow)(
           "memory_update_overflow", capture.memoryUpdateOverflow)(
@@ -734,6 +735,7 @@ class GpuMemoryCaptureController {
       active_->complete = true;
       active_->cleanupComplete = cleanupComplete;
       clipOpenCalls(*active_, active_->endTimestampNs);
+      clipOpenBlockedSpans(*active_);
       pending_.push_back(std::move(active_));
       condition_.notify_one();
     } catch (...) {
@@ -760,6 +762,7 @@ class GpuMemoryCaptureController {
       active_->complete = false;
       active_->cleanupComplete = false;
       clipOpenCalls(*active_, active_->endTimestampNs);
+      clipOpenBlockedSpans(*active_);
       pending_.push_back(std::move(active_));
       condition_.notify_one();
     } catch (...) {
@@ -941,7 +944,7 @@ class GpuMemoryCaptureController {
       }
       CapturedBlockedSpan span;
       span.ownerId = ownerId;
-      span.threadId = folly::getCurrentThreadID();
+      span.threadId = static_cast<int64_t>(folly::getOSThreadID());
       span.startTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
       copyBounded(span.blockingReason, blockingReason);
       active_->openBlockedSpans[ownerId] = span;
@@ -972,6 +975,20 @@ class GpuMemoryCaptureController {
     } catch (...) {
       noteInternalDataLoss("blocked span capture exception", 0);
     }
+  }
+
+  bool wouldRecord(const std::string& taskId, const std::string& taskUuid)
+      const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!enabled_ || taskSelected_) {
+      return false;
+    }
+    // queryId is not known until the drivers are adapted, so match on the two
+    // identities a factory can see. A task the filter rejects here could never
+    // have been selected later.
+    return config_.queryFilter.empty() ||
+        taskId.find(config_.queryFilter) != std::string::npos ||
+        taskUuid.find(config_.queryFilter) != std::string::npos;
   }
 
   void recordOperatorCounts(
@@ -1166,6 +1183,25 @@ class GpuMemoryCaptureController {
     return ++capture.nextEventSequence;
   }
 
+  /// Closes intervals still open at the capture boundary.
+  ///
+  /// A driver blocked when its task is cancelled never reports unblocked, so
+  /// without this the last blocked interval of every blocked driver is lost.
+  static void clipOpenBlockedSpans(CaptureData& capture) noexcept {
+    for (auto& [ownerId, span] : capture.openBlockedSpans) {
+      if (capture.blockedSpans.size() >= kBlockedSpanCapacity) {
+        noteOverflow(capture);
+        break;
+      }
+      auto clipped = span;
+      clipped.eventSequence = retainEvent(capture);
+      clipped.endTimestampNs = capture.endTimestampNs;
+      clipped.truncated = true;
+      capture.blockedSpans.push_back(clipped);
+    }
+    capture.openBlockedSpans.clear();
+  }
+
   static void clipOpenCalls(CaptureData& capture, uint64_t endTimestampNs) {
     capture.openCallsAtEnd = capture.activeCalls;
     for (auto& slot : capture.activeCallSlots) {
@@ -1241,9 +1277,11 @@ class GpuMemoryCaptureController {
 
       try {
         if (!capture->ownerMetadataComplete) {
-          LOG(ERROR) << "Discarding GPU-memory capture because bounded owner "
-                        "metadata could not describe every retained fact";
-          continue;
+          // Reported through owner_metadata_complete rather than discarded: a
+          // truncated profile is worth more than none, and the query has
+          // already paid for it.
+          LOG(WARNING) << "GPU-memory capture retained facts whose owner "
+                          "metadata was evicted";
         }
         const auto path = resolvePath(config.pathPattern, capture->task);
         const auto document = folly::toJson(captureJson(*capture));
@@ -1297,6 +1335,16 @@ bool startGpuMemoryCapture(const GpuMemoryCaptureConfig& config) noexcept {
 
 void stopGpuMemoryCapture() noexcept {
   captureController().stop();
+}
+
+bool gpuMemoryCaptureWouldRecord(
+    const std::string& taskId,
+    const std::string& taskUuid) noexcept {
+  try {
+    return captureController().wouldRecord(taskId, taskUuid);
+  } catch (...) {
+    return false;
+  }
 }
 
 bool gpuMemoryCaptureEnabled() noexcept {

@@ -54,8 +54,9 @@ std::vector<ActiveCall>& activeCalls() {
 
 class GpuMemoryCaptureDriverListener : public exec::DriverListener {
  public:
-  void onOperatorCallBegin(const exec::Operator& op, std::string_view callName)
-      override {
+  void onOperatorCallBegin(
+      const exec::Operator& op,
+      std::string_view callName) noexcept override {
     // activateGpuMemoryOperator registers the owner, which is what makes an
     // allocation during this call attributable to this operator instance.
     auto& call = activeCalls().emplace_back();
@@ -67,8 +68,9 @@ class GpuMemoryCaptureDriverListener : public exec::DriverListener {
     }
   }
 
-  void onOperatorCallEnd(const exec::Operator& op, std::string_view callName)
-      override {
+  void onOperatorCallEnd(
+      const exec::Operator& op,
+      std::string_view callName) noexcept override {
     auto& calls = activeCalls();
     if (calls.empty()) {
       return;
@@ -82,14 +84,15 @@ class GpuMemoryCaptureDriverListener : public exec::DriverListener {
     gpu_memory_detail::restoreGpuMemoryOwner(call.previousOwner);
   }
 
-  void onDriverBlocked(const exec::Operator& op, exec::BlockingReason reason)
-      override {
+  void onDriverBlocked(
+      const exec::Operator& op,
+      exec::BlockingReason reason) noexcept override {
     gpu_memory_detail::beginGpuMemoryCaptureBlockedSpanFor(
         const_cast<exec::Operator*>(&op),
         exec::BlockingReasonName::toName(reason));
   }
 
-  void onDriverUnblocked(const exec::Operator& op) override {
+  void onDriverUnblocked(const exec::Operator& op) noexcept override {
     gpu_memory_detail::endGpuMemoryCaptureBlockedSpanFor(
         const_cast<exec::Operator*>(&op));
   }
@@ -127,10 +130,18 @@ class GpuMemoryCaptureDriverListener : public exec::DriverListener {
 
 std::shared_ptr<exec::DriverListener>
 GpuMemoryCaptureDriverListenerFactory::create(
-    const std::string& /* taskId */,
-    const std::string& /* taskUuid */,
+    const std::string& taskId,
+    const std::string& taskUuid,
     const core::QueryConfig& /* config */) {
-  if (!CudfConfig::getInstance().gpuMemoryTrackingEnabled()) {
+  const auto& cudfConfig = CudfConfig::getInstance();
+  if (!cudfConfig.gpuMemoryTrackingEnabled()) {
+    return nullptr;
+  }
+  // With a profile path the product is one task's document, so every other
+  // task would pay per-call attribution for a ledger nobody exports. Without
+  // one the ledger itself is the product, so every task is observed.
+  if (!cudfConfig.quentMemoryProfilePath.empty() &&
+      !gpuMemoryCaptureWouldRecord(taskId, taskUuid)) {
     return nullptr;
   }
   return std::make_shared<GpuMemoryCaptureDriverListener>();

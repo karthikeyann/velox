@@ -89,6 +89,15 @@ void stopGpuMemoryCapture() noexcept;
 /// Returns true while a task can be selected for capture.
 bool gpuMemoryCaptureEnabled() noexcept;
 
+/// Returns true when a task with this identity could still be recorded.
+///
+/// Lets a listener factory decline a task before any of its drivers pay for
+/// observation, which is the difference between profiling one task and slowing
+/// every task in the worker to profile one.
+bool gpuMemoryCaptureWouldRecord(
+    const std::string& taskId,
+    const std::string& taskUuid) noexcept;
+
 namespace gpu_memory_detail {
 
 /// Returns true while one task capture is actively recording.

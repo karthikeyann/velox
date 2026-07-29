@@ -54,21 +54,21 @@ class DriverListener {
   /// in Driver.h and remains valid for the process lifetime.
   virtual void onOperatorCallBegin(
       const Operator& /* op */,
-      std::string_view /* callName */) {}
+      std::string_view /* callName */) noexcept {}
 
   /// Invoked after the matching onOperatorCallBegin, including when the call
   /// threw. Always paired one-to-one with onOperatorCallBegin.
   virtual void onOperatorCallEnd(
       const Operator& /* op */,
-      std::string_view /* callName */) {}
+      std::string_view /* callName */) noexcept {}
 
   /// Invoked when the driver leaves its thread because 'op' reported 'reason'.
   virtual void onDriverBlocked(
       const Operator& /* op */,
-      BlockingReason /* reason */) {}
+      BlockingReason /* reason */) noexcept {}
 
   /// Invoked when a driver that previously reported onDriverBlocked resumes.
-  virtual void onDriverUnblocked(const Operator& /* op */) {}
+  virtual void onDriverUnblocked(const Operator& /* op */) noexcept {}
 };
 
 /// Creates DriverListeners for Tasks. Factories are registered process-wide;
