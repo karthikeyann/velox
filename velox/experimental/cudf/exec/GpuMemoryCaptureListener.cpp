@@ -60,8 +60,7 @@ class GpuMemoryCaptureDriverListener : public exec::DriverListener {
     // activateGpuMemoryOperator registers the owner, which is what makes an
     // allocation during this call attributable to this operator instance.
     auto& call = activeCalls().emplace_back();
-    call.previousOwner = gpu_memory_detail::activateGpuMemoryOperator(
-        const_cast<exec::Operator*>(&op));
+    call.previousOwner = gpu_memory_detail::activateGpuMemoryOperator(&op);
     if (isSpanWorthy(callName)) {
       call.handle =
           gpu_memory_detail::beginActiveGpuMemoryCaptureCall(callName);
@@ -88,13 +87,11 @@ class GpuMemoryCaptureDriverListener : public exec::DriverListener {
       const exec::Operator& op,
       exec::BlockingReason reason) noexcept override {
     gpu_memory_detail::beginGpuMemoryCaptureBlockedSpanFor(
-        const_cast<exec::Operator*>(&op),
-        exec::BlockingReasonName::toName(reason));
+        &op, exec::BlockingReasonName::toName(reason));
   }
 
   void onDriverUnblocked(const exec::Operator& op) noexcept override {
-    gpu_memory_detail::endGpuMemoryCaptureBlockedSpanFor(
-        const_cast<exec::Operator*>(&op));
+    gpu_memory_detail::endGpuMemoryCaptureBlockedSpanFor(&op);
   }
 
  private:
@@ -107,7 +104,7 @@ class GpuMemoryCaptureDriverListener : public exec::DriverListener {
   static void recordCounts(const exec::Operator& op) {
     GpuMemoryOperatorCounts counts;
     {
-      auto locked = const_cast<exec::Operator&>(op).stats().rlock();
+      auto locked = op.stats().rlock();
       counts.inputRows = locked->inputPositions;
       counts.inputBytes = locked->inputBytes;
       counts.inputBatches = locked->inputVectors;

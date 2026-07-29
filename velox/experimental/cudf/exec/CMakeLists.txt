@@ -39,7 +39,6 @@ add_library(
   DecimalAggregationState.cpp
   GpuMemoryCapture.cpp
   GpuMemoryCaptureListener.cpp
-  NvtxGpuMemoryCounters.cpp
   GpuResources.cpp
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp
@@ -54,7 +53,7 @@ target_sources(
   PUBLIC
     FILE_SET HEADERS
       BASE_DIRS ${PROJECT_SOURCE_DIR}
-      FILES GpuMemoryOwner.h GpuMemoryCaptureListener.h NvtxGpuMemoryCounters.h
+      FILES GpuMemoryOwner.h GpuMemoryCaptureListener.h
 )
 
 target_link_libraries(

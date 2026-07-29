@@ -96,12 +96,6 @@ struct GpuMemoryTraceUpdate {
   uint64_t globalCurrentBytes{0};
   /// Process-wide high-water mark after this transition.
   uint64_t globalPeakBytes{0};
-  /// Query live logical bytes after this transition.
-  uint64_t queryCurrentBytes{0};
-  /// Task, or PlanFragment instance, live logical bytes after this transition.
-  uint64_t taskCurrentBytes{0};
-  /// PlanNode live logical bytes after this transition.
-  uint64_t planNodeCurrentBytes{0};
   /// Operator-instance live logical bytes after this transition.
   uint64_t ownerCurrentBytes{0};
   /// Signed allocation delta applied by this transition.

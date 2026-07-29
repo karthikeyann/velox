@@ -22,7 +22,6 @@ namespace facebook::velox::cudf_velox::test {
 
 TEST(ConfigTest, MemoryTrackingDisabledByDefault) {
   CudfConfig config;
-  EXPECT_FALSE(config.memoryTrackingEnabled);
   EXPECT_TRUE(config.quentMemoryProfilePath.empty());
   EXPECT_EQ(config.quentMaxEvents, 250'000);
   EXPECT_FALSE(config.gpuMemoryTrackingEnabled());
@@ -32,7 +31,6 @@ TEST(ConfigTest, CudfConfig) {
   std::unordered_map<std::string, std::string> options = {
       {CudfConfig::kCudfEnabled, "false"},
       {CudfConfig::kCudfDebugEnabled, "true"},
-      {CudfConfig::kCudfMemoryTrackingEnabled, "true"},
       {CudfConfig::kCudfQuentMemoryProfilePath, "/tmp/gpu-memory-%q-%t.json"},
       {CudfConfig::kCudfQuentQueryFilter, "query-42"},
       {CudfConfig::kCudfQuentMaxEvents, "250000"},
@@ -45,7 +43,6 @@ TEST(ConfigTest, CudfConfig) {
   config.initialize(std::move(options));
   EXPECT_FALSE(config.enabled);
   EXPECT_TRUE(config.debugEnabled);
-  EXPECT_TRUE(config.memoryTrackingEnabled);
   EXPECT_EQ(config.quentMemoryProfilePath, "/tmp/gpu-memory-%q-%t.json");
   EXPECT_EQ(config.quentQueryFilter, "query-42");
   EXPECT_EQ(config.quentMaxEvents, 250'000);
@@ -60,7 +57,6 @@ TEST(ConfigTest, QuentPathEnablesTracking) {
   CudfConfig config;
   config.initialize(
       {{CudfConfig::kCudfQuentMemoryProfilePath, "/tmp/gpu.json"}});
-  EXPECT_FALSE(config.memoryTrackingEnabled);
   EXPECT_TRUE(config.gpuMemoryTrackingEnabled());
 }
 

@@ -373,6 +373,10 @@ class Operator : public BaseRuntimeStatWriter {
     return stats_;
   }
 
+  const folly::Synchronized<OperatorStats>& stats() const {
+    return stats_;
+  }
+
   void recordBlockingTime(uint64_t start, BlockingReason reason);
 
   virtual std::string toString() const;

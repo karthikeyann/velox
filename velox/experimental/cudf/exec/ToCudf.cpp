@@ -26,7 +26,6 @@
 #include "velox/experimental/cudf/exec/GpuMemoryCapture.h"
 #include "velox/experimental/cudf/exec/GpuMemoryCaptureListener.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
-#include "velox/experimental/cudf/exec/NvtxGpuMemoryCounters.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
@@ -511,13 +510,17 @@ void unregisterCudf() {
     previousCudfMemoryResource.reset();
   }
   if (gpuMemoryDiagnosticsInstalled) {
-    VELOX_CHECK(
-        installedCudfMemoryResource.has_value() && output_mr_.has_value() &&
-            installedGpuMemoryDiagnosticRetirementSlot != nullptr,
-        "Tracked cuDF resource owners are missing during cleanup");
-    installedGpuMemoryDiagnosticRetirementSlot->resources =
-        GpuMemoryResourcePair{
-            std::move(*installedCudfMemoryResource), std::move(*output_mr_)};
+    if (installedCudfMemoryResource.has_value() && output_mr_.has_value() &&
+        installedGpuMemoryDiagnosticRetirementSlot != nullptr) {
+      installedGpuMemoryDiagnosticRetirementSlot->resources =
+          GpuMemoryResourcePair{
+              std::move(*installedCudfMemoryResource), std::move(*output_mr_)};
+    } else {
+      // Profiling teardown must not leave cuDF half-unregistered. Report the
+      // lifetime invariant and continue through resource reset, capture
+      // shutdown and adapter removal below.
+      LOG(ERROR) << "Tracked cuDF resource owners are missing during cleanup";
+    }
     installedGpuMemoryDiagnosticRetirementSlot = nullptr;
     gpuMemoryDiagnosticsInstalled = false;
   }
@@ -549,9 +552,6 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfDebugEnabled) != config.end()) {
     debugEnabled = folly::to<bool>(config[kCudfDebugEnabled]);
-  }
-  if (config.find(kCudfMemoryTrackingEnabled) != config.end()) {
-    memoryTrackingEnabled = folly::to<bool>(config[kCudfMemoryTrackingEnabled]);
   }
   if (config.find(kCudfQuentMemoryProfilePath) != config.end()) {
     quentMemoryProfilePath = config[kCudfQuentMemoryProfilePath];

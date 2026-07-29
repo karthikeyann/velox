@@ -17,7 +17,6 @@
 #include "velox/experimental/cudf/exec/GpuMemoryCapture.h"
 #include "velox/experimental/cudf/exec/GpuMemoryOwner.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
-#include "velox/experimental/cudf/exec/NvtxGpuMemoryCounters.h"
 
 #include <folly/dynamic.h>
 #include <folly/json.h>
@@ -105,7 +104,6 @@ struct CapturedOom {
   uint64_t requestedBytes{0};
   uint64_t globalCurrentBytes{0};
   uint64_t sourceLifetimeGlobalPeakBytes{0};
-  uint64_t planNodeCurrentBytes{0};
   uint64_t ownerCurrentBytes{0};
   uint64_t cudaFreeBytes{0};
   uint64_t cudaTotalBytes{0};
@@ -126,7 +124,6 @@ struct CaptureData {
   GpuMemorySnapshot initialSnapshot;
   GpuMemorySnapshot finalSnapshot;
   std::map<uint64_t, CapturedOwner> owners;
-  std::set<uint64_t> requiredOwnerIds;
   std::vector<CapturedMemoryUpdate> memoryUpdates;
   std::vector<CapturedCallSpan> operatorCalls;
   std::vector<CapturedBlockedSpan> blockedSpans;
@@ -153,7 +150,6 @@ struct CaptureData {
   uint64_t observedPeakEventSequence{0};
   uint64_t observedPeakSourceSequence{0};
   std::size_t maxEvents{0};
-  std::size_t ownerMetadataCapacity{0};
   std::size_t memoryUpdateCapacity{0};
   std::size_t operatorCallCapacity{0};
   std::string taskState;
@@ -162,7 +158,6 @@ struct CaptureData {
   bool memoryUpdateOverflow{false};
   bool operatorCallOverflow{false};
   bool sourceSequenceGap{false};
-  bool ownerMetadataComplete{true};
   bool complete{false};
   bool cleanupComplete{false};
 };
@@ -376,9 +371,6 @@ folly::dynamic captureJson(const CaptureData& capture) {
             "plan_node_track_id", update.planNodeId)(
             "global_current_bytes", update.globalCurrentBytes)(
             "source_lifetime_global_peak_bytes", update.globalPeakBytes)(
-            "query_current_bytes", update.queryCurrentBytes)(
-            "task_current_bytes", update.taskCurrentBytes)(
-            "plan_node_current_bytes", update.planNodeCurrentBytes)(
             "owner_current_bytes", update.ownerCurrentBytes)(
             "delta_bytes", update.deltaBytes));
   }
@@ -431,7 +423,6 @@ folly::dynamic captureJson(const CaptureData& capture) {
             "global_current_bytes", oom.globalCurrentBytes)(
             "source_lifetime_global_peak_bytes",
             oom.sourceLifetimeGlobalPeakBytes)(
-            "plan_node_current_bytes", oom.planNodeCurrentBytes)(
             "owner_current_bytes", oom.ownerCurrentBytes)(
             "cuda_free_bytes", oom.cudaFreeBytes)(
             "cuda_total_bytes", oom.cudaTotalBytes)(
@@ -506,7 +497,6 @@ folly::dynamic captureJson(const CaptureData& capture) {
       "integrity",
       folly::dynamic::object("exact_timeline", exactTimeline)(
           "exact_memory_timeline", exactMemoryTimeline)(
-          "owner_metadata_complete", capture.ownerMetadataComplete)(
           "operator_calls_complete", operatorCallsComplete)(
           "capture_overflow", capture.captureOverflow)(
           "memory_update_overflow", capture.memoryUpdateOverflow)(
@@ -652,17 +642,6 @@ class GpuMemoryCaptureController {
       capture->startTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
       capture->startUnixNs = gpu_memory_detail::gpuMemoryUnixTimeNs();
       capture->maxEvents = config_.maxEvents;
-      constexpr auto kOwnerMetadataSlack = 2 * kCriticalEventCapacity;
-      const auto maximumSize = std::numeric_limits<std::size_t>::max();
-      capture->ownerMetadataCapacity = capture->initialSnapshot.owners.size();
-      const auto additionalCapacity =
-          config_.maxEvents > maximumSize - kOwnerMetadataSlack
-          ? maximumSize
-          : config_.maxEvents + kOwnerMetadataSlack;
-      capture->ownerMetadataCapacity =
-          capture->ownerMetadataCapacity > maximumSize - additionalCapacity
-          ? maximumSize
-          : capture->ownerMetadataCapacity + additionalCapacity;
       capture->operatorCallCapacity = config_.maxEvents / 4;
       capture->memoryUpdateCapacity =
           config_.maxEvents - capture->operatorCallCapacity;
@@ -682,8 +661,7 @@ class GpuMemoryCaptureController {
       capture->observedPeakTimestampNs = capture->startTimestampNs;
       capture->observedPeakSourceSequence = capture->initialSnapshot.sequence;
       capture->lastObservedSourceSequence = capture->initialSnapshot.sequence;
-      retainOwnerMetadata(
-          *capture, CapturedOwner{0, 0, capturedUnattributedOwner()}, true);
+      retainOwnerMetadata(*capture, 0, 0, capturedUnattributedOwner());
       mergeSnapshotOwners(*capture, capture->initialSnapshot);
       if (capture->initialSnapshot.dataLossEvents > 0) {
         ++capture->internalDataLossEvents;
@@ -727,7 +705,6 @@ class GpuMemoryCaptureController {
       activeCapture_.store(false, std::memory_order_release);
       active_->finalSnapshot = std::move(finalSnapshot);
       mergeSnapshotOwners(*active_, active_->finalSnapshot);
-      verifyRequiredOwnerMetadata(*active_);
       active_->endTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
       active_->endUnixNs = gpu_memory_detail::gpuMemoryUnixTimeNs();
       active_->taskState = boundedString(taskState, 64);
@@ -754,7 +731,6 @@ class GpuMemoryCaptureController {
       activeCapture_.store(false, std::memory_order_release);
       active_->finalSnapshot = std::move(finalSnapshot);
       mergeSnapshotOwners(*active_, active_->finalSnapshot);
-      verifyRequiredOwnerMetadata(*active_);
       active_->endTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
       active_->endUnixNs = gpu_memory_detail::gpuMemoryUnixTimeNs();
       active_->taskState = "aborted";
@@ -779,8 +755,7 @@ class GpuMemoryCaptureController {
       if (active_ == nullptr) {
         return;
       }
-      retainOwnerMetadata(
-          *active_, CapturedOwner{ownerId, planNodeId, owner}, false);
+      retainOwnerMetadata(*active_, ownerId, planNodeId, owner);
     } catch (...) {
       noteInternalDataLoss("owner metadata capture exception", 0);
     }
@@ -824,15 +799,12 @@ class GpuMemoryCaptureController {
         noteOverflow(*active_);
         return;
       }
-      const bool hasOwnerMetadata = owner == nullptr
-          ? requireExistingOwnerMetadata(*active_, update.ownerId)
-          : retainOwnerMetadata(
-                *active_,
-                CapturedOwner{update.ownerId, update.planNodeId, *owner},
-                true);
-      if (!hasOwnerMetadata) {
+      if (owner != nullptr) {
+        retainOwnerMetadata(
+            *active_, update.ownerId, update.planNodeId, *owner);
+      } else if (!hasOwnerMetadata(*active_, update.ownerId)) {
         active_->memoryUpdateOverflow = true;
-        noteMissingOwnerMetadata(*active_);
+        noteCriticalEventLoss(*active_);
         return;
       }
       const auto eventSequence = retainEvent(*active_);
@@ -864,11 +836,7 @@ class GpuMemoryCaptureController {
         noteOverflow(*active_);
         return {};
       }
-      if (!retainOwnerMetadata(
-              *active_, CapturedOwner{ownerId, planNodeId, owner}, true)) {
-        noteMissingOwnerMetadata(*active_);
-        return {};
-      }
+      retainOwnerMetadata(*active_, ownerId, planNodeId, owner);
       GpuMemoryCaptureCallHandle handle;
       handle.captureId = active_->captureId;
       handle.callId = ++nextCallId_;
@@ -937,11 +905,7 @@ class GpuMemoryCaptureController {
       if (active_ == nullptr) {
         return;
       }
-      if (!retainOwnerMetadata(
-              *active_, CapturedOwner{ownerId, planNodeId, owner}, true)) {
-        noteMissingOwnerMetadata(*active_);
-        return;
-      }
+      retainOwnerMetadata(*active_, ownerId, planNodeId, owner);
       CapturedBlockedSpan span;
       span.ownerId = ownerId;
       span.threadId = static_cast<int64_t>(folly::getOSThreadID());
@@ -1001,11 +965,7 @@ class GpuMemoryCaptureController {
       if (active_ == nullptr) {
         return;
       }
-      if (!retainOwnerMetadata(
-              *active_, CapturedOwner{ownerId, planNodeId, owner}, true)) {
-        noteMissingOwnerMetadata(*active_);
-        return;
-      }
+      retainOwnerMetadata(*active_, ownerId, planNodeId, owner);
       // Counts are cumulative, so a later close simply replaces the earlier
       // reading rather than consuming another event slot.
       active_->operatorCounts[ownerId] = counts;
@@ -1023,7 +983,6 @@ class GpuMemoryCaptureController {
       std::size_t requestedBytes,
       uint64_t globalCurrentBytes,
       uint64_t globalPeakBytes,
-      uint64_t planNodeCurrentBytes,
       uint64_t ownerCurrentBytes,
       std::size_t cudaFreeBytes,
       std::size_t cudaTotalBytes,
@@ -1037,11 +996,7 @@ class GpuMemoryCaptureController {
         noteCriticalEventLoss(*active_);
         return;
       }
-      if (!retainOwnerMetadata(
-              *active_, CapturedOwner{ownerId, planNodeId, owner}, true)) {
-        noteMissingOwnerMetadata(*active_);
-        return;
-      }
+      retainOwnerMetadata(*active_, ownerId, planNodeId, owner);
       const auto eventSequence = retainEvent(*active_);
       active_->oomEvents.push_back(
           CapturedOom{
@@ -1052,7 +1007,6 @@ class GpuMemoryCaptureController {
               static_cast<uint64_t>(requestedBytes),
               globalCurrentBytes,
               globalPeakBytes,
-              planNodeCurrentBytes,
               ownerCurrentBytes,
               static_cast<uint64_t>(cudaFreeBytes),
               static_cast<uint64_t>(cudaTotalBytes),
@@ -1091,86 +1045,27 @@ class GpuMemoryCaptureController {
       CaptureData& capture,
       const GpuMemorySnapshot& snapshot) {
     for (const auto& owner : snapshot.owners) {
-      if (!retainOwnerMetadata(
-              capture,
-              CapturedOwner{
-                  owner.handle.ownerId, owner.handle.planNodeId, owner.owner},
-              true)) {
-        noteMissingOwnerMetadata(capture);
-      }
+      retainOwnerMetadata(
+          capture, owner.handle.ownerId, owner.handle.planNodeId, owner.owner);
     }
   }
 
-  static bool requireExistingOwnerMetadata(
+  static bool hasOwnerMetadata(const CaptureData& capture, uint64_t ownerId) {
+    return capture.owners.contains(ownerId);
+  }
+
+  static void retainOwnerMetadata(
       CaptureData& capture,
-      uint64_t ownerId) {
-    if (!capture.owners.contains(ownerId)) {
-      return false;
-    }
-    capture.requiredOwnerIds.insert(ownerId);
-    return true;
-  }
-
-  static bool retainOwnerMetadata(
-      CaptureData& capture,
-      CapturedOwner owner,
-      bool required) {
-    if (auto existing = capture.owners.find(owner.ownerId);
-        existing != capture.owners.end()) {
-      if (existing->second.owner.planNodeType.empty() &&
-          !owner.owner.planNodeType.empty()) {
-        existing->second = std::move(owner);
-      }
-      if (required) {
-        capture.requiredOwnerIds.insert(existing->first);
-      }
-      return true;
-    }
-
-    if (capture.owners.size() >= capture.ownerMetadataCapacity) {
-      const auto unused = std::find_if(
-          capture.owners.begin(),
-          capture.owners.end(),
-          [&capture](const auto& entry) {
-            return !capture.requiredOwnerIds.contains(entry.first);
-          });
-      if (unused == capture.owners.end()) {
-        return false;
-      }
-      capture.owners.erase(unused);
-    }
-    const auto ownerId = owner.ownerId;
-    capture.owners.emplace(ownerId, std::move(owner));
-    if (required) {
-      capture.requiredOwnerIds.insert(ownerId);
-    }
-    return true;
-  }
-
-  static void verifyRequiredOwnerMetadata(CaptureData& capture) {
-    const bool complete = std::all_of(
-        capture.requiredOwnerIds.begin(),
-        capture.requiredOwnerIds.end(),
-        [&capture](uint64_t ownerId) {
-          return capture.owners.contains(ownerId);
-        });
-    if (complete) {
-      return;
-    }
-    capture.ownerMetadataComplete = false;
-    ++capture.internalDataLossEvents;
-    noteOverflow(capture);
+      uint64_t ownerId,
+      uint64_t planNodeId,
+      const GpuMemoryOwner& owner) {
+    capture.owners.try_emplace(
+        ownerId, CapturedOwner{ownerId, planNodeId, owner});
   }
 
   static void noteOverflow(CaptureData& capture) {
     capture.captureOverflow = true;
     ++capture.droppedEvents;
-  }
-
-  static void noteMissingOwnerMetadata(CaptureData& capture) {
-    capture.ownerMetadataComplete = false;
-    ++capture.internalDataLossEvents;
-    noteOverflow(capture);
   }
 
   static void noteCriticalEventLoss(CaptureData& capture) {
@@ -1276,13 +1171,6 @@ class GpuMemoryCaptureController {
       }
 
       try {
-        if (!capture->ownerMetadataComplete) {
-          // Reported through owner_metadata_complete rather than discarded: a
-          // truncated profile is worth more than none, and the query has
-          // already paid for it.
-          LOG(WARNING) << "GPU-memory capture retained facts whose owner "
-                          "metadata was evicted";
-        }
         const auto path = resolvePath(config.pathPattern, capture->task);
         const auto document = folly::toJson(captureJson(*capture));
         std::string error;
@@ -1434,7 +1322,6 @@ void recordGpuMemoryCaptureOom(
     std::size_t requestedBytes,
     uint64_t globalCurrentBytes,
     uint64_t globalPeakBytes,
-    uint64_t planNodeCurrentBytes,
     uint64_t ownerCurrentBytes,
     std::size_t cudaFreeBytes,
     std::size_t cudaTotalBytes,
@@ -1448,7 +1335,6 @@ void recordGpuMemoryCaptureOom(
       requestedBytes,
       globalCurrentBytes,
       globalPeakBytes,
-      planNodeCurrentBytes,
       ownerCurrentBytes,
       cudaFreeBytes,
       cudaTotalBytes,

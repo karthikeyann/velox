@@ -29,8 +29,6 @@ struct CudfConfig {
   /// Keys used by the initialize() method.
   static constexpr const char* kCudfEnabled{"cudf.enabled"};
   static constexpr const char* kCudfDebugEnabled{"cudf.debug_enabled"};
-  static constexpr const char* kCudfMemoryTrackingEnabled{
-      "cudf.memory_tracking_enabled"};
   static constexpr const char* kCudfQuentMemoryProfilePath{
       "cudf.quent_memory_profile_path"};
   static constexpr const char* kCudfQuentQueryFilter{"cudf.quent_query_filter"};
@@ -74,9 +72,6 @@ struct CudfConfig {
   /// Enable debug printing.
   bool debugEnabled{false};
 
-  /// Enables diagnostic GPU allocation ownership without a trace file.
-  bool memoryTrackingEnabled{false};
-
   /// Writes a task-bounded, versioned raw profile for Quent replay.
   ///
   /// `%p`, `%q`, `%t`, and `%u` expand to process, query, task, and task UUID.
@@ -90,7 +85,7 @@ struct CudfConfig {
 
   /// Returns whether snapshot or Quent diagnostics are requested.
   bool gpuMemoryTrackingEnabled() const {
-    return memoryTrackingEnabled || !quentMemoryProfilePath.empty();
+    return !quentMemoryProfilePath.empty();
   }
 
   /// Allow fallback to CPU operators if GPU operator replacement fails.

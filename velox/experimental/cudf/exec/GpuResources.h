@@ -118,7 +118,7 @@ class GpuMemoryAllocationTracker {
   GpuMemoryOwnerHandle registerOwner(const GpuMemoryOwner& owner);
 
   /// Registers an operator, resolving display metadata only for a new owner.
-  GpuMemoryOwnerHandle registerOperator(exec::Operator* op);
+  GpuMemoryOwnerHandle registerOperator(const exec::Operator* op);
 
   /// Atomically records a call begin with canonical owner metadata.
   GpuMemoryCaptureCallHandle beginCaptureCall(
@@ -237,15 +237,16 @@ struct GpuMemoryActiveOwner {
 };
 
 /// Activates an operator and returns the previous thread-local owner.
-GpuMemoryActiveOwner activateGpuMemoryOperator(exec::Operator* op) noexcept;
+GpuMemoryActiveOwner activateGpuMemoryOperator(
+    const exec::Operator* op) noexcept;
 
 /// Opens a blocked interval for 'op' with canonical owner metadata.
 void beginGpuMemoryCaptureBlockedSpanFor(
-    exec::Operator* op,
+    const exec::Operator* op,
     std::string_view blockingReason) noexcept;
 
 /// Closes the blocked interval opened for 'op'.
-void endGpuMemoryCaptureBlockedSpanFor(exec::Operator* op) noexcept;
+void endGpuMemoryCaptureBlockedSpanFor(const exec::Operator* op) noexcept;
 
 /// Records operator counts with canonical metadata for the active owner.
 void recordActiveGpuMemoryCaptureOperatorCounts(

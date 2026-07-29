@@ -16,7 +16,6 @@
 
 #include "velox/experimental/cudf/CudfDefaultStreamOverload.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
-#include "velox/experimental/cudf/exec/NvtxGpuMemoryCounters.h"
 
 #include "velox/common/base/RuntimeMetrics.h"
 #include "velox/core/PlanNode.h"
@@ -102,9 +101,6 @@ constexpr uint64_t kInvalidOwnerId{std::numeric_limits<uint64_t>::max()};
 
 struct OwnerRecord {
   GpuMemoryOwnerSnapshot snapshot;
-  uint64_t previousLiveOwnerId{kInvalidOwnerId};
-  uint64_t nextLiveOwnerId{kInvalidOwnerId};
-  bool live{false};
 };
 
 struct AllocationRecord {
@@ -147,9 +143,6 @@ class GpuMemoryAllocationTracker::Impl {
         0,
         OwnerRecord{GpuMemoryOwnerSnapshot{
             handle, unattributedOwner(), 0, 0, 0, 0, 0}});
-    queries_.emplace("<unattributed>", LiveBytes{});
-    tasks_.emplace("<unattributed>", LiveBytes{});
-    plans_.emplace(0, LiveBytes{});
   }
 
   GpuMemoryOwnerHandle registerOwner(const GpuMemoryOwner& owner) {
@@ -179,7 +172,6 @@ class GpuMemoryAllocationTracker::Impl {
           } else {
             planNodeId = nextPlanNodeId_++;
             planNodeIds_.emplace(planNodeKey, planNodeId);
-            plans_.emplace(planNodeId, LiveBytes{});
           }
         }
 
@@ -188,8 +180,6 @@ class GpuMemoryAllocationTracker::Impl {
             handle.ownerId,
             OwnerRecord{GpuMemoryOwnerSnapshot{handle, owner, 0, 0, 0, 0, 0}});
         ownerIds_.emplace(owner, handle.ownerId);
-        queries_.try_emplace(owner.queryId, LiveBytes{});
-        tasks_.try_emplace(owner.taskUuid, LiveBytes{});
         canonicalOwner = owner;
         inserted = true;
       }
@@ -197,10 +187,6 @@ class GpuMemoryAllocationTracker::Impl {
 
     gpu_memory_detail::registerGpuMemoryCaptureOwner(
         handle.ownerId, handle.planNodeId, canonicalOwner);
-    if (inserted) {
-      gpu_memory_detail::registerGpuMemoryNvtxOwner(
-          handle.ownerId, handle.planNodeId, canonicalOwner);
-    }
     return handle;
   }
 
@@ -313,7 +299,6 @@ class GpuMemoryAllocationTracker::Impl {
           requestedBytes,
           state.globalCurrentBytes,
           state.globalPeakBytes,
-          state.planNodeCurrentBytes,
           state.ownerCurrentBytes,
           cudaFreeBytes,
           cudaTotalBytes,
@@ -357,9 +342,6 @@ class GpuMemoryAllocationTracker::Impl {
 
         auto& ownerRecord = owner->second;
         auto& ownerSnapshot = ownerRecord.snapshot;
-        if (ownerSnapshot.currentAllocations == 0) {
-          addLiveOwnerLocked(ownerRecord);
-        }
         ownerSnapshot.currentBytes += byteCount;
         ownerSnapshot.peakBytes =
             std::max(ownerSnapshot.peakBytes, ownerSnapshot.currentBytes);
@@ -367,18 +349,8 @@ class GpuMemoryAllocationTracker::Impl {
         ++ownerSnapshot.currentAllocations;
         ++ownerSnapshot.totalAllocations;
 
-        auto& query = queries_.at(ownerSnapshot.owner.queryId);
-        addBytes(query, byteCount);
-        auto& task = tasks_.at(ownerSnapshot.owner.taskUuid);
-        addBytes(task, byteCount);
-        auto& plan = plans_.at(handle.planNodeId);
-        addBytes(plan, byteCount);
-
         update = makeUpdateLocked(
             handle,
-            query.current,
-            task.current,
-            plan.current,
             ownerSnapshot.currentBytes,
             static_cast<int64_t>(byteCount));
         gpu_memory_detail::recordGpuMemoryCaptureUpdate(
@@ -387,10 +359,7 @@ class GpuMemoryAllocationTracker::Impl {
       if (update.ownerId == 0) {
         gpu_memory_detail::registerGpuMemoryCaptureOwner(
             0, 0, unattributedOwner());
-        gpu_memory_detail::registerGpuMemoryNvtxOwner(
-            0, 0, unattributedOwner());
       }
-      gpu_memory_detail::emitGpuMemoryNvtxUpdate(update);
       return update;
     } catch (...) {
       noteDataLoss("allocation accounting exception");
@@ -418,33 +387,18 @@ class GpuMemoryAllocationTracker::Impl {
         const auto handle = allocation->second.handle;
         auto& ownerRecord = owners_.at(handle.ownerId);
         auto& ownerSnapshot = ownerRecord.snapshot;
-        auto& query = queries_.at(ownerSnapshot.owner.queryId);
-        auto& task = tasks_.at(ownerSnapshot.owner.taskUuid);
-        auto& plan = plans_.at(handle.planNodeId);
 
         global_.current -= bytes;
         --currentAllocations_;
         ownerSnapshot.currentBytes -= bytes;
         --ownerSnapshot.currentAllocations;
-        if (ownerSnapshot.currentAllocations == 0) {
-          removeLiveOwnerLocked(ownerRecord);
-        }
-        query.current -= bytes;
-        task.current -= bytes;
-        plan.current -= bytes;
         allocations_.erase(allocation);
 
         update = makeUpdateLocked(
-            handle,
-            query.current,
-            task.current,
-            plan.current,
-            ownerSnapshot.currentBytes,
-            -static_cast<int64_t>(bytes));
+            handle, ownerSnapshot.currentBytes, -static_cast<int64_t>(bytes));
         gpu_memory_detail::recordGpuMemoryCaptureUpdate(
             update, ownerSnapshot.owner);
       }
-      gpu_memory_detail::emitGpuMemoryNvtxUpdate(update);
       return update;
     } catch (...) {
       noteDataLoss("deallocation accounting exception");
@@ -461,9 +415,6 @@ class GpuMemoryAllocationTracker::Impl {
         owner = owners_.find(0);
       }
       handle = owner->second.snapshot.handle;
-      const auto& query = queries_.at(owner->second.snapshot.owner.queryId);
-      const auto& task = tasks_.at(owner->second.snapshot.owner.taskUuid);
-      const auto& plan = plans_.at(handle.planNodeId);
       return GpuMemoryTraceUpdate{
           gpu_memory_detail::gpuMemoryMonotonicTimeNs(),
           sequence_,
@@ -471,9 +422,6 @@ class GpuMemoryAllocationTracker::Impl {
           handle.planNodeId,
           global_.current,
           global_.peak,
-          query.current,
-          task.current,
-          plan.current,
           owner->second.snapshot.currentBytes,
           0};
     } catch (...) {
@@ -528,6 +476,22 @@ class GpuMemoryAllocationTracker::Impl {
     selectedCaptureTaskKey_.reset();
   }
 
+  std::optional<GpuMemoryOwnerHandle> findOperatorHandle(
+      const exec::Operator* op) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = operatorHandles_.find(op);
+    return it == operatorHandles_.end()
+        ? std::nullopt
+        : std::optional<GpuMemoryOwnerHandle>{it->second};
+  }
+
+  void rememberOperatorHandle(
+      const exec::Operator* op,
+      GpuMemoryOwnerHandle handle) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    operatorHandles_.try_emplace(op, handle);
+  }
+
  private:
   GpuMemorySnapshot snapshotCountersLocked() const {
     GpuMemorySnapshot result;
@@ -563,49 +527,12 @@ class GpuMemoryAllocationTracker::Impl {
 
   GpuMemorySnapshot captureSnapshotLocked() const {
     auto result = snapshotCountersLocked();
-    result.owners.reserve(numLiveOwners_);
-
-    for (auto ownerId = liveOwnerHead_; ownerId != kInvalidOwnerId;) {
-      const auto& owner = owners_.at(ownerId);
-      result.owners.push_back(owner.snapshot);
-      ownerId = owner.nextLiveOwnerId;
+    for (const auto& [_, owner] : owners_) {
+      if (owner.snapshot.currentAllocations > 0) {
+        result.owners.push_back(owner.snapshot);
+      }
     }
     return result;
-  }
-
-  void addLiveOwnerLocked(OwnerRecord& owner) {
-    if (owner.live) {
-      return;
-    }
-    const auto ownerId = owner.snapshot.handle.ownerId;
-    owner.previousLiveOwnerId = kInvalidOwnerId;
-    owner.nextLiveOwnerId = liveOwnerHead_;
-    if (liveOwnerHead_ != kInvalidOwnerId) {
-      owners_.at(liveOwnerHead_).previousLiveOwnerId = ownerId;
-    }
-    liveOwnerHead_ = ownerId;
-    owner.live = true;
-    ++numLiveOwners_;
-  }
-
-  void removeLiveOwnerLocked(OwnerRecord& owner) {
-    if (!owner.live) {
-      return;
-    }
-    if (owner.previousLiveOwnerId == kInvalidOwnerId) {
-      liveOwnerHead_ = owner.nextLiveOwnerId;
-    } else {
-      owners_.at(owner.previousLiveOwnerId).nextLiveOwnerId =
-          owner.nextLiveOwnerId;
-    }
-    if (owner.nextLiveOwnerId != kInvalidOwnerId) {
-      owners_.at(owner.nextLiveOwnerId).previousLiveOwnerId =
-          owner.previousLiveOwnerId;
-    }
-    owner.previousLiveOwnerId = kInvalidOwnerId;
-    owner.nextLiveOwnerId = kInvalidOwnerId;
-    owner.live = false;
-    --numLiveOwners_;
   }
 
   static void sortSnapshot(GpuMemorySnapshot& snapshot) {
@@ -637,9 +564,6 @@ class GpuMemoryAllocationTracker::Impl {
 
   GpuMemoryTraceUpdate makeUpdateLocked(
       GpuMemoryOwnerHandle handle,
-      uint64_t queryCurrentBytes,
-      uint64_t taskCurrentBytes,
-      uint64_t planNodeCurrentBytes,
       uint64_t ownerCurrentBytes,
       int64_t deltaBytes) {
     const auto now = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
@@ -655,9 +579,6 @@ class GpuMemoryAllocationTracker::Impl {
         handle.planNodeId,
         global_.current,
         global_.peak,
-        queryCurrentBytes,
-        taskCurrentBytes,
-        planNodeCurrentBytes,
         ownerCurrentBytes,
         deltaBytes};
   }
@@ -686,15 +607,12 @@ class GpuMemoryAllocationTracker::Impl {
   uint64_t lastTimestampNs_{0};
   uint64_t nextOwnerId_{1};
   uint64_t nextPlanNodeId_{1};
-  uint64_t liveOwnerHead_{kInvalidOwnerId};
-  std::size_t numLiveOwners_{0};
   std::unordered_map<GpuMemoryOwner, uint64_t, GpuMemoryOwnerHash> ownerIds_;
   std::unordered_map<uint64_t, OwnerRecord> owners_;
+  std::unordered_map<const exec::Operator*, GpuMemoryOwnerHandle>
+      operatorHandles_;
   std::optional<std::string> selectedCaptureTaskKey_;
-  std::unordered_map<std::string, LiveBytes> queries_;
-  std::unordered_map<std::string, LiveBytes> tasks_;
   std::unordered_map<PlanNodeKey, uint64_t, PlanNodeKeyHash> planNodeIds_;
-  std::unordered_map<uint64_t, LiveBytes> plans_;
   std::unordered_map<void*, AllocationRecord> allocations_;
 };
 
@@ -709,9 +627,13 @@ GpuMemoryOwnerHandle GpuMemoryAllocationTracker::registerOwner(
 }
 
 GpuMemoryOwnerHandle GpuMemoryAllocationTracker::registerOperator(
-    exec::Operator* op) {
+    const exec::Operator* op) {
   if (op == nullptr) {
     return {};
+  }
+
+  if (const auto cached = impl_->findOperatorHandle(op)) {
+    return *cached;
   }
 
   const auto* driverCtx = op->operatorCtx()->driverCtx();
@@ -756,7 +678,9 @@ GpuMemoryOwnerHandle GpuMemoryAllocationTracker::registerOperator(
       owner.planNodeType += "Node";
     }
   }
-  return impl_->registerOwner(owner);
+  const auto handle = impl_->registerOwner(owner);
+  impl_->rememberOperatorHandle(op, handle);
+  return handle;
 }
 
 GpuMemoryCaptureCallHandle GpuMemoryAllocationTracker::beginCaptureCall(
@@ -950,7 +874,6 @@ void logAndTraceAllocationFailure(
 
   if (state.ownerId == 0) {
     gpu_memory_detail::registerGpuMemoryCaptureOwner(0, 0, unattributedOwner());
-    gpu_memory_detail::registerGpuMemoryNvtxOwner(0, 0, unattributedOwner());
   }
   tracker->recordCaptureOom(
       state, bytes, freeBytes, totalBytes, cudaStatusName);
@@ -959,7 +882,7 @@ void logAndTraceAllocationFailure(
              << " owner_id=" << state.ownerId
              << " plan_node_track_id=" << state.planNodeId
              << " owner_live_bytes=" << state.ownerCurrentBytes
-             << " plan_node_live_bytes=" << state.planNodeCurrentBytes
+
              << " cuda_free_bytes=" << freeBytes
              << " cuda_total_bytes=" << totalBytes
              << " cuda_status=" << cudaStatusName;
@@ -1001,7 +924,6 @@ void resetGpuMemoryTracking() {
     std::lock_guard<std::mutex> lock(diagnosticsMutex);
     diagnostics.reset();
   }
-  gpu_memory_detail::resetGpuMemoryNvtxCounters();
 }
 
 GpuMemorySnapshot getGpuMemorySnapshot() {
@@ -1064,7 +986,8 @@ void abortActiveGpuMemoryCapture(std::string_view reason) noexcept {
 
 namespace gpu_memory_detail {
 
-GpuMemoryActiveOwner activateGpuMemoryOperator(exec::Operator* op) noexcept {
+GpuMemoryActiveOwner activateGpuMemoryOperator(
+    const exec::Operator* op) noexcept {
   const auto previous = activeOwner;
   std::shared_ptr<GpuMemoryAllocationTracker> tracker;
   {
@@ -1085,7 +1008,6 @@ GpuMemoryActiveOwner activateGpuMemoryOperator(exec::Operator* op) noexcept {
   }
   if (ownerId == 0) {
     gpu_memory_detail::registerGpuMemoryCaptureOwner(0, 0, unattributedOwner());
-    gpu_memory_detail::registerGpuMemoryNvtxOwner(0, 0, unattributedOwner());
   }
   activeOwner = GpuMemoryActiveOwner{tracker.get(), ownerId};
   return previous;
@@ -1094,7 +1016,7 @@ GpuMemoryActiveOwner activateGpuMemoryOperator(exec::Operator* op) noexcept {
 namespace {
 /// Resolves 'op' to its registered owner without disturbing the thread-local
 /// attribution, which a blocked interval must not claim.
-uint64_t registeredOwnerId(exec::Operator* op) noexcept {
+uint64_t registeredOwnerId(const exec::Operator* op) noexcept {
   try {
     std::shared_ptr<GpuMemoryAllocationTracker> tracker;
     {
@@ -1112,7 +1034,7 @@ uint64_t registeredOwnerId(exec::Operator* op) noexcept {
 } // namespace
 
 void beginGpuMemoryCaptureBlockedSpanFor(
-    exec::Operator* op,
+    const exec::Operator* op,
     std::string_view blockingReason) noexcept {
   if (!gpuMemoryCaptureActive()) {
     return;
@@ -1132,7 +1054,7 @@ void beginGpuMemoryCaptureBlockedSpanFor(
   }
 }
 
-void endGpuMemoryCaptureBlockedSpanFor(exec::Operator* op) noexcept {
+void endGpuMemoryCaptureBlockedSpanFor(const exec::Operator* op) noexcept {
   if (!gpuMemoryCaptureActive()) {
     return;
   }
@@ -1149,17 +1071,12 @@ void recordActiveGpuMemoryCaptureOperatorCounts(
     return;
   }
   try {
-    std::shared_ptr<GpuMemoryAllocationTracker> tracker;
-    {
-      std::lock_guard<std::mutex> lock(diagnosticsMutex);
-      tracker = diagnostics;
-    }
+    auto* tracker = static_cast<GpuMemoryAllocationTracker*>(
+        const_cast<void*>(activeOwner.tracker));
     if (tracker == nullptr) {
       return;
     }
-    const auto ownerId =
-        activeOwner.tracker == tracker.get() ? activeOwner.ownerId : 0;
-    tracker->recordCaptureOperatorCounts(ownerId, counts);
+    tracker->recordCaptureOperatorCounts(activeOwner.ownerId, counts);
   } catch (...) {
     // Profiling must not alter an operator call.
   }
@@ -1171,17 +1088,12 @@ GpuMemoryCaptureCallHandle beginActiveGpuMemoryCaptureCall(
     return {};
   }
   try {
-    std::shared_ptr<GpuMemoryAllocationTracker> tracker;
-    {
-      std::lock_guard<std::mutex> lock(diagnosticsMutex);
-      tracker = diagnostics;
-    }
+    auto* tracker = static_cast<GpuMemoryAllocationTracker*>(
+        const_cast<void*>(activeOwner.tracker));
     if (tracker == nullptr) {
       return {};
     }
-    const auto ownerId =
-        activeOwner.tracker == tracker.get() ? activeOwner.ownerId : 0;
-    return tracker->beginCaptureCall(ownerId, callName);
+    return tracker->beginCaptureCall(activeOwner.ownerId, callName);
   } catch (...) {
     return {};
   }

@@ -230,7 +230,6 @@ TEST_F(DriverListenerTest, pairsBlockedWithUnblocked) {
 
   auto listener = factory->listener();
   ASSERT_NE(listener, nullptr);
-  // Every driver that reported blocked either resumed or was torn down, so
-  // resumptions never exceed blocks.
-  ASSERT_LE(listener->unblockedCount(), listener->blockedCount());
+  ASSERT_GT(listener->blockedCount(), 0);
+  ASSERT_EQ(listener->unblockedCount(), listener->blockedCount());
 }

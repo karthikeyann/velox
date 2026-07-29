@@ -16,7 +16,6 @@
 
 #include "velox/experimental/cudf/exec/GpuMemoryCapture.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
-#include "velox/experimental/cudf/exec/NvtxGpuMemoryCounters.h"
 
 #include <rmm/error.hpp>
 
@@ -334,9 +333,6 @@ GpuMemoryTraceUpdate makeCaptureUpdate(
       .planNodeId = handle.planNodeId,
       .globalCurrentBytes = globalCurrentBytes,
       .globalPeakBytes = sourceLifetimeGlobalPeakBytes,
-      .queryCurrentBytes = ownerCurrentBytes,
-      .taskCurrentBytes = ownerCurrentBytes,
-      .planNodeCurrentBytes = ownerCurrentBytes,
       .ownerCurrentBytes = ownerCurrentBytes,
       .deltaBytes = deltaBytes};
 }
@@ -393,9 +389,6 @@ TEST(GpuResourcesTest, TracksAllocationOriginAndOrderedTransitions) {
   EXPECT_EQ(first->planNodeId, handleA.planNodeId);
   EXPECT_EQ(first->globalCurrentBytes, 100);
   EXPECT_EQ(first->globalPeakBytes, 100);
-  EXPECT_EQ(first->queryCurrentBytes, 100);
-  EXPECT_EQ(first->taskCurrentBytes, 100);
-  EXPECT_EQ(first->planNodeCurrentBytes, 100);
   EXPECT_EQ(first->ownerCurrentBytes, 100);
   EXPECT_EQ(first->deltaBytes, 100);
 
@@ -405,9 +398,6 @@ TEST(GpuResourcesTest, TracksAllocationOriginAndOrderedTransitions) {
   EXPECT_LT(first->timestampNs, second->timestampNs);
   EXPECT_EQ(second->globalCurrentBytes, 160);
   EXPECT_EQ(second->globalPeakBytes, 160);
-  EXPECT_EQ(second->queryCurrentBytes, 160);
-  EXPECT_EQ(second->taskCurrentBytes, 160);
-  EXPECT_EQ(second->planNodeCurrentBytes, 160);
   EXPECT_EQ(second->ownerCurrentBytes, 60);
   EXPECT_EQ(second->deltaBytes, 60);
 
@@ -423,9 +413,6 @@ TEST(GpuResourcesTest, TracksAllocationOriginAndOrderedTransitions) {
   EXPECT_EQ(deallocation->planNodeId, handleA.planNodeId);
   EXPECT_EQ(deallocation->globalCurrentBytes, 60);
   EXPECT_EQ(deallocation->globalPeakBytes, 160);
-  EXPECT_EQ(deallocation->queryCurrentBytes, 60);
-  EXPECT_EQ(deallocation->taskCurrentBytes, 60);
-  EXPECT_EQ(deallocation->planNodeCurrentBytes, 60);
   EXPECT_EQ(deallocation->ownerCurrentBytes, 0);
   EXPECT_EQ(deallocation->deltaBytes, -100);
 
@@ -463,9 +450,6 @@ TEST(GpuResourcesTest, TracksAllocationOriginAndOrderedTransitions) {
   EXPECT_EQ(final->sequence, 4);
   EXPECT_LT(deallocation->timestampNs, final->timestampNs);
   EXPECT_EQ(final->globalCurrentBytes, 0);
-  EXPECT_EQ(final->queryCurrentBytes, 0);
-  EXPECT_EQ(final->taskCurrentBytes, 0);
-  EXPECT_EQ(final->planNodeCurrentBytes, 0);
   EXPECT_EQ(final->ownerCurrentBytes, 0);
 }
 
@@ -484,24 +468,15 @@ TEST(GpuResourcesTest, TracksQueryAndTaskAggregates) {
 
   const auto first = tracker.recordAllocation(&allocationA, 100, handleA);
   ASSERT_TRUE(first.has_value());
-  EXPECT_EQ(first->queryCurrentBytes, 100);
-  EXPECT_EQ(first->taskCurrentBytes, 100);
 
   const auto second = tracker.recordAllocation(&allocationB, 60, handleB);
   ASSERT_TRUE(second.has_value());
-  EXPECT_EQ(second->queryCurrentBytes, 160);
-  EXPECT_EQ(second->taskCurrentBytes, 60);
-  EXPECT_EQ(second->planNodeCurrentBytes, 60);
 
   const auto firstDeallocation = tracker.recordDeallocation(&allocationA);
   ASSERT_TRUE(firstDeallocation.has_value());
-  EXPECT_EQ(firstDeallocation->queryCurrentBytes, 60);
-  EXPECT_EQ(firstDeallocation->taskCurrentBytes, 0);
 
   const auto secondDeallocation = tracker.recordDeallocation(&allocationB);
   ASSERT_TRUE(secondDeallocation.has_value());
-  EXPECT_EQ(secondDeallocation->queryCurrentBytes, 0);
-  EXPECT_EQ(secondDeallocation->taskCurrentBytes, 0);
 }
 
 TEST(GpuResourcesTest, InvalidPointerEventsDoNotCorruptLedger) {
@@ -979,7 +954,6 @@ TEST(GpuMemoryCaptureTest, RetainsSourceAnchoredOomAfterTimelineOverflow) {
       20,
       20,
       20,
-      20,
       1'024,
       8'192,
       "cudaSuccess");
@@ -1162,7 +1136,6 @@ TEST(
       10'003,
       oomOwner,
       4'096,
-      0,
       0,
       0,
       0,

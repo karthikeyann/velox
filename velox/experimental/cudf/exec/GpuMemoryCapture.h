@@ -180,7 +180,6 @@ void recordGpuMemoryCaptureOom(
     std::size_t requestedBytes,
     uint64_t globalCurrentBytes,
     uint64_t globalPeakBytes,
-    uint64_t planNodeCurrentBytes,
     uint64_t ownerCurrentBytes,
     std::size_t cudaFreeBytes,
     std::size_t cudaTotalBytes,

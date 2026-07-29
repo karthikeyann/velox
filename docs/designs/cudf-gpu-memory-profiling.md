@@ -69,17 +69,9 @@ dropped. `summary.capture_local_peak_exact` distinguishes the two cases.
 
 | Key | Effect |
 | --- | --- |
-| `cudf.memory_tracking_enabled` | Installs the tracked memory resources |
 | `cudf.quent_memory_profile_path` | Where to write the capture; also enables tracking. `%p`, `%q`, `%t` and `%u` expand to process id, query id, task id and task uuid |
 | `cudf.quent_query_filter` | Substring selecting the task to record |
 | `cudf.quent_max_events` | Retained memory updates plus operator calls |
-
-## NVTX
-
-`NvtxGpuMemoryCounters` publishes the same ledger transitions as NVTX counters
-for correlation in Nsight, independently of any capture file. Operator ranges
-are not emitted there: `CudfOperatorBase` already emits them, and honours the
-`nvtxMethods_` suppression that keeps nsys profiles readable.
 
 ## Non-goals
 
