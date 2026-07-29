@@ -20,10 +20,22 @@
 
 namespace facebook::velox::cudf_velox::test {
 
+TEST(ConfigTest, MemoryTrackingDisabledByDefault) {
+  CudfConfig config;
+  EXPECT_FALSE(config.memoryTrackingEnabled);
+  EXPECT_TRUE(config.quentMemoryProfilePath.empty());
+  EXPECT_EQ(config.quentMaxEvents, 250'000);
+  EXPECT_FALSE(config.gpuMemoryTrackingEnabled());
+}
+
 TEST(ConfigTest, CudfConfig) {
   std::unordered_map<std::string, std::string> options = {
       {CudfConfig::kCudfEnabled, "false"},
       {CudfConfig::kCudfDebugEnabled, "true"},
+      {CudfConfig::kCudfMemoryTrackingEnabled, "true"},
+      {CudfConfig::kCudfQuentMemoryProfilePath, "/tmp/gpu-memory-%q-%t.json"},
+      {CudfConfig::kCudfQuentQueryFilter, "query-42"},
+      {CudfConfig::kCudfQuentMaxEvents, "250000"},
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
@@ -31,11 +43,25 @@ TEST(ConfigTest, CudfConfig) {
 
   CudfConfig config;
   config.initialize(std::move(options));
-  ASSERT_EQ(config.enabled, false);
-  ASSERT_EQ(config.debugEnabled, true);
-  ASSERT_EQ(config.memoryResource, "arena");
-  ASSERT_EQ(config.memoryPercent, 25);
-  ASSERT_EQ(config.functionNamePrefix, "presto");
-  ASSERT_EQ(config.allowCpuFallback, false);
+  EXPECT_FALSE(config.enabled);
+  EXPECT_TRUE(config.debugEnabled);
+  EXPECT_TRUE(config.memoryTrackingEnabled);
+  EXPECT_EQ(config.quentMemoryProfilePath, "/tmp/gpu-memory-%q-%t.json");
+  EXPECT_EQ(config.quentQueryFilter, "query-42");
+  EXPECT_EQ(config.quentMaxEvents, 250'000);
+  EXPECT_TRUE(config.gpuMemoryTrackingEnabled());
+  EXPECT_EQ(config.memoryResource, "arena");
+  EXPECT_EQ(config.memoryPercent, 25);
+  EXPECT_EQ(config.functionNamePrefix, "presto");
+  EXPECT_FALSE(config.allowCpuFallback);
 }
+
+TEST(ConfigTest, QuentPathEnablesTracking) {
+  CudfConfig config;
+  config.initialize(
+      {{CudfConfig::kCudfQuentMemoryProfilePath, "/tmp/gpu.json"}});
+  EXPECT_FALSE(config.memoryTrackingEnabled);
+  EXPECT_TRUE(config.gpuMemoryTrackingEnabled());
+}
+
 } // namespace facebook::velox::cudf_velox::test

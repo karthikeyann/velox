@@ -25,6 +25,7 @@
 
 #include <glog/logging.h>
 
+#include <optional>
 #include <type_traits>
 
 namespace facebook::velox::cudf_velox {

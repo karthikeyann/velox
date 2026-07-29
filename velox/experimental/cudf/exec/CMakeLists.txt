@@ -37,6 +37,9 @@ add_library(
   DecimalAggregationDevice.cu
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp
+  GpuMemoryCapture.cpp
+  GpuMemoryCaptureListener.cpp
+  NvtxGpuMemoryCounters.cpp
   GpuResources.cpp
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp
@@ -44,6 +47,14 @@ add_library(
   ToCudf.cpp
   Utilities.cpp
   VeloxCudfInterop.cpp
+)
+
+target_sources(
+  velox_cudf_exec
+  PUBLIC
+    FILE_SET HEADERS
+      BASE_DIRS ${PROJECT_SOURCE_DIR}
+      FILES GpuMemoryOwner.h GpuMemoryCaptureListener.h NvtxGpuMemoryCounters.h
 )
 
 target_link_libraries(

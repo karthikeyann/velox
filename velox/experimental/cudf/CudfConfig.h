@@ -18,6 +18,7 @@
 
 #include <cudf/types.hpp>
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -28,6 +29,12 @@ struct CudfConfig {
   /// Keys used by the initialize() method.
   static constexpr const char* kCudfEnabled{"cudf.enabled"};
   static constexpr const char* kCudfDebugEnabled{"cudf.debug_enabled"};
+  static constexpr const char* kCudfMemoryTrackingEnabled{
+      "cudf.memory_tracking_enabled"};
+  static constexpr const char* kCudfQuentMemoryProfilePath{
+      "cudf.quent_memory_profile_path"};
+  static constexpr const char* kCudfQuentQueryFilter{"cudf.quent_query_filter"};
+  static constexpr const char* kCudfQuentMaxEvents{"cudf.quent_max_events"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
@@ -66,6 +73,25 @@ struct CudfConfig {
 
   /// Enable debug printing.
   bool debugEnabled{false};
+
+  /// Enables diagnostic GPU allocation ownership without a trace file.
+  bool memoryTrackingEnabled{false};
+
+  /// Writes a task-bounded, versioned raw profile for Quent replay.
+  ///
+  /// `%p`, `%q`, `%t`, and `%u` expand to process, query, task, and task UUID.
+  std::string quentMemoryProfilePath;
+
+  /// Selects the first GPU task whose query, task, or UUID contains this text.
+  std::string quentQueryFilter;
+
+  /// Bounds retained memory transitions and operator-call spans.
+  std::size_t quentMaxEvents{250'000};
+
+  /// Returns whether snapshot or Quent diagnostics are requested.
+  bool gpuMemoryTrackingEnabled() const {
+    return memoryTrackingEnabled || !quentMemoryProfilePath.empty();
+  }
 
   /// Allow fallback to CPU operators if GPU operator replacement fails.
   bool allowCpuFallback{true};

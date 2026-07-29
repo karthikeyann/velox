@@ -108,6 +108,12 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_gpu_resources_test
+  SOURCES Main.cpp GpuResourcesTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} rmm::rmm GTest::gmock
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_decimal_aggregation_test
   SOURCES Main.cpp DecimalAggregationTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib
