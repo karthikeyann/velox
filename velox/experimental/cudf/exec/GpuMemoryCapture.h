@@ -141,6 +141,19 @@ GpuMemoryCaptureCallHandle beginGpuMemoryCaptureOperatorCall(
 void endGpuMemoryCaptureOperatorCall(
     const GpuMemoryCaptureCallHandle& handle) noexcept;
 
+/// Opens a blocked interval for one operator instance.
+///
+/// Keyed by owner rather than carried in a handle because a driver reports
+/// blocked on one thread and resumes on whichever thread next picks it up.
+void beginGpuMemoryCaptureBlockedSpan(
+    uint64_t ownerId,
+    uint64_t planNodeId,
+    const GpuMemoryOwner& owner,
+    std::string_view blockingReason) noexcept;
+
+/// Closes the blocked interval opened for 'ownerId'.
+void endGpuMemoryCaptureBlockedSpan(uint64_t ownerId) noexcept;
+
 /// Records the row, byte and batch counts one operator instance finished with.
 void recordGpuMemoryCaptureOperatorCounts(
     uint64_t ownerId,

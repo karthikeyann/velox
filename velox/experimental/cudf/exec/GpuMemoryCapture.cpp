@@ -56,6 +56,9 @@ constexpr std::string_view kCaptureFormat{"velox-cudf-gpu-memory-capture"};
 constexpr uint64_t kCaptureVersion{1};
 constexpr std::size_t kMaximumActiveCalls{4'096};
 constexpr std::size_t kCriticalEventCapacity{64};
+/// Blocked intervals are bounded separately: they explain gaps on a driver
+/// lane, and a saturated call timeline must not erase that explanation.
+constexpr std::size_t kBlockedSpanCapacity{4096};
 
 struct CapturedOwner {
   uint64_t ownerId{0};
@@ -76,6 +79,16 @@ struct CapturedCallSpan {
   uint64_t startTimestampNs{0};
   uint64_t endTimestampNs{0};
   std::array<char, 32> callName{};
+  bool truncated{false};
+};
+
+struct CapturedBlockedSpan {
+  uint64_t eventSequence{0};
+  uint64_t ownerId{0};
+  int64_t threadId{0};
+  uint64_t startTimestampNs{0};
+  uint64_t endTimestampNs{0};
+  std::array<char, 32> blockingReason{};
   bool truncated{false};
 };
 
@@ -116,6 +129,8 @@ struct CaptureData {
   std::set<uint64_t> requiredOwnerIds;
   std::vector<CapturedMemoryUpdate> memoryUpdates;
   std::vector<CapturedCallSpan> operatorCalls;
+  std::vector<CapturedBlockedSpan> blockedSpans;
+  std::map<uint64_t, CapturedBlockedSpan> openBlockedSpans;
   std::map<uint64_t, GpuMemoryOperatorCounts> operatorCounts;
   std::vector<CapturedOom> oomEvents;
   std::vector<CapturedDataLoss> dataLossEvents;
@@ -380,6 +395,17 @@ folly::dynamic captureJson(const CaptureData& capture) {
             "truncated", call.truncated));
   }
 
+  auto blockedSpans = folly::dynamic::array();
+  for (const auto& span : capture.blockedSpans) {
+    blockedSpans.push_back(
+        folly::dynamic::object("event_sequence", span.eventSequence)(
+            "owner_id", span.ownerId)("thread_id", span.threadId)(
+            "start_timestamp_ns", span.startTimestampNs)(
+            "end_timestamp_ns", span.endTimestampNs)(
+            "blocking_reason", fixedString(span.blockingReason))(
+            "truncated", span.truncated));
+  }
+
   auto operatorCounts = folly::dynamic::array();
   for (const auto& [ownerId, counts] : capture.operatorCounts) {
     operatorCounts.push_back(
@@ -466,6 +492,7 @@ folly::dynamic captureJson(const CaptureData& capture) {
       "initial_snapshot",
       snapshotJson(capture.initialSnapshot, relevantOwners))(
       "memory_updates", std::move(updates))("operator_calls", std::move(calls))(
+      "blocked_spans", std::move(blockedSpans))(
       "operator_counts", std::move(operatorCounts))(
       "oom_events", std::move(oomEvents))(
       "data_loss_events", std::move(dataLossEvents))(
@@ -894,6 +921,56 @@ class GpuMemoryCaptureController {
               false});
     } catch (...) {
       noteInternalDataLoss("operator call capture exception", 0);
+    }
+  }
+
+  void beginBlockedSpan(
+      uint64_t ownerId,
+      uint64_t planNodeId,
+      const GpuMemoryOwner& owner,
+      std::string_view blockingReason) noexcept {
+    try {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (active_ == nullptr) {
+        return;
+      }
+      if (!retainOwnerMetadata(
+              *active_, CapturedOwner{ownerId, planNodeId, owner}, true)) {
+        noteMissingOwnerMetadata(*active_);
+        return;
+      }
+      CapturedBlockedSpan span;
+      span.ownerId = ownerId;
+      span.threadId = folly::getCurrentThreadID();
+      span.startTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
+      copyBounded(span.blockingReason, blockingReason);
+      active_->openBlockedSpans[ownerId] = span;
+    } catch (...) {
+      noteInternalDataLoss("blocked span capture exception", 0);
+    }
+  }
+
+  void endBlockedSpan(uint64_t ownerId) noexcept {
+    try {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (active_ == nullptr) {
+        return;
+      }
+      auto open = active_->openBlockedSpans.find(ownerId);
+      if (open == active_->openBlockedSpans.end()) {
+        return;
+      }
+      auto span = open->second;
+      active_->openBlockedSpans.erase(open);
+      if (active_->blockedSpans.size() >= kBlockedSpanCapacity) {
+        noteOverflow(*active_);
+        return;
+      }
+      span.eventSequence = retainEvent(*active_);
+      span.endTimestampNs = gpu_memory_detail::gpuMemoryMonotonicTimeNs();
+      active_->blockedSpans.push_back(span);
+    } catch (...) {
+      noteInternalDataLoss("blocked span capture exception", 0);
     }
   }
 
@@ -1328,6 +1405,19 @@ void recordGpuMemoryCaptureOom(
       cudaFreeBytes,
       cudaTotalBytes,
       cudaStatus);
+}
+
+void beginGpuMemoryCaptureBlockedSpan(
+    uint64_t ownerId,
+    uint64_t planNodeId,
+    const GpuMemoryOwner& owner,
+    std::string_view blockingReason) noexcept {
+  captureController().beginBlockedSpan(
+      ownerId, planNodeId, owner, blockingReason);
+}
+
+void endGpuMemoryCaptureBlockedSpan(uint64_t ownerId) noexcept {
+  captureController().endBlockedSpan(ownerId);
 }
 
 void recordGpuMemoryCaptureOperatorCounts(

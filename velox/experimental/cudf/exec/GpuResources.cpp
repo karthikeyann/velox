@@ -221,6 +221,26 @@ class GpuMemoryAllocationTracker::Impl {
     return snapshot.handle;
   }
 
+  void beginCaptureBlockedSpan(
+      uint64_t ownerId,
+      std::string_view blockingReason) noexcept {
+    try {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto owner = owners_.find(ownerId);
+      if (owner == owners_.end()) {
+        return;
+      }
+      const auto& snapshot = owner->second.snapshot;
+      gpu_memory_detail::beginGpuMemoryCaptureBlockedSpan(
+          snapshot.handle.ownerId,
+          snapshot.handle.planNodeId,
+          snapshot.owner,
+          blockingReason);
+    } catch (...) {
+      // Profiling must not alter a blocking transition.
+    }
+  }
+
   void recordCaptureOperatorCounts(
       uint64_t ownerId,
       const GpuMemoryOperatorCounts& counts) noexcept {
@@ -745,6 +765,12 @@ GpuMemoryCaptureCallHandle GpuMemoryAllocationTracker::beginCaptureCall(
   return impl_->beginCaptureCall(ownerId, callName);
 }
 
+void GpuMemoryAllocationTracker::beginCaptureBlockedSpan(
+    uint64_t ownerId,
+    std::string_view blockingReason) noexcept {
+  impl_->beginCaptureBlockedSpan(ownerId, blockingReason);
+}
+
 void GpuMemoryAllocationTracker::recordCaptureOperatorCounts(
     uint64_t ownerId,
     const GpuMemoryOperatorCounts& counts) noexcept {
@@ -1063,6 +1089,58 @@ GpuMemoryActiveOwner activateGpuMemoryOperator(exec::Operator* op) noexcept {
   }
   activeOwner = GpuMemoryActiveOwner{tracker.get(), ownerId};
   return previous;
+}
+
+namespace {
+/// Resolves 'op' to its registered owner without disturbing the thread-local
+/// attribution, which a blocked interval must not claim.
+uint64_t registeredOwnerId(exec::Operator* op) noexcept {
+  try {
+    std::shared_ptr<GpuMemoryAllocationTracker> tracker;
+    {
+      std::lock_guard<std::mutex> lock(diagnosticsMutex);
+      tracker = diagnostics;
+    }
+    if (tracker == nullptr || op == nullptr) {
+      return 0;
+    }
+    return tracker->registerOperator(op).ownerId;
+  } catch (...) {
+    return 0;
+  }
+}
+} // namespace
+
+void beginGpuMemoryCaptureBlockedSpanFor(
+    exec::Operator* op,
+    std::string_view blockingReason) noexcept {
+  if (!gpuMemoryCaptureActive()) {
+    return;
+  }
+  try {
+    std::shared_ptr<GpuMemoryAllocationTracker> tracker;
+    {
+      std::lock_guard<std::mutex> lock(diagnosticsMutex);
+      tracker = diagnostics;
+    }
+    if (tracker == nullptr) {
+      return;
+    }
+    tracker->beginCaptureBlockedSpan(registeredOwnerId(op), blockingReason);
+  } catch (...) {
+    // Profiling must not alter a blocking transition.
+  }
+}
+
+void endGpuMemoryCaptureBlockedSpanFor(exec::Operator* op) noexcept {
+  if (!gpuMemoryCaptureActive()) {
+    return;
+  }
+  try {
+    endGpuMemoryCaptureBlockedSpan(registeredOwnerId(op));
+  } catch (...) {
+    // Profiling must not alter a blocking transition.
+  }
 }
 
 void recordActiveGpuMemoryCaptureOperatorCounts(

@@ -82,6 +82,18 @@ class GpuMemoryCaptureDriverListener : public exec::DriverListener {
     gpu_memory_detail::restoreGpuMemoryOwner(call.previousOwner);
   }
 
+  void onDriverBlocked(const exec::Operator& op, exec::BlockingReason reason)
+      override {
+    gpu_memory_detail::beginGpuMemoryCaptureBlockedSpanFor(
+        const_cast<exec::Operator*>(&op),
+        exec::BlockingReasonName::toName(reason));
+  }
+
+  void onDriverUnblocked(const exec::Operator& op) override {
+    gpu_memory_detail::endGpuMemoryCaptureBlockedSpanFor(
+        const_cast<exec::Operator*>(&op));
+  }
+
  private:
   /// Reads what Velox already counted for this operator, once, as it closes.
   ///
