@@ -67,17 +67,26 @@ namespace {
 constexpr int64_t kFallbackTrackingCapacity{1LL << 40};
 constexpr std::string_view kQueryRegistryKey{"cudfGpuMemoryTracking"};
 
-int64_t trackingCapacity() noexcept {
+int64_t calculateTrackingCapacity(int32_t percent) noexcept {
   size_t freeBytes{0};
   size_t totalBytes{0};
   if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess) {
     return kFallbackTrackingCapacity;
   }
-  const auto percent = std::clamp(
-      CudfConfig::getInstance().memoryPercent, int32_t{1}, int32_t{100});
+  percent = std::clamp(percent, int32_t{1}, int32_t{100});
   const auto capacity =
       freeBytes * static_cast<uint64_t>(percent) / uint64_t{100};
   return static_cast<int64_t>(std::max<uint64_t>(capacity, 1));
+}
+
+std::atomic<int64_t> configuredTrackingCapacity{0};
+
+int64_t trackingCapacity() noexcept {
+  const auto configured =
+      configuredTrackingCapacity.load(std::memory_order_acquire);
+  return configured > 0
+      ? configured
+      : calculateTrackingCapacity(CudfConfig::getInstance().memoryPercent);
 }
 
 uint64_t asUnsigned(int64_t bytes) {
@@ -285,6 +294,11 @@ void submitSamples(std::vector<BufferedSample> samples) {
 
 class ThreadSampleBuffer;
 
+// Serialize accounting transitions with profile submission. Otherwise a
+// flusher can drain a later transition from one thread while an earlier
+// transition remains in another thread's buffer.
+std::mutex trackingUpdateMutex;
+
 struct BufferRegistry {
   std::mutex mutex;
   std::unordered_set<ThreadSampleBuffer*> buffers;
@@ -372,6 +386,7 @@ void flushAllThreadBuffersLocked() {
 }
 
 void flushAllThreadBuffers() {
+  std::lock_guard<std::mutex> updateLock(trackingUpdateMutex);
   auto& submission = submissionState();
   std::lock_guard<std::mutex> submissionLock(submission.mutex);
   flushAllThreadBuffersLocked();
@@ -445,6 +460,7 @@ NvtxCounters registerNvtxOwner(
     std::string_view logicalQueryId,
     std::string_view queryInstance) noexcept {
   try {
+    std::lock_guard<std::mutex> updateLock(trackingUpdateMutex);
     auto& state = nvtxState();
     std::lock_guard<std::mutex> lock(state.mutex);
     initializeNvtxLocked(state);
@@ -579,7 +595,6 @@ class TrackingSession;
 // Profiling is opt-in and bounded. Serialize logical accounting transitions so
 // every emitted global/query/owner sample describes the same state even when
 // multiple driver threads allocate concurrently.
-std::mutex trackingUpdateMutex;
 std::shared_mutex trackingLifecycleMutex;
 
 /// Per-owner shared resource adapted from the first commit on Devavret's
@@ -1175,6 +1190,11 @@ GpuMemoryResourceRefs untrackedRefs(
 }
 
 } // namespace
+
+void configureGpuMemoryTrackingCapacity(int32_t memoryPercent) noexcept {
+  configuredTrackingCapacity.store(
+      calculateTrackingCapacity(memoryPercent), std::memory_order_release);
+}
 
 GpuMemoryResourceRefs gpuMemoryResourcesForCurrentOperator(
     GpuMemoryResource& tempUpstream,

@@ -80,6 +80,10 @@ struct GpuMemoryResourcePair {
   std::shared_ptr<void> keepAlive;
 };
 
+/// Captures the tracking capacity before pool or arena resource construction
+/// can reserve memory. Must be called after CUDA context initialization.
+void configureGpuMemoryTrackingCapacity(int32_t memoryPercent) noexcept;
+
 /// Returns per-owner resources for the operator currently selected by
 /// RuntimeStatWriterScopeGuard. The wrappers retain allocation-time identity,
 /// so a later free on another thread remains charged to the right operator.

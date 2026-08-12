@@ -339,6 +339,9 @@ void registerCudf() {
   CUDF_FUNC_RANGE();
   cudaFree(nullptr); // Initialize CUDA context at startup
 
+  if (CudfConfig::getInstance().memoryTrackingEnabled) {
+    configureGpuMemoryTrackingCapacity(CudfConfig::getInstance().memoryPercent);
+  }
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
   auto mr = cudf_velox::createMemoryResource(
       mrMode, CudfConfig::getInstance().memoryPercent);
