@@ -561,7 +561,8 @@ struct ApproxDistinctAggregator : ReduceAggregator {
   auto mergeSketchesAndApply(
       cudf::column_view const& sketch_column,
       Func&& func,
-      rmm::cuda_stream_view stream) {
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) {
     auto strings_col = cudf::strings_column_view(sketch_column);
     auto offsets_col = strings_col.offsets();
     auto chars_ptr = strings_col.chars_begin(stream);
@@ -582,7 +583,7 @@ struct ApproxDistinctAggregator : ReduceAggregator {
     // Copy to mutable aligned buffer - cudf::approx_distinct_count requires
     // non-const span and proper alignment for int32 registers
     rmm::device_buffer aligned_sketch{
-        static_cast<std::size_t>(first_size), stream};
+        static_cast<std::size_t>(first_size), stream, mr};
     CUDF_CUDA_TRY(cudaMemcpyAsync(
         aligned_sketch.data(),
         chars_ptr + first_offset,
@@ -603,7 +604,8 @@ struct ApproxDistinctAggregator : ReduceAggregator {
       cudf::size_type size = end_offset - start_offset;
 
       if (size > 0) {
-        rmm::device_buffer temp_sketch{static_cast<std::size_t>(size), stream};
+        rmm::device_buffer temp_sketch{
+            static_cast<std::size_t>(size), stream, mr};
         CUDF_CUDA_TRY(cudaMemcpyAsync(
             temp_sketch.data(),
             chars_ptr + start_offset,
@@ -627,8 +629,18 @@ struct ApproxDistinctAggregator : ReduceAggregator {
       rmm::device_async_resource_ref mr) {
     auto inputTable = cudf::table_view({input.column(inputIndex)});
 
+    rmm::device_buffer sketchStorage{
+        cudf::approx_distinct_count::sketch_bytes(precision_), stream, mr};
+    CUDF_CUDA_TRY(cudaMemsetAsync(
+        sketchStorage.data(), 0, sketchStorage.size(), stream.value()));
     cudf::approx_distinct_count sketch{
-        inputTable, precision_, kNullPolicy, kNanPolicy, stream};
+        cuda::std::span<cuda::std::byte>(
+            static_cast<cuda::std::byte*>(sketchStorage.data()),
+            sketchStorage.size()),
+        precision_,
+        kNullPolicy,
+        kNanPolicy};
+    sketch.add(inputTable, stream);
 
     return makeSketchColumn(sketch.sketch(), stream, mr);
   }
@@ -648,7 +660,8 @@ struct ApproxDistinctAggregator : ReduceAggregator {
         [this, stream, mr](cudf::approx_distinct_count& sketch) {
           return makeSketchColumn(sketch.sketch(), stream, mr);
         },
-        stream);
+        stream,
+        mr);
   }
 
   std::unique_ptr<cudf::column> doFinalReduce(
@@ -676,7 +689,8 @@ struct ApproxDistinctAggregator : ReduceAggregator {
               stream,
               mr);
         },
-        stream);
+        stream,
+        mr);
   }
 
   std::int32_t precision_;

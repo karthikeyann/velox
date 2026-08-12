@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
@@ -60,7 +61,18 @@ CudfHiveDataSource::CudfHiveDataSource(
       connectorQueryCtx_(connectorQueryCtx),
       outputType_(outputType),
       pool_(connectorQueryCtx->memoryPool()),
+      memoryResources_(
+          mr_ && output_mr_
+              ? gpuMemoryResourcesForOperatorPool(pool_, *mr_, *output_mr_)
+              : std::nullopt),
       expressionEvaluator_(connectorQueryCtx->expressionEvaluator()) {
+  VELOX_CHECK(
+      !CudfConfig::getInstance().memoryTrackingEnabled || memoryResources_,
+      "Missing TableScan GPU memory attribution binding");
+  std::optional<ScopedCudfMemoryResources> memoryScope;
+  if (memoryResources_) {
+    memoryScope.emplace(memoryResources_->temp, memoryResources_->output);
+  }
   // Set up column projection if needed
   auto readColumnTypes = outputType_->children();
   for (const auto& outputName : outputType_->names()) {
@@ -216,6 +228,10 @@ void CudfHiveDataSource::convertSplit(std::shared_ptr<ConnectorSplit> split) {
 }
 
 void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
+  std::optional<ScopedCudfMemoryResources> memoryScope;
+  if (memoryResources_) {
+    memoryScope.emplace(memoryResources_->temp, memoryResources_->output);
+  }
   // Virtual method for class-specific conversion of the split
   convertSplit(split);
 
@@ -244,6 +260,10 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
 std::optional<RowVectorPtr> CudfHiveDataSource::next(
     uint64_t size,
     velox::ContinueFuture& /* future */) {
+  std::optional<ScopedCudfMemoryResources> memoryScope;
+  if (memoryResources_) {
+    memoryScope.emplace(memoryResources_->temp, memoryResources_->output);
+  }
   VELOX_CHECK_NOT_NULL(split_, "No split present. Call addSplit() first.");
   VELOX_CHECK_NOT_NULL(cudfSplitReader_, "No split to process.");
   auto chunkOpt = cudfSplitReader_->next(size);

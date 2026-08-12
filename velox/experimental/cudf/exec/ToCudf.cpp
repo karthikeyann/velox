@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTracker.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
@@ -34,6 +35,7 @@
 #include "folly/Conv.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
+#include "velox/exec/TableScan.h"
 #include "velox/exec/Values.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
@@ -280,14 +282,36 @@ struct CudfDriverAdapter {
 
   // Call operator needed by DriverAdapter
   bool operator()(const exec::DriverFactory& factory, exec::Driver& driver) {
+    const auto trackingEnabled =
+        CudfConfig::getInstance().memoryTrackingEnabled;
+    if (trackingEnabled) {
+      discardGpuMemoryOwnerCache();
+      for (auto* op : driver.operators()) {
+        if (dynamic_cast<exec::TableScan*>(op) != nullptr) {
+          VELOX_CHECK(
+              registerGpuMemoryOperator(op),
+              "Failed to bind TableScan GPU memory attribution");
+        }
+      }
+    }
     if (!driver.driverCtx()->queryConfig().get<bool>(
             CudfConfig::kCudfEnabled, CudfConfig::getInstance().enabled) &&
         allowCpuFallback_) {
       return false;
     }
     auto state = CompileState(factory, driver);
-    auto res = state.compile(allowCpuFallback_);
-    return res;
+    const auto replacementsMade = state.compile(allowCpuFallback_);
+    if (trackingEnabled) {
+      for (auto* op : driver.operators()) {
+        if (dynamic_cast<CudfOperatorBase*>(op) != nullptr) {
+          VELOX_CHECK(
+              registerGpuMemoryOperator(op),
+              "Failed to bind GPU memory attribution for {}",
+              op->operatorType());
+        }
+      }
+    }
+    return replacementsMade;
   }
 
  private:
@@ -349,6 +373,9 @@ void registerCudf() {
 }
 
 void unregisterCudf() {
+  if (!resetGpuMemoryTracking()) {
+    LOG(WARNING) << "Retaining GPU attribution resources with live allocations";
+  }
   output_mr_.reset();
   mr_.reset();
   exec::DriverFactory::adapters.erase(
@@ -375,6 +402,9 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfDebugEnabled) != config.end()) {
     debugEnabled = folly::to<bool>(config[kCudfDebugEnabled]);
+  }
+  if (config.find(kCudfMemoryTrackingEnabled) != config.end()) {
+    memoryTrackingEnabled = folly::to<bool>(config[kCudfMemoryTrackingEnabled]);
   }
   if (config.find(kCudfMemoryResource) != config.end()) {
     memoryResource = config[kCudfMemoryResource];

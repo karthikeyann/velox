@@ -31,8 +31,30 @@ extern std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> mr_;
 extern std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
     output_mr_;
 
+/// Returns the temporary resource for the operator currently running on this
+/// thread. Falls back to RMM's current resource when attribution is disabled.
+rmm::device_async_resource_ref get_temp_mr();
+
 /// Returns the memory resource designated for output vector allocations.
 rmm::device_async_resource_ref get_output_mr();
+
+/// Temporarily pins resources for connector work that can execute outside a
+/// Driver thread, such as TableScan split preloading.
+class ScopedCudfMemoryResources {
+ public:
+  ScopedCudfMemoryResources(
+      rmm::device_async_resource_ref temp,
+      rmm::device_async_resource_ref output);
+  ~ScopedCudfMemoryResources();
+
+  ScopedCudfMemoryResources(const ScopedCudfMemoryResources&) = delete;
+  ScopedCudfMemoryResources& operator=(const ScopedCudfMemoryResources&) =
+      delete;
+
+ private:
+  std::optional<rmm::device_async_resource_ref> previousTemp_;
+  std::optional<rmm::device_async_resource_ref> previousOutput_;
+};
 
 /**
  * @brief Creates a memory resource based on the given mode.

@@ -184,7 +184,7 @@ std::pair<rmm::device_buffer, cudf::size_type> buildStateValidityMaskImpl(
       mr);
   auto iter = cuda::counting_iterator{0};
   thrust::transform(
-      rmm::exec_policy(stream),
+      rmm::exec_policy(stream, mr),
       iter,
       iter + numRows,
       bools->mutable_view().begin<bool>(),

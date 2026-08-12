@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTracker.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
@@ -117,6 +118,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   RowTypePtr cachedTableRowType_{};
 
   memory::MemoryPool* const pool_;
+  const std::optional<GpuMemoryResourceRefs> memoryResources_;
 
   size_t completedRows_{0};
   size_t completedBytes_{0};

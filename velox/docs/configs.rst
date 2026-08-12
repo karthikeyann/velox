@@ -1524,6 +1524,11 @@ Note: These configurations are experimental and subject to change.
      - integer
      - 50
      - The initial percent of GPU memory to allocate for pool or arena memory resources.
+   * - cudf.memory_tracking_enabled
+     - bool
+     - false
+     - If true, attribute logical GPU allocation bytes to query and operator instances and publish live-byte counters through NVTX.
+       Tracking is intended for bounded profiling runs and enforces a reporting capacity of ``cudf.memory_percent`` of free GPU memory at startup.
    * - cudf.function_name_prefix
      - string
      - ""

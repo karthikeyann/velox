@@ -118,7 +118,8 @@ std::unique_ptr<cudf::column> decimalDivide(
           rhs,
           out->mutable_view(),
           rescaleFactor,
-          stream),
+          stream,
+          mr),
       "Decimal overflow");
 
   finalizeDivideOutputNullCount(*out, stream);
@@ -160,7 +161,8 @@ std::unique_ptr<cudf::column> decimalDivide(
           rhsValue,
           out->mutable_view(),
           DecimalUtil::kPowersOfTen[aRescale],
-          stream),
+          stream,
+          mr),
       "Decimal overflow");
 
   finalizeDivideOutputNullCount(*out, stream);
@@ -203,7 +205,8 @@ std::unique_ptr<cudf::column> decimalDivide(
           rhs,
           out->mutable_view(),
           rescaleFactor,
-          stream),
+          stream,
+          mr),
       "Decimal overflow");
 
   finalizeDivideOutputNullCount(*out, stream);

@@ -38,6 +38,7 @@ add_library(
   DecimalAggregationDevice.cu
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp
+  GpuMemoryTracker.cpp
   GpuResources.cpp
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp
@@ -60,6 +61,7 @@ target_link_libraries(
     velox_cudf_vector
     velox_exception
     velox_exec
+    velox_memory
     velox_test_util
 )
 

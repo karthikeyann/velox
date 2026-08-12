@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfDefaultStreamOverload.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTracker.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include <cudf/detail/utilities/stream_pool.hpp>
@@ -27,6 +29,7 @@
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/managed_memory_resource.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 #include <rmm/mr/prefetch_resource_adaptor.hpp>
 
@@ -36,6 +39,12 @@
 #include <string_view>
 
 namespace facebook::velox::cudf_velox {
+namespace {
+
+thread_local std::optional<rmm::device_async_resource_ref> scopedTempMr;
+thread_local std::optional<rmm::device_async_resource_ref> scopedOutputMr;
+
+} // namespace
 
 cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
     std::string_view mode,
@@ -88,8 +97,38 @@ cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
 std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> mr_;
 std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> output_mr_;
 
+rmm::device_async_resource_ref get_temp_mr() {
+  if (scopedTempMr) {
+    return *scopedTempMr;
+  }
+  if (!CudfConfig::getInstance().memoryTrackingEnabled || !mr_ || !output_mr_) {
+    return rmm::mr::get_current_device_resource_ref();
+  }
+  return gpuMemoryResourcesForCurrentOperator(*mr_, *output_mr_).temp;
+}
+
 rmm::device_async_resource_ref get_output_mr() {
-  return output_mr_.value();
+  if (scopedOutputMr) {
+    return *scopedOutputMr;
+  }
+  VELOX_CHECK(output_mr_.has_value(), "cuDF output memory resource is not set");
+  if (!CudfConfig::getInstance().memoryTrackingEnabled || !mr_) {
+    return rmm::device_async_resource_ref{output_mr_.value()};
+  }
+  return gpuMemoryResourcesForCurrentOperator(*mr_, *output_mr_).output;
+}
+
+ScopedCudfMemoryResources::ScopedCudfMemoryResources(
+    rmm::device_async_resource_ref temp,
+    rmm::device_async_resource_ref output)
+    : previousTemp_(scopedTempMr), previousOutput_(scopedOutputMr) {
+  scopedTempMr = temp;
+  scopedOutputMr = output;
+}
+
+ScopedCudfMemoryResources::~ScopedCudfMemoryResources() {
+  scopedTempMr = previousTemp_;
+  scopedOutputMr = previousOutput_;
 }
 
 } // namespace facebook::velox::cudf_velox

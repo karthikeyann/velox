@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTracker.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 
@@ -49,6 +50,7 @@
 #include <cudf/io/parquet.hpp>
 
 #include <fmt/ranges.h>
+#include <folly/ScopeGuard.h>
 
 using namespace facebook::velox;
 using namespace facebook::velox::common::testutil;
@@ -255,6 +257,59 @@ class TableScanTest : public virtual CudfHiveConnectorTestBase {
 
 class TableScanTestParameterized : public TableScanTest,
                                    public testing::WithParamInterface<bool> {};
+
+TEST_F(TableScanTest, tracksMemoryWhenOperatorReplacementIsDisabled) {
+  auto vectors = makeVectors(1, 1'000);
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+  createDuckDbTable(vectors);
+
+  auto& config = CudfConfig::getInstance();
+  const auto originalTracking = config.memoryTrackingEnabled;
+  SCOPE_EXIT {
+    config.memoryTrackingEnabled = originalTracking;
+  };
+  config.memoryTrackingEnabled = true;
+
+  auto assignments =
+      facebook::velox::exec::test::HiveConnectorTestBase::allRegularColumns(
+          rowType_);
+  auto plan = PlanBuilder(pool_.get())
+                  .startTableScan()
+                  .connectorId(kCudfHiveConnectorId)
+                  .outputType(rowType_)
+                  .dataColumns(rowType_)
+                  .assignments(assignments)
+                  .endTableScan()
+                  .planNode();
+  std::shared_ptr<Task> task;
+  const auto numRows = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                           .config(CudfConfig::kCudfEnabled, false)
+                           .splits(makeCudfHiveConnectorSplits({filePath}))
+                           .countResults(task);
+  EXPECT_EQ(numRows, 1'000);
+
+  const auto snapshot = getGpuMemorySnapshot();
+  EXPECT_EQ(snapshot.currentBytes, 0);
+  const auto tableScan = std::find_if(
+      snapshot.owners.begin(), snapshot.owners.end(), [](const auto& owner) {
+        return owner.owner.operatorType == "TableScan" &&
+            owner.cumulativeRequestedBytes > 0;
+      });
+  ASSERT_NE(tableScan, snapshot.owners.end());
+  EXPECT_EQ(tableScan->owner.planNodeId, plan->id());
+  EXPECT_FALSE(
+      std::any_of(
+          snapshot.owners.begin(),
+          snapshot.owners.end(),
+          [](const auto& owner) {
+            return owner.owner.operatorType == "unattributed" &&
+                owner.cumulativeRequestedBytes > 0;
+          }));
+
+  task.reset();
+  EXPECT_TRUE(resetGpuMemoryTracking());
+}
 
 TEST_P(TableScanTestParameterized, allColumns) {
   auto vectors = makeVectors(10, 1'000);

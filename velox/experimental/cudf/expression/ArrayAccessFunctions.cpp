@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/ArrayAccessFunctions.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
@@ -198,7 +199,7 @@ std::unique_ptr<cudf::column> castSizes(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
   return indexType.id() == cudf::type_id::INT32
-      ? std::make_unique<cudf::column>(sizesView, stream)
+      ? std::make_unique<cudf::column>(sizesView, stream, mr)
       : cudf::cast(sizesView, indexType, stream, mr);
 }
 
@@ -360,13 +361,14 @@ std::unique_ptr<cudf::column> normalizeAndValidateIndicesTyped(
   } else if (positiveNormalizedColumn != nullptr) {
     normalized = std::move(positiveNormalizedColumn);
   } else {
-    normalized = std::make_unique<cudf::column>(positiveNormalized, stream);
+    normalized = std::make_unique<cudf::column>(positiveNormalized, stream, mr);
   }
 
   std::unique_ptr<cudf::column> invalidMask;
   if (policy.nullOnNegativeIndices) {
     // Spark get returns null, rather than throwing, for negative indices.
-    invalidMask = std::make_unique<cudf::column>(rawLessZero->view(), stream);
+    invalidMask =
+        std::make_unique<cudf::column>(rawLessZero->view(), stream, mr);
   }
 
   if (!policy.allowOutOfBound || std::is_same_v<IndexType, int64_t>) {
