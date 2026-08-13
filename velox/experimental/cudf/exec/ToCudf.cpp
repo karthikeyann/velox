@@ -399,6 +399,15 @@ void CudfConfig::initialize(
     batchSizeMinThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMinThreshold]);
   }
+  if (config.find(kCudfBatchSizeMinBytes) != config.end()) {
+    const auto targetBytes =
+        folly::to<uint64_t>(config[kCudfBatchSizeMinBytes]);
+    VELOX_USER_CHECK_GT(
+        targetBytes,
+        0,
+        "cuDF BatchConcat minimum byte target must be positive");
+    batchSizeMinBytes = targetBytes;
+  }
   if (config.find(kCudfBatchSizeMaxThreshold) != config.end()) {
     batchSizeMaxThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMaxThreshold]);
