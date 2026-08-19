@@ -406,22 +406,31 @@ class CudfHashJoinProbe : public CudfOperatorBase {
 
   /// Applies AST filter_join_indices to join index pairs in sub-maxBatchRows
   /// chunks and enqueues the filtered results into pendingIndices_.
+  /// If \p onFilteredIndices is set, it is invoked per chunk with the
+  /// post-filter (left, right) index columns before they are enqueued, so
+  /// callers can accumulate probe/build match state (left and full joins).
   void filterAndEnqueueAstIndices(
       cudf::table_view leftTableView,
       size_t rightTableIndex,
       rmm::device_uvector<cudf::size_type>& leftJoinIndices,
       rmm::device_uvector<cudf::size_type>& rightJoinIndices,
       cudf::join_kind joinKind,
-      rmm::cuda_stream_view stream);
+      rmm::cuda_stream_view stream,
+      const std::function<void(cudf::column_view, cudf::column_view)>&
+          onFilteredIndices = {});
 
   /// Eagerly gathers, applies non-AST filter, and pushes results to
   /// outputQueue_. Splits oversized index spans into sub-maxBatchRows chunks.
+  /// If \p onFilteredLeftIndices is set, it is invoked per chunk with the left
+  /// index column reduced by the filter mask, so callers can accumulate probe
+  /// match state (left join).
   void gatherFilterAndEnqueue(
       cudf::table_view leftTableView,
       cudf::table_view rightTableView,
       rmm::device_uvector<cudf::size_type>& leftJoinIndices,
       rmm::device_uvector<cudf::size_type>& rightJoinIndices,
-      rmm::cuda_stream_view stream);
+      rmm::cuda_stream_view stream,
+      const std::function<void(cudf::column_view)>& onFilteredLeftIndices = {});
 };
 
 /**
