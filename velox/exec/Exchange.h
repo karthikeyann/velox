@@ -50,6 +50,13 @@ struct RemoteConnectorSplit : public connector::ConnectorSplit {
 
 class Exchange : public SourceOperator {
  public:
+  /// 'exchangeClient' must be an InMemoryExchangeClient: this operator reads
+  /// pages off the in-memory exchange queue, which is part of that client's
+  /// data plane rather than of the abstract ExchangeClient control plane. The
+  /// parameter is typed as the base class so that custom exchange operators
+  /// deriving from Exchange keep receiving the client through
+  /// Operator::PlanNodeTranslator. Fails if the client comes from a different
+  /// transport.
   Exchange(
       int32_t operatorId,
       DriverCtx* driverCtx,

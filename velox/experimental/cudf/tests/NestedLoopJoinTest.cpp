@@ -1730,3 +1730,59 @@ TEST_F(CudfNestedLoopJoinTest, crossJoinZeroColumnBuildAndOutput) {
 
   AssertQueryBuilder(plan).assertResults(makeRowVector(ROW({}), 6));
 }
+
+// The mirror of crossJoinZeroColumnBuild, with the projection moved to the probe
+// branch. Only the build side contributes columns, so the whole build table is
+// tiled once per probe row -- and the probe row count can only come from the
+// vector, since a table with no columns reports num_rows() == 0.
+//
+// Before the probe side carried its count, output cardinality was computed as
+// probeTableView.num_rows() * buildRows = 0, so this returned no rows at all.
+// That is the shape behind SELECT count(r.r_name) FROM customer CROSS JOIN
+// region WHERE c_nationkey = 3 returning 0 instead of 30100, and unlike the
+// build-side case it is wrong on both transports.
+TEST_F(CudfNestedLoopJoinTest, crossJoinZeroColumnProbe) {
+  auto probeData = makeRowVector({"p0"}, {makeFlatVector<int64_t>({4, 5})});
+  auto buildData = makeRowVector({"b0"}, {makeFlatVector<int32_t>({1, 2, 3})});
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(planNodeIdGenerator)
+                  .values({probeData})
+                  .project({})
+                  .nestedLoopJoin(
+                      PlanBuilder(planNodeIdGenerator)
+                          .values({buildData})
+                          .planNode(),
+                      {"b0"})
+                  .planNode();
+
+  // Probe-major: the build table repeats as a whole for each of the two probe
+  // rows, rather than each build row repeating twice.
+  auto expected = makeRowVector(
+      {"b0"}, {makeFlatVector<int32_t>({1, 2, 3, 1, 2, 3})});
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
+// Both sides project nothing, so the output carries no columns and the row count
+// is the only result. kLeft rather than kInner on purpose: the inner case is
+// short-circuited earlier in doGetOutput(), so only a non-inner join reaches the
+// cross-join dispatch with both sides column-less.
+TEST_F(CudfNestedLoopJoinTest, crossJoinZeroColumnProbeAndBuildLeftJoin) {
+  auto probeData = makeRowVector({"p0"}, {makeFlatVector<int64_t>({4, 5})});
+  auto buildData = makeRowVector({"b0"}, {makeFlatVector<int32_t>({1, 2, 3})});
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(planNodeIdGenerator)
+                  .values({probeData})
+                  .project({})
+                  .nestedLoopJoin(
+                      PlanBuilder(planNodeIdGenerator)
+                          .values({buildData})
+                          .project({})
+                          .planNode(),
+                      {},
+                      core::JoinType::kLeft)
+                  .planNode();
+
+  AssertQueryBuilder(plan).assertResults(makeRowVector(ROW({}), 6));
+}

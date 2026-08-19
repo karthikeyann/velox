@@ -56,6 +56,23 @@ std::unique_ptr<folly::IOBuf> mergePages(
   }
   return mergedBufs;
 }
+
+std::shared_ptr<InMemoryExchangeClient> asInMemoryExchangeClient(
+    const std::shared_ptr<ExchangeClient>& exchangeClient,
+    const core::ExchangeNode& exchangeNode) {
+  if (exchangeClient == nullptr) {
+    // A null client is accepted here and rejected where it would be used;
+    // LocalPlanner already checks it before building the operator.
+    return nullptr;
+  }
+  auto inMemoryExchangeClient =
+      std::dynamic_pointer_cast<InMemoryExchangeClient>(exchangeClient);
+  VELOX_CHECK_NOT_NULL(
+      inMemoryExchangeClient,
+      "Exchange operator requires an in-memory exchange client, transport: {}",
+      exchangeNode.transportKind());
+  return inMemoryExchangeClient;
+}
 } // namespace
 
 Exchange::Exchange(
@@ -84,7 +101,8 @@ Exchange::Exchange(
               .minShuffleCompressionPageSizeBytes())},
       processSplits_{operatorCtx_->driverCtx()->driverId == 0},
       driverId_{driverCtx->driverId},
-      exchangeClient_{std::move(exchangeClient)} {}
+      exchangeClient_{
+          asInMemoryExchangeClient(exchangeClient, *exchangeNode)} {}
 
 void Exchange::addRemoteTaskIds(std::vector<std::string>& remoteTaskIds) {
   std::shuffle(std::begin(remoteTaskIds), std::end(remoteTaskIds), rng_);

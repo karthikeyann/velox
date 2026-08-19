@@ -100,6 +100,23 @@ CudfFromVelox::CudfFromVelox(
 
 void CudfFromVelox::doAddInput(RowVectorPtr input) {
   if (input->size() > 0) {
+    // A vector with fewer children than its schema has columns cannot be
+    // converted: velox permits it (unprojected columns), but a device-resident
+    // vector is childless while reporting a real row count, so such an input is
+    // a CudfVector arriving at a host-to-device boundary. Its predecessor's
+    // adapter reports producesGpuOutput=false while the operator emits
+    // CudfVectors. Caught here rather than below, where one batch would take the
+    // zero-column shortcut and silently drop every column while two or more
+    // would throw from childAt() instead.
+    VELOX_CHECK_EQ(
+        input->childrenSize(),
+        input->type()->size(),
+        "CudfFromVelox got {} children for a {}-column schema; the upstream "
+        "operator declares it does not produce GPU output but emitted a "
+        "device-resident vector",
+        input->childrenSize(),
+        input->type()->size());
+
     // Materialize lazy vectors
     for (auto& child : input->children()) {
       child->loadedVector();
@@ -157,7 +174,16 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
   // create a CudfVector directly with an empty table, preserving the
   // logical row count. This mirrors the zero-column handling in
   // CudfToVelox::doGetOutput().
-  if (input->childrenSize() == 0) {
+  //
+  // Keyed on the merged input's own schema, not on how many children the vector
+  // happens to carry. A childless vector with a column-bearing schema is a
+  // device-resident vector at a host boundary, not an empty projection, and
+  // taking this shortcut for it would drop every column while keeping the row
+  // count -- a silent wrong answer. doAddInput() rejects that case outright;
+  // this gate states the invariant. outputType_ cannot serve here either: it is
+  // the consuming node's output type, which is empty for a fused
+  // filter-then-project whose filter still needs the input's columns.
+  if (input->type()->size() == 0) {
     auto emptyTable = std::make_unique<cudf::table>();
     return std::make_shared<CudfVector>(
         input->pool(),

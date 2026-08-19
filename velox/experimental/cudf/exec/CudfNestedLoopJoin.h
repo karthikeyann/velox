@@ -207,12 +207,23 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   void doClose() override;
 
  private:
+  /// A join result together with its logical row count. The count is separate
+  /// because a table with no columns cannot report one, which happens whenever
+  /// the output projects nothing from either side.
+  struct JoinOutput {
+    std::unique_ptr<cudf::table> table;
+    cudf::size_type numRows{0};
+  };
+
   /// Joins a single probe batch against the build table. Uses cuDF cross_join
-  /// for regular unfiltered joins and a repeat path for zero-column builds.
-  /// Uses conditional_inner_join for filtered joins. Updates probeMatchedFlags_
-  /// for left/full joins and buildMatchedFlags_ for right/full joins.
-  std::unique_ptr<cudf::table> joinWithBuildBatch(
+  /// for regular unfiltered joins and a repeat/tile path when either side has
+  /// zero columns. Uses conditional_inner_join for filtered joins. Updates
+  /// probeMatchedFlags_ for left/full joins and buildMatchedFlags_ for
+  /// right/full joins. 'probeRows' is the probe batch's logical row count,
+  /// passed separately for the same reason 'buildRows' is.
+  JoinOutput joinWithBuildBatch(
       cudf::table_view probeTableView,
+      cudf::size_type probeRows,
       cudf::table_view buildView,
       cudf::size_type buildRows,
       rmm::cuda_stream_view stream);
@@ -222,13 +233,25 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   /// num_rows() == 0, so each probe row is repeated buildRows times.
   std::unique_ptr<cudf::table> crossJoinZeroColumnBuild(
       cudf::table_view probeView,
+      cudf::size_type probeRows,
       cudf::size_type buildRows,
+      rmm::cuda_stream_view stream);
+
+  /// Produces the cross-join output when the probe side has zero columns, the
+  /// mirror of crossJoinZeroColumnBuild. cudf::cross_join is probe-major, so
+  /// the build table is tiled probeRows times rather than repeated row by row:
+  /// repeating would pair the rows the other way round.
+  std::unique_ptr<cudf::table> crossJoinZeroColumnProbe(
+      cudf::table_view buildView,
+      cudf::size_type probeRows,
       rmm::cuda_stream_view stream);
 
   /// Emits probe rows that had no match across all build batches, with null
   /// build columns. Used for left/full joins after all build batches exhausted.
+  /// 'probeRows' is the probe batch's logical row count.
   std::unique_ptr<cudf::table> emitProbeMismatchRows(
       cudf::table_view probeTableView,
+      cudf::size_type probeRows,
       rmm::cuda_stream_view stream);
 
   /// Emits build rows that had no match across all probe inputs, with null

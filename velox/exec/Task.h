@@ -34,6 +34,7 @@
 namespace facebook::velox::exec {
 
 class OutputBufferManager;
+struct ExchangeTransportEntry;
 
 class HashJoinBridge;
 class IndexLookupJoinBridge;
@@ -1172,11 +1173,14 @@ class Task : public std::enable_shared_from_this<Task> {
 
   int getOutputPipelineId() const;
 
-  // Create an exchange client for the specified exchange plan node at a given
-  // pipeline.
+  // Creates an exchange client for the leaf plan node of a given pipeline.
+  // Resolves the transport 'planNode' names in ExchangeTransportRegistry and
+  // creates the client from that entry, keeping the entry so that the matching
+  // exchange operator can be built from it later. Fails if the transport is not
+  // registered.
   void createExchangeClientLocked(
       int32_t pipelineId,
-      const core::PlanNodeId& planNodeId,
+      const core::PlanNodePtr& planNode,
       int32_t numberOfConsumers);
 
   // Get a shared reference to the exchange client with the specified exchange
@@ -1195,6 +1199,11 @@ class Task : public std::enable_shared_from_this<Task> {
   // 'pipelineId'. The function returns null if there is no client created for
   // 'pipelineId' set in 'exchangeClients_'.
   std::shared_ptr<InMemoryExchangeClient> getExchangeClientLocked(
+      int32_t pipelineId) const;
+
+  // Returns the exchange transport entry resolved for 'pipelineId', or null if
+  // the pipeline does not read from an exchange.
+  std::shared_ptr<ExchangeTransportEntry> getExchangeTransportEntryLocked(
       int32_t pipelineId) const;
 
   // Builds the query trace config.
@@ -1308,6 +1317,13 @@ class Task : public std::enable_shared_from_this<Task> {
   // process remaining remote splits after the task has completed early.
   std::unordered_map<core::PlanNodeId, std::shared_ptr<InMemoryExchangeClient>>
       exchangeClientByPlanNode_;
+
+  // Exchange transport entries, indexed by pipeline ID like
+  // 'exchangeClients_'. Each entry created the client at the same index and
+  // carries the factories that build the matching exchange operators. Null for
+  // pipelines that don't read from an exchange.
+  std::vector<std::shared_ptr<ExchangeTransportEntry>>
+      exchangeTransportEntries_;
 
   // Pool of unique row ids shared by all AssignUniqueId operators in this task.
   // See uniqueRowIdPool().
