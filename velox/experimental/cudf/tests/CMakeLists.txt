@@ -300,6 +300,15 @@ velox_add_cudf_test(
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_window
 )
 
+velox_add_cudf_test(
+  NAME velox_cudf_kvikio_read_plan_test
+  SOURCES
+    Main.cpp
+    KvikioReadPlanTest.cpp
+    ${CMAKE_SOURCE_DIR}/velox/experimental/cudf/benchmarks/KvikioReadPlan.cpp
+  LIBS velox_exception velox_common_base
+)
+
 add_subdirectory(iceberg)
 add_subdirectory(utils)
 
