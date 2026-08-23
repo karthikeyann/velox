@@ -61,6 +61,35 @@ class RemoteTargets {
   std::vector<kvikio::RemoteHandle> handles_;
 };
 
+/// Reports what one timed pass over a read plan moved.
+struct RunResult {
+  /// Total payload bytes transferred.
+  uint64_t bytesRead{0};
+
+  /// Number of range requests issued by the benchmark. KvikIO may split each
+  /// of these further when a non-zero task size is in effect.
+  uint64_t numRequests{0};
+
+  /// Wall time of the pass, excluding target opening.
+  uint64_t elapsedMicros{0};
+};
+
+/// Issues every task in 'plan' and returns what the pass moved.
+///
+/// 'numThreads' reader threads each own one destination buffer of
+/// 'requestBytes' and pull tasks until the plan is exhausted. A
+/// 'kvikioTaskSize' of zero issues each task as a single range GET; any other
+/// value hands the task to KvikIO's thread pool split at that granularity.
+/// 'deviceMemory' selects a device rather than host destination, which for a
+/// remote source routes through KvikIO's bounce buffer.
+RunResult runPlan(
+    RemoteTargets& targets,
+    const std::vector<ReadTask>& plan,
+    int32_t numThreads,
+    uint64_t requestBytes,
+    uint64_t kvikioTaskSize,
+    bool deviceMemory);
+
 /// Reads a manifest from 'path'. Throws if the file is missing, unreadable,
 /// or yields no URIs.
 std::vector<std::string> readManifestFile(const std::string& path);

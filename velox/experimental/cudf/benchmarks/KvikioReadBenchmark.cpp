@@ -17,12 +17,20 @@
 #include "velox/experimental/cudf/benchmarks/KvikioReadBenchmark.h"
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/common/time/Timer.h"
+
+#include <cudf/utilities/error.hpp>
+
+#include <cuda_runtime.h>
 
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
 
+#include <atomic>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <thread>
 
 DEFINE_string(
     paths,
@@ -38,7 +46,62 @@ DEFINE_bool(
     false,
     "Open every target, print its size, and exit without reading payload.");
 
+DEFINE_string(
+    mode,
+    "cold",
+    "'cold' reads each byte at most once so nothing is served from a cache "
+    "this run populated. 'warm' re-reads at random offsets.");
+
+DEFINE_uint64(request_bytes, 8ULL << 20, "Size of each range request.");
+
+DEFINE_uint64(
+    measurement_bytes,
+    1ULL << 30,
+    "Total payload bytes to move in one run, summed across reader threads.");
+
+DEFINE_uint64(seed, 0, "Seed for warm-mode offset selection.");
+
 namespace facebook::velox::cudf_velox {
+
+namespace {
+
+// Owns one destination buffer, allocated on the host or the device.
+class ReadBuffer {
+ public:
+  ReadBuffer(uint64_t bytes, bool device) : device_{device} {
+    if (device_) {
+      CUDF_CUDA_TRY(cudaMalloc(&data_, bytes));
+    } else {
+      data_ = std::malloc(bytes);
+      VELOX_CHECK_NOT_NULL(
+          data_, "Failed to allocate host read buffer of {} bytes", bytes);
+    }
+  }
+
+  ~ReadBuffer() {
+    if (data_ == nullptr) {
+      return;
+    }
+    if (device_) {
+      static_cast<void>(cudaFree(data_));
+    } else {
+      std::free(data_);
+    }
+  }
+
+  ReadBuffer(const ReadBuffer&) = delete;
+  ReadBuffer& operator=(const ReadBuffer&) = delete;
+
+  void* data() const {
+    return data_;
+  }
+
+ private:
+  void* data_{nullptr};
+  bool device_{false};
+};
+
+} // namespace
 
 RemoteTargets::RemoteTargets(const std::vector<std::string>& uris) {
   infos_.reserve(uris.size());
@@ -61,6 +124,56 @@ uint64_t RemoteTargets::totalBytes() const {
     total += info.size;
   }
   return total;
+}
+
+RunResult runPlan(
+    RemoteTargets& targets,
+    const std::vector<ReadTask>& plan,
+    int32_t numThreads,
+    uint64_t requestBytes,
+    uint64_t kvikioTaskSize,
+    bool deviceMemory) {
+  VELOX_USER_CHECK_GT(numThreads, 0, "Reader thread count must be positive");
+
+  std::atomic<size_t> nextTask{0};
+  std::atomic<uint64_t> bytesRead{0};
+
+  RunResult result;
+  {
+    MicrosecondTimer timer(&result.elapsedMicros);
+    std::vector<std::thread> readers;
+    readers.reserve(numThreads);
+    for (int32_t i = 0; i < numThreads; ++i) {
+      readers.emplace_back([&]() {
+        ReadBuffer buffer{requestBytes, deviceMemory};
+        for (size_t index = nextTask.fetch_add(1); index < plan.size();
+             index = nextTask.fetch_add(1)) {
+          const auto& task = plan[index];
+          auto& handle = targets.handleAt(task.targetIndex);
+          const size_t got = kvikioTaskSize == 0
+              ? handle.read(buffer.data(), task.size, task.offset)
+              : handle
+                    .pread(
+                        buffer.data(), task.size, task.offset, kvikioTaskSize)
+                    .get();
+          VELOX_CHECK_EQ(
+              got,
+              task.size,
+              "Short read from {} at offset {}",
+              targets.infos()[task.targetIndex].uri,
+              task.offset);
+          bytesRead.fetch_add(got);
+        }
+      });
+    }
+    for (auto& reader : readers) {
+      reader.join();
+    }
+  }
+
+  result.bytesRead = bytesRead.load();
+  result.numRequests = plan.size();
+  return result;
 }
 
 std::vector<std::string> readManifestFile(const std::string& path) {
@@ -92,7 +205,45 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  std::cout << "Opened " << targets.infos().size() << " targets, "
-            << targets.totalBytes() << " bytes total" << std::endl;
+  VELOX_USER_CHECK(
+      FLAGS_mode == "cold" || FLAGS_mode == "warm",
+      "--mode must be 'cold' or 'warm', got: {}",
+      FLAGS_mode);
+  const auto mode = FLAGS_mode == "cold" ? ReadMode::kCold : ReadMode::kWarm;
+
+  const ReadPlanOptions options{
+      .mode = mode,
+      .requestBytes = FLAGS_request_bytes,
+      .measurementBytes = FLAGS_measurement_bytes,
+      .seed = FLAGS_seed,
+  };
+  const auto plan = makeReadPlan(targets.infos(), options);
+
+  const auto result = runPlan(
+      targets,
+      plan,
+      /*numThreads=*/1,
+      FLAGS_request_bytes,
+      /*kvikioTaskSize=*/0,
+      /*deviceMemory=*/false);
+
+  // Bytes per microsecond equals megabytes per second, matching the units
+  // velox_read_benchmark prints.
+  std::cout << fmt::format(
+                   "{:.1f} MB/s mode={} request={} threads={} "
+                   "kvikio_task_size={} kvikio_nthreads={} device={} "
+                   "bytes={} requests={} elapsed_s={:.3f}",
+                   static_cast<double>(result.bytesRead) /
+                       static_cast<double>(result.elapsedMicros),
+                   FLAGS_mode,
+                   FLAGS_request_bytes,
+                   1,
+                   0,
+                   0,
+                   false,
+                   result.bytesRead,
+                   result.numRequests,
+                   static_cast<double>(result.elapsedMicros) / 1'000'000.0)
+            << std::endl;
   return 0;
 }
