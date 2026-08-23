@@ -21,7 +21,9 @@
 
 #include <cudf/utilities/error.hpp>
 
+#include <kvikio/bounce_buffer.hpp>
 #include <kvikio/defaults.hpp>
+#include <kvikio/utils.hpp>
 
 #include <cuda_runtime.h>
 
@@ -29,6 +31,7 @@
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -232,6 +235,32 @@ RunResult runPlan(
     }
   }
 
+  // Force KvikIO's one-time dlopen of libcuda now. Every read begins by asking
+  // whether its destination is host memory, and that query is what loads the
+  // driver, so leaving it to the readers charges the load to the measured
+  // window.
+  static_cast<void>(kvikio::is_host_memory(buffers.front()->data()));
+
+  // Pre-warm KvikIO's pinned bounce-buffer pool. A remote source has no GDS
+  // path, so every device transfer stages through a pinned host buffer that
+  // the pool allocates lazily, holding one global mutex across the allocation,
+  // before the transfer starts. Left to the readers that cost lands inside the
+  // measured window and only on device mode, and releasing every reader at
+  // once maximizes the contention. Acquiring the buffers here and letting them
+  // destruct returns them to the pool's free stack, where the readers pop them
+  // for free.
+  if (deviceMemory) {
+    // With a non-zero task size the concurrent transfers are KvikIO's pool
+    // workers rather than the reader threads, so warm enough for either.
+    const size_t warmCount =
+        std::max<size_t>(numThreads, kvikio::defaults::thread_pool_nthreads());
+    std::vector<kvikio::CudaPinnedBounceBufferPool::Buffer> warmup;
+    warmup.reserve(warmCount);
+    for (size_t i = 0; i < warmCount; ++i) {
+      warmup.push_back(kvikio::CudaPinnedBounceBufferPool::instance().get());
+    }
+  }
+
   std::atomic<size_t> nextTask{0};
   std::atomic<uint64_t> bytesRead{0};
   std::mutex errorMutex;
@@ -240,8 +269,9 @@ RunResult runPlan(
   // Readers park on 'startGate' until the clock is running, so thread creation
   // stays outside the measured window and every reader starts together rather
   // than in creation order. 'finishGate' ends the window as the last reader
-  // stops, leaving thread teardown outside it too. 'aborted' releases parked
-  // readers without work when a later thread fails to start.
+  // stops, leaving thread teardown outside it too. 'aborted' drains the plan
+  // without work, both when a later thread fails to start and when a reader
+  // throws.
   std::latch startGate{1};
   std::latch finishGate{numThreads};
   std::atomic<bool> aborted{false};
@@ -274,6 +304,11 @@ RunResult runPlan(
             bytesRead.fetch_add(got);
           }
         } catch (...) {
+          // Stop the other readers as well. Against an endpoint that times out
+          // rather than refuses, each task still in the plan would otherwise
+          // burn the full KVIKIO_HTTP_TIMEOUT budget once per attempt, so a
+          // deep plan takes hours to surface the failure already in hand.
+          aborted.store(true);
           std::lock_guard<std::mutex> lock(errorMutex);
           if (!firstError) {
             firstError = std::current_exception();

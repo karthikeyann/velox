@@ -266,6 +266,12 @@ The results file lands in the current directory, which is inside the source
 tree if the sweep is launched from there. Set `RESULTS_FILE` to put it
 somewhere else.
 
+It opens with a `#`-commented header naming the manifest, the measurement size,
+the three axes swept, the pool width used and the cold-read caveat below. The
+benchmark's own warnings go to stderr and so are absent from the file; the
+header is what keeps the file interpretable once it has been copied off the
+machine.
+
 **Only the first run of a sweep is a true cold read.** Every run walks the same
 byte range from the start of the manifest, so later runs may be served from the
 S3 server's cache and read faster for that reason alone, even though every row
@@ -283,7 +289,7 @@ are counted. Trim the matrix through the environment:
 | `REQUEST_SIZES` | `1048576 4194304 8388608 16777216 67108864` | Range request sizes to sweep, in bytes |
 | `READER_THREADS` | `1 4 8 16 32` | Reader thread counts to sweep |
 | `TASK_SIZES` | `0 4194304` | KvikIO task sizes to sweep; `0` is one range GET per request |
-| `KVIKIO_NTHREADS` | the row's thread count | Width of KvikIO's internal pool |
+| `KVIKIO_NTHREADS` | the row's thread count | Width of KvikIO's internal pool, on `task_size != 0` rows only |
 | `DEVICE_MEMORY` | `false` | `true` reads into device memory |
 | `KVIKIO_BENCHMARK_BIN` | `_build/release/.../velox_cudf_kvikio_read_benchmark` | Path to the binary |
 | `RESULTS_FILE` | `./kvikio_sweep_<timestamp>.txt` | Where to tee the result lines |
@@ -294,10 +300,20 @@ REQUEST_SIZES="8388608" READER_THREADS="8 16" TASK_SIZES="0 4194304" \
   ./kvikio_sweep.sh /tmp/lineitem.manifest $((1024 * 1024 * 1024))
 ```
 
-By default the sweep passes `--kvikio_nthreads` equal to each row's reader
-thread count, because KvikIO's own default pool is one thread wide: with a
-non-zero task size and an unwidened pool, every reader queues behind a single
-worker and the whole `--reader_threads` axis measures one serialized stream.
+On rows with a non-zero task size the sweep passes `--kvikio_nthreads` equal to
+the row's reader thread count, because KvikIO's own default pool is one thread
+wide: with a non-zero task size and an unwidened pool, every reader queues
+behind a single worker and the whole `--reader_threads` axis measures one
+serialized stream. A `task_size=0` row never touches the pool, so the sweep
+leaves it at the KvikIO default and those rows print `kvikio_nthreads=1`.
+Reading `1` on a `task_size=0` row is not a misconfiguration; a widened pool
+there would only have printed a number that served no request.
+
+Each reader thread owns one destination buffer of `--request_bytes`, so the
+largest default row, 32 threads at 64 MiB, holds 2 GiB. In host mode that is
+resident RSS, first-touched before the clock starts; in device mode it is the
+same 2 GiB of VRAM. Raising both axes together is what runs a machine out of
+memory, not either one alone.
 
 ### Flags
 
@@ -326,14 +342,28 @@ redirecting stdout captures results only:
 ```
 
 - `kvikio_nthreads=` is the live pool width, not the flag. It reads `1` unless
-  `--kvikio_nthreads` or the `KVIKIO_NTHREADS` environment variable set it.
+  `--kvikio_nthreads` or the `KVIKIO_NTHREADS` environment variable set it, and
+  it is meaningful only when `kvikio_task_size=` is non-zero, since nothing
+  else uses the pool.
 - `requests=` counts the range requests the benchmark issued, which is not the
   number of range GETs. With a non-zero `--kvikio_task_size`, KvikIO splits
   each one into `ceil(size / task_size)` GETs, so per-request latency cannot be
   derived from `requests=` in that mode.
-- `elapsed_s=` covers transfers only. Opening the targets, allocating the
-  destination buffers, creating the CUDA context and starting and joining the
-  reader threads all happen outside it.
+- `elapsed_s=` covers the transfer loop, not the whole process. Deliberately
+  outside it: parsing the manifest and its HEAD request per target, building
+  the read plan, allocating and first-touching the destination buffers, the
+  CUDA primary context that the first device allocation creates, pre-warming
+  KvikIO's pinned bounce-buffer pool in device mode, loading the CUDA driver,
+  starting and joining the reader threads, and freeing the buffers.
+- Two costs are still inside `elapsed_s=`, and both make the first requests of
+  a run slower than its steady state. Opening the targets warms DNS and TLS
+  only for the calling thread's curl handle, so every reader thread pays its
+  own first DNS, TCP and TLS handshake in the window; this hits host and device
+  mode equally. In device mode each reader thread additionally pays for the one
+  CUDA stream KvikIO creates per thread on its first transfer, which is small
+  next to a handshake. Both argue for a longer run rather than a shorter one:
+  at a `--measurement_bytes` small enough that the ramp is a visible fraction
+  of the total, the reported figure sits below the sustained rate.
 
 Two conditions produce a number that is real but does not mean what the line
 says, so the run warns on stderr and continues:
@@ -357,6 +387,7 @@ the same ground:
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `KVIKIO_NTHREADS` | `1` | Width of KvikIO's internal thread pool. `--kvikio_nthreads` overrides it when non-zero |
+| `KVIKIO_NUM_THREADS` | `1` | Alias for `KVIKIO_NTHREADS`. Setting both to different values is an error |
 | `KVIKIO_TASK_SIZE` | 4 MiB | KvikIO's own split granularity. This binary always passes `--kvikio_task_size` explicitly, so the variable has no effect here |
 | `KVIKIO_BOUNCE_BUFFER_SIZE` | 16 MiB | Size of the pinned host buffer each device transfer stages through. `--kvikio_bounce_buffer_bytes` overrides it when non-zero |
 | `KVIKIO_HTTP_MAX_ATTEMPTS` | `3` | Attempts per transfer before KvikIO gives up |
