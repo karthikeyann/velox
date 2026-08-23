@@ -164,6 +164,8 @@ Read from the environment, because that is where KvikIO looks:
 ```bash
 export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
 export AWS_DEFAULT_REGION=us-east-1
+# Required when using temporary credentials from an IAM role, STS, or SSO.
+export AWS_SESSION_TOKEN=...
 # Only for a non-AWS S3 server such as MinIO.
 export AWS_ENDPOINT_URL=http://my-s3-host:9000
 ```
@@ -174,15 +176,25 @@ export AWS_ENDPOINT_URL=http://my-s3-host:9000
 lines starting with `#` are ignored.
 
 ```bash
+# From: _build/release/velox/experimental/cudf/benchmarks/
 ./velox_cudf_kvikio_read_benchmark \
   --paths=/tmp/lineitem.manifest \
   --mode=cold \
   --request_bytes=$((8 * 1024 * 1024)) \
   --measurement_bytes=$((4 * 1024 * 1024 * 1024)) \
   --reader_threads=16
+```
 
-# Sweep request size x threads x task size.
+Sweep request size × reader threads × KvikIO task size:
+
+```bash
+# From: velox/experimental/cudf/benchmarks/ (source tree)
+
+# Default: 4 GiB measurement.  The manifest must total at least 4 GiB.
 ./kvikio_sweep.sh /tmp/lineitem.manifest
+
+# Smaller manifest: pass measurement_bytes explicitly.
+./kvikio_sweep.sh /tmp/lineitem.manifest $((1 * 1024 * 1024 * 1024))
 ```
 
 ### Flags
