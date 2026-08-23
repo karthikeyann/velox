@@ -87,6 +87,13 @@ DEFINE_uint64(
     "Size of the bounce buffer KvikIO uses for device destinations. Zero "
     "leaves the KvikIO default in place.");
 
+DEFINE_bool(
+    device_memory,
+    false,
+    "Read into device rather than host memory. A remote source has no GDS "
+    "path, so this routes through KvikIO's bounce buffer and a "
+    "host-to-device copy.");
+
 namespace facebook::velox::cudf_velox {
 
 namespace {
@@ -206,7 +213,7 @@ RunResult runPlan(
           }
         });
       }
-    } catch (const std::system_error& e) {
+    } catch (const std::exception& e) {
       // Join every thread that started before the constructor failed so none
       // is destructed while joinable.
       for (auto& reader : readers) {
@@ -286,7 +293,7 @@ int main(int argc, char** argv) {
         FLAGS_reader_threads,
         FLAGS_request_bytes,
         FLAGS_kvikio_task_size,
-        /*deviceMemory=*/false);
+        FLAGS_device_memory);
 
     // Bytes per microsecond equals megabytes per second, matching the units
     // velox_read_benchmark prints. Guard against zero elapsed time so a
@@ -304,7 +311,7 @@ int main(int argc, char** argv) {
                      FLAGS_reader_threads,
                      FLAGS_kvikio_task_size,
                      kvikio::defaults::thread_pool_nthreads(),
-                     false,
+                     FLAGS_device_memory,
                      result.bytesRead,
                      result.numRequests,
                      static_cast<double>(result.elapsedMicros) / 1'000'000.0)
