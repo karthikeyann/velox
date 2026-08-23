@@ -10,6 +10,7 @@ Benchmark binaries for TPC-H and TPC-DS queries with optional CuDF GPU accelerat
 | `velox_cudf_tpch_benchmark` | TPC-H (Q1-Q22) | GPU | `CudfTpchBenchmark.cpp` |
 | `velox_tpcds_benchmark` | TPC-DS (Q1-Q99) | CPU | `velox/benchmarks/tpcds/` |
 | `velox_cudf_tpcds_benchmark` | TPC-DS (Q1-Q99) | GPU | `CudfTpcdsBenchmark.cpp` |
+| `velox_cudf_kvikio_read_benchmark` | Raw S3 read throughput | GPU/CPU | `KvikioReadBenchmark.cpp` |
 
 CPU binaries use HiveConnector. GPU binaries use CudfHiveConnector and register
 cuDF GPU operator replacements.
@@ -140,6 +141,79 @@ These flags apply to `velox_cudf_tpch_benchmark` and `velox_cudf_tpcds_benchmark
 | `--cudf_gpu_batch_size_rows` | `100000` | GPU batch size in rows |
 | `--velox_cudf_table_scan` | `true` | Use CuDF table scan |
 | `--cudf_properties` | `""` | Path to a CudfConfig properties file (key=value per line). See `CudfConfig.h` for available keys |
+
+---
+
+## KvikIO Read Benchmark
+
+Measures raw read throughput from S3 through `kvikio::RemoteHandle`, with no
+parquet decode. Use it to find the transport ceiling before asking how much of
+it the TPC-H scan reaches.
+
+### Build
+
+```bash
+CUDA_ARCHITECTURES="native" EXTRA_CMAKE_FLAGS="-DVELOX_ENABLE_BENCHMARKS=ON" make cudf
+cd _build/release && ninja velox_cudf_kvikio_read_benchmark
+```
+
+### Credentials
+
+Read from the environment, because that is where KvikIO looks:
+
+```bash
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+export AWS_DEFAULT_REGION=us-east-1
+# Only for a non-AWS S3 server such as MinIO.
+export AWS_ENDPOINT_URL=http://my-s3-host:9000
+```
+
+### Run
+
+`--paths` names a manifest holding one object URI per line; blank lines and
+lines starting with `#` are ignored.
+
+```bash
+./velox_cudf_kvikio_read_benchmark \
+  --paths=/tmp/lineitem.manifest \
+  --mode=cold \
+  --request_bytes=$((8 * 1024 * 1024)) \
+  --measurement_bytes=$((4 * 1024 * 1024 * 1024)) \
+  --reader_threads=16
+
+# Sweep request size x threads x task size.
+./kvikio_sweep.sh /tmp/lineitem.manifest
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--paths` | (required) | Manifest file of object URIs, one per line |
+| `--mode` | `cold` | `cold` reads each byte at most once; `warm` re-reads at random offsets |
+| `--request_bytes` | `8388608` | Size of each range request |
+| `--measurement_bytes` | `1073741824` | Total payload bytes per run |
+| `--reader_threads` | `8` | Concurrent readers, external to KvikIO |
+| `--kvikio_task_size` | `0` | `0` is one range GET per request; otherwise KvikIO's split granularity |
+| `--kvikio_nthreads` | `0` | Width of KvikIO's internal pool; `0` keeps the KvikIO default |
+| `--kvikio_bounce_buffer_bytes` | `0` | Bounce buffer size for device reads; `0` keeps the KvikIO default |
+| `--device_memory` | `false` | Read into device instead of host memory |
+| `--seed` | `0` | Seed for warm-mode offsets |
+| `--list_targets` | `false` | Print each target's size and exit without reading |
+
+### Interpreting the output
+
+One line per run, in the same MB/s units `velox_read_benchmark` prints, echoing
+the knobs it ran with:
+
+```
+1843.2 MB/s mode=cold request=8388608 threads=16 kvikio_task_size=0 kvikio_nthreads=8 device=false bytes=4294967296 requests=512 elapsed_s=2.330
+```
+
+Cold mode refuses to run when `--measurement_bytes` exceeds the manifest total,
+because wrapping around would serve the excess from the server's cache and
+report a warm result as a cold one. Either shrink the measurement or add
+objects to the manifest.
 
 ---
 
