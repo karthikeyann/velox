@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <thread>
 
 DEFINE_string(
@@ -137,6 +138,8 @@ RunResult runPlan(
 
   std::atomic<size_t> nextTask{0};
   std::atomic<uint64_t> bytesRead{0};
+  std::mutex errorMutex;
+  std::exception_ptr firstError;
 
   RunResult result;
   {
@@ -145,30 +148,41 @@ RunResult runPlan(
     readers.reserve(numThreads);
     for (int32_t i = 0; i < numThreads; ++i) {
       readers.emplace_back([&]() {
-        ReadBuffer buffer{requestBytes, deviceMemory};
-        for (size_t index = nextTask.fetch_add(1); index < plan.size();
-             index = nextTask.fetch_add(1)) {
-          const auto& task = plan[index];
-          auto& handle = targets.handleAt(task.targetIndex);
-          const size_t got = kvikioTaskSize == 0
-              ? handle.read(buffer.data(), task.size, task.offset)
-              : handle
-                    .pread(
-                        buffer.data(), task.size, task.offset, kvikioTaskSize)
-                    .get();
-          VELOX_CHECK_EQ(
-              got,
-              task.size,
-              "Short read from {} at offset {}",
-              targets.infos()[task.targetIndex].uri,
-              task.offset);
-          bytesRead.fetch_add(got);
+        try {
+          ReadBuffer buffer{requestBytes, deviceMemory};
+          for (size_t index = nextTask.fetch_add(1); index < plan.size();
+               index = nextTask.fetch_add(1)) {
+            const auto& task = plan[index];
+            VELOX_CHECK_LE(task.size, requestBytes);
+            auto& handle = targets.handleAt(task.targetIndex);
+            const size_t got = kvikioTaskSize == 0
+                ? handle.read(buffer.data(), task.size, task.offset)
+                : handle
+                      .pread(
+                          buffer.data(), task.size, task.offset, kvikioTaskSize)
+                      .get();
+            VELOX_CHECK_EQ(
+                got,
+                task.size,
+                "Short read from {} at offset {}",
+                targets.infos()[task.targetIndex].uri,
+                task.offset);
+            bytesRead.fetch_add(got);
+          }
+        } catch (...) {
+          std::lock_guard<std::mutex> lock(errorMutex);
+          if (!firstError) {
+            firstError = std::current_exception();
+          }
         }
       });
     }
     for (auto& reader : readers) {
       reader.join();
     }
+  }
+  if (firstError) {
+    std::rethrow_exception(firstError);
   }
 
   result.bytesRead = bytesRead.load();
@@ -228,13 +242,17 @@ int main(int argc, char** argv) {
       /*deviceMemory=*/false);
 
   // Bytes per microsecond equals megabytes per second, matching the units
-  // velox_read_benchmark prints.
+  // velox_read_benchmark prints. Guard against zero elapsed time so a
+  // degenerate or empty-plan run does not print "inf MB/s".
+  const double throughputMBs = result.elapsedMicros == 0
+      ? 0.0
+      : static_cast<double>(result.bytesRead) /
+          static_cast<double>(result.elapsedMicros);
   std::cout << fmt::format(
                    "{:.1f} MB/s mode={} request={} threads={} "
                    "kvikio_task_size={} kvikio_nthreads={} device={} "
                    "bytes={} requests={} elapsed_s={:.3f}",
-                   static_cast<double>(result.bytesRead) /
-                       static_cast<double>(result.elapsedMicros),
+                   throughputMBs,
                    FLAGS_mode,
                    FLAGS_request_bytes,
                    1,

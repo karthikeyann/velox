@@ -63,14 +63,14 @@ class RemoteTargets {
 
 /// Reports what one timed pass over a read plan moved.
 struct RunResult {
-  /// Total payload bytes transferred.
+  /// Holds the total payload bytes transferred.
   uint64_t bytesRead{0};
 
-  /// Number of range requests issued by the benchmark. KvikIO may split each
-  /// of these further when a non-zero task size is in effect.
+  /// Counts the range requests issued by the benchmark; KvikIO may split each
+  /// further when a non-zero task size is in effect.
   uint64_t numRequests{0};
 
-  /// Wall time of the pass, excluding target opening.
+  /// Records the wall time of the pass, excluding target opening.
   uint64_t elapsedMicros{0};
 };
 
