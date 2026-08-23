@@ -47,3 +47,18 @@ target_link_libraries(
   Folly::folly
   Folly::follybenchmark
 )
+
+# --- KvikIO remote read benchmark ---
+
+add_executable(velox_cudf_kvikio_read_benchmark KvikioReadBenchmark.cpp KvikioReadPlan.cpp)
+
+target_link_libraries(
+  velox_cudf_kvikio_read_benchmark
+  cudf::cudf
+  kvikio::kvikio
+  velox_common_base
+  velox_exception
+  velox_time
+  Folly::folly
+  gflags::gflags
+)
