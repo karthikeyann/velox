@@ -157,9 +157,13 @@ CUDA_ARCHITECTURES="native" EXTRA_CMAKE_FLAGS="-DVELOX_ENABLE_BENCHMARKS=ON" mak
 cd _build/release && ninja velox_cudf_kvikio_read_benchmark
 ```
 
+The binary lands in `_build/release/velox/experimental/cudf/benchmarks/`.
+
 ### Credentials
 
-Read from the environment, because that is where KvikIO looks:
+KvikIO reads credentials from these environment variables and from nowhere
+else. It never queries the EC2 instance metadata service, so an instance
+profile by itself leaves it unauthenticated:
 
 ```bash
 export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
@@ -170,13 +174,65 @@ export AWS_SESSION_TOKEN=...
 export AWS_ENDPOINT_URL=http://my-s3-host:9000
 ```
 
+On EC2, materialize the instance profile into the environment first (AWS CLI
+2.9 or newer):
+
+```bash
+eval "$(aws configure export-credentials --format env)"
+export AWS_DEFAULT_REGION=us-east-1  # The bucket's region.
+```
+
+The AWS CLI resolves instance-profile credentials on its own, so `aws s3 cp`
+succeeding on the same box says nothing about whether the benchmark can read
+the bucket. Only the exported variables above matter to it.
+
+Those exported keys are temporary. If a long sweep starts failing partway
+through, re-run the export and restart from the combination that failed.
+
+Missing credentials do not surface as an authentication error. KvikIO falls
+back to a public-bucket endpoint built from the original `s3://` URL, which
+libcurl cannot speak, so the first symptom is `Unsupported URL scheme` or a
+failed HEAD request. The benchmark's error message says as much.
+
+### Manifest
+
+`--paths` names a manifest holding one object URI per line. Blank lines and
+lines whose first non-whitespace character is `#` are ignored:
+
+```
+# TPC-H SF1000 lineitem, first three files.
+s3://my-bucket/tpch/sf1000/lineitem/part-00000.parquet
+s3://my-bucket/tpch/sf1000/lineitem/part-00001.parquet
+s3://my-bucket/tpch/sf1000/lineitem/part-00002.parquet
+```
+
+Generate one for a whole prefix:
+
+```bash
+aws s3 ls --recursive s3://my-bucket/tpch/sf1000/lineitem/ \
+  | awk '{print "s3://my-bucket/" $4}' > /tmp/lineitem.manifest
+```
+
 ### Run
 
-`--paths` names a manifest holding one object URI per line; blank lines and
-lines starting with `#` are ignored.
+Start with `--list_targets`. It opens every target and exits without moving
+payload, so it costs one HEAD request per object and no egress, which makes it
+the cheapest check that credentials, region and object paths are all right:
 
 ```bash
 # From: _build/release/velox/experimental/cudf/benchmarks/
+./velox_cudf_kvikio_read_benchmark \
+  --paths=/tmp/lineitem.manifest \
+  --list_targets
+```
+
+It prints one `<size>\t<uri>` line per target and a final `total_bytes=`. Cold
+mode refuses to read more than `total_bytes`, so that figure is also the upper
+bound on `--measurement_bytes`.
+
+Then take one measurement:
+
+```bash
 ./velox_cudf_kvikio_read_benchmark \
   --paths=/tmp/lineitem.manifest \
   --mode=cold \
@@ -185,7 +241,16 @@ lines starting with `#` are ignored.
   --reader_threads=16
 ```
 
-Sweep request size × reader threads × KvikIO task size:
+Opening the manifest takes one HEAD request per object and prints its progress
+to stderr, so a few hundred objects means tens of seconds before the transfer
+starts. That is not a hang.
+
+### Sweep
+
+`kvikio_sweep.sh` walks request size × reader threads × KvikIO task size,
+printing one result line per combination and teeing every line to a results
+file whose path it prints when it starts. One combination failing does not stop
+the sweep; the row is replaced by a `FAILED` line naming the combination.
 
 ```bash
 # From: velox/experimental/cudf/benchmarks/ (source tree)
@@ -197,35 +262,114 @@ Sweep request size × reader threads × KvikIO task size:
 ./kvikio_sweep.sh /tmp/lineitem.manifest $((1 * 1024 * 1024 * 1024))
 ```
 
+The results file lands in the current directory, which is inside the source
+tree if the sweep is launched from there. Set `RESULTS_FILE` to put it
+somewhere else.
+
+**Only the first run of a sweep is a true cold read.** Every run walks the same
+byte range from the start of the manifest, so later runs may be served from the
+S3 server's cache and read faster for that reason alone, even though every row
+prints `mode=cold`. Compare rows against each other; do not quote any single
+row as an absolute cold-read number. To make a specific row cold again, run it
+by itself against a manifest whose objects the machine has not touched.
+
+The default matrix is 5 request sizes × 5 thread counts × 2 task sizes, so 50
+runs. At the default 4 GiB per run that is 200 GiB of egress, and at a few
+GB/s the wall clock runs to an hour or more before the per-run HEAD requests
+are counted. Trim the matrix through the environment:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `REQUEST_SIZES` | `1048576 4194304 8388608 16777216 67108864` | Range request sizes to sweep, in bytes |
+| `READER_THREADS` | `1 4 8 16 32` | Reader thread counts to sweep |
+| `TASK_SIZES` | `0 4194304` | KvikIO task sizes to sweep; `0` is one range GET per request |
+| `KVIKIO_NTHREADS` | the row's thread count | Width of KvikIO's internal pool |
+| `DEVICE_MEMORY` | `false` | `true` reads into device memory |
+| `KVIKIO_BENCHMARK_BIN` | `_build/release/.../velox_cudf_kvikio_read_benchmark` | Path to the binary |
+| `RESULTS_FILE` | `./kvikio_sweep_<timestamp>.txt` | Where to tee the result lines |
+
+```bash
+# A four-run smoke sweep at 1 GiB each.
+REQUEST_SIZES="8388608" READER_THREADS="8 16" TASK_SIZES="0 4194304" \
+  ./kvikio_sweep.sh /tmp/lineitem.manifest $((1024 * 1024 * 1024))
+```
+
+By default the sweep passes `--kvikio_nthreads` equal to each row's reader
+thread count, because KvikIO's own default pool is one thread wide: with a
+non-zero task size and an unwidened pool, every reader queues behind a single
+worker and the whole `--reader_threads` axis measures one serialized stream.
+
 ### Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--paths` | (required) | Manifest file of object URIs, one per line |
+| `--list_targets` | `false` | Print each target's size and exit without reading |
 | `--mode` | `cold` | `cold` reads each byte at most once; `warm` re-reads at random offsets |
 | `--request_bytes` | `8388608` | Size of each range request |
 | `--measurement_bytes` | `1073741824` | Total payload bytes per run |
 | `--reader_threads` | `8` | Concurrent readers, external to KvikIO |
 | `--kvikio_task_size` | `0` | `0` is one range GET per request; otherwise KvikIO's split granularity |
-| `--kvikio_nthreads` | `0` | Width of KvikIO's internal pool; `0` keeps the KvikIO default |
+| `--kvikio_nthreads` | `0` | Width of KvikIO's internal pool; `0` keeps the KvikIO default of 1 |
 | `--kvikio_bounce_buffer_bytes` | `0` | Bounce buffer size for device reads; `0` keeps the KvikIO default |
 | `--device_memory` | `false` | Read into device instead of host memory |
 | `--seed` | `0` | Seed for warm-mode offsets |
-| `--list_targets` | `false` | Print each target's size and exit without reading |
 
 ### Interpreting the output
 
-One line per run, in the same MB/s units `velox_read_benchmark` prints, echoing
-the knobs it ran with:
+One line per run on stdout, in the same MB/s units `velox_read_benchmark`
+prints, echoing the knobs it ran with. Progress and warnings go to stderr, so
+redirecting stdout captures results only:
 
 ```
-1843.2 MB/s mode=cold request=8388608 threads=16 kvikio_task_size=0 kvikio_nthreads=8 device=false bytes=4294967296 requests=512 elapsed_s=2.330
+1843.2 MB/s mode=cold request=8388608 threads=16 kvikio_task_size=0 kvikio_nthreads=1 device=false bytes=4294967296 requests=512 elapsed_s=2.330
 ```
+
+- `kvikio_nthreads=` is the live pool width, not the flag. It reads `1` unless
+  `--kvikio_nthreads` or the `KVIKIO_NTHREADS` environment variable set it.
+- `requests=` counts the range requests the benchmark issued, which is not the
+  number of range GETs. With a non-zero `--kvikio_task_size`, KvikIO splits
+  each one into `ceil(size / task_size)` GETs, so per-request latency cannot be
+  derived from `requests=` in that mode.
+- `elapsed_s=` covers transfers only. Opening the targets, allocating the
+  destination buffers, creating the CUDA context and starting and joining the
+  reader threads all happen outside it.
+
+Two conditions produce a number that is real but does not mean what the line
+says, so the run warns on stderr and continues:
+
+- The KvikIO pool is one thread wide while a non-zero task size and more than
+  one reader thread are in play, which serializes the readers.
+- The plan holds fewer than four requests per reader thread, which measures
+  request latency and ramp rather than sustained throughput. Raise
+  `--measurement_bytes` or lower `--request_bytes`.
 
 Cold mode refuses to run when `--measurement_bytes` exceeds the manifest total,
 because wrapping around would serve the excess from the server's cache and
 report a warm result as a cold one. Either shrink the measurement or add
 objects to the manifest.
+
+### KvikIO environment variables
+
+These change throughput and are worth knowing about even where a flag covers
+the same ground:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `KVIKIO_NTHREADS` | `1` | Width of KvikIO's internal thread pool. `--kvikio_nthreads` overrides it when non-zero |
+| `KVIKIO_TASK_SIZE` | 4 MiB | KvikIO's own split granularity. This binary always passes `--kvikio_task_size` explicitly, so the variable has no effect here |
+| `KVIKIO_BOUNCE_BUFFER_SIZE` | 16 MiB | Size of the pinned host buffer each device transfer stages through. `--kvikio_bounce_buffer_bytes` overrides it when non-zero |
+| `KVIKIO_HTTP_MAX_ATTEMPTS` | `3` | Attempts per transfer before KvikIO gives up |
+| `KVIKIO_HTTP_TIMEOUT` | `60` | Per-transfer timeout, in seconds |
+
+KvikIO retries HTTP 429, 500, 502, 503 and 504 up to `KVIKIO_HTTP_MAX_ATTEMPTS`
+times, each with a `KVIKIO_HTTP_TIMEOUT` budget. S3 throttling therefore shows
+up as a low throughput figure rather than as an error, which is worth checking
+before believing a number that comes back well under the instance's network
+ceiling.
+
+The benchmark never calls `cudaSetDevice`, so on a multi-GPU instance
+`--device_memory=true` always reads into device 0.
 
 ---
 

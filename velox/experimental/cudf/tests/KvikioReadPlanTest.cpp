@@ -108,6 +108,22 @@ TEST(KvikioReadPlanTest, coldPlanRespectsMeasurementCap) {
   EXPECT_EQ(totalBytes(plan), 6);
 }
 
+TEST(KvikioReadPlanTest, coldPlanTruncatesRequestLargerThanTarget) {
+  const ReadPlanOptions options{
+      .mode = ReadMode::kCold,
+      .requestBytes = 4,
+      .measurementBytes = 3,
+      .seed = 0,
+  };
+
+  const auto plan = makeReadPlan({TargetInfo{"s3://bucket/tiny", 3}}, options);
+
+  // A request wider than the whole object yields one short task rather than a
+  // range running past the end of it.
+  EXPECT_THAT(
+      asTuples(plan), testing::ElementsAre(std::make_tuple(0UL, 0UL, 3UL)));
+}
+
 TEST(KvikioReadPlanTest, coldPlanRejectsMeasurementLargerThanManifest) {
   const ReadPlanOptions options{
       .mode = ReadMode::kCold,
@@ -134,9 +150,33 @@ TEST(KvikioReadPlanTest, warmPlanProducesRequestedVolume) {
   // Warm mode re-reads, so it is allowed to exceed the manifest size.
   EXPECT_EQ(totalBytes(plan), 100);
   for (const auto& task : plan) {
-    ASSERT_LT(task.targetIndex, 2);
+    EXPECT_LT(task.targetIndex, 2UL);
     const uint64_t targetSize = task.targetIndex == 0 ? 10 : 5;
     EXPECT_LE(task.offset + task.size, targetSize);
+  }
+}
+
+TEST(KvikioReadPlanTest, warmPlanSkipsZeroSizeTargets) {
+  const std::vector<TargetInfo> targets{
+      TargetInfo{"s3://bucket/empty", 0},
+      TargetInfo{"s3://bucket/b", 8},
+      TargetInfo{"s3://bucket/also-empty", 0},
+  };
+  const ReadPlanOptions options{
+      .mode = ReadMode::kWarm,
+      .requestBytes = 4,
+      .measurementBytes = 32,
+      .seed = 7,
+  };
+
+  const auto plan = makeReadPlan(targets, options);
+
+  // Drawing an empty target redraws instead of emitting a zero-byte task,
+  // which is what stops the draw loop from spinning without making progress.
+  EXPECT_EQ(totalBytes(plan), 32);
+  for (const auto& task : plan) {
+    EXPECT_EQ(task.targetIndex, 1UL);
+    EXPECT_LE(task.offset + task.size, 8UL);
   }
 }
 

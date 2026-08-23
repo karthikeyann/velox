@@ -34,14 +34,6 @@ std::string trim(const std::string& line) {
   return line.substr(begin, end - begin + 1);
 }
 
-uint64_t sumSizes(const std::vector<TargetInfo>& targets) {
-  uint64_t total{0};
-  for (const auto& target : targets) {
-    total += target.size;
-  }
-  return total;
-}
-
 std::vector<ReadTask> makeColdPlan(
     const std::vector<TargetInfo>& targets,
     const ReadPlanOptions& options,
@@ -118,6 +110,14 @@ std::vector<std::string> parseManifest(std::istream& in) {
   return uris;
 }
 
+uint64_t totalTargetBytes(const std::vector<TargetInfo>& targets) {
+  uint64_t total{0};
+  for (const auto& target : targets) {
+    total += target.size;
+  }
+  return total;
+}
+
 std::vector<ReadTask> makeReadPlan(
     const std::vector<TargetInfo>& targets,
     const ReadPlanOptions& options) {
@@ -128,7 +128,7 @@ std::vector<ReadTask> makeReadPlan(
       0,
       "Measurement size must be greater than zero");
 
-  const uint64_t availableBytes = sumSizes(targets);
+  const uint64_t availableBytes = totalTargetBytes(targets);
   VELOX_USER_CHECK_GT(
       availableBytes,
       0,

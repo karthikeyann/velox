@@ -21,15 +21,21 @@
 
 #include <cudf/utilities/error.hpp>
 
+#include <kvikio/defaults.hpp>
+
 #include <cuda_runtime.h>
 
+#include <fmt/format.h>
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
 
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
+#include <latch>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -39,8 +45,9 @@ DEFINE_string(
     "Path to a manifest file holding one object URI per line. Blank lines "
     "and lines starting with '#' are ignored. Credentials come from the "
     "AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION and "
-    "AWS_SESSION_TOKEN environment variables; set AWS_ENDPOINT_URL to target "
-    "a non-AWS S3 server.");
+    "AWS_SESSION_TOKEN environment variables and from nowhere else, not from "
+    "the EC2 instance metadata service; set AWS_ENDPOINT_URL to target a "
+    "non-AWS S3 server.");
 
 DEFINE_bool(
     list_targets,
@@ -78,8 +85,9 @@ DEFINE_uint64(
 DEFINE_int32(
     kvikio_nthreads,
     0,
-    "Width of KvikIO's internal thread pool. Zero leaves the KvikIO default "
-    "in place.");
+    "Width of KvikIO's internal thread pool, which serves --kvikio_task_size "
+    "splits. Zero leaves the KvikIO default in place, and that default is one "
+    "thread unless KVIKIO_NTHREADS says otherwise.");
 
 DEFINE_uint64(
     kvikio_bounce_buffer_bytes,
@@ -134,11 +142,47 @@ class ReadBuffer {
   bool device_{false};
 };
 
+// Warns when KvikIO's thread pool is narrower than the reader concurrency it
+// has to serve. The combination is legal but almost never intended: every
+// reader queues behind the same worker, so the run measures one serialized
+// stream while still reporting the requested thread count.
+void warnIfKvikioPoolSerializesReaders(
+    int32_t numThreads,
+    uint64_t kvikioTaskSize) {
+  if (kvikioTaskSize == 0 || numThreads <= 1 ||
+      kvikio::defaults::thread_pool_nthreads() > 1) {
+    return;
+  }
+  std::cerr << "Warning: --kvikio_task_size is non-zero and KvikIO's thread "
+               "pool is one thread wide, so all "
+            << numThreads
+            << " reader threads serialize through a single worker and this "
+               "run measures a single stream. Pass --kvikio_nthreads to widen "
+               "the pool."
+            << std::endl;
+}
+
+// Warns when the plan holds too few requests to keep every reader busy past
+// the ramp, in which case the run reports request latency rather than the
+// sustained throughput its thread count implies.
+void warnIfPlanTooShallow(size_t planSize, int32_t numThreads) {
+  if (planSize >= 4 * static_cast<size_t>(numThreads)) {
+    return;
+  }
+  std::cerr << "Warning: the plan holds " << planSize << " requests for "
+            << numThreads
+            << " reader threads, fewer than four each, so this run reports "
+               "request latency and ramp rather than sustained throughput. "
+               "Raise --measurement_bytes or lower --request_bytes."
+            << std::endl;
+}
+
 } // namespace
 
 RemoteTargets::RemoteTargets(const std::vector<std::string>& uris) {
   infos_.reserve(uris.size());
   handles_.reserve(uris.size());
+  std::cerr << "Opening " << uris.size() << " remote targets..." << std::endl;
   for (const auto& uri : uris) {
     try {
       auto handle = kvikio::RemoteHandle::open(uri);
@@ -146,17 +190,21 @@ RemoteTargets::RemoteTargets(const std::vector<std::string>& uris) {
       handles_.push_back(std::move(handle));
     } catch (const std::exception& e) {
       VELOX_USER_FAIL(
-          "Failed to open remote target. URI: {}, error: {}", uri, e.what());
+          "Failed to open remote target. KvikIO reads credentials only from "
+          "the AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and "
+          "AWS_DEFAULT_REGION environment variables, plus AWS_SESSION_TOKEN "
+          "for temporary keys; it never queries the EC2 instance metadata "
+          "service, so an instance profile alone leaves it unauthenticated. "
+          "Missing credentials surface here as an unsupported-protocol or "
+          "HEAD failure rather than as an authentication error, because "
+          "KvikIO falls back to its public-bucket endpoint. URI: {}, error: "
+          "{}",
+          uri,
+          e.what());
     }
   }
-}
-
-uint64_t RemoteTargets::totalBytes() const {
-  uint64_t total{0};
-  for (const auto& info : infos_) {
-    total += info.size;
-  }
-  return total;
+  std::cerr << "Opened " << infos_.size() << " remote targets holding "
+            << totalBytes() << " bytes." << std::endl;
 }
 
 RunResult runPlan(
@@ -167,63 +215,96 @@ RunResult runPlan(
     uint64_t kvikioTaskSize,
     bool deviceMemory) {
   VELOX_USER_CHECK_GT(numThreads, 0, "Reader thread count must be positive");
+  warnIfKvikioPoolSerializesReaders(numThreads, kvikioTaskSize);
+  warnIfPlanTooShallow(plan.size(), numThreads);
+
+  // Allocate and first-touch every destination up front. In device mode the
+  // first cudaMalloc creates the CUDA primary context, and a host buffer takes
+  // a page fault per page on first write; both are startup costs rather than
+  // transfer costs, and the former lands only on device mode, biasing the very
+  // comparison --device_memory exists to make.
+  std::vector<std::unique_ptr<ReadBuffer>> buffers;
+  buffers.reserve(numThreads);
+  for (int32_t i = 0; i < numThreads; ++i) {
+    buffers.push_back(std::make_unique<ReadBuffer>(requestBytes, deviceMemory));
+    if (!deviceMemory) {
+      std::memset(buffers.back()->data(), 0, requestBytes);
+    }
+  }
 
   std::atomic<size_t> nextTask{0};
   std::atomic<uint64_t> bytesRead{0};
   std::mutex errorMutex;
   std::exception_ptr firstError;
 
-  RunResult result;
-  {
-    MicrosecondTimer timer(&result.elapsedMicros);
-    std::vector<std::thread> readers;
-    readers.reserve(numThreads);
-    try {
-      for (int32_t i = 0; i < numThreads; ++i) {
-        readers.emplace_back([&]() {
-          try {
-            ReadBuffer buffer{requestBytes, deviceMemory};
-            for (size_t index = nextTask.fetch_add(1); index < plan.size();
-                 index = nextTask.fetch_add(1)) {
-              const auto& task = plan[index];
-              VELOX_CHECK_LE(task.size, requestBytes);
-              auto& handle = targets.handleAt(task.targetIndex);
-              const size_t got = kvikioTaskSize == 0
-                  ? handle.read(buffer.data(), task.size, task.offset)
-                  : handle
-                        .pread(
-                            buffer.data(),
-                            task.size,
-                            task.offset,
-                            kvikioTaskSize)
-                        .get();
-              VELOX_CHECK_EQ(
-                  got,
-                  task.size,
-                  "Short read from {} at offset {}",
-                  targets.infos()[task.targetIndex].uri,
-                  task.offset);
-              bytesRead.fetch_add(got);
+  // Readers park on 'startGate' until the clock is running, so thread creation
+  // stays outside the measured window and every reader starts together rather
+  // than in creation order. 'finishGate' ends the window as the last reader
+  // stops, leaving thread teardown outside it too. 'aborted' releases parked
+  // readers without work when a later thread fails to start.
+  std::latch startGate{1};
+  std::latch finishGate{numThreads};
+  std::atomic<bool> aborted{false};
+
+  std::vector<std::thread> readers;
+  readers.reserve(numThreads);
+  try {
+    for (int32_t i = 0; i < numThreads; ++i) {
+      readers.emplace_back([&, buffer = buffers[i]->data()]() {
+        try {
+          startGate.wait();
+          while (!aborted.load()) {
+            const size_t index = nextTask.fetch_add(1);
+            if (index >= plan.size()) {
+              break;
             }
-          } catch (...) {
-            std::lock_guard<std::mutex> lock(errorMutex);
-            if (!firstError) {
-              firstError = std::current_exception();
-            }
+            const auto& task = plan[index];
+            VELOX_CHECK_LE(task.size, requestBytes);
+            auto& handle = targets.handleAt(task.targetIndex);
+            const size_t got = kvikioTaskSize == 0
+                ? handle.read(buffer, task.size, task.offset)
+                : handle.pread(buffer, task.size, task.offset, kvikioTaskSize)
+                      .get();
+            VELOX_CHECK_EQ(
+                got,
+                task.size,
+                "Short read from {} at offset {}",
+                targets.infos()[task.targetIndex].uri,
+                task.offset);
+            bytesRead.fetch_add(got);
           }
-        });
-      }
-    } catch (const std::exception& e) {
-      // Join every thread that started before the constructor failed so none
-      // is destructed while joinable.
-      for (auto& reader : readers) {
-        reader.join();
-      }
-      VELOX_FAIL("Failed to create reader thread: {}", e.what());
+        } catch (...) {
+          std::lock_guard<std::mutex> lock(errorMutex);
+          if (!firstError) {
+            firstError = std::current_exception();
+          }
+        }
+        // Counted down on every path, including failure, so the caller's wait
+        // always completes.
+        finishGate.count_down();
+      });
     }
+  } catch (const std::exception& e) {
+    // Release every thread that did start, without work since the run is
+    // already abandoned, so none is destructed while joinable. Nothing waits
+    // on 'finishGate' here, so the readers that were never created cannot
+    // stall the join.
+    aborted.store(true);
+    startGate.count_down();
     for (auto& reader : readers) {
       reader.join();
     }
+    VELOX_FAIL("Failed to create reader thread: {}", e.what());
+  }
+
+  RunResult result;
+  {
+    MicrosecondTimer timer(&result.elapsedMicros);
+    startGate.count_down();
+    finishGate.wait();
+  }
+  for (auto& reader : readers) {
+    reader.join();
   }
   if (firstError) {
     std::rethrow_exception(firstError);
@@ -263,6 +344,13 @@ int main(int argc, char** argv) {
     }
 
     VELOX_USER_CHECK(!FLAGS_paths.empty(), "--paths is required");
+    // Reject a bad mode before opening anything, so a typo costs no HEAD
+    // requests and --list_targets cannot accept one silently.
+    VELOX_USER_CHECK(
+        FLAGS_mode == "cold" || FLAGS_mode == "warm",
+        "--mode must be 'cold' or 'warm', got: {}",
+        FLAGS_mode);
+
     RemoteTargets targets{readManifestFile(FLAGS_paths)};
 
     if (FLAGS_list_targets) {
@@ -273,10 +361,6 @@ int main(int argc, char** argv) {
       return 0;
     }
 
-    VELOX_USER_CHECK(
-        FLAGS_mode == "cold" || FLAGS_mode == "warm",
-        "--mode must be 'cold' or 'warm', got: {}",
-        FLAGS_mode);
     const auto mode = FLAGS_mode == "cold" ? ReadMode::kCold : ReadMode::kWarm;
 
     const ReadPlanOptions options{
@@ -295,17 +379,23 @@ int main(int argc, char** argv) {
         FLAGS_kvikio_task_size,
         FLAGS_device_memory);
 
+    // Reporting a throughput for an unmeasurably short run would be a
+    // confident wrong answer, so refuse rather than divide by zero.
+    VELOX_CHECK_GT(
+        result.elapsedMicros,
+        0,
+        "Run finished in under a microsecond, so it has no throughput to "
+        "report. Raise --measurement_bytes. Bytes read: {}",
+        result.bytesRead);
+
     // Bytes per microsecond equals megabytes per second, matching the units
-    // velox_read_benchmark prints. Guard against zero elapsed time so a
-    // degenerate or empty-plan run does not print "inf MB/s".
+    // velox_read_benchmark prints.
     std::cout << fmt::format(
                      "{:.1f} MB/s mode={} request={} threads={} "
                      "kvikio_task_size={} kvikio_nthreads={} device={} "
                      "bytes={} requests={} elapsed_s={:.3f}",
-                     result.elapsedMicros == 0
-                         ? 0.0
-                         : static_cast<double>(result.bytesRead) /
-                             static_cast<double>(result.elapsedMicros),
+                     static_cast<double>(result.bytesRead) /
+                         static_cast<double>(result.elapsedMicros),
                      FLAGS_mode,
                      FLAGS_request_bytes,
                      FLAGS_reader_threads,

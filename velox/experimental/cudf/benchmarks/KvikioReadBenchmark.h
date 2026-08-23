@@ -18,7 +18,6 @@
 
 #include "velox/experimental/cudf/benchmarks/KvikioReadPlan.h"
 
-#include <kvikio/defaults.hpp>
 #include <kvikio/remote_handle.hpp>
 
 #include <string>
@@ -33,8 +32,11 @@ namespace facebook::velox::cudf_velox {
 /// thread pool, with every task calling `read()` on the same handle.
 class RemoteTargets {
  public:
-  /// Opens each URI in order. Opening also resolves DNS and completes the TLS
-  /// handshake, keeping that cost out of the measured window.
+  /// Opens each URI in order, reporting progress to stderr because a manifest
+  /// of a few hundred objects spends tens of seconds here. Opening warms DNS
+  /// and TLS only for the curl handle of the calling thread, so every reader
+  /// thread still pays a handshake inside the measured window and the first
+  /// requests of a run are slower than the steady state.
   ///
   /// Throws naming the offending URI if any target fails to open, rather than
   /// dropping it, because a shorter manifest changes what a run measures
@@ -52,7 +54,9 @@ class RemoteTargets {
   }
 
   /// Returns the combined size of every target.
-  uint64_t totalBytes() const;
+  uint64_t totalBytes() const {
+    return totalTargetBytes(infos_);
+  }
 
  private:
   // URI and size per target, parallel to handles_.
@@ -83,6 +87,15 @@ struct RunResult {
 /// value hands the task to KvikIO's thread pool split at that granularity.
 /// 'deviceMemory' selects a device rather than host destination, which for a
 /// remote source routes through KvikIO's bounce buffer.
+///
+/// Allocates and first-touches every buffer, and creates and joins every
+/// thread, outside the measured window, so the reported time covers transfers
+/// alone. In device mode that also keeps CUDA primary context creation out of
+/// the window, which would otherwise be charged to device mode only.
+///
+/// Warns to stderr, without failing, when the configuration cannot deliver the
+/// concurrency it names: a KvikIO thread pool too narrow to serve the readers,
+/// or a plan too short to keep them all busy.
 RunResult runPlan(
     RemoteTargets& targets,
     const std::vector<ReadTask>& plan,

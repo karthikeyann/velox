@@ -75,6 +75,9 @@ struct ReadPlanOptions {
 /// whitespace from the rest.
 std::vector<std::string> parseManifest(std::istream& in);
 
+/// Returns the combined size of every target in 'targets'.
+uint64_t totalTargetBytes(const std::vector<TargetInfo>& targets);
+
 /// Builds the sequence of range requests to issue against 'targets'.
 ///
 /// Cold mode emits pairwise disjoint tasks in target order, so no byte is
