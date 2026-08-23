@@ -18,6 +18,7 @@
 
 #include "velox/experimental/cudf/benchmarks/KvikioReadPlan.h"
 
+#include <kvikio/defaults.hpp>
 #include <kvikio/remote_handle.hpp>
 
 #include <string>

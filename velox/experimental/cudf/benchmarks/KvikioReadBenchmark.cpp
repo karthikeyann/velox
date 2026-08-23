@@ -62,6 +62,31 @@ DEFINE_uint64(
 
 DEFINE_uint64(seed, 0, "Seed for warm-mode offset selection.");
 
+DEFINE_int32(
+    reader_threads,
+    8,
+    "Number of reader threads, each issuing its own range requests. This is "
+    "concurrency external to KvikIO and is independent of "
+    "--kvikio_task_size.");
+
+DEFINE_uint64(
+    kvikio_task_size,
+    0,
+    "Zero issues each request as one range GET. Any other value hands the "
+    "request to KvikIO's thread pool, split at this granularity.");
+
+DEFINE_int32(
+    kvikio_nthreads,
+    0,
+    "Width of KvikIO's internal thread pool. Zero leaves the KvikIO default "
+    "in place.");
+
+DEFINE_uint64(
+    kvikio_bounce_buffer_bytes,
+    0,
+    "Size of the bounce buffer KvikIO uses for device destinations. Zero "
+    "leaves the KvikIO default in place.");
+
 namespace facebook::velox::cudf_velox {
 
 namespace {
@@ -146,36 +171,48 @@ RunResult runPlan(
     MicrosecondTimer timer(&result.elapsedMicros);
     std::vector<std::thread> readers;
     readers.reserve(numThreads);
-    for (int32_t i = 0; i < numThreads; ++i) {
-      readers.emplace_back([&]() {
-        try {
-          ReadBuffer buffer{requestBytes, deviceMemory};
-          for (size_t index = nextTask.fetch_add(1); index < plan.size();
-               index = nextTask.fetch_add(1)) {
-            const auto& task = plan[index];
-            VELOX_CHECK_LE(task.size, requestBytes);
-            auto& handle = targets.handleAt(task.targetIndex);
-            const size_t got = kvikioTaskSize == 0
-                ? handle.read(buffer.data(), task.size, task.offset)
-                : handle
-                      .pread(
-                          buffer.data(), task.size, task.offset, kvikioTaskSize)
-                      .get();
-            VELOX_CHECK_EQ(
-                got,
-                task.size,
-                "Short read from {} at offset {}",
-                targets.infos()[task.targetIndex].uri,
-                task.offset);
-            bytesRead.fetch_add(got);
+    try {
+      for (int32_t i = 0; i < numThreads; ++i) {
+        readers.emplace_back([&]() {
+          try {
+            ReadBuffer buffer{requestBytes, deviceMemory};
+            for (size_t index = nextTask.fetch_add(1); index < plan.size();
+                 index = nextTask.fetch_add(1)) {
+              const auto& task = plan[index];
+              VELOX_CHECK_LE(task.size, requestBytes);
+              auto& handle = targets.handleAt(task.targetIndex);
+              const size_t got = kvikioTaskSize == 0
+                  ? handle.read(buffer.data(), task.size, task.offset)
+                  : handle
+                        .pread(
+                            buffer.data(),
+                            task.size,
+                            task.offset,
+                            kvikioTaskSize)
+                        .get();
+              VELOX_CHECK_EQ(
+                  got,
+                  task.size,
+                  "Short read from {} at offset {}",
+                  targets.infos()[task.targetIndex].uri,
+                  task.offset);
+              bytesRead.fetch_add(got);
+            }
+          } catch (...) {
+            std::lock_guard<std::mutex> lock(errorMutex);
+            if (!firstError) {
+              firstError = std::current_exception();
+            }
           }
-        } catch (...) {
-          std::lock_guard<std::mutex> lock(errorMutex);
-          if (!firstError) {
-            firstError = std::current_exception();
-          }
-        }
-      });
+        });
+      }
+    } catch (const std::system_error& e) {
+      // Join every thread that started before the constructor failed so none
+      // is destructed while joinable.
+      for (auto& reader : readers) {
+        reader.join();
+      }
+      VELOX_FAIL("Failed to create reader thread: {}", e.what());
     }
     for (auto& reader : readers) {
       reader.join();
@@ -206,62 +243,75 @@ int main(int argc, char** argv) {
       "Run with --helpon=KvikioReadBenchmark for the full flag list.");
   folly::Init init{&argc, &argv, false};
 
-  using namespace facebook::velox::cudf_velox;
+  try {
+    using namespace facebook::velox::cudf_velox;
 
-  VELOX_USER_CHECK(!FLAGS_paths.empty(), "--paths is required");
-  RemoteTargets targets{readManifestFile(FLAGS_paths)};
-
-  if (FLAGS_list_targets) {
-    for (const auto& info : targets.infos()) {
-      std::cout << info.size << '\t' << info.uri << std::endl;
+    if (FLAGS_kvikio_nthreads > 0) {
+      kvikio::defaults::set_thread_pool_nthreads(
+          static_cast<unsigned int>(FLAGS_kvikio_nthreads));
     }
-    std::cout << "total_bytes=" << targets.totalBytes() << std::endl;
+    if (FLAGS_kvikio_bounce_buffer_bytes > 0) {
+      kvikio::defaults::set_bounce_buffer_size(
+          FLAGS_kvikio_bounce_buffer_bytes);
+    }
+
+    VELOX_USER_CHECK(!FLAGS_paths.empty(), "--paths is required");
+    RemoteTargets targets{readManifestFile(FLAGS_paths)};
+
+    if (FLAGS_list_targets) {
+      for (const auto& info : targets.infos()) {
+        std::cout << info.size << '\t' << info.uri << std::endl;
+      }
+      std::cout << "total_bytes=" << targets.totalBytes() << std::endl;
+      return 0;
+    }
+
+    VELOX_USER_CHECK(
+        FLAGS_mode == "cold" || FLAGS_mode == "warm",
+        "--mode must be 'cold' or 'warm', got: {}",
+        FLAGS_mode);
+    const auto mode = FLAGS_mode == "cold" ? ReadMode::kCold : ReadMode::kWarm;
+
+    const ReadPlanOptions options{
+        .mode = mode,
+        .requestBytes = FLAGS_request_bytes,
+        .measurementBytes = FLAGS_measurement_bytes,
+        .seed = FLAGS_seed,
+    };
+    const auto plan = makeReadPlan(targets.infos(), options);
+
+    const auto result = runPlan(
+        targets,
+        plan,
+        FLAGS_reader_threads,
+        FLAGS_request_bytes,
+        FLAGS_kvikio_task_size,
+        /*deviceMemory=*/false);
+
+    // Bytes per microsecond equals megabytes per second, matching the units
+    // velox_read_benchmark prints. Guard against zero elapsed time so a
+    // degenerate or empty-plan run does not print "inf MB/s".
+    std::cout << fmt::format(
+                     "{:.1f} MB/s mode={} request={} threads={} "
+                     "kvikio_task_size={} kvikio_nthreads={} device={} "
+                     "bytes={} requests={} elapsed_s={:.3f}",
+                     result.elapsedMicros == 0
+                         ? 0.0
+                         : static_cast<double>(result.bytesRead) /
+                             static_cast<double>(result.elapsedMicros),
+                     FLAGS_mode,
+                     FLAGS_request_bytes,
+                     FLAGS_reader_threads,
+                     FLAGS_kvikio_task_size,
+                     kvikio::defaults::thread_pool_nthreads(),
+                     false,
+                     result.bytesRead,
+                     result.numRequests,
+                     static_cast<double>(result.elapsedMicros) / 1'000'000.0)
+              << std::endl;
     return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "velox_cudf_kvikio_read_benchmark: " << e.what() << "\n";
+    return 1;
   }
-
-  VELOX_USER_CHECK(
-      FLAGS_mode == "cold" || FLAGS_mode == "warm",
-      "--mode must be 'cold' or 'warm', got: {}",
-      FLAGS_mode);
-  const auto mode = FLAGS_mode == "cold" ? ReadMode::kCold : ReadMode::kWarm;
-
-  const ReadPlanOptions options{
-      .mode = mode,
-      .requestBytes = FLAGS_request_bytes,
-      .measurementBytes = FLAGS_measurement_bytes,
-      .seed = FLAGS_seed,
-  };
-  const auto plan = makeReadPlan(targets.infos(), options);
-
-  const auto result = runPlan(
-      targets,
-      plan,
-      /*numThreads=*/1,
-      FLAGS_request_bytes,
-      /*kvikioTaskSize=*/0,
-      /*deviceMemory=*/false);
-
-  // Bytes per microsecond equals megabytes per second, matching the units
-  // velox_read_benchmark prints. Guard against zero elapsed time so a
-  // degenerate or empty-plan run does not print "inf MB/s".
-  const double throughputMBs = result.elapsedMicros == 0
-      ? 0.0
-      : static_cast<double>(result.bytesRead) /
-          static_cast<double>(result.elapsedMicros);
-  std::cout << fmt::format(
-                   "{:.1f} MB/s mode={} request={} threads={} "
-                   "kvikio_task_size={} kvikio_nthreads={} device={} "
-                   "bytes={} requests={} elapsed_s={:.3f}",
-                   throughputMBs,
-                   FLAGS_mode,
-                   FLAGS_request_bytes,
-                   1,
-                   0,
-                   0,
-                   false,
-                   result.bytesRead,
-                   result.numRequests,
-                   static_cast<double>(result.elapsedMicros) / 1'000'000.0)
-            << std::endl;
-  return 0;
 }
