@@ -107,8 +107,19 @@ so an oversubscribed configuration fails immediately rather than partway
 through a run.
 
 KvikIO allocates a pinned host bounce buffer per concurrent device transfer,
-16 MiB by default (`defaults.cpp:123`, `KVIKIO_BOUNCE_BUFFER_SIZE`), so a wide
-pool in device mode reserves `kvikio_nthreads x 16 MiB` of pinned host memory.
+16 MiB by default (`defaults.cpp:123`, `KVIKIO_BOUNCE_BUFFER_SIZE`). In device
+mode the benchmark pre-warms `max(reader_threads, kvikio_nthreads)` of them
+before the clock starts, so budget that many times 16 MiB of pinned host
+memory.
+
+The pre-warm exists because those allocations are otherwise made lazily on the
+first device transfer, inside the timed region, serialized behind one global
+mutex in `BounceBufferPool::get()`. Measured on an RTX 5880 Ada, that cost
+9.5 ms at one reader and 560 ms at 32 — larger than the CUDA context creation
+it accompanies, and charged to device mode only. Pre-warming drops it below
+0.1 ms. If you ever see a device run that is inexplicably slower than host by a
+fixed amount rather than a proportional one, suspect that this pre-warm has
+regressed.
 
 ## KvikIO environment variables not exposed as flags
 
