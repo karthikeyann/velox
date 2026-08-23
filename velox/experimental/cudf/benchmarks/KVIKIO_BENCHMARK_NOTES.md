@@ -118,8 +118,14 @@ timeout. S3 throttling therefore depresses reported throughput silently. If a
 number comes back unexpectedly low at high concurrency, suspect `SlowDown`
 before concluding anything about the transport.
 
-`KVIKIO_NTHREADS`, `KVIKIO_TASK_SIZE` and `KVIKIO_BOUNCE_BUFFER_SIZE` are the
-environment equivalents of the corresponding flags.
+`KVIKIO_NTHREADS` and `KVIKIO_BOUNCE_BUFFER_SIZE` take effect only when the
+corresponding flag is left at 0, because the binary calls KvikIO's setter just
+for a non-zero flag value.
+
+`KVIKIO_TASK_SIZE` has no effect on this binary at all. The reader passes its
+task size explicitly to `pread(buf, size, offset, kvikioTaskSize)` and never
+consults `kvikio::defaults::task_size()`, and `--kvikio_task_size=0` calls
+`read()`, which does not split. Use `--kvikio_task_size`.
 
 ## Verified, and not
 
