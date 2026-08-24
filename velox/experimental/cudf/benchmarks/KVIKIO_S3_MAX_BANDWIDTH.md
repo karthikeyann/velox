@@ -59,6 +59,33 @@ figure came from comparing across configurations and window lengths, which is a
 different quantity. At a fixed configuration with a scored window the
 measurement is tight enough that a 1% change is real.
 
+### The hardware bound: each ENI caps at ~397 Gbps
+
+One card driven alone, whole node, at three very different reader counts:
+
+| Readers | app Gbps | NIC RX Gbps |
+|---:|---:|---:|
+| 700 | 391.0 | **396.7** |
+| 1,400 | 373.0 | **396.8** |
+| 2,100 | 267.5 | **396.8** |
+
+The NIC figure is flat to three digits while the application figure falls away.
+A resource limit varies with load; this does not, so ~397 Gbps is the ENI's line
+rate rather than anything about cores, threads or S3. `bw_in_allowance_exceeded`
+stays at 0 throughout, so this is the configured link rate and not throttling.
+
+That bounds everything: **4 x 396.8 = 1,587 Gbps is the hardware maximum**. The
+reference's 1,413 Gbps is 89% of it and this benchmark's 1,336 is 84%. The target
+is therefore reachable on four cards -- 1,399 needs 350 per card against a 397
+cap -- and the deficit is entirely in the two 12-queue cards, which deliver ~250
+where ~353 is needed. Their neighbours are already past the requirement at 400.
+
+Worth noting for anyone reading the numbers: at 2,100 readers the application
+rate collapses to 267 Gbps while the NIC still carries 396.8. Whatever that is
+-- ramp inside the window, or accounting that loses track at extreme thread
+counts -- it means a single application figure at a high thread count should not
+be trusted without the NIC cross-check beside it.
+
 ### Why it stops at ~1,336: it is per-core efficiency, and nothing else
 
 Each card reaches ~400 Gbps and needs cores to get there. Measured, cores per
