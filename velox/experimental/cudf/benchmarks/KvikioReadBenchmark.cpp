@@ -27,12 +27,17 @@
 
 #include <cuda_runtime.h>
 
+#include <sys/mman.h>
+
 #include <fmt/format.h>
+#include <folly/ScopeGuard.h>
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -105,20 +110,115 @@ DEFINE_bool(
     "path, so this routes through KvikIO's bounce buffer and a "
     "host-to-device copy.");
 
+DEFINE_bool(
+    pinned_memory,
+    false,
+    "Allocate host destinations as CUDA pinned memory rather than ordinary "
+    "paged memory. Pinned is what a GPU consumer needs for an async H2D copy, "
+    "and it is never paged out, but it is a scarce global resource and slow to "
+    "allocate. Ignored under --device_memory.");
+
+DEFINE_bool(
+    huge_pages,
+    true,
+    "Back paged host destinations with 2 MiB transparent huge pages instead of "
+    "4 KiB pages. The destination set is reader_threads x request_bytes, which "
+    "at 128 readers and 256 MiB is 32 GiB, or over eight million base pages for "
+    "the write to walk. Requires /sys/kernel/mm/transparent_hugepage/enabled to "
+    "offer 'always' or 'madvise'; falls back to ordinary pages if madvise is "
+    "refused. Ignored for pinned and device destinations.");
+
+DEFINE_bool(
+    write_combined,
+    false,
+    "Allocate pinned host destinations write-combined. WC lines are not fetched "
+    "before a write, which halves the DRAM traffic of a receive path whose "
+    "destination is far larger than last-level cache. The catch is that host "
+    "reads of WC memory are orders of magnitude slower, so this is only safe "
+    "while nothing on the CPU inspects the payload before the GPU consumes it. "
+    "Requires --pinned_memory.");
+
+DEFINE_int32(
+    cuda_device,
+    0,
+    "CUDA device to allocate device destinations on. Only meaningful under "
+    "--device_memory. One process per card on a multi-GPU host must set this, "
+    "since otherwise every process lands on device 0 and they collectively ask "
+    "for N times the VRAM that one card has.");
+
+DEFINE_int32(
+    warmup_seconds,
+    0,
+    "Read for this long before the scored window opens, so that per-thread DNS, "
+    "TCP and TLS handshakes and the S3 ramp land outside the number. Zero keeps "
+    "the whole run scored, which understates throughput at short measurements.");
+
+DEFINE_int32(
+    score_seconds,
+    0,
+    "Length of the scored window. Zero scores until --measurement_bytes is "
+    "exhausted, which makes the window a consequence of the achieved rate "
+    "rather than a fixed quantity, so runs at different rates are not directly "
+    "comparable. A fixed window plus --warmup_seconds is what the reference "
+    "campaign used, and --measurement_bytes must then be large enough that the "
+    "plan outlives the window.");
+
+DEFINE_bool(
+    unsafe_shared_buffer,
+    false,
+    "Hand every reader the same destination buffer with no mutual exclusion, so "
+    "the footprint is one --request_bytes no matter how many readers there are. "
+    "Readers scribble over each other, so this measures a transport ceiling and "
+    "nothing else; pair it with KVIKIO_REMOTE_IO_DISCARD=1, which stops the "
+    "writes happening at all. It exists because the alternative for a "
+    "reference-scale geometry -- 768 readers at 512 MiB -- is 384 GiB of "
+    "destinations, which perturbs the thing being measured.");
+
+DEFINE_int32(
+    buffer_slots,
+    0,
+    "Number of destination buffers in the ring, each --request_bytes wide. Zero "
+    "gives one per reader, which never blocks but makes the resident footprint "
+    "--reader_threads x --request_bytes. A smaller count models a consumer that "
+    "recycles slots: readers acquire a free slot, fill it, and release it, so "
+    "the footprint is --buffer_slots x --request_bytes independently of the "
+    "reader count. Keeping that product inside last-level cache is what stops "
+    "the destination write from costing more than the transfer.");
+
 namespace facebook::velox::cudf_velox {
 
 namespace {
 
-// Owns one destination buffer, allocated on the host or the device.
+// How a destination buffer is backed. Paged and pinned are both host memory
+// and interchangeable as a read target, but only pinned can be the source of an
+// async host-to-device copy, so a GPU consumer needs it.
+enum class BufferKind { kPaged, kPinned, kDevice };
+
+// Owns one destination buffer.
 class ReadBuffer {
  public:
-  ReadBuffer(uint64_t bytes, bool device) : device_{device} {
-    if (device_) {
-      CUDF_CUDA_TRY(cudaMalloc(&data_, bytes));
-    } else {
-      data_ = std::malloc(bytes);
-      VELOX_CHECK_NOT_NULL(
-          data_, "Failed to allocate host read buffer of {} bytes", bytes);
+  ReadBuffer(uint64_t bytes, BufferKind kind) : kind_{kind} {
+    switch (kind_) {
+      case BufferKind::kDevice:
+        CUDF_CUDA_TRY(cudaMalloc(&data_, bytes));
+        break;
+      case BufferKind::kPinned:
+        CUDF_CUDA_TRY(cudaHostAlloc(
+            &data_,
+            bytes,
+            FLAGS_write_combined ? cudaHostAllocWriteCombined
+                                 : cudaHostAllocDefault));
+        break;
+      case BufferKind::kPaged:
+        if (FLAGS_huge_pages) {
+          allocateHugePages(bytes);
+        }
+        if (data_ == nullptr) {
+          data_ = std::malloc(bytes);
+          VELOX_CHECK_NOT_NULL(
+              data_, "Failed to allocate host read buffer of {} bytes", bytes);
+        }
+        break;
     }
   }
 
@@ -126,10 +226,20 @@ class ReadBuffer {
     if (data_ == nullptr) {
       return;
     }
-    if (device_) {
-      static_cast<void>(cudaFree(data_));
-    } else {
-      std::free(data_);
+    switch (kind_) {
+      case BufferKind::kDevice:
+        static_cast<void>(cudaFree(data_));
+        break;
+      case BufferKind::kPinned:
+        static_cast<void>(cudaFreeHost(data_));
+        break;
+      case BufferKind::kPaged:
+        if (mapping_ != nullptr) {
+          static_cast<void>(munmap(mapping_, mappingBytes_));
+        } else {
+          std::free(data_);
+        }
+        break;
     }
   }
 
@@ -141,8 +251,103 @@ class ReadBuffer {
   }
 
  private:
+  // THP only promotes ranges that are themselves huge-page aligned, and mmap
+  // guarantees only base-page alignment, so over-map by one huge page and align
+  // inside the mapping. munmap needs the original address and length, which is
+  // why both are kept.
+  void allocateHugePages(uint64_t bytes) {
+    constexpr uintptr_t kHugePage = 2UL << 20;
+    const size_t total = bytes + kHugePage;
+    void* raw = mmap(
+        nullptr,
+        total,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0);
+    if (raw == MAP_FAILED) {
+      return;
+    }
+    const auto aligned =
+        (reinterpret_cast<uintptr_t>(raw) + kHugePage - 1) & ~(kHugePage - 1);
+    // A refusal here is not fatal: the mapping stays usable, just with base
+    // pages, which is exactly the fallback behaviour we want.
+    static_cast<void>(
+        madvise(reinterpret_cast<void*>(aligned), bytes, MADV_HUGEPAGE));
+    mapping_ = raw;
+    mappingBytes_ = total;
+    data_ = reinterpret_cast<void*>(aligned);
+  }
+
   void* data_{nullptr};
-  bool device_{false};
+  void* mapping_{nullptr};
+  size_t mappingBytes_{0};
+  BufferKind kind_{BufferKind::kPaged};
+};
+
+// Hands destination slots out to readers and takes them back, so the resident
+// footprint is the ring depth rather than the reader count. A real consumer
+// would sit between release and the next acquire; here the slot is recycled
+// immediately, which is the best case a consumer could achieve and so bounds
+// what the transport can deliver into reusable memory.
+class BufferRing {
+ public:
+  BufferRing(int32_t slots, uint64_t bytes, BufferKind kind, bool unsafeShared)
+      : unsafeShared_{unsafeShared} {
+    buffers_.reserve(slots);
+    free_.reserve(slots);
+    for (int32_t i = 0; i < slots; ++i) {
+      buffers_.push_back(std::make_unique<ReadBuffer>(bytes, kind));
+      if (kind != BufferKind::kDevice) {
+        // First-touch here so the page faults land outside the measured window.
+        std::memset(buffers_.back()->data(), 0, bytes);
+      }
+      free_.push_back(buffers_.back()->data());
+    }
+  }
+
+  // Blocks while every slot is in flight. Returns nullptr once the run is over
+  // so a waiting reader cannot outlive the plan.
+  void* acquire(const std::atomic<bool>& aborted) {
+    if (unsafeShared_) {
+      return buffers_.front()->data();
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    available_.wait(lock, [&] { return !free_.empty() || aborted.load(); });
+    if (free_.empty()) {
+      return nullptr;
+    }
+    void* slot = free_.back();
+    free_.pop_back();
+    return slot;
+  }
+
+  void release(void* slot) {
+    if (unsafeShared_) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      free_.push_back(slot);
+    }
+    available_.notify_one();
+  }
+
+  // Wakes every reader parked in acquire() so an aborted run can drain.
+  void wakeAll() {
+    available_.notify_all();
+  }
+
+  void* first() const {
+    return buffers_.front()->data();
+  }
+
+ private:
+  bool unsafeShared_{false};
+  std::vector<std::unique_ptr<ReadBuffer>> buffers_;
+  std::vector<void*> free_;
+  std::mutex mutex_;
+  std::condition_variable available_;
 };
 
 // Warns when KvikIO's thread pool is narrower than the reader concurrency it
@@ -226,20 +431,25 @@ RunResult runPlan(
   // a page fault per page on first write; both are startup costs rather than
   // transfer costs, and the former lands only on device mode, biasing the very
   // comparison --device_memory exists to make.
-  std::vector<std::unique_ptr<ReadBuffer>> buffers;
-  buffers.reserve(numThreads);
-  for (int32_t i = 0; i < numThreads; ++i) {
-    buffers.push_back(std::make_unique<ReadBuffer>(requestBytes, deviceMemory));
-    if (!deviceMemory) {
-      std::memset(buffers.back()->data(), 0, requestBytes);
-    }
-  }
+  const BufferKind bufferKind = deviceMemory ? BufferKind::kDevice
+      : FLAGS_pinned_memory                  ? BufferKind::kPinned
+                                             : BufferKind::kPaged;
+  const int32_t slots = FLAGS_unsafe_shared_buffer ? 1
+      : FLAGS_buffer_slots > 0                       ? FLAGS_buffer_slots
+                                                     : numThreads;
+  VELOX_USER_CHECK_LE(
+      slots,
+      numThreads,
+      "More buffer slots than readers just wastes memory; a reader can only "
+      "hold one at a time");
+  BufferRing ring{
+      slots, requestBytes, bufferKind, FLAGS_unsafe_shared_buffer};
 
   // Force KvikIO's one-time dlopen of libcuda now. Every read begins by asking
   // whether its destination is host memory, and that query is what loads the
   // driver, so leaving it to the readers charges the load to the measured
   // window.
-  static_cast<void>(kvikio::is_host_memory(buffers.front()->data()));
+  static_cast<void>(kvikio::is_host_memory(ring.first()));
 
   // Pre-warm KvikIO's pinned bounce-buffer pool. A remote source has no GDS
   // path, so every device transfer stages through a pinned host buffer that
@@ -266,6 +476,13 @@ RunResult runPlan(
   std::mutex errorMutex;
   std::exception_ptr firstError;
 
+  // A timed run needs the readers to keep going until the window shuts rather
+  // than until the plan empties, and to stop promptly once it has.
+  using Clock = std::chrono::steady_clock;
+  const bool timedWindow = FLAGS_score_seconds > 0;
+  std::atomic<bool> windowShut{false};
+  auto windowClosed = [&] { return windowShut.load(std::memory_order_relaxed); };
+
   // Readers park on 'startGate' until the clock is running, so thread creation
   // stays outside the measured window and every reader starts together rather
   // than in creation order. 'finishGate' ends the window as the last reader
@@ -280,14 +497,25 @@ RunResult runPlan(
   readers.reserve(numThreads);
   try {
     for (int32_t i = 0; i < numThreads; ++i) {
-      readers.emplace_back([&, buffer = buffers[i]->data()]() {
+      readers.emplace_back([&]() {
         try {
           startGate.wait();
           while (!aborted.load()) {
+            if (windowClosed()) {
+              break;
+            }
             const size_t index = nextTask.fetch_add(1);
             if (index >= plan.size()) {
               break;
             }
+            void* buffer = ring.acquire(aborted);
+            if (buffer == nullptr) {
+              break;
+            }
+            // The slot must come back even if the read throws, or the readers
+            // still running deadlock on an empty ring.
+            const auto releaseSlot =
+                folly::makeGuard([&] { ring.release(buffer); });
             const auto& task = plan[index];
             VELOX_CHECK_LE(task.size, requestBytes);
             auto& handle = targets.handleAt(task.targetIndex);
@@ -309,6 +537,7 @@ RunResult runPlan(
           // burn the full KVIKIO_HTTP_TIMEOUT budget once per attempt, so a
           // deep plan takes hours to surface the failure already in hand.
           aborted.store(true);
+          ring.wakeAll();
           std::lock_guard<std::mutex> lock(errorMutex);
           if (!firstError) {
             firstError = std::current_exception();
@@ -325,6 +554,7 @@ RunResult runPlan(
     // on 'finishGate' here, so the readers that were never created cannot
     // stall the join.
     aborted.store(true);
+    ring.wakeAll();
     startGate.count_down();
     for (auto& reader : readers) {
       reader.join();
@@ -333,7 +563,34 @@ RunResult runPlan(
   }
 
   RunResult result;
-  {
+  if (timedWindow) {
+    // Snapshot a monotonically increasing byte counter at both edges of the
+    // window. Counting whole requests at completion would bias a short window
+    // badly -- one 512 MiB request per reader is hundreds of GiB -- but the
+    // difference of two snapshots is the completion rate over the interval,
+    // and in steady state the in-flight volume is constant, so the overcount
+    // at the opening edge and the undercount at the closing edge cancel.
+    startGate.count_down();
+    if (FLAGS_warmup_seconds > 0) {
+      std::this_thread::sleep_for(std::chrono::seconds(FLAGS_warmup_seconds));
+    }
+    const auto scoreStart = Clock::now();
+    const uint64_t bytesAtStart = bytesRead.load();
+    std::this_thread::sleep_for(std::chrono::seconds(FLAGS_score_seconds));
+    const uint64_t bytesAtEnd = bytesRead.load();
+    const auto scoreEnd = Clock::now();
+
+    result.bytesRead = bytesAtEnd - bytesAtStart;
+    result.elapsedMicros = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            scoreEnd - scoreStart)
+            .count());
+
+    // Let the readers finish what they hold, then join.
+    windowShut.store(true, std::memory_order_relaxed);
+    ring.wakeAll();
+    finishGate.wait();
+  } else {
     MicrosecondTimer timer(&result.elapsedMicros);
     startGate.count_down();
     finishGate.wait();
@@ -345,8 +602,15 @@ RunResult runPlan(
     std::rethrow_exception(firstError);
   }
 
-  result.bytesRead = bytesRead.load();
-  result.numRequests = plan.size();
+  // A timed window already recorded the bytes and duration for its own
+  // interval; overwriting them here with the whole-run totals would silently
+  // put the ramp back into the number the window exists to exclude.
+  if (!timedWindow) {
+    result.bytesRead = bytesRead.load();
+    result.numRequests = plan.size();
+  } else {
+    result.numRequests = nextTask.load();
+  }
   return result;
 }
 
@@ -368,6 +632,19 @@ int main(int argc, char** argv) {
 
   try {
     using namespace facebook::velox::cudf_velox;
+
+    // Select the device before anything allocates, so the primary context and
+    // every later cudaMalloc land on the requested card.
+    if (FLAGS_device_memory) {
+      int deviceCount = 0;
+      CUDF_CUDA_TRY(cudaGetDeviceCount(&deviceCount));
+      VELOX_USER_CHECK_LT(
+          FLAGS_cuda_device,
+          deviceCount,
+          "--cuda_device is out of range; the host has {} device(s)",
+          deviceCount);
+      CUDF_CUDA_TRY(cudaSetDevice(FLAGS_cuda_device));
+    }
 
     if (FLAGS_kvikio_nthreads > 0) {
       kvikio::defaults::set_thread_pool_nthreads(

@@ -40,16 +40,21 @@ set(
 set(VELOX_rmm_SOURCE_URL "https://github.com/rapidsai/rmm/archive/${VELOX_rmm_COMMIT}.tar.gz")
 velox_resolve_dependency_url(rmm)
 
-# kvikio commit 93606c0 from 2026-07-23 (release/26.08 branch)
+# kvikio: karthikeyann/kvikio branch s3-max-bandwidth, c5b1c38, which is
+# 93606c0 (release/26.08) plus the remote-path work the S3 read benchmark needs:
+# a retry-accounting fix without which 512 MiB ranges fail under load, streaming
+# stores in the receive callback (+29% delivered bandwidth), and the egress and
+# buffer controls documented in KVIKIO_S3_MAX_BANDWIDTH.md. Revert both lines
+# below to rapidsai/kvikio at 93606c0 to build against upstream.
 set(VELOX_kvikio_VERSION 26.08)
-set(VELOX_kvikio_COMMIT 93606c074f3d863a7052af25afae569f72cb3304)
+set(VELOX_kvikio_COMMIT c5b1c38b86f83e40f4aed4c90f93b9943ea83819)
 set(
   VELOX_kvikio_BUILD_SHA256_CHECKSUM
-  882e1b7c8950c0bf3520c3c317b0d85da2c91b66d90f3ff44ae81a60166979f3
+  eed1dc7bd2c81d1fffa3ba6ab3ab27243f04db0e58c95c12e9398e00119c219e
 )
 set(
   VELOX_kvikio_SOURCE_URL
-  "https://github.com/rapidsai/kvikio/archive/${VELOX_kvikio_COMMIT}.tar.gz"
+  "https://github.com/karthikeyann/kvikio/archive/${VELOX_kvikio_COMMIT}.tar.gz"
 )
 velox_resolve_dependency_url(kvikio)
 
