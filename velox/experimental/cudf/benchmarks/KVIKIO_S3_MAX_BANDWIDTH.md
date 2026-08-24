@@ -49,8 +49,38 @@ Like for like, after 30 s warmup over a 60 s scored window:
 
 | Metric | This benchmark | Reference | Ratio |
 |---|---:|---:|---:|
-| Application body | **1,316.2 Gbps** | 1,399.4 Gbps | **94.1%** |
-| NIC RX | **1,337.1 Gbps** | 1,413.0 Gbps | **94.6%** |
+| Application body | **1,323 +/- 8 Gbps** | 1,399.4 Gbps | **94.6%** |
+| NIC RX | **1,336 +/- 4 Gbps** | 1,413.0 Gbps | **94.6%** |
+
+Five consecutive runs at the same configuration, 30 s scored after 15 s warmup:
+NIC RX 1,340.7 / 1,333.5 / 1,335.2 / 1,333.3 / 1,339.1 Gbps. **Run-to-run spread
+is 0.3%**, not the several percent claimed earlier in this document -- that
+figure came from comparing across configurations and window lengths, which is a
+different quantity. At a fixed configuration with a scored window the
+measurement is tight enough that a 1% change is real.
+
+### Why it stops at ~1,336: it is per-core efficiency, and nothing else
+
+Each card reaches ~400 Gbps and needs cores to get there. Measured, cores per
+card against that card's delivered rate:
+
+| Logical cores | Gbps |
+|---:|---:|
+| 40 | ~250 |
+| 48 | ~319 |
+| 56 | ~400 |
+| 96 (card alone) | 397 |
+
+That is ~7 Gbps per logical core up to a per-card ceiling near 400. Both card
+classes reach ~397 Gbps when run alone with a whole node, so the 12-queue cards
+are not weaker hardware -- earlier notes in this document guessed they were, and
+that was wrong. They are simply core-starved when sharing a node.
+
+192 cores x 7 Gbps = 1,344 Gbps, which is what we measure. The reference moved
+1,413 Gbps through the same 192 cores, or 7.36 Gbps per core. **The entire
+remaining 5% is per-core receive efficiency.** No amount of placement,
+partitioning, queue count or concurrency changes that, and the sweeps confirm
+it: every one of them is now flat or negative.
 
 ### Partitioning cores between the two cards on a node: +6%
 
@@ -167,6 +197,14 @@ card and prints a `WARNING: only N of 4 cards reported` otherwise.
   ~700 concurrent): 976 and 1,064 Gbps, both below `EASY_THREADPOOL`.
 - **Dropping the 1,024 idle pool threads** when `task_size=0` never touches the
   pool: 1,173 against 1,182. Free either way.
+- **Raising the socket receive buffer.** `__tcp_select_window` is ~1.8% of the
+  profile, so `SO_RCVBUF` via `CURLOPT_SOCKOPTFUNCTION` looked worth trying. It
+  is not: `net.core.rmem_max` is 208 KiB here, and setting `SO_RCVBUF`
+  explicitly *disables* TCP autotuning and clamps to that cap. Autotuning
+  already grows live S3 connections to 1.6-2.8 MB (`ss -tmi` reports `rb1663923`
+  and `rb2819285`), so an explicit value would be an order of magnitude worse.
+  Left alone.
+
 - **Aligning each card's cores with where its interrupts land.** irqbalance
   spreads a card's receive queues across the whole node, so a contiguous
   partition leaves most of a card's softirq running on its node-mate's cores:
