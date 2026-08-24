@@ -302,10 +302,22 @@ concurrently from NIC counters in steady state:
 | enp187s0 | 12 | 228.9 |
 | **total** | | **1,271.4** |
 
-`24,12,24,12` is not a tuning choice, it is what these four cards actually are:
-two ~400 Gbps cards and two ~235 Gbps cards. Flattening every card to 32 queues
-did not make the small cards bigger, it just spread each card's traffic over more
-queues, coalescing less per GRO context. Revert with
+The asymmetric vector is optimal, and that has now been tested rather than
+assumed. Three channel configurations, same partition and geometry:
+
+| Channels | NIC RX Gbps |
+|---|---:|
+| **24,12,24,12** (reference) | **1,336** |
+| 24,24,24,24 | 1,299 |
+| 32,32,32,32 | 1,181 |
+
+More queues is worse, consistently. Giving the 12-queue cards their neighbours'
+24 queues does not make them faster: it spreads each card's traffic over more
+queues and coalesces less per GRO context, and with only 40 cores to service them
+that costs more than the extra parallelism returns. An earlier note in this
+document explained the asymmetry as the cards being different sizes -- two
+~400 Gbps and two ~235 Gbps. That was wrong: both classes reach ~397 Gbps alone,
+so the vector is about queue-to-core ratio, not card capability. Revert with
 `./set-channels.sh 32 32 32 32`.
 
 **Two measurement bugs this exposed, both in the harness rather than the
