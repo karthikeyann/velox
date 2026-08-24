@@ -167,6 +167,24 @@ card and prints a `WARNING: only N of 4 cards reported` otherwise.
   ~700 concurrent): 976 and 1,064 Gbps, both below `EASY_THREADPOOL`.
 - **Dropping the 1,024 idle pool threads** when `task_size=0` never touches the
   pool: 1,173 against 1,182. Free either way.
+- **Aligning each card's cores with where its interrupts land.** irqbalance
+  spreads a card's receive queues across the whole node, so a contiguous
+  partition leaves most of a card's softirq running on its node-mate's cores:
+  only 3 of 12 of one card's interrupts fell inside its own slice. Moving the
+  partition to the interrupts rather than repinning them (no host change) was
+  tried three ways and lost every time: 1,143 Gbps assigning individual CPUs,
+  1,250 assigning whole physical cores, and a third variant killed a card
+  outright, against 1,326 for a plain contiguous split. Splitting hyperthread
+  siblings between cards explains the first result -- CPU 0 went to one card and
+  its sibling 96 to another -- but core-granular alignment still lost, so
+  contiguous ranges are winning on something else, most likely L3 and CHA
+  locality. Interrupt locality is not the lever here.
+
+- **AES-128 instead of AES-256.** Not a lever, because S3 already negotiates
+  `TLS_AES_128_GCM_SHA256`. An earlier estimate in this document assumed TLS 1.3
+  had defaulted to AES-256 and put the win at 12-21 Gbps; the negotiated cipher
+  says there is nothing to take.
+
 - **Jumbo frames, GRO, LRO.** MTU is already 9001, GRO is on, LRO is
   `[fixed] off` on ENA.
 - **Leaving cores free for softirq.** Restricting app threads to 80 of a node's
