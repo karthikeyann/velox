@@ -69,13 +69,15 @@ std::vector<std::string> mergeColumnNames(
 void TpchQueryBuilder::readFileSchema(
     const std::string& tableName,
     const std::string& filePath,
-    const std::vector<std::string>& columns) {
+    const std::vector<std::string>& columns,
+    std::shared_ptr<const config::ConfigBase> fileSystemProperties) {
   dwio::common::ReaderOptions readerOptions(pool_.get());
   readerOptions.setDataIoStats(dataIoStats_);
   readerOptions.setMetadataIoStats(metadataIoStats_);
   readerOptions.setFileFormat(format_);
   auto uniqueReadFile =
-      filesystems::getFileSystem(filePath, nullptr)->openFileForRead(filePath);
+      filesystems::getFileSystem(filePath, fileSystemProperties)
+          ->openFileForRead(filePath);
   std::shared_ptr<ReadFile> readFile;
   readFile.reset(uniqueReadFile.release());
   auto input = std::make_unique<dwio::common::BufferedInput>(
@@ -104,6 +106,12 @@ void TpchQueryBuilder::readFileSchema(
 }
 
 void TpchQueryBuilder::initialize(const std::string& dataPath) {
+  initialize(dataPath, nullptr);
+}
+
+void TpchQueryBuilder::initialize(
+    const std::string& dataPath,
+    std::shared_ptr<const config::ConfigBase> fileSystemProperties) {
   for (const auto& [tableName, columns] : kTables_) {
     const fs::path tablePath{dataPath + "/" + tableName};
     std::error_code error;
@@ -119,7 +127,8 @@ void TpchQueryBuilder::initialize(const std::string& dataPath) {
       }
       if (tableMetadata_[tableName].dataFiles.empty()) {
         anyFound = true;
-        readFileSchema(tableName, dirEntry.path().string(), columns);
+        readFileSchema(
+            tableName, dirEntry.path().string(), columns, fileSystemProperties);
       }
       tableMetadata_[tableName].dataFiles.push_back(dirEntry.path());
     }
@@ -128,7 +137,7 @@ void TpchQueryBuilder::initialize(const std::string& dataPath) {
       std::string line;
       while (std::getline(file, line)) {
         if (tableMetadata_[tableName].dataFiles.empty()) {
-          readFileSchema(tableName, line, columns);
+          readFileSchema(tableName, line, columns, fileSystemProperties);
         }
         tableMetadata_[tableName].dataFiles.push_back(line);
       }
@@ -138,6 +147,27 @@ void TpchQueryBuilder::initialize(const std::string& dataPath) {
 
 const std::vector<std::string>& TpchQueryBuilder::getTableNames() {
   return kTableNames_;
+}
+
+TpchPlan TpchQueryBuilder::getTableScanPlan(
+    const std::string& tableName) const {
+  const auto table = kTables_.find(tableName);
+  VELOX_CHECK(table != kTables_.end(), "Unknown TPC-H table: {}", tableName);
+
+  const auto selectedRowType = getRowType(tableName, table->second);
+  const auto& fileColumnNames = getFileColumnNames(tableName);
+  core::PlanNodeId scanNodeId;
+  auto plan = PlanBuilder(pool_.get())
+                  .filtersAsNode(filtersAsNode_)
+                  .tableScan(tableName, selectedRowType, fileColumnNames)
+                  .captureScanNodeId(scanNodeId)
+                  .planNode();
+
+  TpchPlan context;
+  context.plan = std::move(plan);
+  context.dataFiles[scanNodeId] = getTableFilePaths(tableName);
+  context.dataFileFormat = format_;
+  return context;
 }
 
 TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {

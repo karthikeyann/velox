@@ -63,7 +63,11 @@ DEFINE_int32(
 void TpchBenchmark::initQueryBuilder() {
   queryBuilder_ =
       std::make_shared<TpchQueryBuilder>(toFileFormat(FLAGS_data_format));
-  queryBuilder_->initialize(FLAGS_data_path);
+  queryBuilder_->initialize(FLAGS_data_path, connectorProperties_);
+}
+
+const std::shared_ptr<TpchQueryBuilder>& TpchBenchmark::queryBuilder() const {
+  return queryBuilder_;
 }
 
 void TpchBenchmark::initialize() {
@@ -214,11 +218,30 @@ BENCHMARK(q22) {
 void tpchBenchmarkMain() {
   VELOX_CHECK_NOT_NULL(benchmark);
   benchmark->initialize();
-  if (FLAGS_test_flags_file.empty()) {
-    RunStats ignore;
-    benchmark->runMain(std::cout, ignore);
-  } else {
-    benchmark->runAllCombinations();
+  // A benchmark may hold process-global state, such as a registered file
+  // system, that has to be released however the run ends. A handler rather
+  // than a scope guard, because an exception that escapes main() reaches
+  // std::terminate without unwinding, so nothing else would run.
+  try {
+    if (FLAGS_test_flags_file.empty()) {
+      RunStats ignore;
+      benchmark->runMain(std::cout, ignore);
+    } else {
+      benchmark->runAllCombinations();
+    }
+  } catch (...) {
+    try {
+      benchmark->shutdown();
+    } catch (const std::exception& e) {
+      // The run's own failure is the one that explains what happened, so it
+      // stays the exception the caller sees.
+      LOG(ERROR) << "Benchmark shutdown after a failed run failed: "
+                 << e.what();
+    } catch (...) {
+      LOG(ERROR) << "Benchmark shutdown after a failed run failed with an "
+                    "unknown exception";
+    }
+    throw;
   }
   benchmark->shutdown();
 }

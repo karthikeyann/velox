@@ -66,9 +66,21 @@ class TpchQueryBuilder {
   /// @param dataPath path to the data files
   void initialize(const std::string& dataPath);
 
+  /// Read each data file using the given filesystem properties, initialize row
+  /// types, and determine data paths for each table.
+  /// @param dataPath path to the data files
+  /// @param fileSystemProperties properties forwarded to filesystem creation
+  void initialize(
+      const std::string& dataPath,
+      std::shared_ptr<const config::ConfigBase> fileSystemProperties);
+
   /// Get the query plan for a given TPC-H query number.
   /// @param queryId TPC-H query number
   TpchPlan getQueryPlan(int queryId) const;
+
+  /// Get an unfiltered table-scan plan for one canonical TPC-H table.
+  /// @param tableName TPC-H table name
+  TpchPlan getTableScanPlan(const std::string& tableName) const;
 
   /// Get an alternate plan for a TPC-H query whose original predicate is not
   /// estimable from column statistics (e.g. a substring `like`). A cost-based
@@ -95,11 +107,12 @@ class TpchQueryBuilder {
 
  private:
   // Initializes the schema information for 'tableName' from sample file at
-  // 'filePath'.
+  // 'filePath' using the provided filesystem properties.
   void readFileSchema(
       const std::string& tableName,
       const std::string& filePath,
-      const std::vector<std::string>& columns);
+      const std::vector<std::string>& columns,
+      std::shared_ptr<const config::ConfigBase> fileSystemProperties);
 
   TpchPlan getQ1Plan() const;
   TpchPlan getQ2Plan() const;

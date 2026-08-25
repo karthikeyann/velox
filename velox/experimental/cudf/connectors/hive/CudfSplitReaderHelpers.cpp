@@ -18,6 +18,8 @@
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 
 #include "velox/common/Casts.h"
+#include "velox/common/base/RuntimeMetrics.h"
+#include "velox/common/file/File.h"
 #include "velox/dwio/common/BufferedInput.h"
 
 #include <cudf/detail/utilities/integer_utils.hpp>
@@ -29,13 +31,44 @@
 #include <cuda/iterator>
 #include <cuda/std/tuple>
 
+#include <fmt/format.h>
 #include <folly/futures/Future.h>
 
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <future>
+#include <limits>
 #include <mutex>
+#include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
+
+using facebook::velox::IoStats;
+using facebook::velox::RuntimeCounter;
+using facebook::velox::saturateCast;
+using facebook::velox::cudf_velox::connector::hive::kColumnChunkCompletedBytes;
+using facebook::velox::cudf_velox::connector::hive::kColumnChunkLogicalRanges;
+using facebook::velox::cudf_velox::connector::hive::
+    kColumnChunkPhysicalRequests;
+using facebook::velox::cudf_velox::connector::hive::kColumnChunkReadWallNanos;
+using facebook::velox::cudf_velox::connector::hive::kColumnChunkRequestedBytes;
+
+using SteadyClock = std::chrono::steady_clock;
+
+// Pad buffer sizes to be a multiple of 8 bytes. Required by
+// `decode_page_data_kernel` in cuDF Parquet reader.
+constexpr size_t kBufferPaddingMultiple = 8;
+
+// Largest total the payload of one fetch may reach. Rounding that total up to
+// kBufferPaddingMultiple has to stay representable, because the destination
+// buffer is allocated from the padded value.
+constexpr size_t kMaxTotalRangeBytes =
+    std::numeric_limits<size_t>::max() - (kBufferPaddingMultiple - 1);
 
 /**
  * @brief Static mutex to serialize batches of IO operations across drivers
@@ -46,6 +79,122 @@ namespace {
 std::mutex& ioBatchMutex() {
   static std::mutex mutex;
   return mutex;
+}
+
+// A submitted read paired with the request it must satisfy, so a failed or
+// short read can be reported with its exact offset and sizes.
+struct PendingRead {
+  size_t offset;
+  size_t size;
+  std::future<size_t> bytesRead;
+};
+
+// Publishes the counters that are known before any read is submitted. Ranges
+// whose reads later fail still count as requested.
+void recordSubmittedRanges(
+    IoStats* ioStats,
+    size_t requestedBytes,
+    size_t logicalRanges,
+    size_t physicalRequests) {
+  if (ioStats == nullptr) {
+    return;
+  }
+  ioStats->addCounter(
+      std::string(kColumnChunkRequestedBytes),
+      RuntimeCounter(
+          saturateCast(requestedBytes), RuntimeCounter::Unit::kBytes));
+  ioStats->addCounter(
+      std::string(kColumnChunkLogicalRanges),
+      RuntimeCounter(saturateCast(logicalRanges)));
+  ioStats->addCounter(
+      std::string(kColumnChunkPhysicalRequests),
+      RuntimeCounter(saturateCast(physicalRequests)));
+}
+
+// Publishes the counters that are only known once the reads have been joined.
+// Called on the failure path too, so 'completedBytes' reflects the transfers
+// that did succeed.
+void recordJoinedReads(
+    IoStats* ioStats,
+    size_t completedBytes,
+    SteadyClock::time_point readStart) {
+  if (ioStats == nullptr) {
+    return;
+  }
+  const auto readWallNanos =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          SteadyClock::now() - readStart)
+          .count();
+  ioStats->addCounter(
+      std::string(kColumnChunkCompletedBytes),
+      RuntimeCounter(
+          saturateCast(completedBytes), RuntimeCounter::Unit::kBytes));
+  ioStats->addCounter(
+      std::string(kColumnChunkReadWallNanos),
+      RuntimeCounter(readWallNanos, RuntimeCounter::Unit::kNanos));
+}
+
+// Packages 'error' as an already-satisfied future, so a read that never made
+// it past submission is drained and reported through the same path as one that
+// failed after it was accepted.
+std::future<size_t> failedFuture(std::exception_ptr error) {
+  std::promise<size_t> promise;
+  promise.set_exception(std::move(error));
+  return promise.get_future();
+}
+
+// Attributes 'cause' to the request 'read' was meant to satisfy, so a caller
+// that only sees the joined future can tell which transfer went wrong.
+std::exception_ptr readFailure(
+    const PendingRead& read,
+    std::string_view cause) {
+  try {
+    VELOX_FAIL(
+        "Read failed at offset {} expecting {} bytes: {}",
+        read.offset,
+        read.size,
+        cause);
+  } catch (...) {
+    return std::current_exception();
+  }
+}
+
+// Waits for every read in 'reads', adding each fully satisfied transfer to
+// 'completedBytes' and returning the first failure rather than throwing it, so
+// the caller can finish draining and publish accurate counters first. Draining
+// the whole vector is what guarantees that no read is still writing into the
+// destination buffer once this returns, so the buffer stays valid without
+// relying on when a future happens to be destroyed.
+std::exception_ptr drainPendingReads(
+    std::vector<PendingRead>& reads,
+    size_t& completedBytes) {
+  std::exception_ptr firstFailure;
+  const auto retainFailure = [&](const PendingRead& read,
+                                 std::string_view cause) {
+    if (firstFailure == nullptr) {
+      firstFailure = readFailure(read, cause);
+    }
+  };
+
+  for (auto& read : reads) {
+    size_t bytesRead = 0;
+    try {
+      bytesRead = read.bytesRead.get();
+    } catch (const std::exception& e) {
+      retainFailure(read, e.what());
+      continue;
+    } catch (...) {
+      retainFailure(read, "unknown exception");
+      continue;
+    }
+    if (bytesRead != read.size) {
+      retainFailure(
+          read, fmt::format("short read returned {} bytes", bytesRead));
+      continue;
+    }
+    completedBytes += bytesRead;
+  }
+  return firstFailure;
 }
 
 template <typename T>
@@ -170,6 +319,96 @@ void BufferedInputDataSource::readContiguous(
   stream->readFully(reinterpret_cast<char*>(dst), size);
 }
 
+ParquetColumnChunkRanges selectParquetColumnChunkRanges(
+    cudf::io::parquet::experimental::hybrid_scan_reader& reader,
+    const cudf::io::parquet_reader_options& options,
+    rmm::cuda_stream_view stream) {
+  auto rowGroupIndices = reader.all_row_groups(options);
+
+  // Filter row groups using row group byte ranges
+  if (options.get_skip_bytes() > 0 or options.get_num_bytes().has_value()) {
+    rowGroupIndices =
+        reader.filter_row_groups_with_byte_range(rowGroupIndices, options);
+  }
+
+  // Filter row groups using column chunk statistics
+  if (options.get_filter().has_value()) {
+    rowGroupIndices =
+        reader.filter_row_groups_with_stats(rowGroupIndices, options, stream);
+  }
+
+  auto ranges = reader.all_column_chunks_byte_ranges(rowGroupIndices, options);
+  return ParquetColumnChunkRanges{
+      .ranges = std::move(ranges),
+      .rowGroupIndices = std::move(rowGroupIndices)};
+}
+
+void validateByteRanges(
+    cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
+    size_t dataSourceSize) {
+  size_t totalSize = 0;
+  int64_t previousOffset = 0;
+  int64_t previousEnd = 0;
+  for (size_t index = 0; index < byteRanges.size(); ++index) {
+    const int64_t offset = byteRanges[index].offset();
+    const int64_t size = byteRanges[index].size();
+    // Repeated by every message so that a failure identifies the range without
+    // naming the object, whose URI can carry a credential.
+    const auto where = [&] {
+      return fmt::format(
+          "Byte range {} of {} at offset {} of size {} in a {}-byte object",
+          index,
+          byteRanges.size(),
+          offset,
+          size,
+          dataSourceSize);
+    };
+
+    VELOX_USER_CHECK_GE(offset, 0, "{} starts before the object.", where());
+    VELOX_USER_CHECK_GT(size, 0, "{} is empty.", where());
+    // Checked as each size is added, so the sum itself cannot overflow while
+    // it is being validated.
+    VELOX_USER_CHECK_LE(
+        static_cast<size_t>(size),
+        kMaxTotalRangeBytes - totalSize,
+        "{} takes the fetch past the {} bytes it can allocate for.",
+        where(),
+        kMaxTotalRangeBytes);
+    totalSize += static_cast<size_t>(size);
+
+    VELOX_USER_CHECK_LE(
+        size,
+        std::numeric_limits<int64_t>::max() - offset,
+        "{} ends past the largest representable offset.",
+        where());
+    const int64_t end = offset + size;
+    VELOX_USER_CHECK_LE(
+        static_cast<size_t>(end),
+        dataSourceSize,
+        "{} ends past the object.",
+        where());
+
+    if (index > 0) {
+      VELOX_USER_CHECK_GE(
+          offset,
+          previousOffset,
+          "{} starts before range {}, which starts at offset {}.",
+          where(),
+          index - 1,
+          previousOffset);
+      VELOX_USER_CHECK_GE(
+          offset,
+          previousEnd,
+          "{} overlaps range {}, which ends at offset {}.",
+          where(),
+          index - 1,
+          previousEnd);
+    }
+    previousOffset = offset;
+    previousEnd = end;
+  }
+}
+
 std::tuple<
     std::vector<rmm::device_buffer>,
     std::vector<cudf::device_span<const uint8_t>>,
@@ -178,10 +417,12 @@ fetchByteRangesAsync(
     std::shared_ptr<cudf::io::datasource> dataSource,
     cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
-  // Pad buffer sizes to be a multiple of 8 bytes. Required by
-  // `decode_page_data_kernel` in cuDF Parquet reader.
-  constexpr auto kBufferPaddingMultiple = 8;
+    rmm::device_async_resource_ref memoryResource,
+    IoStats* ioStats) {
+  VELOX_CHECK_NOT_NULL(dataSource, "A range fetch needs a data source.");
+  validateByteRanges(byteRanges, dataSource->size());
+
+  const auto readStart = SteadyClock::now();
 
   // Allocate device spans for each column chunk
   std::vector<cudf::device_span<const uint8_t>> columnChunkData{};
@@ -199,7 +440,7 @@ fetchByteRangesAsync(
   columnChunkBuffers.emplace_back(
       cudf::util::round_up_safe<size_t>(totalSize, kBufferPaddingMultiple),
       stream,
-      mr);
+      memoryResource);
 
   // Compute device spans for each column chunk
   auto bufferData = static_cast<uint8_t*>(columnChunkBuffers.back().data());
@@ -217,6 +458,12 @@ fetchByteRangesAsync(
   // actual load asynchronously.
   if (auto bufferedInput =
           dynamic_cast<BufferedInputDataSource*>(dataSource.get())) {
+    // BufferedInput may coalesce the enqueued ranges further downstream, so
+    // one physical request per enqueued range is the finest granularity
+    // observable here.
+    recordSubmittedRanges(
+        ioStats, totalSize, byteRanges.size(), byteRanges.size());
+
     auto iter =
         cuda::make_zip_iterator(byteRanges.begin(), columnChunkData.begin());
     std::for_each(
@@ -229,12 +476,22 @@ fetchByteRangesAsync(
               const_cast<uint8_t*>(destination.data()));
         });
 
-    // load buffered input data source
-    auto syncFunction = [](std::shared_ptr<cudf::io::datasource> dataSource,
-                           rmm::cuda_stream_view stream) {
-      auto buffer =
-          checkedPointerCast<BufferedInputDataSource>(dataSource.get());
-      buffer->load(stream);
+    // load buffered input data source. A successful load() satisfies every
+    // enqueued range, so it accounts for all requested bytes at once.
+    auto syncFunction = [ioStats, readStart, totalSize](
+                            std::shared_ptr<cudf::io::datasource> dataSource,
+                            rmm::cuda_stream_view stream) {
+      size_t completedBytes = 0;
+      try {
+        auto buffer =
+            checkedPointerCast<BufferedInputDataSource>(dataSource.get());
+        buffer->load(stream);
+        completedBytes = totalSize;
+      } catch (...) {
+        recordJoinedReads(ioStats, completedBytes, readStart);
+        throw;
+      }
+      recordJoinedReads(ioStats, completedBytes, readStart);
     };
 
     return {
@@ -278,11 +535,14 @@ fetchByteRangesAsync(
       destinations.size(),
       "Number of IO sizes and destinations must be equal");
 
+  recordSubmittedRanges(
+      ioStats, totalSize, byteRanges.size(), ioOffsets.size());
+
   auto iter = cuda::make_zip_iterator(
       ioOffsets.begin(), ioSizes.begin(), destinations.begin());
 
-  std::vector<std::future<size_t>> deviceReadTasks;
-  std::vector<std::future<size_t>> hostReadTasks;
+  std::vector<PendingRead> deviceReadTasks;
+  std::vector<PendingRead> hostReadTasks;
   deviceReadTasks.reserve(ioOffsets.size());
   hostReadTasks.reserve(ioOffsets.size());
 
@@ -298,39 +558,61 @@ fetchByteRangesAsync(
       const auto ioSize = cuda::std::get<1>(tuple);
       const auto dest = cuda::std::get<2>(tuple);
 
-      if (dataSource->supports_device_read() and
-          dataSource->is_device_read_preferred(ioSize)) {
-        deviceReadTasks.emplace_back(
-            dataSource->device_read_async(ioOffset, ioSize, dest, stream));
-      } else {
-        // TODO(mh): We can't yet guarantee (without a safe thread pool) that
-        // all `cudaMemcpyAsync`s will be launched by the time we release the
-        // mutex. That said, this is a rare usecase as host-buffer data should
-        // prefer using a `BufferedInputDataSource` datasource.
-        hostReadTasks.emplace_back(
-            std::async(
-                std::launch::async,
-                [dataSource, ioOffset, ioSize, dest, stream]() {
-                  auto hostBuffer = dataSource->host_read(ioOffset, ioSize);
-                  CUDF_CUDA_TRY(cudaMemcpyAsync(
-                      dest,
-                      hostBuffer->data(),
-                      hostBuffer->size(),
-                      cudaMemcpyDefault,
-                      stream.value()));
-                  return ioSize;
-                }));
+      // Submission that throws instead of returning a future is stored as an
+      // already-failed future rather than unwinding out of this loop. That
+      // keeps every earlier read joinable by the deferred drain before the
+      // destination buffer is released, lets later ranges still be submitted,
+      // and reports the failure with the same offset and size context as a
+      // read that failed after it was accepted.
+      bool preferDevice = false;
+      std::future<size_t> submitted;
+      try {
+        preferDevice = dataSource->supports_device_read() and
+            dataSource->is_device_read_preferred(ioSize);
+        submitted = preferDevice
+            ? dataSource->device_read_async(ioOffset, ioSize, dest, stream)
+            // TODO(mh): We can't yet guarantee (without a safe thread pool)
+            // that all `cudaMemcpyAsync`s will be launched by the time we
+            // release the mutex. That said, this is a rare usecase as
+            // host-buffer data should prefer using a `BufferedInputDataSource`
+            // datasource.
+            : std::async(
+                  std::launch::async,
+                  [dataSource, ioOffset, ioSize, dest, stream]() {
+                    auto hostBuffer = dataSource->host_read(ioOffset, ioSize);
+                    CUDF_CUDA_TRY(cudaMemcpyAsync(
+                        dest,
+                        hostBuffer->data(),
+                        hostBuffer->size(),
+                        cudaMemcpyDefault,
+                        stream.value()));
+                    return hostBuffer->size();
+                  });
+      } catch (...) {
+        submitted = failedFuture(std::current_exception());
       }
+
+      // Exactly one pending read per range, so a failed submission does not
+      // add a second physical request.
+      auto& tasks = preferDevice ? deviceReadTasks : hostReadTasks;
+      tasks.emplace_back(PendingRead{ioOffset, ioSize, std::move(submitted)});
     });
   }
 
-  auto syncFunction = [](decltype(hostReadTasks)&& hostReadTasks,
-                         decltype(deviceReadTasks)&& deviceReadTasks) {
-    for (auto& task : hostReadTasks) {
-      task.get();
-    }
-    for (auto& task : deviceReadTasks) {
-      task.get();
+  auto syncFunction = [ioStats, readStart](
+                          decltype(hostReadTasks)&& hostReadTasks,
+                          decltype(deviceReadTasks)&& deviceReadTasks) {
+    size_t completedBytes = 0;
+    // Both vectors are drained before anything is reported or rethrown, so the
+    // counters cover every transfer that did succeed and no read outlives this
+    // call.
+    const auto hostFailure = drainPendingReads(hostReadTasks, completedBytes);
+    const auto deviceFailure =
+        drainPendingReads(deviceReadTasks, completedBytes);
+    recordJoinedReads(ioStats, completedBytes, readStart);
+    if (const auto failure =
+            hostFailure != nullptr ? hostFailure : deviceFailure) {
+      std::rethrow_exception(failure);
     }
   };
 

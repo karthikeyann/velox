@@ -85,10 +85,25 @@ class QueryBenchmarkBase {
   virtual std::shared_ptr<config::ConfigBase> makeConnectorProperties();
 
  protected:
+  // Execute one pass of a TPC-H plan and return the task cursor and results.
+  std::pair<std::unique_ptr<exec::TaskCursor>, std::vector<RowVectorPtr>>
+  runOnce(
+      const exec::test::TpchPlan& tpchPlan,
+      const std::unordered_map<std::string, std::string>& queryConfigs);
+
+  // Builds the connector properties unless they have already been built, and
+  // returns them. initialize() calls this, so a subclass that has to inspect
+  // the properties before initializing can build them first and have
+  // initialize() reuse them rather than parse the configuration twice.
+  const std::shared_ptr<config::ConfigBase>& ensureConnectorProperties();
+
   std::unique_ptr<folly::IOThreadPoolExecutor> ioExecutor_;
   std::unique_ptr<folly::IOThreadPoolExecutor> cacheExecutor_;
   std::shared_ptr<memory::MemoryAllocator> allocator_;
   std::shared_ptr<cache::AsyncDataCache> cache_;
+
+  // Connector properties used by the benchmark's Hive connector.
+  std::shared_ptr<config::ConfigBase> connectorProperties_;
 
   // QueryConfig properties. May be part of parameter sweep.
   std::unordered_map<std::string, std::string> config_;

@@ -14,13 +14,38 @@
 
 # --- TPC-H benchmarks ---
 
-add_executable(velox_cudf_tpch_benchmark CudfTpchBenchmark.cpp)
+add_executable(velox_cudf_tpch_benchmark CudfTpchBenchmarkMain.cpp)
+
+# The benchmark itself, plus the resource lifecycle, I/O mode configuration,
+# discarding sink, and raw read runner it is built from. Only the entry point
+# above is exclusive to the executable, so a test can compile these same
+# sources and drive the benchmark directly.
+target_sources(
+  velox_cudf_tpch_benchmark
+  PRIVATE
+    CudfTpchBenchmark.cpp
+    CudfBenchmarkLifecycle.cpp
+    CudfTpchIoConfig.cpp
+    CudfBenchmarkDiscard.cpp
+    CudfRawReadBenchmark.cpp
+)
+
+velox_add_test_headers(
+  velox_cudf_tpch_benchmark
+  CudfBenchmarkDiscard.h
+  CudfBenchmarkLifecycle.h
+  CudfRawReadBenchmark.h
+  CudfTpchBenchmark.h
+  CudfTpchIoConfig.h
+)
 
 target_link_libraries(
   velox_cudf_tpch_benchmark
   velox_cudf_exec
   velox_cudf_exec_test_lib
   velox_tpch_benchmark_lib
+  velox_s3fs
+  velox_cudf_hive_connector
 )
 
 # --- TPC-DS benchmarks ---

@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/common/caching/CacheTTLController.h"
 #include "velox/common/time/Timer.h"
 #include "velox/connectors/hive/BufferedInputBuilder.h"
@@ -42,13 +43,16 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <ranges>
+#include <string>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -159,6 +163,66 @@ std::unique_ptr<cudf::table> castDecimalColumnsToVeloxTypes(
 
 } // namespace
 
+// Brackets decode work with a timing-enabled CUDA event pair recorded on the
+// reader's stream, so decode time is measured without adding a second
+// synchronization point. Exactly one interval can be pending at a time: the
+// reader records a chunk, the data source synchronizes, and the interval is
+// then consumed.
+class CudfSplitReader::DecodeTimer {
+ public:
+  DecodeTimer() {
+    CUDF_CUDA_TRY(cudaEventCreate(&start_));
+    try {
+      CUDF_CUDA_TRY(cudaEventCreate(&end_));
+    } catch (...) {
+      static_cast<void>(cudaEventDestroy(start_));
+      throw;
+    }
+  }
+
+  ~DecodeTimer() {
+    static_cast<void>(cudaEventDestroy(start_));
+    static_cast<void>(cudaEventDestroy(end_));
+  }
+
+  DecodeTimer(const DecodeTimer&) = delete;
+  DecodeTimer& operator=(const DecodeTimer&) = delete;
+
+  // Marks the beginning of a decode interval on 'stream'.
+  void recordStart(rmm::cuda_stream_view stream) {
+    CUDF_CUDA_TRY(cudaEventRecord(start_, stream.value()));
+    pending_ = false;
+  }
+
+  // Marks the end of the decode interval opened by recordStart().
+  void recordEnd(rmm::cuda_stream_view stream) {
+    CUDF_CUDA_TRY(cudaEventRecord(end_, stream.value()));
+    pending_ = true;
+  }
+
+  // Returns the pending interval in nanoseconds and clears it, or nullopt when
+  // no interval is pending. The caller must have synchronized the stream the
+  // interval was recorded on.
+  std::optional<int64_t> takeElapsedNanos() {
+    if (!pending_) {
+      return std::nullopt;
+    }
+    pending_ = false;
+    float elapsedMs{0};
+    CUDF_CUDA_TRY(cudaEventElapsedTime(&elapsedMs, start_, end_));
+    return static_cast<int64_t>(static_cast<double>(elapsedMs) * 1'000'000.0);
+  }
+
+ private:
+  cudaEvent_t start_{};
+  cudaEvent_t end_{};
+
+  // Whether an end event has been recorded but not yet consumed.
+  bool pending_{false};
+};
+
+CudfSplitReader::~CudfSplitReader() = default;
+
 CudfSplitReader::CudfSplitReader(
     std::shared_ptr<CudfHiveConnectorSplit> split,
     std::shared_ptr<const HiveTableHandle> tableHandle,
@@ -265,49 +329,40 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
   VELOX_CHECK_NOT_NULL(hybridScanState_, "hybrid scan state not present");
 
   std::call_once(*hybridScanState_->isHybridScanSetup_, [&]() {
-    auto rowGroupIndices = exptSplitReader_->all_row_groups(readerOptions_);
+    // Select the row groups and column chunk byte ranges to fetch
+    const auto columnChunkRanges = selectParquetColumnChunkRanges(
+        *exptSplitReader_, readerOptions_, stream_);
 
-    // Filter row groups using row group byte ranges
-    if (readerOptions_.get_skip_bytes() > 0 or
-        readerOptions_.get_num_bytes().has_value()) {
-      rowGroupIndices = exptSplitReader_->filter_row_groups_with_byte_range(
-          rowGroupIndices, readerOptions_);
+    // Fetch column chunk byte ranges. The range is scoped so that a failed
+    // read cannot leave it open.
+    {
+      const nvtx3::scoped_range fetchRange{"fetchByteRanges"};
+
+      // Tuple containing a vector of device buffers, a vector of device spans
+      // for each input byte range, and a future to wait for all reads to
+      // complete
+      auto ioData = fetchByteRangesAsync(
+          dataSource_,
+          columnChunkRanges.ranges,
+          stream_,
+          get_temp_mr(),
+          ioStats_.get());
+
+      // Join all pending reads. get() rather than wait() so that a failed or
+      // short read surfaces here instead of being silently dropped.
+      std::get<2>(ioData).get();
+
+      // Save state for hybrid scan reader for future calls to `next()`
+      hybridScanState_->columnChunkBuffers_ = std::move(std::get<0>(ioData));
+      hybridScanState_->columnChunkData_ = std::move(std::get<1>(ioData));
     }
-
-    // Filter row groups using column chunk statistics
-    if (readerOptions_.get_filter().has_value()) {
-      rowGroupIndices = exptSplitReader_->filter_row_groups_with_stats(
-          rowGroupIndices, readerOptions_, stream_);
-    }
-
-    // Get column chunk byte ranges to fetch
-    const auto columnChunkByteRanges =
-        exptSplitReader_->all_column_chunks_byte_ranges(
-            rowGroupIndices, readerOptions_);
-
-    // Fetch column chunk byte ranges
-    nvtxRangePush("fetchByteRanges");
-
-    // Tuple containing a vector of device buffers, a vector of device spans
-    // for each input byte range, and a future to wait for all reads to
-    // complete
-    auto ioData = fetchByteRangesAsync(
-        dataSource_, columnChunkByteRanges, stream_, get_temp_mr());
-
-    // Wait for all pending reads to complete
-    std::get<2>(ioData).wait();
-    nvtxRangePop();
-
-    // Save state for hybrid scan reader for future calls to `next()`
-    hybridScanState_->columnChunkBuffers_ = std::move(std::get<0>(ioData));
-    hybridScanState_->columnChunkData_ = std::move(std::get<1>(ioData));
 
     exptSplitReader_->setup_chunking_for_all_columns(
         cudfHiveConfig_->maxChunkReadLimitSession(
             connectorQueryCtx_->sessionProperties()),
         cudfHiveConfig_->maxPassReadLimitSession(
             connectorQueryCtx_->sessionProperties()),
-        rowGroupIndices,
+        columnChunkRanges.rowGroupIndices,
         hybridScanState_->columnChunkData_,
         readerOptions_,
         stream_,
@@ -318,9 +373,25 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
     return std::nullopt;
   }
 
+  decodeTimer_->recordStart(stream_);
   auto tableWithMetadata = exptSplitReader_->materialize_all_columns_chunk();
-  return castDecimalColumnsToVeloxTypes(
+  auto table = castDecimalColumnsToVeloxTypes(
       std::move(tableWithMetadata.tbl), outputType_, stream_, output_mr);
+  decodeTimer_->recordEnd(stream_);
+  return table;
+}
+
+void CudfSplitReader::recordCompletedDecodeTime() {
+  if (decodeTimer_ == nullptr or ioStats_ == nullptr) {
+    return;
+  }
+  const auto decodeNanos = decodeTimer_->takeElapsedNanos();
+  if (not decodeNanos.has_value()) {
+    return;
+  }
+  ioStats_->addCounter(
+      std::string(kParquetDecodeGpuNanos),
+      RuntimeCounter(*decodeNanos, RuntimeCounter::Unit::kNanos));
 }
 
 void CudfSplitReader::resetSplit() {
@@ -563,6 +634,9 @@ void CudfSplitReader::createExperimentalReader() {
 
   exptSplitReader_ = std::move(reader);
   hybridScanState_ = std::make_unique<HybridScanState>();
+  if (decodeTimer_ == nullptr) {
+    decodeTimer_ = std::make_unique<DecodeTimer>();
+  }
 
   // Metadata ingested
   fileMetaData_.clear();

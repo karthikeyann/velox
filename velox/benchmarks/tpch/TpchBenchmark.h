@@ -32,6 +32,10 @@ class TpchBenchmark : public facebook::velox::QueryBenchmarkBase {
   }
 
  protected:
+  // Returns the initialized TPC-H query builder used by this benchmark.
+  const std::shared_ptr<facebook::velox::exec::test::TpchQueryBuilder>&
+  queryBuilder() const;
+
   std::unordered_map<std::string, std::string> queryConfigs_;
 
  private:

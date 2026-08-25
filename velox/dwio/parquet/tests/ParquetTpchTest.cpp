@@ -21,6 +21,7 @@
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/connectors/ConnectorRegistry.h"
 #include "velox/connectors/hive/HiveConnector.h"
+#include "velox/connectors/hive/TableHandle.h"
 #include "velox/connectors/tpch/TpchConnector.h"
 #include "velox/dwio/parquet/RegisterParquetReader.h"
 #include "velox/dwio/parquet/RegisterParquetWriter.h"
@@ -163,6 +164,45 @@ class ParquetTpchTest : public testing::Test {
 std::shared_ptr<DuckDbQueryRunner> ParquetTpchTest::duckDb_ = nullptr;
 std::shared_ptr<TempDirectoryPath> ParquetTpchTest::tempDirectory_ = nullptr;
 std::shared_ptr<TpchQueryBuilder> ParquetTpchTest::tpchBuilder_ = nullptr;
+
+TEST_F(ParquetTpchTest, TableScanPlanAllTables) {
+  for (const auto& tableName : TpchQueryBuilder::getTableNames()) {
+    const auto plan = tpchBuilder_->getTableScanPlan(tableName);
+    const auto scanNode =
+        std::dynamic_pointer_cast<const core::TableScanNode>(plan.plan);
+    ASSERT_NE(scanNode, nullptr) << tableName;
+
+    auto table = std::find_if(
+        tpch::tables.begin(), tpch::tables.end(), [&](const auto table) {
+          return toTableName(table) == tableName;
+        });
+    ASSERT_NE(table, tpch::tables.end()) << tableName;
+    EXPECT_EQ(
+        scanNode->outputType()->names(), tpch::getTableSchema(*table)->names())
+        << tableName;
+
+    const auto tableHandle =
+        std::dynamic_pointer_cast<const connector::hive::HiveTableHandle>(
+            scanNode->tableHandle());
+    ASSERT_NE(tableHandle, nullptr) << tableName;
+    EXPECT_TRUE(tableHandle->subfieldFilters().empty()) << tableName;
+    EXPECT_EQ(tableHandle->remainingFilter(), nullptr) << tableName;
+
+    ASSERT_EQ(plan.dataFiles.size(), 1) << tableName;
+    const auto files = plan.dataFiles.find(scanNode->id());
+    ASSERT_NE(files, plan.dataFiles.end()) << tableName;
+    EXPECT_FALSE(files->second.empty()) << tableName;
+  }
+}
+
+TEST_F(ParquetTpchTest, TableScanPlanRejectsUnknownTable) {
+  try {
+    tpchBuilder_->getTableScanPlan("not_a_tpch_table");
+    FAIL() << "Expected invalid table name to fail.";
+  } catch (const VeloxException& e) {
+    EXPECT_NE(e.message().find("not_a_tpch_table"), std::string::npos);
+  }
+}
 
 TEST_F(ParquetTpchTest, Q1) {
   assertQuery(1);

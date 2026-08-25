@@ -66,7 +66,9 @@ class CudfSplitReader : public NvtxHelper {
       bool useExperimentalCudfReader,
       cudf::ast::expression const* subfieldFilterExpr);
 
-  virtual ~CudfSplitReader() = default;
+  /// Releases the split's cuDF readers, data source and decode timing
+  /// resources.
+  virtual ~CudfSplitReader();
 
   using PushdownFilterBuilder = std::function<cudf::ast::expression const*(
       const cudf::io::parquet::FileMetaData&)>;
@@ -85,6 +87,14 @@ class CudfSplitReader : public NvtxHelper {
 
   /// Read the next raw cudf table chunk. Returns nullopt when done.
   virtual std::optional<std::unique_ptr<cudf::table>> next(uint64_t size);
+
+  /// Adds the GPU decode time of the most recently read chunk to the shared
+  /// I/O stats and clears the pending interval. The caller must have
+  /// synchronized stream() since that chunk was read, otherwise the interval
+  /// is not yet measurable. Reading a chunk with the regular Parquet reader
+  /// and reaching end of stream both leave no interval pending, so this is
+  /// then a no-op.
+  void recordCompletedDecodeTime();
 
   /// Get the stream.
   rmm::cuda_stream_view stream() const {
@@ -142,6 +152,10 @@ class CudfSplitReader : public NvtxHelper {
   bool prependRowIndex_{false};
 
  private:
+  // Owns the CUDA event pair that brackets experimental-reader decode work.
+  // Defined in the .cpp so that no CUDA event handle appears in this header.
+  class DecodeTimer;
+
   // Clear splitReaders and datasources after split has been fully processed.
   void resetSplit();
 
@@ -164,6 +178,10 @@ class CudfSplitReader : public NvtxHelper {
   CudfHybridScanReaderPtr exptSplitReader_;
   std::unique_ptr<HybridScanState> hybridScanState_;
   bool useExperimentalCudfReader_;
+
+  // Times decode work on stream_. Created only for the experimental reader, so
+  // it stays null on the regular Parquet reader path.
+  std::unique_ptr<DecodeTimer> decodeTimer_;
 
   dwio::common::ReaderOptions baseReaderOpts_;
   cudf::ast::expression const* subfieldFilterExpr_;

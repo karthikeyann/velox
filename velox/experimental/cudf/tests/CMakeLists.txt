@@ -219,10 +219,17 @@ velox_add_cudf_test(
 )
 
 if(VELOX_ENABLE_S3)
+  # The discarding sink and the raw read runner are compiled directly because
+  # they live in an executable target that cannot be linked against.
   velox_add_cudf_test(
     NAME velox_cudf_s3_read_test
-    SOURCES Main.cpp S3ReadTest.cpp
+    SOURCES
+      Main.cpp
+      S3ReadTest.cpp
+      ${CMAKE_SOURCE_DIR}/velox/experimental/cudf/benchmarks/CudfBenchmarkDiscard.cpp
+      ${CMAKE_SOURCE_DIR}/velox/experimental/cudf/benchmarks/CudfRawReadBenchmark.cpp
     LIBS
+      velox_cudf_exec
       velox_cudf_exec_test_lib
       velox_cudf_hive_connector
       velox_exec
@@ -230,6 +237,47 @@ if(VELOX_ENABLE_S3)
       velox_file
       velox_s3fs
       velox_test_util
+      cudf::cudf
+  )
+
+  # Drives the benchmark itself, so it compiles every benchmark source except
+  # the executable's entry point, which it replaces with its own main. Its main
+  # also has to set --data_path before any flag is parsed, so gtest_main is
+  # deliberately absent.
+  add_executable(
+    velox_cudf_tpch_benchmark_s3_test
+    CudfTpchBenchmarkS3Test.cpp
+    ${CMAKE_SOURCE_DIR}/velox/experimental/cudf/benchmarks/CudfTpchBenchmark.cpp
+    ${CMAKE_SOURCE_DIR}/velox/experimental/cudf/benchmarks/CudfBenchmarkLifecycle.cpp
+    ${CMAKE_SOURCE_DIR}/velox/experimental/cudf/benchmarks/CudfTpchIoConfig.cpp
+    ${CMAKE_SOURCE_DIR}/velox/experimental/cudf/benchmarks/CudfBenchmarkDiscard.cpp
+    ${CMAKE_SOURCE_DIR}/velox/experimental/cudf/benchmarks/CudfRawReadBenchmark.cpp
+  )
+  set_target_properties(
+    velox_cudf_tpch_benchmark_s3_test
+    PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CUDF_TESTS_OUTPUT_DIR}
+  )
+  add_test(
+    NAME velox_cudf_tpch_benchmark_s3_test
+    COMMAND velox_cudf_tpch_benchmark_s3_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  set_tests_properties(velox_cudf_tpch_benchmark_s3_test PROPERTIES LABELS cuda_driver TIMEOUT 900)
+  target_link_libraries(
+    velox_cudf_tpch_benchmark_s3_test
+    velox_cudf_exec
+    velox_cudf_exec_test_lib
+    velox_cudf_hive_connector
+    velox_tpch_benchmark_lib
+    velox_exec
+    velox_exec_test_lib
+    velox_file
+    velox_s3fs
+    velox_test_util
+    velox_tpch_gen
+    velox_vector_test_lib
+    cudf::cudf
+    gtest
   )
 endif()
 
@@ -298,6 +346,30 @@ velox_add_cudf_test(
   NAME velox_cudf_window_test
   SOURCES Main.cpp WindowTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_window
+)
+
+# Resource lifecycle, I/O mode configuration, discarding sink, and raw read
+# runner tests. The benchmark sources are compiled directly because they live in
+# an executable target that cannot be linked against.
+velox_add_cudf_test(
+  NAME velox_cudf_tpch_io_benchmark_test
+  SOURCES
+    Main.cpp
+    CudfBenchmarkLifecycleTest.cpp
+    CudfTpchIoConfigTest.cpp
+    CudfBenchmarkDiscardTest.cpp
+    CudfRawReadBenchmarkTest.cpp
+    ${CMAKE_SOURCE_DIR}/velox/experimental/cudf/benchmarks/CudfBenchmarkLifecycle.cpp
+    ${CMAKE_SOURCE_DIR}/velox/experimental/cudf/benchmarks/CudfTpchIoConfig.cpp
+    ${CMAKE_SOURCE_DIR}/velox/experimental/cudf/benchmarks/CudfBenchmarkDiscard.cpp
+    ${CMAKE_SOURCE_DIR}/velox/experimental/cudf/benchmarks/CudfRawReadBenchmark.cpp
+  LIBS
+    ${CUDF_TEST_DEFAULT_LIBS}
+    velox_cudf_exec_test_lib
+    velox_cudf_hive_connector
+    velox_exec
+    velox_exec_test_lib
+    cudf::cudf
 )
 
 add_subdirectory(iceberg)

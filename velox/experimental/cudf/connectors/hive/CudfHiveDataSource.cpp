@@ -295,6 +295,10 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
             cudfTable->view(), pool_, outputType_, stream, get_temp_mr());
   stream.synchronize();
 
+  // The chunk's decode events have now completed, so their interval can be
+  // read without introducing another synchronization point.
+  cudfSplitReader_->recordCompletedDecodeTime();
+
   VELOX_CHECK_NOT_NULL(output, "Cudf to Velox conversion yielded a nullptr");
 
   completedRows_ += output->size();

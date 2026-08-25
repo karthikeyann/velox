@@ -206,16 +206,26 @@ void QueryBenchmarkBase::initialize() {
       std::make_unique<folly::IOThreadPoolExecutor>(FLAGS_num_io_threads);
 
   // Add new values into the hive configuration...
-  auto properties = makeConnectorProperties();
+  ensureConnectorProperties();
 
   // Create hive connector with config...
   connector::hive::HiveConnectorFactory factory;
-  auto hiveConnector =
-      factory.newConnector(kHiveConnectorId, properties, ioExecutor_.get());
+  auto hiveConnector = factory.newConnector(
+      kHiveConnectorId, connectorProperties_, ioExecutor_.get());
   connector::ConnectorRegistry::global().insert(
       hiveConnector->connectorId(), hiveConnector);
   parquet::registerParquetReaderFactory();
   dwrf::registerDwrfReaderFactory();
+}
+
+const std::shared_ptr<config::ConfigBase>&
+QueryBenchmarkBase::ensureConnectorProperties() {
+  if (connectorProperties_ == nullptr) {
+    connectorProperties_ = makeConnectorProperties();
+    VELOX_CHECK_NOT_NULL(
+        connectorProperties_, "makeConnectorProperties() returned nothing.");
+  }
+  return connectorProperties_;
 }
 
 std::shared_ptr<config::ConfigBase>
@@ -255,37 +265,45 @@ void QueryBenchmarkBase::shutdown() {
 }
 
 std::pair<std::unique_ptr<TaskCursor>, std::vector<RowVectorPtr>>
+QueryBenchmarkBase::runOnce(
+    const TpchPlan& tpchPlan,
+    const std::unordered_map<std::string, std::string>& queryConfigs) {
+  CursorParameters params;
+  params.maxDrivers = FLAGS_num_drivers;
+  params.planNode = tpchPlan.plan;
+  params.queryConfigs = queryConfigs;
+  params.queryConfigs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
+      std::to_string(FLAGS_split_preload_per_driver);
+  const int numSplitsPerFile = FLAGS_num_splits_per_file;
+
+  auto addSplits = [&](TaskCursor* taskCursor) {
+    auto& task = taskCursor->task();
+    if (!taskCursor->noMoreSplits()) {
+      for (const auto& entry : tpchPlan.dataFiles) {
+        for (const auto& path : entry.second) {
+          auto splits = listSplits(path, numSplitsPerFile, tpchPlan);
+          for (auto split : splits) {
+            task->addSplit(entry.first, exec::Split(std::move(split)));
+          }
+        }
+        task->noMoreSplits(entry.first);
+      }
+    }
+    taskCursor->setNoMoreSplits();
+  };
+  auto result = readCursor(params, addSplits);
+  ensureTaskCompletion(result.first->task().get());
+  return result;
+}
+
+std::pair<std::unique_ptr<TaskCursor>, std::vector<RowVectorPtr>>
 QueryBenchmarkBase::run(
     const TpchPlan& tpchPlan,
     const std::unordered_map<std::string, std::string>& queryConfigs) {
   int32_t repeat = 0;
   try {
     for (;;) {
-      CursorParameters params;
-      params.maxDrivers = FLAGS_num_drivers;
-      params.planNode = tpchPlan.plan;
-      params.queryConfigs = queryConfigs;
-      params.queryConfigs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
-          std::to_string(FLAGS_split_preload_per_driver);
-      const int numSplitsPerFile = FLAGS_num_splits_per_file;
-
-      auto addSplits = [&](TaskCursor* taskCursor) {
-        auto& task = taskCursor->task();
-        if (!taskCursor->noMoreSplits()) {
-          for (const auto& entry : tpchPlan.dataFiles) {
-            for (const auto& path : entry.second) {
-              auto splits = listSplits(path, numSplitsPerFile, tpchPlan);
-              for (auto split : splits) {
-                task->addSplit(entry.first, exec::Split(std::move(split)));
-              }
-            }
-            task->noMoreSplits(entry.first);
-          }
-        }
-        taskCursor->setNoMoreSplits();
-      };
-      auto result = readCursor(params, addSplits);
-      ensureTaskCompletion(result.first->task().get());
+      auto result = runOnce(tpchPlan, queryConfigs);
       if (++repeat >= FLAGS_num_repeats) {
         return result;
       }

@@ -43,3 +43,7 @@ target_link_libraries(
 add_executable(velox_tpch_benchmark TpchBenchmarkMain.cpp)
 
 target_link_libraries(velox_tpch_benchmark velox_tpch_benchmark_lib)
+
+if(${VELOX_BUILD_TESTING})
+  add_subdirectory(tests)
+endif()
