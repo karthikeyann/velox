@@ -15,6 +15,7 @@
  */
 
 #include "velox/benchmarks/tpch/TpchBenchmark.h"
+#include <folly/json.h>
 #include <iostream>
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/PlanNodeStats.h"
@@ -53,6 +54,10 @@ DEFINE_int32(
     run_query_verbose,
     -1,
     "Run a given query and print execution statistics");
+DEFINE_bool(
+    tpch_json_results,
+    false,
+    "Print typed JSON result cells for unambiguous research validation");
 DEFINE_int32(
     io_meter_column_pct,
     0,
@@ -96,6 +101,30 @@ void TpchBenchmark::runMain(
       printResults(actualResults, out);
       out << std::endl;
     }
+    if (FLAGS_tpch_json_results) {
+      folly::dynamic result = folly::dynamic::object;
+      result["types"] = folly::dynamic::array;
+      result["rows"] = folly::dynamic::array;
+      for (const auto& type : queryPlan.plan->outputType()->children()) {
+        result["types"].push_back(type->toString());
+      }
+      for (const auto& batch : actualResults) {
+        for (vector_size_t row = 0; row < batch->size(); ++row) {
+          folly::dynamic cells = folly::dynamic::array;
+          for (const auto& column : batch->children()) {
+            if (column->isNullAt(row)) {
+              cells.push_back(nullptr);
+            } else {
+              // Cell strings preserve the vector's round-trip representation;
+              // explicit types distinguish strings from numeric-looking text.
+              cells.push_back(column->toString(row));
+            }
+          }
+          result["rows"].push_back(std::move(cells));
+        }
+      }
+      out << "Results JSON: " << folly::toJson(result) << std::endl;
+    }
     const auto stats = task->taskStats();
     int64_t rawInputBytes = 0;
     for (auto& pipeline : stats.pipelineStats) {
@@ -110,6 +139,8 @@ void TpchBenchmark::runMain(
                facebook::velox::succinctMillis(
                    stats.executionEndTimeMs - stats.executionStartTimeMs))
         << std::endl;
+    out << "Execution time ms: "
+        << stats.executionEndTimeMs - stats.executionStartTimeMs << std::endl;
     out << fmt::format(
                "Splits total: {}, finished: {}",
                stats.numTotalSplits,

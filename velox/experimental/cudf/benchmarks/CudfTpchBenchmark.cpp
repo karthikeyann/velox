@@ -137,9 +137,8 @@ void CudfTpchBenchmark::initialize() {
       not FLAGS_cudf_hive_use_gpu_decoded_column_cache or
           FLAGS_cudf_hive_use_decoded_column_cache,
       "The GPU decoded column cache requires the decoded column CPU cache");
-  cudf_velox::connector::hive::CudfDecodedColumnCache::
-      configureMaxPinnedBytes(
-          FLAGS_cudf_hive_decoded_column_cache_max_pinned_bytes);
+  cudf_velox::connector::hive::CudfDecodedColumnCache::configureMaxPinnedBytes(
+      FLAGS_cudf_hive_decoded_column_cache_max_pinned_bytes);
   cudf_velox::connector::hive::CudfDecodedColumnCache::configureMaxGpuBytes(
       FLAGS_cudf_hive_decoded_column_cache_max_gpu_bytes);
 
@@ -174,10 +173,9 @@ void CudfTpchBenchmark::initialize() {
     cudfHiveConfigurationValues[cudf_velox::connector::hive::CudfHiveConfig::
                                     kExperimentalDecodedColumnCacheEnabled] =
         std::to_string(FLAGS_cudf_hive_use_decoded_column_cache);
-    cudfHiveConfigurationValues
-        [cudf_velox::connector::hive::CudfHiveConfig::
-             kExperimentalDecodedColumnGpuCacheEnabled] =
-            std::to_string(FLAGS_cudf_hive_use_gpu_decoded_column_cache);
+    cudfHiveConfigurationValues[cudf_velox::connector::hive::CudfHiveConfig::
+                                    kExperimentalDecodedColumnGpuCacheEnabled] =
+        std::to_string(FLAGS_cudf_hive_use_gpu_decoded_column_cache);
     cudfHiveConfigurationValues
         [cudf_velox::connector::hive::CudfHiveConfig::
              kExperimentalDecodedColumnCacheCompression] =
@@ -254,7 +252,8 @@ void CudfTpchBenchmark::runMain(
       out << fmt::format(
           "decoded-cache iteration={} compression={} gpu_cache={} "
           "max_pinned_bytes={} "
-          "pinned_bytes={} "
+          "pinned_bytes={} host_admission_rejected_allocations={} "
+          "host_admission_rejected_bytes={} "
           "inserted_uncompressed_bytes={} inserted_stored_bytes={} "
           "compressed_ranges={} raw_ranges={} compression_attempts={} "
           "encode_ms={:.3f} restore_calls={} restored_stored_bytes={} "
@@ -262,12 +261,19 @@ void CudfTpchBenchmark::runMain(
           "restore_batches={} max_gpu_bytes={} gpu_bytes={} "
           "gpu_inserted_bytes={} gpu_inserted_ranges={} "
           "gpu_admission_rejected_ranges={} gpu_restore_calls={} "
-          "gpu_restored_bytes={} gpu_restore_batches={}\n",
+          "gpu_restored_bytes={} gpu_restore_batches={} "
+          "gpu_packed_inserted_bytes={} gpu_packed_restore_calls={} "
+          "gpu_packed_restored_stored_bytes={} gpu_packed_decompress_ms={:.3f} "
+          "gpu_scaled_inserted_bytes={} gpu_scaled_inserted_ranges={} gpu_scaled_restore_calls={} "
+          "gpu_admission_policy_skipped_ranges={}\n",
           iteration,
           FLAGS_cudf_hive_decoded_column_cache_compression,
           FLAGS_cudf_hive_use_gpu_decoded_column_cache,
           after.maxPinnedBytes,
           after.pinnedBytes,
+          after.hostAdmissionRejectedAllocations -
+              before.hostAdmissionRejectedAllocations,
+          after.hostAdmissionRejectedBytes - before.hostAdmissionRejectedBytes,
           insertedUncompressed,
           insertedStored,
           after.insertedCompressedRanges - before.insertedCompressedRanges,
@@ -287,11 +293,23 @@ void CudfTpchBenchmark::runMain(
           after.gpuBytes,
           after.gpuInsertedBytes - before.gpuInsertedBytes,
           after.gpuInsertedRanges - before.gpuInsertedRanges,
-          after.gpuAdmissionRejectedRanges -
-              before.gpuAdmissionRejectedRanges,
+          after.gpuAdmissionRejectedRanges - before.gpuAdmissionRejectedRanges,
           after.gpuRestoreCalls - before.gpuRestoreCalls,
           after.gpuRestoredBytes - before.gpuRestoredBytes,
-          after.gpuRestoreBatches - before.gpuRestoreBatches);
+          after.gpuRestoreBatches - before.gpuRestoreBatches,
+          after.gpuPackedInsertedBytes - before.gpuPackedInsertedBytes,
+          after.gpuPackedRestoreCalls - before.gpuPackedRestoreCalls,
+          after.gpuPackedRestoredStoredBytes -
+              before.gpuPackedRestoredStoredBytes,
+          static_cast<double>(
+              after.gpuPackedDecompressionNanos -
+              before.gpuPackedDecompressionNanos) /
+              1'000'000.0,
+          after.gpuScaledInsertedBytes - before.gpuScaledInsertedBytes,
+          after.gpuScaledInsertedRanges - before.gpuScaledInsertedRanges,
+          after.gpuScaledRestoreCalls - before.gpuScaledRestoreCalls,
+          after.gpuAdmissionPolicySkippedRanges -
+              before.gpuAdmissionPolicySkippedRanges);
     }
   }
 }
