@@ -20,7 +20,109 @@
 #include "velox/dwio/common/ReaderFactory.h"
 #include "velox/tpch/gen/TpchGen.h"
 
+#include <gflags/gflags.h>
 #include <fstream>
+
+DEFINE_bool(
+    tpch_q17_filter_aggregation,
+    false,
+    "Restrict Q17's average calculation to the parts selected by the query.");
+DEFINE_bool(
+    tpch_q19_pushdown,
+    false,
+    "Push necessary Q19 join predicates into scans and prune unused output columns.");
+DEFINE_bool(
+    tpch_q19_numeric_predicate,
+    false,
+    "Compute Q19 per-part quantity bounds before joining instead of rechecking strings.");
+DEFINE_bool(
+    tpch_q19_late_revenue,
+    false,
+    "Compute Q19 revenue only after the selective join and its residual predicate.");
+DEFINE_bool(
+    tpch_q21_candidate_summary,
+    false,
+    "Evaluate Q21 supplier existence predicates with candidate-order summaries.");
+DEFINE_bool(
+    tpch_q21_prune_candidate_dates,
+    false,
+    "Read Q21 candidate dates for the scan predicate without gathering them into output.");
+DEFINE_bool(
+    tpch_q21_late_supplier_projection,
+    false,
+    "Compute Q21's nullable late-supplier field after joining candidate orders.");
+DEFINE_bool(
+    tpch_q17_window,
+    false,
+    "Compute Q17's selected-part averages with one scan and a partition window.");
+DEFINE_bool(
+    tpch_q15_window,
+    false,
+    "Compute Q15's maximum revenue with one aggregation and a global window.");
+DEFINE_bool(
+    tpch_q1_share_aggregates,
+    false,
+    "Share Q1 SUM states with AVG and compute averages after aggregation.");
+DEFINE_bool(
+    tpch_q13_preaggregate,
+    false,
+    "Aggregate Q13 orders by customer before joining the customer dimension.");
+DEFINE_bool(
+    tpch_q9_dimension_first,
+    false,
+    "Build filtered Q9 part/supplier dimensions first and aggregate before nation names.");
+DEFINE_bool(
+    tpch_q10_late_payload,
+    false,
+    "Use TPC-H key constraints to aggregate and limit Q10 before customer payload joins.");
+DEFINE_bool(
+    tpch_q18_late_customer,
+    false,
+    "Use TPC-H key constraints to limit Q18 before looking up customer names.");
+DEFINE_bool(
+    tpch_q18_complete_groups,
+    false,
+    "Use complete lineitem order-key batches for Q18; requires runtime-validated GPU complete-batch groupby.");
+DEFINE_bool(
+    tpch_q3_topn,
+    false,
+    "Use TopN instead of full sort plus limit in Q3.");
+DEFINE_bool(
+    tpch_q4_join_first,
+    false,
+    "Join filtered Q4 orders before deduplicating matching order keys (TPC-H primary keys).");
+DEFINE_bool(
+    tpch_q5_customer_first,
+    false,
+    "Join Q5 filtered customers and orders before lineitem, then check supplier nation.");
+DEFINE_bool(
+    tpch_q8_part_first,
+    false,
+    "Apply Q8's selective part join before its order and supplier joins.");
+DEFINE_bool(
+    tpch_q13_count_rows,
+    false,
+    "Count Q13 order rows without reading the non-null TPC-H order primary key.");
+DEFINE_bool(
+    tpch_q13_raw_single,
+    false,
+    "Gather filtered order keys into a single raw SUM(BIGINT one) aggregation.");
+DEFINE_bool(
+    tpch_q13_single_count,
+    false,
+    "Use COUNT(*) instead of SUM(materialized one) in Q13's raw single aggregation.");
+DEFINE_bool(
+    tpch_q13_prune_comment,
+    false,
+    "Read Q13 comments for the scan predicate but omit them from scan output.");
+DEFINE_bool(
+    tpch_prune_filter_only_columns,
+    false,
+    "Omit filter-only scan outputs in Q1, Q6, Q13 and Q19 when filters stay inside scans.");
+DEFINE_bool(
+    tpch_q7_numeric_nations,
+    false,
+    "Carry Q7's two filtered nation labels as booleans through joins and aggregation.");
 
 namespace facebook::velox::exec::test {
 
@@ -219,33 +321,78 @@ TpchPlan TpchQueryBuilder::getQ1Plan() const {
 
   core::PlanNodeId lineitemPlanNodeId;
 
+  auto builder = PlanBuilder(pool_.get());
+  const bool pruneFilterColumns =
+      FLAGS_tpch_prune_filter_only_columns && !filtersAsNode_;
+  const auto scanOutputType = pruneFilterColumns ? getRowType(
+                                                       kLineitem,
+                                                       {"l_returnflag",
+                                                        "l_linestatus",
+                                                        "l_quantity",
+                                                        "l_extendedprice",
+                                                        "l_discount",
+                                                        "l_tax"})
+                                                 : selectedRowType;
+  builder.filtersAsNode(filtersAsNode_)
+      .tableScan(
+          kLineitem,
+          scanOutputType,
+          fileColumnNames,
+          {filter},
+          "",
+          pruneFilterColumns ? selectedRowType : nullptr)
+      .captureScanNodeId(lineitemPlanNodeId)
+      .project(
+          {"l_returnflag",
+           "l_linestatus",
+           "l_quantity",
+           "l_extendedprice",
+           "l_extendedprice * (1.0 - l_discount) AS l_sum_disc_price",
+           "l_extendedprice * (1.0 - l_discount) * (1.0 + l_tax) AS l_sum_charge",
+           "l_discount"});
+  if (FLAGS_tpch_q1_share_aggregates) {
+    builder
+        .partialAggregation(
+            {"l_returnflag", "l_linestatus"},
+            {"sum(l_quantity) AS sum_qty",
+             "sum(l_extendedprice) AS sum_price",
+             "sum(l_sum_disc_price) AS sum_disc_price",
+             "sum(l_sum_charge) AS sum_charge",
+             "sum(l_discount) AS sum_discount",
+             "count(l_quantity) AS count_qty",
+             "count(l_extendedprice) AS count_price",
+             "count(l_discount) AS count_discount",
+             "count(0) AS count_order"})
+        .localPartition(std::vector<std::string>{})
+        .finalAggregation()
+        .project(
+            {"l_returnflag",
+             "l_linestatus",
+             "sum_qty AS a0",
+             "sum_price AS a1",
+             "sum_disc_price AS a2",
+             "sum_charge AS a3",
+             "sum_qty / cast(count_qty as double) AS a4",
+             "sum_price / cast(count_price as double) AS a5",
+             "sum_discount / cast(count_discount as double) AS a6",
+             "count_order AS a7"});
+  } else {
+    builder
+        .partialAggregation(
+            {"l_returnflag", "l_linestatus"},
+            {"sum(l_quantity)",
+             "sum(l_extendedprice)",
+             "sum(l_sum_disc_price)",
+             "sum(l_sum_charge)",
+             "avg(l_quantity)",
+             "avg(l_extendedprice)",
+             "avg(l_discount)",
+             "count(0)"})
+        .localPartition(std::vector<std::string>{})
+        .finalAggregation();
+  }
   auto plan =
-      PlanBuilder(pool_.get())
-          .filtersAsNode(filtersAsNode_)
-          .tableScan(kLineitem, selectedRowType, fileColumnNames, {filter})
-          .captureScanNodeId(lineitemPlanNodeId)
-          .project(
-              {"l_returnflag",
-               "l_linestatus",
-               "l_quantity",
-               "l_extendedprice",
-               "l_extendedprice * (1.0 - l_discount) AS l_sum_disc_price",
-               "l_extendedprice * (1.0 - l_discount) * (1.0 + l_tax) AS l_sum_charge",
-               "l_discount"})
-          .partialAggregation(
-              {"l_returnflag", "l_linestatus"},
-              {"sum(l_quantity)",
-               "sum(l_extendedprice)",
-               "sum(l_sum_disc_price)",
-               "sum(l_sum_charge)",
-               "avg(l_quantity)",
-               "avg(l_extendedprice)",
-               "avg(l_discount)",
-               "count(0)"})
-          .localPartition(std::vector<std::string>{})
-          .finalAggregation()
-          .orderBy({"l_returnflag", "l_linestatus"}, false)
-          .planNode();
+      builder.orderBy({"l_returnflag", "l_linestatus"}, false).planNode();
 
   TpchPlan context;
   context.plan = std::move(plan);
@@ -543,9 +690,15 @@ TpchPlan TpchQueryBuilder::getQ3Plan() const {
           .localPartition(std::vector<std::string>{})
           .finalAggregation()
           .project({"l_orderkey", "revenue", "o_orderdate", "o_shippriority"})
-          .orderBy({"revenue DESC", "o_orderdate"}, false)
-          .limit(0, 10, false)
           .planNode();
+  auto orderBuilder = PlanBuilder(plan, planNodeIdGenerator, pool_.get());
+  if (FLAGS_tpch_q3_topn) {
+    orderBuilder.topN({"revenue DESC", "o_orderdate"}, 10, false);
+  } else {
+    orderBuilder.orderBy({"revenue DESC", "o_orderdate"}, false)
+        .limit(0, 10, false);
+  }
+  plan = orderBuilder.planNode();
 
   TpchPlan context;
   context.plan = std::move(plan);
@@ -583,6 +736,42 @@ TpchPlan TpchQueryBuilder::getQ4Plan() const {
                         {orderDateFilter})
                     .captureScanNodeId(ordersPlanNodeId)
                     .planNode();
+
+  if (FLAGS_tpch_q4_join_first) {
+    // TPC-H declares o_orderkey a primary key. Deduplicating matching keys
+    // after the selective orders join is equivalent to the original EXISTS,
+    // without materializing all qualifying lineitem order keys globally.
+    auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                    .filtersAsNode(filtersAsNode_)
+                    .tableScan(
+                        kLineitem,
+                        lineitemSelectedRowType,
+                        lineitemFileColumns,
+                        {},
+                        "l_commitdate < l_receiptdate")
+                    .captureScanNodeId(lineitemPlanNodeId)
+                    .hashJoin(
+                        {"l_orderkey"},
+                        {"o_orderkey"},
+                        orders,
+                        "",
+                        {"o_orderkey", "o_orderpriority"})
+                    .partialAggregation({"o_orderkey", "o_orderpriority"}, {})
+                    .localPartition({"o_orderkey", "o_orderpriority"})
+                    .finalAggregation()
+                    .partialAggregation(
+                        {"o_orderpriority"}, {"count(0) AS order_count"})
+                    .localPartition(std::vector<std::string>{})
+                    .finalAggregation()
+                    .orderBy({"o_orderpriority"}, false)
+                    .planNode();
+    TpchPlan context;
+    context.plan = std::move(plan);
+    context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
+    context.dataFiles[ordersPlanNodeId] = getTableFilePaths(kOrders);
+    context.dataFileFormat = format_;
+    return context;
+  }
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
@@ -694,6 +883,76 @@ TpchPlan TpchQueryBuilder::getQ5Plan() const {
               {"n_nationkey", "n_name"})
           .planNode();
 
+  if (FLAGS_tpch_q5_customer_first) {
+    // All joins are inner joins. Since c_nationkey = s_nationkey, the
+    // region/nation restriction can be applied on customers first without
+    // assuming key uniqueness. Filter orders before touching the fact table
+    // and defer revenue computation until both fact joins have succeeded.
+    auto selectedCustomers =
+        PlanBuilder(customer, planNodeIdGenerator, pool_.get())
+            .hashJoin(
+                {"c_nationkey"},
+                {"n_nationkey"},
+                nationJoinRegion,
+                "",
+                {"c_custkey", "c_nationkey", "n_name"})
+            .planNode();
+    auto selectedOrders = PlanBuilder(orders, planNodeIdGenerator, pool_.get())
+                              .hashJoin(
+                                  {"o_custkey"},
+                                  {"c_custkey"},
+                                  selectedCustomers,
+                                  "",
+                                  {"o_orderkey", "c_nationkey", "n_name"})
+                              .planNode();
+    auto supplier =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .filtersAsNode(filtersAsNode_)
+            .tableScan(kSupplier, supplierSelectedRowType, supplierFileColumns)
+            .captureScanNodeId(supplierScanNodeId)
+            .planNode();
+    auto plan =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .filtersAsNode(filtersAsNode_)
+            .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
+            .captureScanNodeId(lineitemScanNodeId)
+            .hashJoin(
+                {"l_orderkey"},
+                {"o_orderkey"},
+                selectedOrders,
+                "",
+                {"l_suppkey",
+                 "l_extendedprice",
+                 "l_discount",
+                 "c_nationkey",
+                 "n_name"})
+            .hashJoin(
+                {"l_suppkey", "c_nationkey"},
+                {"s_suppkey", "s_nationkey"},
+                supplier,
+                "",
+                {"l_extendedprice", "l_discount", "n_name"})
+            .project(
+                {"n_name",
+                 "l_extendedprice * (1.0 - l_discount) AS part_revenue"})
+            .partialAggregation({"n_name"}, {"sum(part_revenue) as revenue"})
+            .localPartition(std::vector<std::string>{})
+            .finalAggregation()
+            .orderBy({"revenue DESC"}, false)
+            .project({"n_name", "revenue"})
+            .planNode();
+    TpchPlan context;
+    context.plan = std::move(plan);
+    context.dataFiles[customerScanNodeId] = getTableFilePaths(kCustomer);
+    context.dataFiles[ordersScanNodeId] = getTableFilePaths(kOrders);
+    context.dataFiles[lineitemScanNodeId] = getTableFilePaths(kLineitem);
+    context.dataFiles[supplierScanNodeId] = getTableFilePaths(kSupplier);
+    context.dataFiles[nationScanNodeId] = getTableFilePaths(kNation);
+    context.dataFiles[regionScanNodeId] = getTableFilePaths(kRegion);
+    context.dataFileFormat = format_;
+    return context;
+  }
+
   auto supplierJoinNationRegion =
       PlanBuilder(planNodeIdGenerator, pool_.get())
           .filtersAsNode(filtersAsNode_)
@@ -765,15 +1024,22 @@ TpchPlan TpchQueryBuilder::getQ6Plan() const {
       shipDate, selectedRowType, "'1994-01-01'", "'1994-12-31'");
 
   core::PlanNodeId lineitemPlanNodeId;
+  const bool pruneFilterColumns =
+      FLAGS_tpch_prune_filter_only_columns && !filtersAsNode_;
+  const auto scanOutputType = pruneFilterColumns
+      ? getRowType(kLineitem, {"l_extendedprice", "l_discount"})
+      : selectedRowType;
   auto plan = PlanBuilder(pool_.get())
                   .filtersAsNode(filtersAsNode_)
                   .tableScan(
                       kLineitem,
-                      selectedRowType,
+                      scanOutputType,
                       fileColumnNames,
                       {shipDateFilter,
                        "l_discount between 0.05 and 0.07",
-                       "l_quantity < 24.0"})
+                       "l_quantity < 24.0"},
+                      "",
+                      pruneFilterColumns ? selectedRowType : nullptr)
                   .captureScanNodeId(lineitemPlanNodeId)
                   .project({"l_extendedprice * l_discount"})
                   .partialAggregation({}, {"sum(p0)"})
@@ -837,7 +1103,11 @@ TpchPlan TpchQueryBuilder::getQ7Plan() const {
               custNation,
               "",
               {"n_name", "c_custkey"})
-          .project({"n_name as cust_nation", "c_custkey"})
+          .project(
+              {FLAGS_tpch_q7_numeric_nations
+                   ? "n_name = 'FRANCE' AS cust_nation"
+                   : "n_name AS cust_nation",
+               "c_custkey"})
           .planNode();
 
   auto ordersJoinCustomer =
@@ -872,51 +1142,66 @@ TpchPlan TpchQueryBuilder::getQ7Plan() const {
               suppNation,
               "",
               {"n_name", "s_suppkey"})
-          .project({"n_name as supp_nation", "s_suppkey"})
+          .project(
+              {FLAGS_tpch_q7_numeric_nations
+                   ? "n_name = 'FRANCE' AS supp_nation"
+                   : "n_name AS supp_nation",
+               "s_suppkey"})
           .planNode();
 
-  auto plan =
-      PlanBuilder(planNodeIdGenerator, pool_.get())
-          .filtersAsNode(filtersAsNode_)
-          .tableScan(
-              kLineitem,
-              lineitemSelectedRowType,
-              lineitemFileColumns,
-              {shipDateFilter})
-          .captureScanNodeId(lineitemScanNodeId)
-          .hashJoin(
-              {"l_suppkey"},
-              {"s_suppkey"},
-              supplierJoinNation,
-              "",
-              {"supp_nation",
-               "l_extendedprice",
-               "l_discount",
-               "l_shipdate",
-               "l_orderkey"})
-          .hashJoin(
-              {"l_orderkey"},
-              {"o_orderkey"},
-              ordersJoinCustomer,
-              "(((cust_nation = 'FRANCE') AND (supp_nation = 'GERMANY')) OR "
-              "((cust_nation = 'GERMANY') AND (supp_nation = 'FRANCE')))",
-              {"supp_nation",
-               "cust_nation",
-               "l_extendedprice",
-               "l_discount",
-               "l_shipdate"})
-          .project(
-              {"cust_nation",
-               "supp_nation",
-               "l_extendedprice * (1.0 - l_discount) as part_revenue",
-               "year(l_shipdate) as l_year"})
-          .partialAggregation(
-              {"supp_nation", "cust_nation", "l_year"},
-              {"sum(part_revenue) as revenue"})
-          .localPartition(std::vector<std::string>{})
-          .finalAggregation()
-          .orderBy({"supp_nation", "cust_nation", "l_year"}, false)
-          .planNode();
+  auto builder = PlanBuilder(planNodeIdGenerator, pool_.get());
+  builder.filtersAsNode(filtersAsNode_)
+      .tableScan(
+          kLineitem,
+          lineitemSelectedRowType,
+          lineitemFileColumns,
+          {shipDateFilter})
+      .captureScanNodeId(lineitemScanNodeId)
+      .hashJoin(
+          {"l_suppkey"},
+          {"s_suppkey"},
+          supplierJoinNation,
+          "",
+          {"supp_nation",
+           "l_extendedprice",
+           "l_discount",
+           "l_shipdate",
+           "l_orderkey"})
+      .hashJoin(
+          {"l_orderkey"},
+          {"o_orderkey"},
+          ordersJoinCustomer,
+          FLAGS_tpch_q7_numeric_nations
+              ? "cust_nation <> supp_nation"
+              : "(((cust_nation = 'FRANCE') AND (supp_nation = 'GERMANY')) OR "
+                "((cust_nation = 'GERMANY') AND (supp_nation = 'FRANCE')))",
+          {"supp_nation",
+           "cust_nation",
+           "l_extendedprice",
+           "l_discount",
+           "l_shipdate"})
+      .project(
+          {"cust_nation",
+           "supp_nation",
+           "l_extendedprice * (1.0 - l_discount) as part_revenue",
+           "year(l_shipdate) as l_year"})
+      .partialAggregation(
+          {"supp_nation", "cust_nation", "l_year"},
+          {"sum(part_revenue) as revenue"})
+      .localPartition(std::vector<std::string>{})
+      .finalAggregation();
+  if (FLAGS_tpch_q7_numeric_nations) {
+    // Both nation scans already admit only the two literal labels, excluding
+    // nulls. Decode after aggregation so the output and ordering stay
+    // unchanged.
+    builder.project(
+        {"CASE WHEN supp_nation THEN 'FRANCE' ELSE 'GERMANY' END AS supp_nation",
+         "CASE WHEN cust_nation THEN 'FRANCE' ELSE 'GERMANY' END AS cust_nation",
+         "l_year",
+         "revenue"});
+  }
+  auto plan = builder.orderBy({"supp_nation", "cust_nation", "l_year"}, false)
+                  .planNode();
 
   TpchPlan context;
   context.plan = std::move(plan);
@@ -1054,37 +1339,55 @@ TpchPlan TpchQueryBuilder::getQ8Plan() const {
               {"s_suppkey", "n_name"})
           .planNode();
 
+  auto factBuilder = PlanBuilder(planNodeIdGenerator, pool_.get());
+  factBuilder.filtersAsNode(filtersAsNode_)
+      .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
+      .captureScanNodeId(lineitemScanNodeId);
+  if (FLAGS_tpch_q8_part_first) {
+    // Inner-join reassociation preserves duplicates and null semantics. The
+    // selected part type is far more selective than the selected orders.
+    factBuilder.hashJoin(
+        {"l_partkey"},
+        {"p_partkey"},
+        part,
+        "",
+        {"l_orderkey",
+         "l_partkey",
+         "l_suppkey",
+         "l_extendedprice",
+         "l_discount"});
+  }
+  factBuilder
+      .hashJoin(
+          {"l_orderkey"},
+          {"o_orderkey"},
+          ordersJoinCustomerJoinNationJoinRegion,
+          "",
+          {"l_partkey",
+           "l_suppkey",
+           "o_orderdate",
+           "l_extendedprice",
+           "l_discount"})
+      .hashJoin(
+          {"l_suppkey"},
+          {"s_suppkey"},
+          supplierJoinNation,
+          "",
+          {"n_name",
+           "o_orderdate",
+           "l_partkey",
+           "l_extendedprice",
+           "l_discount"});
+  if (!FLAGS_tpch_q8_part_first) {
+    factBuilder.hashJoin(
+        {"l_partkey"},
+        {"p_partkey"},
+        part,
+        "",
+        {"n_name", "o_orderdate", "l_extendedprice", "l_discount"});
+  }
   auto plan =
-      PlanBuilder(planNodeIdGenerator, pool_.get())
-          .filtersAsNode(filtersAsNode_)
-          .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
-          .captureScanNodeId(lineitemScanNodeId)
-          .hashJoin(
-              {"l_orderkey"},
-              {"o_orderkey"},
-              ordersJoinCustomerJoinNationJoinRegion,
-              "",
-              {"l_partkey",
-               "l_suppkey",
-               "o_orderdate",
-               "l_extendedprice",
-               "l_discount"})
-          .hashJoin(
-              {"l_suppkey"},
-              {"s_suppkey"},
-              supplierJoinNation,
-              "",
-              {"n_name",
-               "o_orderdate",
-               "l_partkey",
-               "l_extendedprice",
-               "l_discount"})
-          .hashJoin(
-              {"l_partkey"},
-              {"p_partkey"},
-              part,
-              "",
-              {"n_name", "o_orderdate", "l_extendedprice", "l_discount"})
+      factBuilder
           .project(
               {"l_extendedprice * (1.0 - l_discount) as volume",
                "n_name",
@@ -1177,6 +1480,81 @@ TpchPlan TpchQueryBuilder::getQ9Plan(const std::string& partFilter) const {
           .tableScan(kNation, nationSelectedRowType, nationFileColumns)
           .captureScanNodeId(nationScanNodeId)
           .planNode();
+
+  if (FLAGS_tpch_q9_dimension_first) {
+    auto selectedPartsupp =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .filtersAsNode(filtersAsNode_)
+            .tableScan(kPartsupp, partsuppSelectedRowType, partsuppFileColumns)
+            .captureScanNodeId(partsuppScanNodeId)
+            .hashJoin({"ps_partkey"}, {"p_partkey"}, part, "", partsuppColumns)
+            .hashJoin(
+                {"ps_suppkey"},
+                {"s_suppkey"},
+                supplier,
+                "",
+                {"ps_partkey", "ps_suppkey", "ps_supplycost", "s_nationkey"})
+            .planNode();
+    auto profits =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .filtersAsNode(filtersAsNode_)
+            .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
+            .captureScanNodeId(lineitemScanNodeId)
+            .hashJoin(
+                {"l_partkey", "l_suppkey"},
+                {"ps_partkey", "ps_suppkey"},
+                selectedPartsupp,
+                "",
+                {"l_orderkey",
+                 "s_nationkey",
+                 "l_extendedprice",
+                 "l_discount",
+                 "l_quantity",
+                 "ps_supplycost"})
+            .project(
+                {"l_orderkey",
+                 "s_nationkey",
+                 "l_extendedprice * (1.0 - l_discount) - ps_supplycost * l_quantity AS amount"})
+            .planNode();
+    TpchPlan context;
+    context.plan =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .filtersAsNode(filtersAsNode_)
+            .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
+            .captureScanNodeId(ordersScanNodeId)
+            .hashJoin(
+                {"o_orderkey"},
+                {"l_orderkey"},
+                profits,
+                "",
+                {"s_nationkey", "amount", "o_orderdate"})
+            .project({"s_nationkey", "year(o_orderdate) AS o_year", "amount"})
+            .partialAggregation(
+                {"s_nationkey", "o_year"}, {"sum(amount) AS profit"})
+            .localPartition(std::vector<std::string>{})
+            .finalAggregation()
+            .hashJoin(
+                {"s_nationkey"},
+                {"n_nationkey"},
+                nation,
+                "",
+                {"n_name", "o_year", "profit"})
+            // Keep the final grouping by name: distinct nation keys with the
+            // same name must still contribute to the same output group.
+            .project({"n_name AS nation", "o_year", "profit"})
+            .singleAggregation(
+                {"nation", "o_year"}, {"sum(profit) AS sum_profit"})
+            .orderBy({"nation", "o_year DESC"}, false)
+            .planNode();
+    context.dataFiles[partScanNodeId] = getTableFilePaths(kPart);
+    context.dataFiles[supplierScanNodeId] = getTableFilePaths(kSupplier);
+    context.dataFiles[lineitemScanNodeId] = getTableFilePaths(kLineitem);
+    context.dataFiles[partsuppScanNodeId] = getTableFilePaths(kPartsupp);
+    context.dataFiles[ordersScanNodeId] = getTableFilePaths(kOrders);
+    context.dataFiles[nationScanNodeId] = getTableFilePaths(kNation);
+    context.dataFileFormat = format_;
+    return context;
+  }
 
   auto lineitemJoinPartJoinSupplier =
       PlanBuilder(planNodeIdGenerator, pool_.get())
@@ -1305,6 +1683,72 @@ TpchPlan TpchQueryBuilder::getQ10Plan() const {
                         {orderDateFilter})
                     .captureScanNodeId(ordersScanNodeId)
                     .planNode();
+
+  if (FLAGS_tpch_q10_late_payload) {
+    // TPC-H guarantees a unique customer and nation for each order. Aggregate
+    // and limit narrow fact rows before fetching the functionally dependent
+    // customer payload. This optimization relies on those PK/FK constraints.
+    auto topCustomers =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .filtersAsNode(filtersAsNode_)
+            .tableScan(
+                kLineitem,
+                lineitemSelectedRowType,
+                lineitemFileColumns,
+                {lineitemReturnFlagFilter})
+            .captureScanNodeId(lineitemScanNodeId)
+            .project(
+                {"l_orderkey",
+                 "l_extendedprice * (1.0 - l_discount) AS part_revenue"})
+            .hashJoin(
+                {"l_orderkey"},
+                {"o_orderkey"},
+                orders,
+                "",
+                {"o_custkey", "part_revenue"})
+            .partialAggregation({"o_custkey"}, {"sum(part_revenue) AS revenue"})
+            .localPartition(std::vector<std::string>{})
+            .finalAggregation()
+            .topN({"revenue DESC"}, 20, false)
+            .planNode();
+    TpchPlan context;
+    context.plan =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .filtersAsNode(filtersAsNode_)
+            .tableScan(kCustomer, customerSelectedRowType, customerFileColumns)
+            .captureScanNodeId(customerScanNodeId)
+            .hashJoin(
+                {"c_custkey"},
+                {"o_custkey"},
+                topCustomers,
+                "",
+                mergeColumnNames(
+                    customerOutputColumns, {"c_nationkey", "revenue"}))
+            .hashJoin(
+                {"c_nationkey"},
+                {"n_nationkey"},
+                nation,
+                "",
+                mergeColumnNames(customerOutputColumns, {"n_name", "revenue"}))
+            .localPartition(std::vector<std::string>{})
+            .orderBy({"revenue DESC"}, false)
+            .project(
+                {"c_custkey",
+                 "c_name",
+                 "revenue",
+                 "c_acctbal",
+                 "n_name",
+                 "c_address",
+                 "c_phone",
+                 "c_comment"})
+            .planNode();
+    context.dataFiles[customerScanNodeId] = getTableFilePaths(kCustomer);
+    context.dataFiles[nationScanNodeId] = getTableFilePaths(kNation);
+    context.dataFiles[lineitemScanNodeId] = getTableFilePaths(kLineitem);
+    context.dataFiles[ordersScanNodeId] = getTableFilePaths(kOrders);
+    context.dataFileFormat = format_;
+    return context;
+  }
 
   auto partialPlan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
@@ -1583,8 +2027,12 @@ TpchPlan TpchQueryBuilder::getQ12Plan() const {
 }
 
 TpchPlan TpchQueryBuilder::getQ13Plan() const {
-  std::vector<std::string> ordersColumns = {
-      "o_custkey", "o_comment", "o_orderkey"};
+  const bool countOrderRows =
+      FLAGS_tpch_q13_preaggregate && FLAGS_tpch_q13_count_rows;
+  std::vector<std::string> ordersColumns = {"o_custkey", "o_comment"};
+  if (!countOrderRows) {
+    ordersColumns.push_back("o_orderkey");
+  }
   std::vector<std::string> customerColumns = {"c_custkey"};
 
   const auto ordersSelectedRowType = getRowType(kOrders, ordersColumns);
@@ -1603,6 +2051,75 @@ TpchPlan TpchQueryBuilder::getQ13Plan() const {
           .tableScan(kCustomer, customerSelectedRowType, customerFileColumns)
           .captureScanNodeId(customerScanNodeId)
           .planNode();
+
+  if (FLAGS_tpch_q13_preaggregate) {
+    const bool pruneComment = (FLAGS_tpch_q13_prune_comment ||
+                               FLAGS_tpch_prune_filter_only_columns) &&
+        !filtersAsNode_;
+    const auto orderOutputType = pruneComment
+        ? getRowType(
+              kOrders,
+              countOrderRows
+                  ? std::vector<std::string>{"o_custkey"}
+                  : std::vector<std::string>{"o_custkey", "o_orderkey"})
+        : ordersSelectedRowType;
+    auto orderBuilder = PlanBuilder(planNodeIdGenerator, pool_.get());
+    orderBuilder.filtersAsNode(filtersAsNode_)
+        .tableScan(
+            kOrders,
+            orderOutputType,
+            ordersFileColumns,
+            {},
+            "o_comment not like '%special%requests%'",
+            pruneComment ? ordersSelectedRowType : nullptr)
+        .captureScanNodeId(ordersScanNodeId);
+    if (FLAGS_tpch_q13_raw_single) {
+      VELOX_USER_CHECK(
+          countOrderRows,
+          "Q13 raw single aggregation requires tpch_q13_count_rows");
+      if (FLAGS_tpch_q13_single_count) {
+        orderBuilder.localPartition(std::vector<std::string>{})
+            .singleAggregation({"o_custkey"}, {"count(0) AS order_count"});
+      } else {
+        orderBuilder.project({"o_custkey", "cast(1 as bigint) AS order_one"})
+            .localPartition(std::vector<std::string>{})
+            .singleAggregation(
+                {"o_custkey"}, {"sum(order_one) AS order_count"});
+      }
+    } else {
+      orderBuilder
+          .partialAggregation(
+              {"o_custkey"},
+              {countOrderRows ? "count(0) AS order_count"
+                              : "count(o_orderkey) AS order_count"})
+          .localPartition({"o_custkey"})
+          .finalAggregation();
+    }
+    auto orderCounts = orderBuilder.planNode();
+    TpchPlan context;
+    // c_custkey is the TPC-H customer primary key. Preaggregating the many-side
+    // preserves each customer's count, including customers with no matching
+    // orders, without materializing one joined row per order.
+    context.plan =
+        PlanBuilder(customers, planNodeIdGenerator, pool_.get())
+            .hashJoin(
+                {"c_custkey"},
+                {"o_custkey"},
+                orderCounts,
+                "",
+                {"c_custkey", "order_count"},
+                core::JoinType::kLeft)
+            .project({"coalesce(order_count, cast(0 as bigint)) AS c_count"})
+            .partialAggregation({"c_count"}, {"count(0) AS custdist"})
+            .localPartition(std::vector<std::string>{})
+            .finalAggregation()
+            .orderBy({"custdist DESC", "c_count DESC"}, false)
+            .planNode();
+    context.dataFiles[ordersScanNodeId] = getTableFilePaths(kOrders);
+    context.dataFiles[customerScanNodeId] = getTableFilePaths(kCustomer);
+    context.dataFileFormat = format_;
+    return context;
+  }
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
@@ -1719,6 +2236,51 @@ TpchPlan TpchQueryBuilder::getQ15Plan() const {
   core::PlanNodeId lineitemScanNodeIdSubQuery;
   core::PlanNodeId lineitemScanNodeId;
   core::PlanNodeId supplierScanNodeId;
+
+  if (FLAGS_tpch_q15_window) {
+    auto revenue =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .filtersAsNode(filtersAsNode_)
+            .tableScan(
+                kLineitem,
+                lineitemSelectedRowType,
+                lineitemFileColumns,
+                {shipDateFilter})
+            .captureScanNodeId(lineitemScanNodeId)
+            .project(
+                {"l_suppkey AS supplier_no",
+                 "l_extendedprice * (1.0 - l_discount) AS part_revenue"})
+            .partialAggregation(
+                {"supplier_no"}, {"sum(part_revenue) AS total_revenue"})
+            .localPartition(std::vector<std::string>{})
+            .finalAggregation()
+            .window({"max(total_revenue) OVER () AS max_revenue"})
+            .filter("total_revenue = max_revenue")
+            .project({"supplier_no", "total_revenue"})
+            .planNode();
+    TpchPlan context;
+    context.plan =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .filtersAsNode(filtersAsNode_)
+            .tableScan(kSupplier, supplierSelectedRowType, supplierFileColumns)
+            .captureScanNodeId(supplierScanNodeId)
+            .hashJoin(
+                {"s_suppkey"},
+                {"supplier_no"},
+                revenue,
+                "",
+                {"s_suppkey",
+                 "s_name",
+                 "s_address",
+                 "s_phone",
+                 "total_revenue"})
+            .orderBy({"s_suppkey"}, false)
+            .planNode();
+    context.dataFiles[lineitemScanNodeId] = getTableFilePaths(kLineitem);
+    context.dataFiles[supplierScanNodeId] = getTableFilePaths(kSupplier);
+    context.dataFileFormat = format_;
+    return context;
+  }
 
   auto maxRevenue =
       PlanBuilder(planNodeIdGenerator, pool_.get())
@@ -1906,11 +2468,20 @@ TpchPlan TpchQueryBuilder::getQ17Plan() const {
                   .captureScanNodeId(partScanId)
                   .planNode();
 
-  auto partAgg = PlanBuilder(planNodeIdGenerator, pool_.get())
-                     .filtersAsNode(filtersAsNode_)
-                     .tableScan(kPart, partRowType, partFileColumns, {})
-                     .captureScanNodeId(partAggScanId)
-                     .planNode();
+  auto partAgg =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(
+              kPart,
+              partRowType,
+              partFileColumns,
+              FLAGS_tpch_q17_filter_aggregation
+                  ? std::vector<
+                        std::
+                            string>{"p_brand = 'Brand#23'", "p_container = 'MED BOX'"}
+                  : std::vector<std::string>{})
+          .captureScanNodeId(partAggScanId)
+          .planNode();
 
   auto lineitemJoinPart =
       PlanBuilder(planNodeIdGenerator, pool_.get())
@@ -1924,6 +2495,25 @@ TpchPlan TpchQueryBuilder::getQ17Plan() const {
               "",
               {"l_quantity", "p_partkey", "l_extendedprice"})
           .planNode();
+
+  if (FLAGS_tpch_q17_window) {
+    TpchPlan context;
+    // The selected part key is unique in part, so this window sees exactly the
+    // same lineitems as the correlated AVG, without rescanning lineitem.
+    context.plan =
+        PlanBuilder(lineitemJoinPart, planNodeIdGenerator, pool_.get())
+            .localPartition(std::vector<std::string>{})
+            .window(
+                {"avg(l_quantity) OVER (PARTITION BY p_partkey) AS avg_quantity"})
+            .filter("l_quantity < 0.2 * avg_quantity")
+            .singleAggregation({}, {"sum(l_extendedprice) AS partial_sum"})
+            .project({"partial_sum / 7.0 AS avg_yearly"})
+            .planNode();
+    context.dataFiles[lineitemScanId] = getTableFilePaths(kLineitem);
+    context.dataFiles[partScanId] = getTableFilePaths(kPart);
+    context.dataFileFormat = format_;
+    return context;
+  }
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
@@ -1981,16 +2571,83 @@ TpchPlan TpchQueryBuilder::getQ18Plan() const {
   core::PlanNodeId ordersScanNodeId;
   core::PlanNodeId lineitemScanNodeId;
 
-  auto bigOrders =
+  auto bigOrdersBuilder =
       PlanBuilder(planNodeIdGenerator, pool_.get())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
-          .captureScanNodeId(lineitemScanNodeId)
-          .partialAggregation({"l_orderkey"}, {"sum(l_quantity) AS quantity"})
-          .localPartition({"l_orderkey"})
-          .finalAggregation()
-          .filter("quantity > 300.0")
-          .planNode();
+          .captureScanNodeId(lineitemScanNodeId);
+  if (FLAGS_tpch_q18_complete_groups) {
+    std::string completeBatchOption;
+    VELOX_USER_CHECK(
+        gflags::GetCommandLineOption(
+            "cudf_groupby_complete_batches", &completeBatchOption) &&
+            completeBatchOption == "true",
+        "Q18 complete groups requires --cudf_groupby_complete_batches=true for runtime validation");
+    bigOrdersBuilder
+        .singleAggregation({"l_orderkey"}, {"sum(l_quantity) AS quantity"})
+        .addNode([](std::string, core::PlanNodePtr node) {
+          auto aggregation =
+              std::dynamic_pointer_cast<const core::AggregationNode>(node);
+          return core::AggregationNode::Builder(*aggregation)
+              .preGroupedKeys(aggregation->groupingKeys())
+              .noGroupsSpanBatches(true)
+              .build();
+        });
+  } else {
+    bigOrdersBuilder
+        .partialAggregation({"l_orderkey"}, {"sum(l_quantity) AS quantity"})
+        .localPartition({"l_orderkey"})
+        .finalAggregation();
+  }
+  auto bigOrders = bigOrdersBuilder.filter("quantity > 300.0").planNode();
+
+  if (FLAGS_tpch_q18_late_customer) {
+    // TPC-H orders reference exactly one customer. The ORDER BY uses only
+    // order attributes, so the top 100 can be chosen before fetching names.
+    auto topOrders =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .filtersAsNode(filtersAsNode_)
+            .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
+            .captureScanNodeId(ordersScanNodeId)
+            .hashJoin(
+                {"o_orderkey"},
+                {"l_orderkey"},
+                bigOrders,
+                "",
+                {"o_orderkey",
+                 "o_custkey",
+                 "o_orderdate",
+                 "o_totalprice",
+                 "quantity"})
+            .localPartition(std::vector<std::string>{})
+            .topN({"o_totalprice DESC", "o_orderdate"}, 100, false)
+            .planNode();
+    TpchPlan context;
+    context.plan =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .filtersAsNode(filtersAsNode_)
+            .tableScan(kCustomer, customerSelectedRowType, customerFileColumns)
+            .captureScanNodeId(customerScanNodeId)
+            .hashJoin(
+                {"c_custkey"},
+                {"o_custkey"},
+                topOrders,
+                "",
+                {"c_name",
+                 "c_custkey",
+                 "o_orderkey",
+                 "o_orderdate",
+                 "o_totalprice",
+                 "quantity"})
+            .localPartition(std::vector<std::string>{})
+            .orderBy({"o_totalprice DESC", "o_orderdate"}, false)
+            .planNode();
+    context.dataFiles[lineitemScanNodeId] = getTableFilePaths(kLineitem);
+    context.dataFiles[ordersScanNodeId] = getTableFilePaths(kOrders);
+    context.dataFiles[customerScanNodeId] = getTableFilePaths(kCustomer);
+    context.dataFileFormat = format_;
+    return context;
+  }
 
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
@@ -2061,7 +2718,41 @@ TpchPlan TpchQueryBuilder::getQ19Plan() const {
   const std::string shipModeFilter = "l_shipmode IN ('AIR', 'AIR REG')";
   const std::string shipInstructFilter =
       "(l_shipinstruct = 'DELIVER IN PERSON')";
-  const std::string joinFilterExpr =
+  // These are necessary conditions of the complete residual predicate below.
+  // Retain that predicate to preserve each brand's exact quantity interval.
+  const bool pushdown =
+      FLAGS_tpch_q19_pushdown || FLAGS_tpch_q19_numeric_predicate;
+  const bool pruneFilterColumns =
+      FLAGS_tpch_prune_filter_only_columns && !filtersAsNode_;
+  const auto lineitemOutputType = pruneFilterColumns && pushdown
+      ? getRowType(
+            kLineitem,
+            {"l_partkey", "l_extendedprice", "l_discount", "l_quantity"})
+      : lineitemSelectedRowType;
+  const auto partOutputType =
+      pruneFilterColumns && FLAGS_tpch_q19_numeric_predicate
+      ? getRowType(kPart, {"p_partkey", "p_brand"})
+      : partSelectedRowType;
+  const std::string partFilter = pushdown
+      ? "((p_brand = 'Brand#12' AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') AND p_size BETWEEN 1 AND 5)"
+        " OR (p_brand = 'Brand#23' AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') AND p_size BETWEEN 1 AND 10)"
+        " OR (p_brand = 'Brand#34' AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') AND p_size BETWEEN 1 AND 15))"
+      : "";
+  std::vector<std::string> lineitemFilters{shipModeFilter, shipInstructFilter};
+  std::vector<std::string> lineitemProjection{
+      "l_extendedprice * (1.0 - l_discount) as part_revenue",
+      "l_shipmode",
+      "l_shipinstruct",
+      "l_partkey",
+      "l_quantity"};
+  if (pushdown) {
+    lineitemFilters.push_back("l_quantity between 1.0 and 30.0");
+    lineitemProjection = {
+        "l_extendedprice * (1.0 - l_discount) as part_revenue",
+        "l_partkey",
+        "l_quantity"};
+  }
+  std::string joinFilterExpr =
       "     ((p_brand = 'Brand#12')"
       "     AND (l_quantity between 1.0 and 11.0)"
       "     AND (p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG'))"
@@ -2077,34 +2768,60 @@ TpchPlan TpchQueryBuilder::getQ19Plan() const {
 
   auto part = PlanBuilder(planNodeIdGenerator, pool_.get())
                   .filtersAsNode(filtersAsNode_)
-                  .tableScan(kPart, partSelectedRowType, partFileColumns)
+                  .tableScan(
+                      kPart,
+                      partOutputType,
+                      partFileColumns,
+                      {},
+                      partFilter,
+                      pruneFilterColumns ? partSelectedRowType : nullptr)
                   .captureScanNodeId(partScanNodeId)
                   .planNode();
 
-  auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
-                  .filtersAsNode(filtersAsNode_)
-                  .tableScan(
-                      kLineitem,
-                      lineitemSelectedRowType,
-                      lineitemFileColumns,
-                      {shipModeFilter, shipInstructFilter})
-                  .captureScanNodeId(lineitemScanNodeId)
-                  .project(
-                      {"l_extendedprice * (1.0 - l_discount) as part_revenue",
-                       "l_shipmode",
-                       "l_shipinstruct",
-                       "l_partkey",
-                       "l_quantity"})
-                  .hashJoin(
-                      {"l_partkey"},
-                      {"p_partkey"},
-                      part,
-                      joinFilterExpr,
-                      {"part_revenue"})
-                  .partialAggregation({}, {"sum(part_revenue) as revenue"})
-                  .localPartition(std::vector<std::string>{})
-                  .finalAggregation()
-                  .planNode();
+  if (FLAGS_tpch_q19_numeric_predicate) {
+    // The pushed filter has already checked the disjoint brand/container/size
+    // branches. Only each surviving part's quantity interval remains to be
+    // checked on the lineitem side. Drop all strings from the join input.
+    part =
+        PlanBuilder(part, planNodeIdGenerator, pool_.get())
+            .project(
+                {"p_partkey",
+                 "CASE WHEN p_brand = 'Brand#12' THEN 1.0 WHEN p_brand = 'Brand#23' THEN 10.0 ELSE 20.0 END AS min_qty",
+                 "CASE WHEN p_brand = 'Brand#12' THEN 11.0 WHEN p_brand = 'Brand#23' THEN 20.0 ELSE 30.0 END AS max_qty"})
+            .planNode();
+    joinFilterExpr = "l_quantity >= min_qty AND l_quantity <= max_qty";
+  }
+
+  auto factBuilder = PlanBuilder(planNodeIdGenerator, pool_.get());
+  factBuilder.filtersAsNode(filtersAsNode_)
+      .tableScan(
+          kLineitem,
+          lineitemOutputType,
+          lineitemFileColumns,
+          lineitemFilters,
+          "",
+          pruneFilterColumns ? lineitemSelectedRowType : nullptr)
+      .captureScanNodeId(lineitemScanNodeId);
+  if (!FLAGS_tpch_q19_late_revenue) {
+    factBuilder.project(lineitemProjection);
+  }
+  factBuilder.hashJoin(
+      {"l_partkey"},
+      {"p_partkey"},
+      part,
+      joinFilterExpr,
+      FLAGS_tpch_q19_late_revenue
+          ? std::vector<std::string>{"l_extendedprice", "l_discount"}
+          : std::vector<std::string>{"part_revenue"});
+  if (FLAGS_tpch_q19_late_revenue) {
+    factBuilder.project(
+        {"l_extendedprice * (1.0 - l_discount) as part_revenue"});
+  }
+  auto plan =
+      factBuilder.partialAggregation({}, {"sum(part_revenue) as revenue"})
+          .localPartition(std::vector<std::string>{})
+          .finalAggregation()
+          .planNode();
 
   TpchPlan context;
   context.plan = std::move(plan);
@@ -2254,6 +2971,9 @@ TpchPlan TpchQueryBuilder::getQ20Plan() const {
 }
 
 TpchPlan TpchQueryBuilder::getQ21Plan() const {
+  if (FLAGS_tpch_q21_candidate_summary) {
+    return getQ21CandidateSummaryPlan();
+  }
   std::vector<std::string> supplierColumns = {
       "s_nationkey", "s_name", "s_suppkey"};
   std::vector<std::string> lineitemColumnsWithDates = {
@@ -2393,6 +3113,170 @@ TpchPlan TpchQueryBuilder::getQ21Plan() const {
   context.dataFiles[ordersScanNodeId] = getTableFilePaths(kOrders);
   context.dataFiles[nationScanNodeId] = getTableFilePaths(kNation);
   context.dataFileFormat = format_;
+  return context;
+}
+
+TpchPlan TpchQueryBuilder::getQ21CandidateSummaryPlan() const {
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  TpchPlan context;
+  context.dataFileFormat = format_;
+  core::PlanNodeId nationScan;
+  core::PlanNodeId supplierScan;
+  core::PlanNodeId candidateScan;
+  core::PlanNodeId ordersScan;
+  core::PlanNodeId summaryScan;
+  core::PlanNodeId namesScan;
+
+  auto nation = PlanBuilder(ids, pool_.get())
+                    .filtersAsNode(filtersAsNode_)
+                    .tableScan(
+                        kNation,
+                        getRowType(kNation, {"n_nationkey", "n_name"}),
+                        getFileColumnNames(kNation),
+                        {"n_name = 'SAUDI ARABIA'"})
+                    .captureScanNodeId(nationScan)
+                    .planNode();
+  auto saudiSuppliers =
+      PlanBuilder(ids, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(
+              kSupplier,
+              getRowType(kSupplier, {"s_suppkey", "s_nationkey"}),
+              getFileColumnNames(kSupplier))
+          .captureScanNodeId(supplierScan)
+          .hashJoin({"s_nationkey"}, {"n_nationkey"}, nation, "", {"s_suppkey"})
+          .planNode();
+  const std::vector<std::string> lineColumns{
+      "l_orderkey", "l_suppkey", "l_receiptdate", "l_commitdate"};
+  const bool pruneCandidateDates =
+      FLAGS_tpch_q21_prune_candidate_dates && !filtersAsNode_;
+  auto candidates =
+      PlanBuilder(ids, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(
+              kLineitem,
+              getRowType(
+                  kLineitem,
+                  pruneCandidateDates
+                      ? std::vector<std::string>{"l_orderkey", "l_suppkey"}
+                      : lineColumns),
+              getFileColumnNames(kLineitem),
+              {},
+              "l_receiptdate > l_commitdate",
+              pruneCandidateDates ? getRowType(kLineitem, lineColumns)
+                                  : nullptr)
+          .captureScanNodeId(candidateScan)
+          .hashJoin(
+              {"l_suppkey"},
+              {"s_suppkey"},
+              saudiSuppliers,
+              "",
+              {"l_orderkey", "l_suppkey"})
+          .planNode();
+  auto candidateOrders =
+      PlanBuilder(ids, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(
+              kOrders,
+              getRowType(kOrders, {"o_orderkey", "o_orderstatus"}),
+              getFileColumnNames(kOrders),
+              {"o_orderstatus = 'F'"})
+          .captureScanNodeId(ordersScan)
+          .hashJoin(
+              {"o_orderkey"},
+              {"l_orderkey"},
+              candidates,
+              "",
+              {"l_orderkey", "l_suppkey"})
+          .partialAggregation(
+              {"l_orderkey", "l_suppkey"}, {"count(1) AS candidate_count"})
+          .localPartition({"l_orderkey", "l_suppkey"})
+          .finalAggregation()
+          .project(
+              {"l_orderkey AS c_orderkey",
+               "l_suppkey AS c_suppkey",
+               "candidate_count"})
+          .planNode();
+
+  auto names = PlanBuilder(ids, pool_.get())
+                   .filtersAsNode(filtersAsNode_)
+                   .tableScan(
+                       kSupplier,
+                       getRowType(kSupplier, {"s_suppkey", "s_name"}),
+                       getFileColumnNames(kSupplier))
+                   .captureScanNodeId(namesScan)
+                   .planNode();
+
+  // For each (order, candidate supplier), preserve the number of original late
+  // lineitems. Joining a grouped candidate to all order lines cannot multiply
+  // that count. A different supplier exists iff min(supp) != max(supp), and no
+  // different late supplier exists iff min(late_supp) == max(late_supp). The
+  // candidate itself is late, so the late summary is never empty. TPC-H
+  // supplier and order keys are non-null. This avoids buffering the entire
+  // probe relation in a right-semi join or building all late lineitems for an
+  // anti join.
+  auto summaryBuilder = PlanBuilder(ids, pool_.get());
+  summaryBuilder.filtersAsNode(filtersAsNode_)
+      .tableScan(
+          kLineitem,
+          getRowType(kLineitem, lineColumns),
+          getFileColumnNames(kLineitem))
+      .captureScanNodeId(summaryScan);
+  if (!FLAGS_tpch_q21_late_supplier_projection) {
+    summaryBuilder.project(
+        {"l_orderkey",
+         "l_suppkey",
+         "if(l_receiptdate > l_commitdate, l_suppkey, "
+         "cast(null as bigint)) AS late_suppkey"});
+  }
+  std::vector<std::string> summaryJoinOutput{
+      "c_orderkey", "c_suppkey", "candidate_count", "l_suppkey"};
+  if (FLAGS_tpch_q21_late_supplier_projection) {
+    summaryJoinOutput.push_back("l_receiptdate");
+    summaryJoinOutput.push_back("l_commitdate");
+  } else {
+    summaryJoinOutput.push_back("late_suppkey");
+  }
+  summaryBuilder.hashJoin(
+      {"l_orderkey"}, {"c_orderkey"}, candidateOrders, "", summaryJoinOutput);
+  if (FLAGS_tpch_q21_late_supplier_projection) {
+    summaryBuilder.project(
+        {"c_orderkey",
+         "c_suppkey",
+         "candidate_count",
+         "l_suppkey",
+         "if(l_receiptdate > l_commitdate, l_suppkey, "
+         "cast(null as bigint)) AS late_suppkey"});
+  }
+  context.plan =
+      summaryBuilder
+          .partialAggregation(
+              {"c_orderkey", "c_suppkey", "candidate_count"},
+              {"min(l_suppkey) AS min_supp",
+               "max(l_suppkey) AS max_supp",
+               "min(late_suppkey) AS min_late",
+               "max(late_suppkey) AS max_late"})
+          .localPartition({"c_orderkey", "c_suppkey", "candidate_count"})
+          .finalAggregation()
+          .filter("min_supp <> max_supp AND min_late = max_late")
+          .partialAggregation(
+              {"c_suppkey"}, {"sum(candidate_count) AS numwait"})
+          .localPartition({"c_suppkey"})
+          .finalAggregation()
+          .hashJoin(
+              {"c_suppkey"}, {"s_suppkey"}, names, "", {"s_name", "numwait"})
+          .partialAggregation({"s_name"}, {"sum(numwait) AS numwait"})
+          .localPartition(std::vector<std::string>{})
+          .finalAggregation()
+          .orderBy({"numwait DESC", "s_name"}, false)
+          .limit(0, 100, false)
+          .planNode();
+  context.dataFiles[nationScan] = getTableFilePaths(kNation);
+  context.dataFiles[supplierScan] = getTableFilePaths(kSupplier);
+  context.dataFiles[candidateScan] = getTableFilePaths(kLineitem);
+  context.dataFiles[ordersScan] = getTableFilePaths(kOrders);
+  context.dataFiles[summaryScan] = getTableFilePaths(kLineitem);
+  context.dataFiles[namesScan] = getTableFilePaths(kSupplier);
   return context;
 }
 

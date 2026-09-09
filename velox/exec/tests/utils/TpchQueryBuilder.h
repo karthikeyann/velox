@@ -125,6 +125,7 @@ class TpchQueryBuilder {
   TpchPlan getQ19Plan() const;
   TpchPlan getQ20Plan() const;
   TpchPlan getQ21Plan() const;
+  TpchPlan getQ21CandidateSummaryPlan() const;
   TpchPlan getQ22Plan() const;
 
   const std::vector<std::string>& getTableFilePaths(
