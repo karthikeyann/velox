@@ -21,9 +21,17 @@
 
 #include "velox/connectors/hive/HiveDataSource.h"
 
+#include <gflags/gflags.h>
+
+DECLARE_bool(cudf_dynamic_filters);
+
 namespace facebook::velox::cudf_velox::connector::hive {
 
 using namespace facebook::velox::connector;
+
+bool CudfHiveConnector::canAddDynamicFilter() const {
+  return FLAGS_cudf_dynamic_filters;
+}
 
 CudfHiveConnector::CudfHiveConnector(
     const std::string& id,

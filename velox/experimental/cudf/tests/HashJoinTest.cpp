@@ -16,7 +16,9 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/JoinBloomFilter.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 
 #include "folly/synchronization/EventCount.h"
@@ -38,10 +40,24 @@
 #include "velox/vector/VectorPrinter.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 
+#include <cudf/copying.hpp>
+#include <cudf/utilities/error.hpp>
+
 #include <fmt/format.h>
+#include <gflags/gflags.h>
 #include <re2/re2.h>
 
 #include <atomic>
+
+DECLARE_bool(cudf_distinct_hash_join);
+DECLARE_int64(cudf_distinct_hash_join_max_build_rows);
+DECLARE_bool(cudf_dense_int_join);
+DECLARE_uint64(cudf_dense_int_join_max_range);
+DECLARE_double(cudf_dense_int_join_min_density);
+DECLARE_bool(cudf_join_bloom_filter);
+DECLARE_int64(cudf_join_bloom_min_build_rows);
+DECLARE_int64(cudf_join_bloom_min_probe_rows);
+DECLARE_uint64(cudf_join_exact_bitmap_max_range);
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -99,6 +115,387 @@ core::PlanNodePtr countStarOverZeroColumnHashJoinPlan(
       .partialAggregation({}, {"count(*)"})
       .finalAggregation()
       .planNode();
+}
+
+TEST_F(HashJoinTest, verifiedDistinctInnerJoinAndDuplicateFallback) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_dense_int_join = false;
+  FLAGS_cudf_distinct_hash_join = true;
+  FLAGS_cudf_distinct_hash_join_max_build_rows = 100;
+  auto probe = makeRowVector(
+      {"k", "v"},
+      {makeNullableFlatVector<int32_t>({1, 2, 2, 3, std::nullopt}),
+       makeFlatVector<int32_t>({10, 20, 30, 40, 50})});
+  for (bool duplicate : {false, true}) {
+    std::vector<int32_t> keys = duplicate ? std::vector<int32_t>{2, 2, 3, 4}
+                                          : std::vector<int32_t>{2, 3, 4};
+    std::vector<int32_t> values = duplicate ? std::vector<int32_t>{5, 50, 6, 7}
+                                            : std::vector<int32_t>{5, 6, 7};
+    auto build = makeRowVector(
+        {"u_k", "u_v"},
+        {makeFlatVector<int32_t>(keys), makeFlatVector<int32_t>(values)});
+    for (bool filtered : {false, true}) {
+      std::vector<int32_t> expectedKeys, expectedProbe, expectedBuild;
+      const std::vector<int32_t> probeKeys{1, 2, 2, 3};
+      const std::vector<int32_t> probeValues{10, 20, 30, 40};
+      for (size_t left = 0; left < probeKeys.size(); ++left) {
+        for (size_t right = 0; right < keys.size(); ++right) {
+          if (probeKeys[left] == keys[right] &&
+              (!filtered || probeValues[left] + values[right] > 30)) {
+            expectedKeys.push_back(probeKeys[left]);
+            expectedProbe.push_back(probeValues[left]);
+            expectedBuild.push_back(values[right]);
+          }
+        }
+      }
+      auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+      auto plan = PlanBuilder(ids)
+                      .values({probe})
+                      .hashJoin(
+                          {"k"},
+                          {"u_k"},
+                          PlanBuilder(ids).values({build}).planNode(),
+                          filtered ? "v + u_v > 30" : "",
+                          {"k", "v", "u_v"})
+                      .planNode();
+      auto expected = makeRowVector(
+          {"k", "v", "u_v"},
+          {makeFlatVector<int32_t>(expectedKeys),
+           makeFlatVector<int32_t>(expectedProbe),
+           makeFlatVector<int32_t>(expectedBuild)});
+      auto task = AssertQueryBuilder(plan).assertResults(expected);
+      int64_t checks = 0, distinctBuilds = 0;
+      for (const auto& pipeline : task->taskStats().pipelineStats) {
+        for (const auto& op : pipeline.operatorStats) {
+          if (auto it = op.runtimeStats.find("distinctBuildKeyChecks");
+              it != op.runtimeStats.end()) {
+            checks += it->second.sum;
+          }
+          if (auto it = op.runtimeStats.find("distinctHashJoinBuilds");
+              it != op.runtimeStats.end()) {
+            distinctBuilds += it->second.sum;
+          }
+        }
+      }
+      EXPECT_EQ(checks, 1);
+      EXPECT_EQ(distinctBuilds, duplicate ? 0 : 1);
+    }
+  }
+}
+
+TEST_F(HashJoinTest, denseIntegerJoinBoundsAndFallback) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_dense_int_join = true;
+  FLAGS_cudf_distinct_hash_join = true;
+  FLAGS_cudf_distinct_hash_join_max_build_rows = 100;
+  FLAGS_cudf_dense_int_join_max_range = 1024;
+  FLAGS_cudf_dense_int_join_min_density = 0.05;
+  const auto minimum = std::numeric_limits<int64_t>::min();
+  const auto maximum = std::numeric_limits<int64_t>::max();
+  const std::vector<std::optional<int64_t>> probeKeys{
+      minimum, -3, -1, 0, 1, 2, 2, 3, 4, 5, 6, 100000, maximum, std::nullopt};
+  auto probe = makeRowVector(
+      {"k", "v"},
+      {makeNullableFlatVector<int64_t>(probeKeys),
+       makeFlatVector<int64_t>(
+           probeKeys.size(), [](auto i) { return i * 10; })});
+  struct Case {
+    std::vector<std::optional<int64_t>> keys;
+    bool dense;
+  };
+  for (const auto& test : std::vector<Case>{
+           {{2, 3, 5}, true},
+           {{0, 1, 4}, true},
+           {{5}, true},
+           {{2, 2, 5}, false},
+           {{0, 100000}, false},
+           {{-1, 0, 1}, false},
+           {{maximum - 1, maximum}, false},
+           {{2, std::nullopt, 5}, false},
+           {{}, false},
+           {{20, 21}, true}}) {
+    SCOPED_TRACE(
+        fmt::format("build rows={}, dense={}", test.keys.size(), test.dense));
+    auto build = makeRowVector(
+        {"u_k", "u_v"},
+        {makeNullableFlatVector<int64_t>(test.keys),
+         makeFlatVector<int64_t>(
+             test.keys.size(), [](auto i) { return i + 100; })});
+    std::vector<int64_t> expectedKeys, expectedProbe, expectedBuild;
+    for (size_t left = 0; left < probeKeys.size(); ++left) {
+      for (size_t right = 0; right < test.keys.size(); ++right) {
+        if (probeKeys[left] && test.keys[right] &&
+            probeKeys[left] == test.keys[right]) {
+          expectedKeys.push_back(*probeKeys[left]);
+          expectedProbe.push_back(left * 10);
+          expectedBuild.push_back(right + 100);
+        }
+      }
+    }
+    auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+    auto plan = PlanBuilder(ids)
+                    .values({probe})
+                    .hashJoin(
+                        {"k"},
+                        {"u_k"},
+                        PlanBuilder(ids).values({build}).planNode(),
+                        "",
+                        {"k", "v", "u_v"})
+                    .planNode();
+    auto task = AssertQueryBuilder(plan).assertResults(makeRowVector(
+        {"k", "v", "u_v"},
+        {makeFlatVector<int64_t>(expectedKeys),
+         makeFlatVector<int64_t>(expectedProbe),
+         makeFlatVector<int64_t>(expectedBuild)}));
+    int64_t denseBuilds = 0;
+    for (const auto& pipeline : task->taskStats().pipelineStats) {
+      for (const auto& op : pipeline.operatorStats) {
+        if (auto it = op.runtimeStats.find("denseIntJoinBuilds");
+            it != op.runtimeStats.end()) {
+          denseBuilds += it->second.sum;
+        }
+      }
+    }
+    EXPECT_EQ(denseBuilds, test.dense ? 1 : 0);
+  }
+}
+
+TEST_F(HashJoinTest, bloomFilterCompositeKeysNullsAndSignedBounds) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_dense_int_join = false;
+  FLAGS_cudf_join_bloom_filter = true;
+  FLAGS_cudf_join_bloom_min_build_rows = 0;
+  FLAGS_cudf_join_bloom_min_probe_rows = 0;
+  const auto minimum = std::numeric_limits<int64_t>::min();
+  const auto maximum = std::numeric_limits<int64_t>::max();
+  std::vector<std::optional<int64_t>> probes;
+  for (int64_t i = 0; i < 1000; ++i) {
+    probes.push_back(i - 20);
+  }
+  probes[0] = minimum;
+  probes[1] = maximum;
+  probes[2] = std::nullopt;
+  auto probe = makeRowVector(
+      {"k", "k2", "v"},
+      {makeNullableFlatVector<int64_t>(probes),
+       makeFlatVector<int64_t>(probes.size(), [](auto i) { return i % 2; }),
+       makeFlatVector<int64_t>(probes.size(), [](auto i) { return i * 10; })});
+  for (auto builds : std::vector<std::vector<std::optional<int64_t>>>{
+           {minimum, maximum, 2, 2, -1, 5, std::nullopt},
+           {std::nullopt, std::nullopt},
+           {}}) {
+    auto build = makeRowVector(
+        {"u_k", "u_k2", "u_v"},
+        {makeNullableFlatVector<int64_t>(builds),
+         makeFlatVector<int64_t>(builds.size(), [](auto i) { return i % 2; }),
+         makeFlatVector<int64_t>(
+             builds.size(), [](auto i) { return i + 100; })});
+    for (bool composite : {false, true}) {
+      std::vector<int64_t> expectedKeys, expectedProbe, expectedBuild;
+      for (size_t i = 0; i < probes.size(); ++i) {
+        for (size_t j = 0; j < builds.size(); ++j) {
+          if (probes[i] && builds[j] && probes[i] == builds[j] &&
+              (!composite || i % 2 == j % 2)) {
+            expectedKeys.push_back(*probes[i]);
+            expectedProbe.push_back(i * 10);
+            expectedBuild.push_back(j + 100);
+          }
+        }
+      }
+      auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+      auto plan = PlanBuilder(ids)
+                      .values({probe})
+                      .hashJoin(
+                          composite ? std::vector<std::string>{"k", "k2"}
+                                    : std::vector<std::string>{"k"},
+                          composite ? std::vector<std::string>{"u_k", "u_k2"}
+                                    : std::vector<std::string>{"u_k"},
+                          PlanBuilder(ids).values({build}).planNode(),
+                          "",
+                          {"k", "v", "u_v"})
+                      .planNode();
+      auto task = AssertQueryBuilder(plan).assertResults(makeRowVector(
+          {"k", "v", "u_v"},
+          {makeFlatVector<int64_t>(expectedKeys),
+           makeFlatVector<int64_t>(expectedProbe),
+           makeFlatVector<int64_t>(expectedBuild)}));
+      int64_t filteredBatches = 0;
+      for (const auto& pipeline : task->taskStats().pipelineStats) {
+        for (const auto& op : pipeline.operatorStats) {
+          if (auto it = op.runtimeStats.find("joinBloomFilteredBatches");
+              it != op.runtimeStats.end()) {
+            filteredBatches += it->second.sum;
+          }
+        }
+      }
+      if (!builds.empty()) {
+        EXPECT_GT(filteredBatches, 0);
+      }
+    }
+  }
+}
+
+TEST_F(HashJoinTest, exactBitmapMembershipRangesAndSlices) {
+  using namespace facebook::velox::cudf_velox;
+  const auto stream = cudf::get_default_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+  const auto run = [&]<typename Key>(Key base) {
+    const std::vector<std::optional<Key>> builds = {
+        base,
+        std::nullopt,
+        static_cast<Key>(base + 3),
+        static_cast<Key>(base + 3),
+        static_cast<Key>(base + 63)};
+    std::vector<std::optional<Key>> probes{std::nullopt};
+    for (int index = 0; index < 100; ++index) {
+      probes.push_back(static_cast<Key>(base + index));
+    }
+    probes.push_back(std::numeric_limits<Key>::min());
+    probes.push_back(std::numeric_limits<Key>::max());
+    auto build = makeRowVector({makeNullableFlatVector<Key>(builds)});
+    auto probe = makeRowVector({makeNullableFlatVector<Key>(probes)});
+    auto buildTable = with_arrow::toCudfTable(build, pool_.get(), stream, mr);
+    auto probeTable = with_arrow::toCudfTable(probe, pool_.get(), stream, mr);
+    for (bool sliced : {false, true}) {
+      auto buildView = sliced
+          ? cudf::slice(buildTable->view().column(0), {1, 5}, stream).front()
+          : buildTable->view().column(0);
+      auto probeView = sliced
+          ? cudf::slice(probeTable->view().column(0), {2, 103}, stream).front()
+          : probeTable->view().column(0);
+      auto bitmap = makeJoinBloomFilter(buildView, 8, stream, mr, 256000000);
+      ASSERT_GT(bitmap->range, 0);
+      auto selected = filterJoinProbeKeys(*bitmap, probeView, stream, mr);
+      std::vector<cudf::size_type> actual(selected->size());
+      if (!actual.empty()) {
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+            actual.data(),
+            selected->data(),
+            actual.size() * sizeof(cudf::size_type),
+            cudaMemcpyDeviceToHost,
+            stream.value()));
+      }
+      stream.synchronize();
+      std::vector<cudf::size_type> expected;
+      const int probeBegin = sliced ? 2 : 0;
+      for (int index = probeBegin; index < static_cast<int>(probes.size());
+           ++index) {
+        if (!probes[index]) {
+          continue;
+        }
+        for (int buildIndex = sliced ? 1 : 0;
+             buildIndex < static_cast<int>(builds.size());
+             ++buildIndex) {
+          if (builds[buildIndex] && probes[index] == builds[buildIndex]) {
+            expected.push_back(index - probeBegin);
+            break;
+          }
+        }
+      }
+      EXPECT_EQ(actual, expected);
+    }
+  };
+  run.template operator()<int32_t>(-50);
+  run.template operator()<int32_t>(std::numeric_limits<int32_t>::min());
+  run.template operator()<int32_t>(std::numeric_limits<int32_t>::max() - 100);
+  run.template operator()<int64_t>(-50);
+  run.template operator()<int64_t>(std::numeric_limits<int64_t>::min());
+  run.template operator()<int64_t>(std::numeric_limits<int64_t>::max() - 100);
+
+  for (auto keys : std::vector<std::vector<std::optional<int64_t>>>{
+           {std::numeric_limits<int64_t>::min(),
+            std::numeric_limits<int64_t>::max()},
+           {std::nullopt, std::nullopt},
+           {0, 100000000}}) {
+    auto input = makeRowVector({makeNullableFlatVector<int64_t>(keys)});
+    auto table = with_arrow::toCudfTable(input, pool_.get(), stream, mr);
+    auto bitmap =
+        makeJoinBloomFilter(table->view().column(0), 8, stream, mr, 256000000);
+    EXPECT_EQ(bitmap->range, 0);
+  }
+}
+
+TEST_F(HashJoinTest, exactBitmapSparseMemoryRatio) {
+  using namespace facebook::velox::cudf_velox;
+  const auto stream = cudf::get_default_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+  const auto run = [&]<typename Key>() {
+    auto build = makeRowVector(
+        {makeNullableFlatVector<Key>({0, 1000, std::nullopt, 1000})});
+    auto probe = makeRowVector(
+        {makeNullableFlatVector<Key>({0, 2, 1000, 1001, std::nullopt, -1})});
+    auto buildTable = with_arrow::toCudfTable(build, pool_.get(), stream, mr);
+    auto probeTable = with_arrow::toCudfTable(probe, pool_.get(), stream, mr);
+    auto conservative = makeJoinBloomFilter(
+        buildTable->view().column(0), 8, stream, mr, 2000, 4);
+    EXPECT_EQ(conservative->range, 0);
+    auto exact = makeJoinBloomFilter(
+        buildTable->view().column(0), 8, stream, mr, 2000, 64);
+    EXPECT_EQ(exact->range, 1001);
+    auto selected =
+        filterJoinProbeKeys(*exact, probeTable->view().column(0), stream, mr);
+    std::vector<cudf::size_type> actual(selected->size());
+    ASSERT_EQ(actual.size(), 2);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        actual.data(),
+        selected->data(),
+        actual.size() * sizeof(cudf::size_type),
+        cudaMemcpyDeviceToHost,
+        stream.value()));
+    stream.synchronize();
+    EXPECT_EQ(actual, (std::vector<cudf::size_type>{0, 2}));
+    auto capped = makeJoinBloomFilter(
+        buildTable->view().column(0), 8, stream, mr, 1000, 64);
+    EXPECT_EQ(capped->range, 0);
+    EXPECT_THROW(
+        makeJoinBloomFilter(
+            buildTable->view().column(0), 8, stream, mr, 2000, 0),
+        cudf::logic_error);
+  };
+  run.template operator()<int32_t>();
+  run.template operator()<int64_t>();
+}
+
+TEST_F(HashJoinTest, exactBitmapCompositeJoin) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_dense_int_join = false;
+  FLAGS_cudf_join_bloom_filter = true;
+  FLAGS_cudf_join_bloom_min_build_rows = 0;
+  FLAGS_cudf_join_bloom_min_probe_rows = 0;
+  FLAGS_cudf_join_exact_bitmap_max_range = 256000000;
+  auto probe = makeRowVector(
+      {"k", "k2", "v"},
+      {makeNullableFlatVector<int64_t>({-8, -8, 3, 3, 7, std::nullopt}),
+       makeFlatVector<int64_t>({1, 2, 1, 2, 1, 1}),
+       makeFlatVector<int64_t>({0, 1, 2, 3, 4, 5})});
+  auto build = makeRowVector(
+      {"u", "u2", "w"},
+      {makeNullableFlatVector<int64_t>({-8, -8, 3, std::nullopt}),
+       makeFlatVector<int64_t>({2, 2, 1, 1}),
+       makeFlatVector<int64_t>({10, 11, 12, 13})});
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(ids)
+                  .values({probe})
+                  .hashJoin(
+                      {"k", "k2"},
+                      {"u", "u2"},
+                      PlanBuilder(ids).values({build}).planNode(),
+                      "",
+                      {"v", "w"})
+                  .planNode();
+  auto task = AssertQueryBuilder(plan).assertResults(makeRowVector(
+      {makeFlatVector<int64_t>({1, 1, 2}),
+       makeFlatVector<int64_t>({10, 11, 12})}));
+  int64_t exactBuilds = 0;
+  for (const auto& pipeline : task->taskStats().pipelineStats) {
+    for (const auto& op : pipeline.operatorStats) {
+      if (const auto it = op.runtimeStats.find("joinExactBitmapBuilds");
+          it != op.runtimeStats.end()) {
+        exactBuilds += it->second.sum;
+      }
+    }
+  }
+  EXPECT_GT(exactBuilds, 0);
 }
 
 TEST_F(HashJoinTest, countStarOverInnerJoinWithZeroColumnOutput) {

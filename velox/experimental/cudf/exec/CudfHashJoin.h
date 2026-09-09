@@ -17,6 +17,8 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/DenseJoinIndex.h"
+#include "velox/experimental/cudf/exec/JoinBloomFilter.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/AstExpressionUtils.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -28,6 +30,7 @@
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/join/hash_join.hpp>
 #include <cudf/table/table.hpp>
 
@@ -39,6 +42,56 @@ namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
 class CudfExpression;
+
+// Common probe interface for the regular and verified-distinct build paths.
+// The latter is only selected after an exact runtime uniqueness check.
+class CudfJoinHash {
+ public:
+  struct ProbeStats {
+    int64_t inputRows{0};
+    int64_t candidateRows{0};
+    bool filtered{false};
+  };
+
+  CudfJoinHash(
+      cudf::table_view keys,
+      bool distinct,
+      bool allowBloom,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr);
+
+  std::pair<
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>>>
+  inner_join(
+      cudf::table_view keys,
+      std::optional<std::size_t> outputSize,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr,
+      ProbeStats* stats = nullptr) const;
+
+  size_t bloomFilterBytes() const {
+    return bloom_ ? bloom_->words.size() * sizeof(uint64_t) : 0;
+  }
+
+  uint64_t exactBitmapRange() const {
+    return bloom_ ? bloom_->range : 0;
+  }
+
+  size_t denseIndexRange() const {
+    return dense_ ? dense_->rows.size() : 0;
+  }
+
+  bool usesDistinctHash() const {
+    return distinct_ != nullptr;
+  }
+
+ private:
+  std::unique_ptr<JoinBloomFilter> bloom_;
+  std::unique_ptr<DenseJoinIndex> dense_;
+  std::unique_ptr<cudf::hash_join> general_;
+  std::unique_ptr<cudf::distinct_hash_join> distinct_;
+};
 
 /**
  * @brief Bridge for transferring build-side hash tables between build and probe
@@ -61,7 +114,7 @@ class CudfHashJoinBridge : public exec::JoinBridge {
    * batched processing */
   using hash_type = std::pair<
       std::vector<std::shared_ptr<cudf::table>>,
-      std::vector<std::shared_ptr<cudf::hash_join>>>;
+      std::vector<std::shared_ptr<CudfJoinHash>>>;
 
   void setHashTable(std::optional<hash_type> hashObject);
 

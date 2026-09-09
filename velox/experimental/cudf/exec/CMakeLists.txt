@@ -36,10 +36,12 @@ add_library(
   CudfTopNRowNumber.cpp
   CudfWindow.cpp
   DebugUtil.cpp
+  DenseJoinIndex.cu
   DecimalAggregationDevice.cu
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp
   GpuResources.cpp
+  JoinBloomFilter.cu
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp
   SparkAggregateFunctions.cpp

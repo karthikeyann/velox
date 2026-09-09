@@ -26,8 +26,10 @@
 
 #include "velox/common/testutil/TestValue.h"
 #include "velox/core/PlanNode.h"
+#include "velox/exec/Driver.h"
 #include "velox/exec/Task.h" // NOLINT(misc-unused-headers)
 #include "velox/expression/ExprOptimizer.h"
+#include "velox/type/Filter.h"
 #include "velox/type/TypeUtil.h"
 
 #include <cudf/aggregation.hpp>
@@ -43,6 +45,7 @@
 #include <cudf/join/mixed_join.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/reduction/distinct_count.hpp>
 #include <cudf/reshape.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/search.hpp>
@@ -55,13 +58,91 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <gflags/gflags.h>
+
 #include <algorithm>
 #include <iterator>
 #include <optional>
 
+DEFINE_bool(
+    cudf_dynamic_filters,
+    false,
+    "Enable exact small integer build-key filters from GPU joins to Hive scans");
+DEFINE_int64(
+    cudf_dynamic_filter_max_build_rows,
+    64,
+    "Maximum small integer-key GPU join build eligible for exact scan filters");
+
+DEFINE_bool(
+    cudf_join_fast_null_stats,
+    false,
+    "Skip null-mask reduction for join statistics when all columns have zero nulls");
+DEFINE_bool(
+    cudf_distinct_hash_join,
+    false,
+    "Use distinct hash joins for inner joins after exact build-key uniqueness checks");
+DEFINE_int64(
+    cudf_distinct_hash_join_max_build_rows,
+    64'000'000,
+    "Maximum build rows eligible for experimental distinct hash join checks");
+DEFINE_bool(
+    cudf_dense_int_join,
+    false,
+    "Use a bounded direct-address index for verified-unique integer inner joins");
+DEFINE_uint64(
+    cudf_dense_int_join_max_range,
+    256'000'000,
+    "Maximum direct-address key range");
+DEFINE_double(
+    cudf_dense_int_join_min_density,
+    0.05,
+    "Minimum direct-address key density");
+DEFINE_bool(
+    cudf_join_bloom_filter,
+    false,
+    "Prefilter inner-join probes with a blocked integer-key Bloom filter");
+DEFINE_int64(
+    cudf_join_bloom_min_build_rows,
+    1'000'000,
+    "Minimum Bloom-filter build rows");
+DEFINE_int64(
+    cudf_join_bloom_max_build_rows,
+    100'000'000,
+    "Maximum Bloom-filter build rows");
+DEFINE_int64(
+    cudf_join_bloom_min_probe_rows,
+    1'000'000,
+    "Minimum Bloom-filter probe rows");
+DEFINE_uint64(
+    cudf_join_bloom_bits_per_row,
+    8,
+    "Bloom-filter bits per build row (1..64)");
+DEFINE_uint64(
+    cudf_join_exact_bitmap_max_range,
+    0,
+    "Use exact membership bits for bounded integer domains up to this range; zero disables");
+DEFINE_uint64(
+    cudf_join_exact_bitmap_max_bloom_ratio,
+    4,
+    "Maximum exact-bitmap/Bloom memory ratio, in addition to the absolute domain cap");
+
 namespace facebook::velox::cudf_velox {
 
 namespace {
+
+cudf::size_type countInputNullRows(
+    cudf::table_view input,
+    rmm::cuda_stream_view stream) {
+  if (FLAGS_cudf_join_fast_null_stats &&
+      std::all_of(input.begin(), input.end(), [](const auto& column) {
+        return column.null_count() == 0;
+      })) {
+    return 0;
+  }
+  // Preserve the existing statistic's definition and nullable-input path.
+  // Only the all-valid case can be answered from existing column metadata.
+  return cudf::bitmask_and(input, stream, get_temp_mr()).second;
+}
 
 /// Creates extended table view by appending precomputed columns
 cudf::table_view createExtendedTableView(
@@ -205,6 +286,91 @@ void CudfHashJoinBuild::doClose() {
   Operator::close();
 }
 
+CudfJoinHash::CudfJoinHash(
+    cudf::table_view keys,
+    bool distinct,
+    bool allowBloom,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  if (distinct && FLAGS_cudf_dense_int_join && keys.num_columns() == 1) {
+    dense_ = tryMakeDenseJoinIndex(
+        keys.column(0),
+        FLAGS_cudf_dense_int_join_max_range,
+        FLAGS_cudf_dense_int_join_min_density,
+        stream,
+        mr);
+    if (dense_) {
+      return;
+    }
+  }
+  if (allowBloom && FLAGS_cudf_join_bloom_filter && keys.num_rows() > 0 &&
+      keys.num_rows() >= FLAGS_cudf_join_bloom_min_build_rows &&
+      keys.num_rows() <= FLAGS_cudf_join_bloom_max_build_rows &&
+      (keys.column(0).type().id() == cudf::type_id::INT32 ||
+       keys.column(0).type().id() == cudf::type_id::INT64)) {
+    bloom_ = makeJoinBloomFilter(
+        keys.column(0),
+        FLAGS_cudf_join_bloom_bits_per_row,
+        stream,
+        mr,
+        FLAGS_cudf_join_exact_bitmap_max_range,
+        FLAGS_cudf_join_exact_bitmap_max_bloom_ratio);
+  }
+  if (distinct && FLAGS_cudf_distinct_hash_join) {
+    distinct_ = std::make_unique<cudf::distinct_hash_join>(
+        keys, cudf::null_equality::UNEQUAL, 0.5, stream);
+  } else {
+    general_ = std::make_unique<cudf::hash_join>(
+        keys, cudf::null_equality::UNEQUAL, stream, mr);
+  }
+}
+
+std::pair<
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>>>
+CudfJoinHash::inner_join(
+    cudf::table_view keys,
+    std::optional<std::size_t> outputSize,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr,
+    ProbeStats* stats) const {
+  if (dense_) {
+    return probeDenseJoinIndex(*dense_, keys.column(0), stream, mr);
+  }
+  if (bloom_ && keys.num_rows() >= FLAGS_cudf_join_bloom_min_probe_rows) {
+    auto candidates = filterJoinProbeKeys(*bloom_, keys.column(0), stream, mr);
+    if (stats) {
+      stats->inputRows = keys.num_rows();
+      stats->candidateRows = candidates->size();
+    }
+    // Skip the extra gather when most keys survive. This check is per batch:
+    // do not infer future selectivity from a differently partitioned input.
+    if (candidates->size() * 5 <
+        uint64_t{static_cast<uint32_t>(keys.num_rows())} * 4) {
+      auto candidateView = cudf::column_view{
+          cudf::device_span<const cudf::size_type>{*candidates}};
+      auto candidateKeys = cudf::gather(
+          keys,
+          candidateView,
+          cudf::out_of_bounds_policy::DONT_CHECK,
+          stream,
+          mr);
+      auto indices = distinct_
+          ? distinct_->inner_join(candidateKeys->view(), stream, mr)
+          : general_->inner_join(candidateKeys->view(), outputSize, stream, mr);
+      remapJoinProbeIndices(*indices.first, *candidates, stream);
+      if (stats) {
+        stats->filtered = true;
+      }
+      return indices;
+    }
+  }
+  if (distinct_) {
+    return distinct_->inner_join(keys, stream, mr);
+  }
+  return general_->inner_join(keys, outputSize, stream, mr);
+}
+
 void CudfHashJoinBridge::setHashTable(
     std::optional<CudfHashJoinBridge::hash_type> hashObject) {
   if (CudfConfig::getInstance().debugEnabled) {
@@ -289,8 +455,8 @@ void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     VELOX_CHECK_NOT_NULL(cudfInput);
     // Count nulls in join key columns
-    auto [_, null_count] = cudf::bitmask_and(
-        cudfInput->getTableView(), cudfInput->stream(), get_temp_mr());
+    auto null_count =
+        countInputNullRows(cudfInput->getTableView(), cudfInput->stream());
     {
       // Update statistics for null keys in join operator.
       auto lockedStats = stats_.wlock();
@@ -391,17 +557,65 @@ void CudfHashJoinBuild::doNoMoreInput() {
        joinNode_->isRightJoin() || joinNode_->isFullJoin() ||
        joinNode_->isLeftSemiProjectJoin());
 
-  std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
+  std::vector<std::shared_ptr<CudfJoinHash>> hashObjects;
   for (auto i = 0; i < tbls.size(); i++) {
+    auto keys = tbls[i]->view().select(buildKeyIndices);
+    bool distinct = false;
+    // Start conservatively: small, non-null integer key tuples on inner joins.
+    // Duplicate tuples always retain the general multimap implementation.
+    if ((FLAGS_cudf_distinct_hash_join || FLAGS_cudf_dense_int_join) &&
+        joinNode_->isInnerJoin() && keys.num_rows() > 0 &&
+        keys.num_rows() <= FLAGS_cudf_distinct_hash_join_max_build_rows &&
+        std::all_of(keys.begin(), keys.end(), [](const auto& column) {
+          return column.null_count() == 0 &&
+              (column.type().id() == cudf::type_id::INT32 ||
+               column.type().id() == cudf::type_id::INT64);
+        })) {
+      distinct =
+          cudf::distinct_count(keys, cudf::null_equality::EQUAL, stream) ==
+          keys.num_rows();
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat("distinctBuildKeyChecks", RuntimeCounter(1));
+      lockedStats->addRuntimeStat(
+          "distinctBuildKeyCheckRows", RuntimeCounter(keys.num_rows()));
+    }
     hashObjects.push_back(
-        (buildHashJoin) ? std::make_shared<cudf::hash_join>(
-                              tbls[i]->view().select(buildKeyIndices),
-                              cudf::null_equality::UNEQUAL,
+        (buildHashJoin) ? std::make_shared<CudfJoinHash>(
+                              keys,
+                              distinct,
+                              joinNode_->isInnerJoin(),
                               stream,
                               get_temp_mr())
                         : nullptr);
     if (buildHashJoin) {
       VELOX_CHECK_NOT_NULL(hashObjects.back());
+      if (distinct) {
+        auto lockedStats = stats_.wlock();
+        lockedStats->addRuntimeStat(
+            "distinctHashJoinBuilds",
+            RuntimeCounter(hashObjects.back()->usesDistinctHash() ? 1 : 0));
+      }
+      if (hashObjects.back()->denseIndexRange() != 0) {
+        auto lockedStats = stats_.wlock();
+        lockedStats->addRuntimeStat("denseIntJoinBuilds", RuntimeCounter(1));
+        lockedStats->addRuntimeStat(
+            "denseIntJoinRange",
+            RuntimeCounter(hashObjects.back()->denseIndexRange()));
+      }
+      if (hashObjects.back()->bloomFilterBytes() != 0) {
+        auto lockedStats = stats_.wlock();
+        lockedStats->addRuntimeStat("joinBloomBuilds", RuntimeCounter(1));
+        lockedStats->addRuntimeStat(
+            "joinBloomBytes",
+            RuntimeCounter(hashObjects.back()->bloomFilterBytes()));
+        if (hashObjects.back()->exactBitmapRange() != 0) {
+          lockedStats->addRuntimeStat(
+              "joinExactBitmapBuilds", RuntimeCounter(1));
+          lockedStats->addRuntimeStat(
+              "joinExactBitmapRange",
+              RuntimeCounter(hashObjects.back()->exactBitmapRange()));
+        }
+      }
     }
     if (CudfConfig::getInstance().debugEnabled) {
       if (hashObjects.back() != nullptr) {
@@ -651,8 +865,8 @@ void CudfHashJoinProbe::doAddInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
   // Count nulls in join key columns
-  auto [_, null_count] = cudf::bitmask_and(
-      cudfInput->getTableView(), cudfInput->stream(), get_temp_mr());
+  auto null_count =
+      countInputNullRows(cudfInput->getTableView(), cudfInput->stream());
   {
     // Update statistics for null keys in join operator.
     auto lockedStats = stats_.wlock();
@@ -961,11 +1175,23 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
 
     // left = probe, right = build
     VELOX_CHECK_NOT_NULL(hb);
+    CudfJoinHash::ProbeStats bloomStats;
     auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
         leftTableView.select(leftKeyIndices_),
         std::nullopt,
         stream,
-        get_temp_mr());
+        get_temp_mr(),
+        &bloomStats);
+    if (bloomStats.inputRows != 0) {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "joinBloomInputRows", RuntimeCounter(bloomStats.inputRows));
+      lockedStats->addRuntimeStat(
+          "joinBloomCandidateRows", RuntimeCounter(bloomStats.candidateRows));
+      lockedStats->addRuntimeStat(
+          "joinBloomFilteredBatches",
+          RuntimeCounter(bloomStats.filtered ? 1 : 0));
+    }
 
     auto leftIndicesSpan =
         cudf::device_span<cudf::size_type const>{*leftJoinIndices};
@@ -2382,6 +2608,50 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   hashObject_ = std::move(hashObject);
   buildStream_ = cudfJoinBridge->getBuildStream();
   buildReadyEvent_ = cudfJoinBridge->getBuildReadyEvent();
+
+  if (FLAGS_cudf_dynamic_filters && leftKeyIndices_.size() == 1 &&
+      !joinNode_->isNullAware() &&
+      (joinNode_->isInnerJoin() || joinNode_->isLeftSemiFilterJoin())) {
+    const auto& tables = hashObject_.value().first;
+    int64_t buildRows = 0;
+    bool integerKey = true;
+    for (const auto& table : tables) {
+      buildRows += table->num_rows();
+      const auto id = table->view().column(rightKeyIndices_[0]).type().id();
+      integerKey &= id == cudf::type_id::INT32 || id == cudf::type_id::INT64;
+    }
+    auto* driver = operatorCtx_->driverCtx()->driver;
+    const std::vector<column_index_t> channels{
+        static_cast<column_index_t>(leftKeyIndices_[0])};
+    if (integerKey && buildRows > 0 &&
+        buildRows <= FLAGS_cudf_dynamic_filter_max_build_rows &&
+        !driver->canPushdownFilters(this, channels).empty()) {
+      const auto stream = cudfGlobalStreamPool().get_stream();
+      waitForBuildReady(stream);
+      std::vector<int64_t> values;
+      for (const auto& table : tables) {
+        const auto key = table->view().column(rightKeyIndices_[0]);
+        auto host = with_arrow::toVeloxColumn(
+            cudf::table_view({key}), pool(), "key", stream, get_temp_mr());
+        auto column = host->childAt(0);
+        for (vector_size_t row = 0; row < column->size(); ++row) {
+          if (!column->isNullAt(row)) {
+            values.push_back(
+                key.type().id() == cudf::type_id::INT64
+                    ? column->as<FlatVector<int64_t>>()->valueAt(row)
+                    : column->as<FlatVector<int32_t>>()->valueAt(row));
+          }
+        }
+      }
+      std::sort(values.begin(), values.end());
+      values.erase(std::unique(values.begin(), values.end()), values.end());
+      driver->pushdownFilters(
+          this, channels, [&](column_index_t, common::FilterPtr& filter) {
+            filter = common::createBigintValues(values, false);
+            return true;
+          });
+    }
+  }
 
   // Lazy initialize matched flags only when build side is done
   if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {

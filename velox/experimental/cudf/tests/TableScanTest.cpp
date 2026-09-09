@@ -57,6 +57,7 @@ DECLARE_bool(cudf_scan_prune_before_filter);
 DECLARE_bool(cudf_scan_borrow_gpu_cache);
 DECLARE_bool(cudf_scan_borrow_gpu_cache_unfiltered);
 DECLARE_bool(cudf_scan_async_output);
+DECLARE_bool(cudf_dynamic_filters);
 DECLARE_bool(cudf_project_borrowed_views);
 DECLARE_bool(cudf_scan_jit_subfield_filters);
 DECLARE_uint64(cudf_scan_jit_subfield_min_rows);
@@ -1005,6 +1006,97 @@ TEST_F(TableScanTest, jitCachedSubfieldPredicates) {
               custom.at("totalRemainingFilterWallNanos").sum > 0);
         } else {
           EXPECT_GT(custom.at("jitSubfieldFilterBatches").sum, 0);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(TableScanTest, smallJoinDynamicFiltersAndCacheIsolation) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_dynamic_filters = true;
+  FLAGS_cudf_project_borrowed_views = true;
+  FLAGS_cudf_scan_prune_before_filter = true;
+  FLAGS_cudf_scan_borrow_gpu_cache = true;
+  FLAGS_cudf_scan_borrow_gpu_cache_unfiltered = true;
+  using CacheConfig =
+      facebook::velox::cudf_velox::connector::hive::CudfHiveConfig;
+  resetCudfHiveConnector(
+      std::make_shared<config::ConfigBase>(
+          std::unordered_map<std::string, std::string>{
+              {CacheConfig::kUseExperimentalCudfReader, "true"},
+              {CacheConfig::kExperimentalDecodedColumnCacheEnabled, "true"},
+              {CacheConfig::kExperimentalDecodedColumnGpuCacheEnabled, "true"},
+              {CacheConfig::kImmutableFiles, "true"}}));
+  for (bool int32 : {false, true}) {
+    VectorPtr probeKeys;
+    if (int32) {
+      probeKeys = makeNullableFlatVector<int32_t>(
+          {1, 2, 3, 4, 5, 1000000, std::nullopt});
+    } else {
+      probeKeys = makeNullableFlatVector<int64_t>(
+          {1, 2, 3, 4, 5, 1000000, std::nullopt});
+    }
+    auto input = makeRowVector(
+        {"k", "v", "comment"},
+        {probeKeys,
+         makeNullableFlatVector<double>({1, 2, 3, std::nullopt, 5, 6, 7}),
+         makeFlatVector<std::string>(
+             {"keep", "keep", "drop", "keep", "keep", "keep", "keep"})});
+    auto file = TempFilePath::create();
+    writeToFile(file->getPath(), {input});
+    createDuckDbTable("probe", {input});
+    for (const auto& keys : std::vector<std::vector<std::optional<int64_t>>>{
+             {2, 2, std::nullopt, 5},
+             {1, 1000000},
+             {std::nullopt, std::nullopt},
+             {8, 9},
+             {4}}) {
+      auto buildKeys = makeNullableFlatVector<int64_t>(keys);
+      VectorPtr typedBuildKeys = buildKeys;
+      if (int32) {
+        std::vector<std::optional<int32_t>> narrow(keys.begin(), keys.end());
+        typedBuildKeys = makeNullableFlatVector<int32_t>(narrow);
+      }
+      auto build = makeRowVector({"bk"}, {typedBuildKeys});
+      createDuckDbTable("build", {build});
+      for (auto joinType :
+           {core::JoinType::kInner, core::JoinType::kLeftSemiFilter}) {
+        for (int repeat = 0; repeat < 2; ++repeat) {
+          auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+          auto buildPlan =
+              PlanBuilder(ids, pool_.get()).values({build}).planNode();
+          core::PlanNodeId scanId;
+          auto plan =
+              PlanBuilder(ids, pool_.get())
+                  .startTableScan()
+                  .connectorId(kCudfHiveConnectorId)
+                  .outputType(
+                      ROW({"alias_key", "v"}, {probeKeys->type(), DOUBLE()}))
+                  .dataColumns(asRowType(input->type()))
+                  .columnAliases({{"alias_key", "k"}})
+                  .remainingFilter("k >= 2 AND comment LIKE '%keep%'")
+                  .endTableScan()
+                  .capturePlanNodeId(scanId)
+                  .project({"alias_key as join_key", "v + 0.0 as v"})
+                  .hashJoin(
+                      {"join_key"},
+                      {"bk"},
+                      buildPlan,
+                      "",
+                      {"join_key", "v"},
+                      joinType)
+                  .planNode();
+          const auto sql = joinType == core::JoinType::kInner
+              ? "SELECT k, v FROM probe JOIN build ON k = bk WHERE k >= 2 AND comment LIKE '%keep%'"
+              : "SELECT k, v FROM probe WHERE k >= 2 AND comment LIKE '%keep%' AND k IN (SELECT bk FROM build)";
+          auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                          .splits(scanId, makeCudfHiveConnectorSplits({file}))
+                          .maxDrivers(3)
+                          .assertResults(sql);
+          auto stats = toPlanStats(task->taskStats());
+          EXPECT_GT(
+              stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 0);
         }
       }
     }
