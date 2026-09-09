@@ -37,6 +37,7 @@ add_library(
   CudfWindow.cpp
   DebugUtil.cpp
   DenseJoinIndex.cu
+  DenseIntegerSum.cu
   DecimalAggregationDevice.cu
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp
@@ -45,7 +46,9 @@ add_library(
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp
   SparkAggregateFunctions.cpp
+  ShortStringGroupKeys.cu
   ToCudf.cpp
+  TopKSortKeys.cu
   Utilities.cpp
   VeloxCudfInterop.cpp
 )

@@ -39,10 +39,13 @@
 
 #include <fmt/format.h>
 #include <folly/String.h>
+#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
 #include <limits>
 #include <sstream>
+
+DECLARE_bool(cudf_window_full_partition_avg);
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -337,6 +340,55 @@ TEST_F(CudfWindowTest, avgWindow) {
           makeFlatVector<double>({10.0, 15.0, 20.0, 100.0, 150.0}),
       });
 
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
+TEST_F(CudfWindowTest, fullPartitionAverageWithNulls) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_window_full_partition_avg = true;
+  auto data = makeRowVector(
+      {"p", "v"},
+      {makeNullableFlatVector<int32_t>(
+           {1, 1, 1, 2, 2, 3, 3, std::nullopt, std::nullopt}),
+       makeNullableFlatVector<double>(
+           {10, std::nullopt, 30, std::nullopt, std::nullopt, -6, 12, 8, 12})});
+  auto expected = makeRowVector(
+      {"p", "v", "average"},
+      {data->childAt(0),
+       data->childAt(1),
+       makeNullableFlatVector<double>(
+           {20, 20, 20, std::nullopt, std::nullopt, 3, 3, 10, 10})});
+  for (
+      const auto& frame :
+      {"partition by p",
+       "partition by p order by v rows between unbounded preceding and unbounded following",
+       "partition by p order by v range between unbounded preceding and unbounded following"}) {
+    auto plan = PlanBuilder()
+                    .values({data})
+                    .window({fmt::format("avg(v) over ({}) AS average", frame)})
+                    .planNode();
+    AssertQueryBuilder(plan).assertResults(expected);
+  }
+}
+
+TEST_F(CudfWindowTest, fullPartitionIntegerAverageWidensBeforeSumming) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_window_full_partition_avg = true;
+  const auto big = std::numeric_limits<int64_t>::max();
+  auto data = makeRowVector(
+      {"p", "v"},
+      {makeFlatVector<int32_t>({1, 1, 2, 2}),
+       makeFlatVector<int64_t>({big, big, -6, 12})});
+  auto expected = makeRowVector(
+      {"p", "v", "average"},
+      {data->childAt(0),
+       data->childAt(1),
+       makeFlatVector<double>(
+           {static_cast<double>(big), static_cast<double>(big), 3, 3})});
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .window({"avg(v) over (partition by p) AS average"})
+                  .planNode();
   AssertQueryBuilder(plan).assertResults(expected);
 }
 

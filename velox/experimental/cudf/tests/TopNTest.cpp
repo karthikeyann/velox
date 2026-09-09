@@ -22,6 +22,13 @@
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
+#include <gflags/gflags.h>
+
+#include <limits>
+
+DECLARE_bool(cudf_topn_select_candidates);
+DECLARE_int64(cudf_topn_select_min_rows);
+
 using namespace facebook::velox;
 using namespace facebook::velox::exec::test;
 
@@ -119,6 +126,65 @@ class TopNTest : public OperatorTestBase {
     }
   }
 };
+
+TEST_F(TopNTest, numericSelectionPreservesBoundaryTiesAndSpecialDoubles) {
+  // Exercise the selected-candidate path and its all-equal fallback.
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_topn_select_candidates = true;
+  FLAGS_cudf_topn_select_min_rows = 0;
+  constexpr int32_t size = 4096;
+  for (bool allEqual : {false, true}) {
+    auto data = makeRowVector(
+        {"k", "tie", "id"},
+        {makeFlatVector<double>(
+             size,
+             [&](auto i) {
+               if (allEqual) {
+                 return i % 2 ? 0.0 : -0.0;
+               }
+               if (i % 503 == 0) {
+                 return std::numeric_limits<double>::quiet_NaN();
+               }
+               if (i % 509 == 0) {
+                 return -std::numeric_limits<double>::quiet_NaN();
+               }
+               if (i % 499 == 0) {
+                 return std::numeric_limits<double>::infinity();
+               }
+               if (i % 491 == 0) {
+                 return -std::numeric_limits<double>::infinity();
+               }
+               if (i % 487 == 0) {
+                 return std::numeric_limits<double>::denorm_min();
+               }
+               if (i % 479 == 0) {
+                 return -std::numeric_limits<double>::denorm_min();
+               }
+               return static_cast<double>((i * 17) % 127 - 63);
+             }),
+         makeFlatVector<int64_t>(size, [](auto i) { return (size - i) % 7; }),
+         makeFlatVector<int64_t>(size, [](auto i) { return i; })});
+    createDuckDbTable({data});
+    for (const auto& direction : {"ASC", "DESC"}) {
+      for (int32_t count : {5, 63}) {
+        SCOPED_TRACE(
+            fmt::format(
+                "equal={}, direction={}, k={}", allEqual, direction, count));
+        auto order = fmt::format("k {}, tie ASC, id ASC", direction);
+        auto plan =
+            PlanBuilder()
+                .values({data})
+                .topN(
+                    {fmt::format("k {}", direction), "tie", "id"}, count, false)
+                .planNode();
+        assertQueryOrdered(
+            plan,
+            fmt::format("SELECT * FROM tmp ORDER BY {} LIMIT {}", order, count),
+            {0, 1, 2});
+      }
+    }
+  }
+}
 
 TEST_F(TopNTest, selectiveFilter) {
   vector_size_t batchSize = 1000;

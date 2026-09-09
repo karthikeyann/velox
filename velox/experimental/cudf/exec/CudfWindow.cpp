@@ -27,6 +27,7 @@
 #include "velox/type/Type.h"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
@@ -45,11 +46,17 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <fmt/format.h>
+#include <gflags/gflags.h>
 
 #include <limits>
 #include <optional>
 #include <unordered_set>
 #include <utility>
+
+DEFINE_bool(
+    cudf_window_full_partition_avg,
+    false,
+    "Evaluate full-partition GPU AVG windows using optimized SUM and COUNT");
 
 namespace facebook::velox::cudf_velox {
 
@@ -239,6 +246,53 @@ std::unique_ptr<cudf::column> computeGlobalAggregate(
     VELOX_FAIL("Unsupported global aggregate window function: {}", baseName);
   }
   return cudf::make_column_from_scalar(*resultScalar, numRows, stream, mr);
+}
+
+std::unique_ptr<cudf::column> computeFullPartitionAverage(
+    const cudf::table_view& partitionKeys,
+    cudf::column_view input,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  // libcudf's optimized unbounded-window path does not support MEAN. SUM and
+  // COUNT do support it, avoiding both a CPU fallback and quadratic rolling
+  // work. Widen before summing, as AVG uses a floating-point accumulator even
+  // for integer inputs. Decimal AVG remains excluded by canRunOnGPU.
+  std::unique_ptr<cudf::column> widened;
+  const auto doubleType = cudf::data_type(cudf::type_id::FLOAT64);
+  if (input.type() != doubleType) {
+    widened = cudf::cast(input, doubleType, stream, mr);
+    input = widened->view();
+  }
+  auto sumAgg = cudf::make_sum_aggregation<cudf::rolling_aggregation>();
+  auto countAgg = cudf::make_count_aggregation<cudf::rolling_aggregation>(
+      cudf::null_policy::EXCLUDE);
+  auto sums = cudf::grouped_rolling_window(
+      partitionKeys,
+      input,
+      cudf::window_bounds::unbounded(),
+      cudf::window_bounds::unbounded(),
+      1,
+      *sumAgg,
+      stream,
+      mr);
+  auto counts = cudf::grouped_rolling_window(
+      partitionKeys,
+      input,
+      cudf::window_bounds::unbounded(),
+      cudf::window_bounds::unbounded(),
+      1,
+      *countAgg,
+      stream,
+      mr);
+  // min_periods=1 makes an all-null partition's SUM null; division retains that
+  // null rather than producing an observable zero-count value.
+  return cudf::binary_operation(
+      sums->view(),
+      counts->view(),
+      cudf::binary_operator::DIV,
+      doubleType,
+      stream,
+      mr);
 }
 
 bool containsCustomComparison(const TypePtr& type) {
@@ -570,7 +624,8 @@ bool CudfWindow::canRunOnGPU(
         !windowNode.partitionKeys().empty() ||
         !windowNode.sortingKeys().empty();
 
-    if (baseName == "avg" && isFullPartition && usesRollingFullPartitionPath) {
+    if (baseName == "avg" && isFullPartition && usesRollingFullPartitionPath &&
+        !FLAGS_cudf_window_full_partition_avg) {
       if (reason) {
         *reason = "Full-partition AVG requires optimized cuDF MEAN support";
       }
@@ -1151,6 +1206,11 @@ RowVectorPtr CudfWindow::doGetOutput() {
             logicalRowCount_,
             stream_,
             mr);
+      } else if (
+          baseName == "avg" && isFullPartition &&
+          FLAGS_cudf_window_full_partition_avg) {
+        windowResultCols[funcIndex] =
+            computeFullPartitionAverage(partKeys, inputCol, stream_, mr);
       } else if (
           auto rangeTypes = toBatchRangeWindowTypes(func, isFullPartition)) {
         addRangeRollingRequest(

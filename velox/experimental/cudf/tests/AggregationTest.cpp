@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
@@ -28,7 +29,21 @@
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/type/Timestamp.h"
 
+#include <gflags/gflags.h>
+
 #include <cmath>
+
+DECLARE_bool(cudf_groupby_detect_sorted_keys);
+DECLARE_int64(cudf_groupby_detect_sorted_min_rows);
+DECLARE_bool(cudf_groupby_share_nonnull_counts);
+DECLARE_bool(cudf_groupby_complete_batches);
+DECLARE_bool(cudf_groupby_stream_raw_single);
+DECLARE_bool(cudf_groupby_pack_short_string_keys);
+DECLARE_int64(cudf_groupby_pack_short_string_min_rows);
+DECLARE_uint64(cudf_dense_integer_sum_max_range);
+DECLARE_int64(cudf_dense_integer_sum_min_rows);
+DECLARE_bool(cudf_dense_integer_count_rows);
+DECLARE_uint64(cudf_dense_integer_count_32_max_rows);
 
 namespace facebook::velox::exec::test {
 
@@ -292,6 +307,261 @@ int64_t streamingGroupbyStatSum(
   }
   const auto statIt = planIt->second.customStats.find(std::string{name});
   return statIt == planIt->second.customStats.end() ? 0 : statIt->second.sum;
+}
+
+TEST_F(AggregationTest, verifiedSortedIntegerKeysAndUnsortedFallback) {
+  // Keep conversion batches separate so input and compaction checks both run.
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_groupby_detect_sorted_keys = true;
+  FLAGS_cudf_groupby_detect_sorted_min_rows = 0;
+  for (bool sorted : {false, true}) {
+    for (bool masked : {false, true}) {
+      for (bool ignoreNullKeys : {false, true}) {
+        SCOPED_TRACE(
+            fmt::format(
+                "sorted={}, masked={}, ignoreNull={}",
+                sorted,
+                masked,
+                ignoreNullKeys));
+        std::vector<std::optional<int64_t>> keys = sorted
+            ? std::vector<std::optional<
+                  int64_t>>{std::nullopt, std::nullopt, 1, 1, 2, 3, 3}
+            : std::vector<std::optional<int64_t>>{
+                  2, std::nullopt, 1, 3, 1, std::nullopt, 3};
+        auto data = makeRowVector(
+            {"k", "v", "m"},
+            {makeNullableFlatVector<int64_t>(keys),
+             makeNullableFlatVector<double>(
+                 {4, std::nullopt, 5, 6, std::nullopt, 8, std::nullopt}),
+             makeNullableFlatVector<bool>(
+                 {true, true, false, true, true, std::nullopt, true})});
+        // Two individually sorted batches are not necessarily sorted when
+        // concatenated during partial/intermediate aggregation.
+        createDuckDbTable({data, data});
+        core::PlanNodeId partialId;
+        auto plan =
+            PlanBuilder()
+                .values({data, data})
+                .aggregation(
+                    {"k"},
+                    {"sum(v)", "avg(v)", "count(v)", "min(v)", "max(v)"},
+                    masked ? std::vector<std::string>{"m", "", "m", "m", "m"}
+                           : std::vector<std::string>{},
+                    core::AggregationNode::Step::kPartial,
+                    ignoreNullKeys)
+                .capturePlanNodeId(partialId)
+                .intermediateAggregation()
+                .finalAggregation()
+                .planNode();
+        const std::string mask = masked ? " FILTER (WHERE m)" : "";
+        auto task =
+            AssertQueryBuilder(plan, duckDbQueryRunner_)
+                .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "7")
+                .assertResults(
+                    "SELECT k, sum(v)" + mask + ", avg(v), count(v)" + mask +
+                    ", min(v)" + mask + ", max(v)" + mask + " FROM tmp" +
+                    (ignoreNullKeys ? " WHERE k IS NOT NULL" : "") +
+                    " GROUP BY k");
+        EXPECT_GE(
+            streamingGroupbyStatSum(task, partialId, "sortedGroupbyChecks"), 2);
+        if (sorted) {
+          EXPECT_GE(
+              streamingGroupbyStatSum(task, partialId, "sortedGroupbyBatches"),
+              2);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(AggregationTest, sharedNonnullCountsChangingNullability) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_groupby_share_nonnull_counts = true;
+  auto first = makeRowVector(
+      {"k", "x", "y", "m"},
+      {makeNullableFlatVector<int64_t>({std::nullopt, 1, 1, 2}),
+       makeFlatVector<int64_t>({1, 2, 3, 4}),
+       makeFlatVector<double>({1.0, 2.0, 3.0, 4.0}),
+       makeNullableFlatVector<bool>({true, false, std::nullopt, true})});
+  auto second = makeRowVector(
+      {"k", "x", "y", "m"},
+      {makeNullableFlatVector<int64_t>({std::nullopt, 1, 1, 2}),
+       makeNullableFlatVector<int64_t>({std::nullopt, 2, std::nullopt, 4}),
+       makeNullableFlatVector<double>({1.0, std::nullopt, 3.0, 4.0}),
+       makeNullableFlatVector<bool>({true, true, true, std::nullopt})});
+  createDuckDbTable({first, second, first});
+  for (bool partial : {false, true}) {
+    core::PlanNodeId aggregateId;
+    auto builder = PlanBuilder().values({first, second, first});
+    builder.aggregation(
+        {"k"},
+        {"count(*)",
+         "count(x)",
+         "count(y)",
+         "count(null)",
+         "count(x)",
+         "sum(x)"},
+        {"", "", "", "", "m", ""},
+        partial ? core::AggregationNode::Step::kPartial
+                : core::AggregationNode::Step::kSingle,
+        false);
+    builder.capturePlanNodeId(aggregateId);
+    if (partial) {
+      builder.intermediateAggregation().finalAggregation();
+    }
+    auto task =
+        AssertQueryBuilder(builder.planNode(), duckDbQueryRunner_)
+            .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "4")
+            .assertResults(
+                "SELECT k, count(*), count(x), count(y), count(null), "
+                "count(x) FILTER (WHERE m), sum(x) FROM tmp GROUP BY k");
+    EXPECT_GT(
+        streamingGroupbyStatSum(
+            task, aggregateId, "groupbyRequestedAggregates"),
+        streamingGroupbyStatSum(task, aggregateId, "groupbySubmittedRequests"));
+  }
+}
+
+TEST_F(AggregationTest, completeGroupBatchesValidated) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_groupby_complete_batches = true;
+  FLAGS_cudf_groupby_detect_sorted_keys = true;
+  FLAGS_cudf_groupby_detect_sorted_min_rows = 0;
+  auto high = makeRowVector(
+      {"k", "v"},
+      {makeFlatVector<int64_t>({10, 10, 12, 13}),
+       makeNullableFlatVector<double>({1, std::nullopt, 3, std::nullopt})});
+  auto low = makeRowVector(
+      {"k", "v"},
+      {makeFlatVector<int64_t>({-4, -4, -2, -1}),
+       makeNullableFlatVector<double>({2, 4, std::nullopt, 7})});
+  // Ranges can arrive out of order; aggregate values can be null.
+  createDuckDbTable({high, low});
+  core::PlanNodeId aggregateId;
+  auto plan =
+      PlanBuilder()
+          .values({high, low})
+          .singleAggregation(
+              {"k"}, {"sum(v)", "count(v)", "count(*)", "avg(v)"})
+          .addNode([](std::string, core::PlanNodePtr node) {
+            auto aggregation =
+                std::dynamic_pointer_cast<const core::AggregationNode>(node);
+            return core::AggregationNode::Builder(*aggregation)
+                .preGroupedKeys(aggregation->groupingKeys())
+                .noGroupsSpanBatches(true)
+                .build();
+          })
+          .capturePlanNodeId(aggregateId)
+          .planNode();
+  auto task =
+      AssertQueryBuilder(plan, duckDbQueryRunner_)
+          .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "4")
+          .assertResults(
+              "SELECT k, sum(v), count(v), count(*), avg(v) FROM tmp GROUP BY k");
+  EXPECT_EQ(
+      streamingGroupbyStatSum(task, aggregateId, "completeGroupBatches"), 2);
+}
+
+TEST_F(AggregationTest, completeGroupBatchesRejectOverlapAndNull) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_groupby_complete_batches = true;
+  auto first = makeRowVector(
+      {"k", "v"},
+      {makeFlatVector<int32_t>({1, 1, 2, 3}),
+       makeFlatVector<int64_t>({1, 2, 3, 4})});
+  auto overlapping = makeRowVector(
+      {"k", "v"},
+      {makeFlatVector<int32_t>({3, 4, 5, 6}),
+       makeFlatVector<int64_t>({1, 2, 3, 4})});
+  auto nullable = makeRowVector(
+      {"k", "v"},
+      {makeNullableFlatVector<int32_t>({std::nullopt, 4, 5, 6}),
+       makeFlatVector<int64_t>({1, 2, 3, 4})});
+  for (const auto& second : {overlapping, nullable}) {
+    auto plan =
+        PlanBuilder()
+            .values({first, second})
+            .singleAggregation({"k"}, {"sum(v)"})
+            .addNode([](std::string, core::PlanNodePtr node) {
+              auto aggregation =
+                  std::dynamic_pointer_cast<const core::AggregationNode>(node);
+              return core::AggregationNode::Builder(*aggregation)
+                  .preGroupedKeys(aggregation->groupingKeys())
+                  .noGroupsSpanBatches(true)
+                  .build();
+            })
+            .planNode();
+    VELOX_ASSERT_THROW(
+        AssertQueryBuilder(plan)
+            .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "4")
+            .copyResults(pool()),
+        second == nullable ? "requires non-null keys"
+                           : "overlapping integer key ranges");
+  }
+  // Parallel Values gives each driver the same batch. Validate across drivers,
+  // not only successive batches within one operator instance.
+  auto plan =
+      PlanBuilder()
+          .values({first}, true)
+          .singleAggregation({"k"}, {"sum(v)"})
+          .addNode([](std::string, core::PlanNodePtr node) {
+            auto aggregation =
+                std::dynamic_pointer_cast<const core::AggregationNode>(node);
+            return core::AggregationNode::Builder(*aggregation)
+                .preGroupedKeys(aggregation->groupingKeys())
+                .noGroupsSpanBatches(true)
+                .build();
+          })
+          .planNode();
+  VELOX_ASSERT_THROW(
+      AssertQueryBuilder(plan).maxDrivers(3).copyResults(pool()),
+      "overlapping integer key ranges");
+}
+
+TEST_F(AggregationTest, losslessShortStringGroupingKeys) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_groupby_pack_short_string_keys = true;
+  FLAGS_cudf_groupby_pack_short_string_min_rows = 0;
+  const std::string embeddedNull("x\0y", 3);
+  for (bool twoKeys : {false, true}) {
+    for (int fallback : {0, 1, 2}) {
+      std::vector<std::optional<std::string>> keys{
+          "", "A", "AB", "ABC", "é", "界", embeddedNull, "A"};
+      if (fallback == 1) {
+        keys[2] = std::nullopt;
+      } else if (fallback == 2) {
+        keys[2] = "ABCD";
+      }
+      auto data = makeRowVector(
+          {"k", "k2", "v"},
+          {makeNullableFlatVector<std::string>(keys),
+           makeFlatVector<std::string>({"X", "X", "Y", "Y", "X", "Y", "", "X"}),
+           makeNullableFlatVector<double>(
+               {1, 2, 3, std::nullopt, 5, 6, 7, 8})});
+      createDuckDbTable({data, data});
+      core::PlanNodeId partialId;
+      auto plan = PlanBuilder()
+                      .values({data, data})
+                      .partialAggregation(
+                          twoKeys ? std::vector<std::string>{"k", "k2"}
+                                  : std::vector<std::string>{"k"},
+                          {"sum(v)", "count(v)", "avg(v)"})
+                      .capturePlanNodeId(partialId)
+                      .finalAggregation()
+                      .planNode();
+      const std::string groupKeys = twoKeys ? "k, k2" : "k";
+      auto task =
+          AssertQueryBuilder(plan, duckDbQueryRunner_)
+              .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "8")
+              .assertResults(
+                  "SELECT " + groupKeys +
+                  ", sum(v), count(v), avg(v) FROM tmp GROUP BY " + groupKeys);
+      EXPECT_EQ(
+          streamingGroupbyStatSum(task, partialId, "packedStringGroupBatches") >
+              0,
+          fallback == 0);
+    }
+  }
 }
 
 TEST_F(AggregationTest, global) {
@@ -1171,6 +1441,360 @@ TEST_F(
       task, partialAggId, cudf_velox::kStreamingGroupbyUsedStat));
   EXPECT_TRUE(hasStreamingGroupbyStat(
       task, finalAggId, cudf_velox::kStreamingGroupbyUsedStat));
+}
+
+TEST_F(StreamingGroupbyAggregationTest, rawSingleSupportedAndFallback) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_groupby_stream_raw_single = true;
+  auto vectors = makeVectors(rowType_, 10, 100);
+  createDuckDbTable(vectors);
+  for (const bool supported : {true, false}) {
+    SCOPED_TRACE(
+        supported ? "raw supported fields" : "fallback count and average");
+    core::PlanNodeId aggregateId;
+    const auto aggregates = supported
+        ? std::vector<std::string>{"sum(c2)", "min(c3)", "max(c5)"}
+        : std::vector<std::string>{"count(c1)", "avg(c4)", "count(0)"};
+    auto task =
+        AssertQueryBuilder(duckDbQueryRunner_)
+            .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 100)
+            .plan(
+                PlanBuilder()
+                    .values(vectors)
+                    .singleAggregation({"c0", "c6"}, aggregates)
+                    .capturePlanNodeId(aggregateId)
+                    .planNode())
+            .assertResults(
+                supported
+                    ? "SELECT c0, c6, sum(c2), min(c3), max(c5) FROM tmp GROUP BY c0,c6"
+                    : "SELECT c0, c6, count(c1), avg(c4), count(0) FROM tmp GROUP BY c0,c6");
+    EXPECT_EQ(
+        hasStreamingGroupbyStat(
+            task, aggregateId, cudf_velox::kStreamingGroupbyUsedStat),
+        supported);
+  }
+}
+
+TEST_F(StreamingGroupbyAggregationTest, denseIntegerSumNullsAndPermutation) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_dense_integer_sum_max_range = 1024;
+  FLAGS_cudf_dense_integer_sum_min_rows = 0;
+  const auto run = [&]<typename Key>() {
+    std::vector<RowVectorPtr> vectors;
+    vectors.push_back(makeRowVector(
+        {"junk", "v", "k"},
+        {makeFlatVector<int64_t>({0, 0, 0, 0, 0, 0, 0}),
+         makeNullableFlatVector<int64_t>(
+             {1, std::nullopt, 3, 0, -2, std::nullopt, 5}),
+         makeNullableFlatVector<Key>({-2, -1, std::nullopt, 1, 1, 2, 5})}));
+    vectors.push_back(makeRowVector(
+        {"junk", "v", "k"},
+        {makeFlatVector<int64_t>({0, 0, 0, 0, 0, 0, 0}),
+         makeNullableFlatVector<int64_t>(
+             {4, std::nullopt, std::nullopt, 2, -5, 10, std::nullopt}),
+         makeNullableFlatVector<Key>(
+             {-2, -1, std::nullopt, 1, 5, 7, std::nullopt})}));
+    createDuckDbTable(vectors);
+    for (bool ignoreNullKeys : {false, true}) {
+      core::PlanNodeId id;
+      auto task =
+          AssertQueryBuilder(duckDbQueryRunner_)
+              .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 7)
+              .plan(
+                  PlanBuilder()
+                      .values(vectors)
+                      .aggregation(
+                          {"k"},
+                          {"sum(v)"},
+                          {},
+                          core::AggregationNode::Step::kSingle,
+                          ignoreNullKeys)
+                      .capturePlanNodeId(id)
+                      .planNode())
+              .assertResults(
+                  ignoreNullKeys
+                      ? "SELECT k,sum(v) FROM tmp WHERE k IS NOT NULL GROUP BY k"
+                      : "SELECT k,sum(v) FROM tmp GROUP BY k");
+      EXPECT_GT(streamingGroupbyStatSum(task, id, "denseIntegerSumBatches"), 0);
+      EXPECT_EQ(
+          streamingGroupbyStatSum(task, id, "denseIntegerSumFallbacks"), 0);
+    }
+  };
+  run.template operator()<int32_t>();
+  run.template operator()<int64_t>();
+}
+
+TEST_F(
+    StreamingGroupbyAggregationTest,
+    denseIntegerSumFallsBackAfterPriorBatches) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_dense_integer_sum_max_range = 16;
+  FLAGS_cudf_dense_integer_sum_min_rows = 0;
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    std::vector<RowVectorPtr> vectors;
+    const bool negative = scenario == 2;
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>({0, 1}),
+         makeFlatVector<int64_t>(
+             negative ? std::vector<int64_t>{-2, -3}
+                      : std::vector<int64_t>{2, 3})}));
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>({scenario == 0 ? 10000 : 2}),
+         makeFlatVector<int64_t>(
+             {scenario == 0  ? 9
+                  : negative ? std::numeric_limits<int64_t>::min()
+                             : std::numeric_limits<int64_t>::max()})}));
+    createDuckDbTable(vectors);
+    core::PlanNodeId id;
+    auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                    .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 2)
+                    .plan(
+                        PlanBuilder()
+                            .values(vectors)
+                            .singleAggregation({"c0"}, {"sum(c1)"})
+                            .capturePlanNodeId(id)
+                            .planNode())
+                    .assertResults("SELECT c0,sum(c1) FROM tmp GROUP BY c0");
+    EXPECT_GT(streamingGroupbyStatSum(task, id, "denseIntegerSumBatches"), 0);
+    EXPECT_EQ(streamingGroupbyStatSum(task, id, "denseIntegerSumFallbacks"), 1);
+  }
+}
+
+TEST_F(
+    StreamingGroupbyAggregationTest,
+    denseIntegerSumSignedLimitsAndNullFirst) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_dense_integer_sum_max_range = 64;
+  FLAGS_cudf_dense_integer_sum_min_rows = 0;
+  for (auto base :
+       {std::numeric_limits<int64_t>::min(),
+        std::numeric_limits<int64_t>::max() - 10,
+        int64_t{-3}}) {
+    std::vector<RowVectorPtr> vectors{
+        makeRowVector(
+            {makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt}),
+             makeNullableFlatVector<int64_t>({std::nullopt, 3})}),
+        makeRowVector(
+            {makeNullableFlatVector<int64_t>({base, base + 1, std::nullopt}),
+             makeNullableFlatVector<int64_t>({4, std::nullopt, -1})}),
+        makeRowVector(
+            {makeNullableFlatVector<int64_t>({base + 2, base}),
+             makeNullableFlatVector<int64_t>({6, 5})})};
+    createDuckDbTable(vectors);
+    core::PlanNodeId id;
+    auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                    .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 2)
+                    .plan(
+                        PlanBuilder()
+                            .values(vectors)
+                            .singleAggregation({"c0"}, {"sum(c1)"})
+                            .capturePlanNodeId(id)
+                            .planNode())
+                    .assertResults("SELECT c0,sum(c1) FROM tmp GROUP BY c0");
+    EXPECT_GT(streamingGroupbyStatSum(task, id, "denseIntegerSumBatches"), 0);
+    EXPECT_EQ(streamingGroupbyStatSum(task, id, "denseIntegerSumFallbacks"), 0);
+  }
+}
+
+TEST_F(StreamingGroupbyAggregationTest, denseIntegerSumAllNullKeys) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_dense_integer_sum_max_range = 64;
+  FLAGS_cudf_dense_integer_sum_min_rows = 0;
+  auto input = makeRowVector(
+      {makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt}),
+       makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt})});
+  auto largeIgnored = makeRowVector(
+      {makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt}),
+       makeNullableFlatVector<int64_t>(
+           {std::numeric_limits<int64_t>::max(), std::nullopt})});
+  createDuckDbTable({input, largeIgnored});
+  for (bool ignore : {false, true}) {
+    core::PlanNodeId id;
+    auto task =
+        AssertQueryBuilder(duckDbQueryRunner_)
+            .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 2)
+            .plan(
+                PlanBuilder()
+                    .values({input, largeIgnored})
+                    .aggregation(
+                        {"c0"},
+                        {"sum(c1)"},
+                        {},
+                        core::AggregationNode::Step::kSingle,
+                        ignore)
+                    .capturePlanNodeId(id)
+                    .planNode())
+            .assertResults(
+                ignore
+                    ? "SELECT c0,sum(c1) FROM tmp WHERE c0 IS NOT NULL GROUP BY c0"
+                    : "SELECT c0,sum(c1) FROM tmp GROUP BY c0");
+    EXPECT_GT(streamingGroupbyStatSum(task, id, "denseIntegerSumBatches"), 0);
+    EXPECT_EQ(
+        streamingGroupbyStatSum(task, id, "denseIntegerSumFallbacks"),
+        ignore ? 0 : 1);
+  }
+}
+
+TEST_F(StreamingGroupbyAggregationTest, denseIntegerCountRowsAndNullModes) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_dense_integer_sum_max_range = 64;
+  FLAGS_cudf_dense_integer_sum_min_rows = 0;
+  FLAGS_cudf_dense_integer_count_rows = true;
+  const auto run = [&]<typename Key>() {
+    std::vector<RowVectorPtr> vectors{
+        makeRowVector(
+            {makeNullableFlatVector<Key>(
+                 {std::nullopt, std::nullopt, std::nullopt, std::nullopt}),
+             makeNullableFlatVector<int64_t>({0, std::nullopt, 4, 5})}),
+        makeRowVector(
+            {makeNullableFlatVector<Key>({-2, 0, 0, std::nullopt}),
+             makeNullableFlatVector<int64_t>({std::nullopt, 2, 3, 4})}),
+        makeRowVector(
+            {makeNullableFlatVector<Key>({-2, 4, 7, 7}),
+             makeNullableFlatVector<int64_t>({1, 2, std::nullopt, 4})})};
+    createDuckDbTable(vectors);
+    for (const std::string aggregate :
+         {"count(*)", "count(0)", "count(c1)", "count(cast(null as bigint))"}) {
+      for (bool ignore : {false, true}) {
+        core::PlanNodeId id;
+        auto task =
+            AssertQueryBuilder(duckDbQueryRunner_)
+                .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 4)
+                .plan(
+                    PlanBuilder()
+                        .values(vectors)
+                        .aggregation(
+                            {"c0"},
+                            {aggregate},
+                            {},
+                            core::AggregationNode::Step::kSingle,
+                            ignore)
+                        .capturePlanNodeId(id)
+                        .planNode())
+                .assertResults(
+                    "SELECT c0," + aggregate + " FROM tmp " +
+                    (ignore ? "WHERE c0 IS NOT NULL " : "") + "GROUP BY c0");
+        EXPECT_EQ(
+            streamingGroupbyStatSum(task, id, "denseIntegerCountBatches") > 0,
+            aggregate == "count(*)" || aggregate == "count(0)");
+        EXPECT_EQ(
+            streamingGroupbyStatSum(task, id, "denseIntegerSumFallbacks"), 0);
+      }
+    }
+  };
+  for (uint64_t limit : {uint64_t{0}, uint64_t{0xffffffff}}) {
+    FLAGS_cudf_dense_integer_count_32_max_rows = limit;
+    run.template operator()<int32_t>();
+    run.template operator()<int64_t>();
+  }
+}
+
+TEST_F(StreamingGroupbyAggregationTest, denseIntegerCountRangeFallback) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_dense_integer_sum_max_range = 32;
+  FLAGS_cudf_dense_integer_sum_min_rows = 0;
+  FLAGS_cudf_dense_integer_count_rows = true;
+  for (uint64_t limit : {uint64_t{0}, uint64_t{0xffffffff}}) {
+    FLAGS_cudf_dense_integer_count_32_max_rows = limit;
+    for (bool ignore : {false, true}) {
+      std::vector<RowVectorPtr> vectors{
+          makeRowVector(
+              {makeNullableFlatVector<int64_t>({0, 1, 1, std::nullopt})}),
+          makeRowVector({makeNullableFlatVector<int64_t>(
+              {1, std::numeric_limits<int64_t>::max(), std::nullopt, 1})}),
+          makeRowVector(
+              {makeNullableFlatVector<int64_t>({0, 1, 2, std::nullopt})})};
+      createDuckDbTable(vectors);
+      core::PlanNodeId id;
+      auto task =
+          AssertQueryBuilder(duckDbQueryRunner_)
+              .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 4)
+              .plan(
+                  PlanBuilder()
+                      .values(vectors)
+                      .aggregation(
+                          {"c0"},
+                          {"count(*)"},
+                          {},
+                          core::AggregationNode::Step::kSingle,
+                          ignore)
+                      .capturePlanNodeId(id)
+                      .planNode())
+              .assertResults(
+                  ignore
+                      ? "SELECT c0,count(*) FROM tmp WHERE c0 IS NOT NULL GROUP BY c0"
+                      : "SELECT c0,count(*) FROM tmp GROUP BY c0");
+      EXPECT_GT(
+          streamingGroupbyStatSum(task, id, "denseIntegerCountBatches"), 0);
+      EXPECT_EQ(
+          streamingGroupbyStatSum(task, id, "denseIntegerSumFallbacks"), 1);
+    }
+  }
+}
+
+TEST_F(StreamingGroupbyAggregationTest, denseIntegerCount32RowBoundFallback) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_dense_integer_sum_max_range = 32;
+  FLAGS_cudf_dense_integer_sum_min_rows = 0;
+  FLAGS_cudf_dense_integer_count_rows = true;
+  // Small limits exercise the same host-side overflow guard without billions
+  // of test rows. Equality is accepted; the next batch must fall back before
+  // any counters are modified. NULL counts and growth survive conversion.
+  for (uint64_t limit : {uint64_t{4}, uint64_t{8}}) {
+    FLAGS_cudf_dense_integer_count_32_max_rows = limit;
+    std::vector<RowVectorPtr> vectors{
+        makeRowVector(
+            {makeNullableFlatVector<int64_t>({0, 1, 1, std::nullopt})}),
+        makeRowVector(
+            {makeNullableFlatVector<int64_t>({-5, 1, std::nullopt, 1})}),
+        makeRowVector(
+            {makeNullableFlatVector<int64_t>({0, 1, 2, std::nullopt})})};
+    createDuckDbTable(vectors);
+    core::PlanNodeId id;
+    auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                    .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 4)
+                    .plan(
+                        PlanBuilder()
+                            .values(vectors)
+                            .singleAggregation({"c0"}, {"count(*)"})
+                            .capturePlanNodeId(id)
+                            .planNode())
+                    .assertResults("SELECT c0,count(*) FROM tmp GROUP BY c0");
+    EXPECT_EQ(
+        streamingGroupbyStatSum(task, id, "denseIntegerCount32Batches"),
+        limit / 4);
+    EXPECT_EQ(streamingGroupbyStatSum(task, id, "denseIntegerSumFallbacks"), 1);
+  }
+}
+
+TEST_F(StreamingGroupbyAggregationTest, rawSingleGrowthAndNullableValues) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_groupby_stream_raw_single = true;
+  auto vectors = makeHighCardinalityBatches(8, 8);
+  vectors.push_back(makeRowVector(
+      {makeNullableFlatVector<int64_t>(
+           {0, 1, 2, std::nullopt, std::nullopt, 64, 65, 66}),
+       makeNullableFlatVector<int64_t>(
+           {std::nullopt, 4, -2, 3, std::nullopt, std::nullopt, 7, 8})}));
+  createDuckDbTable(vectors);
+  core::PlanNodeId aggregateId;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 8)
+          .plan(
+              PlanBuilder()
+                  .values(vectors)
+                  .singleAggregation({"c0"}, {"sum(c1)", "min(c1)", "max(c1)"})
+                  .capturePlanNodeId(aggregateId)
+                  .planNode())
+          .assertResults(
+              "SELECT c0, sum(c1), min(c1), max(c1) FROM tmp GROUP BY c0");
+  EXPECT_TRUE(hasStreamingGroupbyStat(
+      task, aggregateId, cudf_velox::kStreamingGroupbyUsedStat));
+  EXPECT_GT(
+      streamingGroupbyStatSum(
+          task, aggregateId, cudf_velox::kStreamingGroupbyRebuildsStat),
+      0);
 }
 
 TEST_F(

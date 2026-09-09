@@ -17,12 +17,29 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/TopKSortKeys.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
+#include <cudf/binaryop.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/merge.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/stream_compaction.hpp>
+
+#include <gflags/gflags.h>
+
+DEFINE_bool(
+    cudf_topn_select_candidates,
+    false,
+    "Select numeric TopN candidates before the final stable sort");
+DEFINE_int64(
+    cudf_topn_select_min_rows,
+    100'000,
+    "Minimum input rows for TopN candidate selection");
 
 namespace facebook::velox::cudf_velox {
 CudfTopN::CudfTopN(
@@ -111,6 +128,91 @@ std::unique_ptr<cudf::table> CudfTopN::getTopK(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
   auto keys = values.select(sortKeys_);
+  auto primary = keys.column(0);
+  if (FLAGS_cudf_topn_select_candidates &&
+      values.num_rows() >= FLAGS_cudf_topn_select_min_rows &&
+      int64_t{k} * 32 < values.num_rows() && primary.null_count() == 0 &&
+      (primary.type().id() == cudf::type_id::INT32 ||
+       primary.type().id() == cudf::type_id::INT64 ||
+       primary.type().id() == cudf::type_id::FLOAT64)) {
+    std::unique_ptr<cudf::column> encoded;
+    if (primary.type().id() == cudf::type_id::FLOAT64) {
+      encoded = makeDoubleTopKSortKeys(primary, stream, get_temp_mr());
+      primary = encoded->view();
+    }
+    auto selected =
+        cudf::top_k_order(primary, k, columnOrder_[0], stream, get_temp_mr());
+    auto selectedKeys = cudf::gather(
+        cudf::table_view({primary}),
+        selected->view(),
+        cudf::out_of_bounds_policy::DONT_CHECK,
+        cudf::negative_index_policy::NOT_ALLOWED,
+        stream,
+        get_temp_mr());
+    auto [low, high] =
+        cudf::minmax(selectedKeys->view().column(0), stream, get_temp_mr());
+    const bool descending = columnOrder_[0] == cudf::order::DESCENDING;
+    auto mask = cudf::binary_operation(
+        primary,
+        descending ? *low : *high,
+        descending ? cudf::binary_operator::GREATER_EQUAL
+                   : cudf::binary_operator::LESS_EQUAL,
+        cudf::data_type{cudf::type_id::BOOL8},
+        stream,
+        get_temp_mr());
+    auto rowIds = cudf::sequence(
+        values.num_rows(),
+        cudf::numeric_scalar<int32_t>(0, true, stream, get_temp_mr()),
+        cudf::numeric_scalar<int32_t>(1, true, stream, get_temp_mr()),
+        stream,
+        get_temp_mr());
+    auto candidates = cudf::apply_boolean_mask(
+        cudf::table_view({rowIds->view()}),
+        mask->view(),
+        stream,
+        get_temp_mr());
+    {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat("topKSelectionBatches", RuntimeCounter(1));
+      lockedStats->addRuntimeStat(
+          "topKInputRows", RuntimeCounter(values.num_rows()));
+      lockedStats->addRuntimeStat(
+          "topKCandidateRows", RuntimeCounter(candidates->num_rows()));
+    }
+    VELOX_CHECK_GE(candidates->num_rows(), k);
+    if (candidates->num_rows() < values.num_rows() / 2) {
+      // Keep ALL ties on the leading key. Only then apply secondary keys and
+      // stable ordering; an arbitrary top-k boundary subset would be wrong.
+      auto candidateKeys = cudf::gather(
+          keys,
+          candidates->view().column(0),
+          cudf::out_of_bounds_policy::DONT_CHECK,
+          cudf::negative_index_policy::NOT_ALLOWED,
+          stream,
+          get_temp_mr());
+      auto order = cudf::stable_sorted_order(
+          candidateKeys->view(),
+          columnOrder_,
+          nullOrder_,
+          stream,
+          get_temp_mr());
+      auto first = cudf::split(order->view(), {k}, stream).front();
+      auto indices = cudf::gather(
+          candidates->view(),
+          first,
+          cudf::out_of_bounds_policy::DONT_CHECK,
+          cudf::negative_index_policy::NOT_ALLOWED,
+          stream,
+          get_temp_mr());
+      return cudf::gather(
+          values,
+          indices->view().column(0),
+          cudf::out_of_bounds_policy::DONT_CHECK,
+          cudf::negative_index_policy::NOT_ALLOWED,
+          stream,
+          mr);
+    }
+  }
   auto const indices =
       cudf::stable_sorted_order(keys, columnOrder_, nullOrder_, stream, mr);
   auto const kIndices =

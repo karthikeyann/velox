@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 #pragma once
-
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/DenseIntegerSum.h"
 
 #include <cudf/groupby.hpp>
 
@@ -27,6 +27,7 @@
 namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
+class DisjointGroupbyRanges;
 
 inline constexpr std::string_view kStreamingGroupbyUsedStat{
     "streamingGroupbyUsed"};
@@ -163,7 +164,7 @@ class CudfGroupby : public CudfOperatorBase {
   void initialize() override;
 
   bool needsInput() const override {
-    return !noMoreInput_;
+    return !noMoreInput_ && !disjointBatchOutput_;
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /* unused */) override {
@@ -205,8 +206,10 @@ class CudfGroupby : public CudfOperatorBase {
   void computeFinalGroupbyStreaming(CudfVectorPtr input);
 
   CudfVectorPtr finalizeStreamingGroupby();
+  bool tryAddDenseIntegerSum(CudfVectorPtr input);
 
   void computePartialGroupbyIncrementally(CudfVectorPtr tbl);
+  void flushPendingPartialResults();
   void computeFinalGroupbyIncrementally(CudfVectorPtr tbl);
   void computeSingleGroupbyIncrementally(CudfVectorPtr tbl);
 
@@ -227,6 +230,12 @@ class CudfGroupby : public CudfOperatorBase {
   // Incremental aggregation is disabled if companion aggregates are present.
   bool incrementalAggregationEnabled_{true};
   bool streamingGroupbyEnabled_{false};
+  bool denseIntegerSumEligible_{false};
+  bool denseIntegerCountRows_{false};
+  column_index_t denseIntegerSumValueChannel_{0};
+  std::unique_ptr<DenseIntegerSum> denseIntegerSum_;
+  std::shared_ptr<DisjointGroupbyRanges> disjointGroupRanges_;
+  CudfVectorPtr disjointBatchOutput_;
   const int64_t maxPartialAggregationMemoryUsage_;
   int64_t numInputRows_ = 0;
 
@@ -238,6 +247,9 @@ class CudfGroupby : public CudfOperatorBase {
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
   CudfVectorPtr bufferedResult_;
+  std::vector<CudfVectorPtr> pendingPartialResults_;
+  int64_t pendingPartialRows_{0};
+  int64_t pendingPartialBytes_{0};
 
   std::vector<std::unique_ptr<StreamingGroupbyAggregator>>
       streamingGroupbyAggregators_;
