@@ -38,7 +38,35 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 
+#include <gflags/gflags.h>
+
 #include <algorithm>
+#include <numeric>
+
+DEFINE_bool(
+    cudf_scan_prune_before_filter,
+    false,
+    "Do not gather filter-only columns after evaluating the final scan predicate");
+DEFINE_bool(
+    cudf_scan_async_output,
+    false,
+    "Return stream-owning GPU scan vectors without a redundant final host synchronization");
+DEFINE_bool(
+    cudf_scan_borrow_gpu_cache,
+    false,
+    "Read raw GPU cache views directly when a scan filter materializes owned output");
+DEFINE_bool(
+    cudf_scan_borrow_gpu_cache_unfiltered,
+    false,
+    "Extend borrowed GPU cache views to unfiltered scan outputs with shared read-only ownership");
+DEFINE_bool(
+    cudf_scan_jit_subfield_filters,
+    false,
+    "Use cuDF JIT for post-read subfield and dynamic predicates");
+DEFINE_uint64(
+    cudf_scan_jit_subfield_min_rows,
+    4096,
+    "Minimum input rows for JIT post-read scan predicates");
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -47,13 +75,13 @@ using namespace facebook::velox::connector::hive;
 
 namespace {
 
-std::string rowGroupSelectionFilterKey(
-    const common::SubfieldFilters& filters) {
+std::string rowGroupSelectionFilterKey(const common::SubfieldFilters& filters) {
   std::vector<std::string> entries;
   entries.reserve(filters.size());
   for (const auto& [field, filter] : filters) {
     VELOX_CHECK_NOT_NULL(filter);
-    entries.push_back(fmt::format("{}={}", field.toString(), filter->toString()));
+    entries.push_back(
+        fmt::format("{}={}", field.toString(), filter->toString()));
   }
   std::sort(entries.begin(), entries.end());
   std::string result;
@@ -76,7 +104,10 @@ CudfHiveDataSource::CudfHiveDataSource(
     : NvtxHelper(
           nvtx3::rgb{80, 171, 241}, // CudfHive blue,
           std::nullopt,
-          fmt::format("[{}]", tableHandle->name())),
+          fmt::format(
+              "[{}:{}]",
+              tableHandle->name(),
+              connectorQueryCtx->planNodeId())),
       cudfHiveConfig_(cudfHiveConfig),
       fileHandleFactory_(fileHandleFactory),
       executor_(executor),
@@ -170,8 +201,7 @@ CudfHiveDataSource::CudfHiveDataSource(
     subfieldFilterExpr_ = &createAstFromSubfieldFilters(
         subfieldFilters_, subfieldTree_, subfieldScalars_, readerFilterType);
   }
-  rowGroupSelectionFilterKey_ =
-      rowGroupSelectionFilterKey(subfieldFilters_);
+  rowGroupSelectionFilterKey_ = rowGroupSelectionFilterKey(subfieldFilters_);
 
   VELOX_CHECK_NOT_NULL(fileHandleFactory_, "No FileHandleFactory present");
 
@@ -250,8 +280,7 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
     decodedColumnCacheMisses_ += cudfSplitReader_->decodedColumnCacheMisses();
     decodedColumnCacheDecodeCalls_ +=
         cudfSplitReader_->decodedColumnCacheDecodeCalls();
-    decodedColumnGpuCacheHits_ +=
-        cudfSplitReader_->decodedColumnGpuCacheHits();
+    decodedColumnGpuCacheHits_ += cudfSplitReader_->decodedColumnGpuCacheHits();
   }
   cudfSplitReader_ = createCudfSplitReader();
   cudfSplitReader_->prepareSplit(runtimeStats_);
@@ -282,45 +311,148 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   }
 }
 
+void CudfHiveDataSource::addDynamicFilter(
+    column_index_t outputChannel,
+    const std::shared_ptr<common::Filter>& filter) {
+  VELOX_CHECK_LT(outputChannel, outputType_->size());
+  VELOX_CHECK_NOT_NULL(filter);
+  const common::Subfield field(readColumnNames_.at(outputChannel));
+  auto found = dynamicFilters_.find(field);
+  if (found == dynamicFilters_.end()) {
+    dynamicFilters_.emplace(field.clone(), filter->clone());
+  } else {
+    found->second = found->second->mergeWith(filter.get());
+  }
+  dynamicFilterExpr_ = &createAstFromSubfieldFilters(
+      dynamicFilters_,
+      dynamicFilterTree_,
+      dynamicFilterScalars_,
+      getTableRowType());
+}
+
 std::optional<RowVectorPtr> CudfHiveDataSource::next(
     uint64_t size,
     velox::ContinueFuture& /* future */) {
+  VELOX_NVTX_OPERATOR_FUNC_RANGE();
   VELOX_CHECK_NOT_NULL(split_, "No split present. Call addSplit() first.");
   VELOX_CHECK_NOT_NULL(cudfSplitReader_, "No split to process.");
-  auto chunkOpt = cudfSplitReader_->next(size);
-  if (!chunkOpt.has_value()) {
-    return nullptr;
-  }
-  auto cudfTable = std::move(chunkOpt.value());
   auto stream = cudfSplitReader_->stream();
+  const bool hasFilter =
+      cudfSplitReader_->shouldApplySubfieldFilterAfterRead() ||
+      optimizedRemainingFilter_ != nullptr || dynamicFilterExpr_ != nullptr;
+  auto borrowed = FLAGS_cudf_scan_borrow_gpu_cache &&
+          (hasFilter ||
+           (FLAGS_cudf_scan_borrow_gpu_cache_unfiltered &&
+            outputType_->size() > 0))
+      ? cudfSplitReader_->tryNextBorrowedGpuColumns()
+      : nullptr;
+  std::unique_ptr<cudf::table> cudfTable;
+  if (!borrowed) {
+    auto chunkOpt = cudfSplitReader_->next(size);
+    if (!chunkOpt.has_value()) {
+      return nullptr;
+    }
+    cudfTable = std::move(chunkOpt.value());
+  } else {
+    borrowedGpuCacheBatches_.fetch_add(1, std::memory_order_relaxed);
+  }
+  auto inputView =
+      borrowed ? cudf::table_view(borrowed->views) : cudfTable->view();
+
+  if (borrowed && !hasFilter) {
+    std::vector<cudf::size_type> channels(outputType_->size());
+    std::iota(channels.begin(), channels.end(), 0);
+    auto view = inputView.select(channels);
+    const auto rows = view.num_rows();
+    const bool gpuOutput = cudfIsRegistered();
+    RowVectorPtr output;
+    if (gpuOutput) {
+      const auto bytes = borrowed->retainedBytes;
+      auto orderRelease = borrowed->orderRelease;
+      std::shared_ptr<const void> owner(std::move(borrowed));
+      output = std::make_shared<CudfVector>(
+          pool_,
+          outputType_,
+          rows,
+          view,
+          std::move(owner),
+          bytes,
+          stream,
+          get_output_mr(),
+          std::move(orderRelease));
+    } else {
+      output = with_arrow::toVeloxColumn(
+          view, pool_, outputType_, stream, get_temp_mr());
+    }
+    if (!FLAGS_cudf_scan_async_output || !gpuOutput) {
+      stream.synchronize();
+    } else {
+      asynchronousScanOutputs_.fetch_add(1, std::memory_order_relaxed);
+    }
+    borrowedUnfilteredGpuCacheBatches_.fetch_add(1, std::memory_order_relaxed);
+    completedRows_ += output->size();
+    return output;
+  }
+
+  auto applyFilter = [&](cudf::table_view table,
+                         cudf::column_view predicate,
+                         bool finalFilter) {
+    if (FLAGS_cudf_scan_prune_before_filter && finalFilter &&
+        outputType_->size() > 0 && outputType_->size() < table.num_columns()) {
+      // Read columns are ordered as output columns followed by filter-only
+      // columns. Evaluate the predicate on all columns before narrowing the
+      // gather; earlier filters must retain inputs needed by later filters.
+      std::vector<cudf::size_type> channels(outputType_->size());
+      std::iota(channels.begin(), channels.end(), 0);
+      prunedFilterColumns_.fetch_add(
+          table.num_columns() - channels.size(), std::memory_order_relaxed);
+      return cudf::apply_boolean_mask(
+          table.select(channels), predicate, stream, get_output_mr());
+    }
+    return cudf::apply_boolean_mask(table, predicate, stream, get_output_mr());
+  };
+
+  auto evaluateScanPredicate = [&](const cudf::ast::expression& expression) {
+    if (FLAGS_cudf_scan_jit_subfield_filters &&
+        inputView.num_rows() >= FLAGS_cudf_scan_jit_subfield_min_rows) {
+      jitSubfieldFilterBatches_.fetch_add(1, std::memory_order_relaxed);
+      return cudf::compute_column_jit(
+          inputView, expression, stream, get_temp_mr());
+    }
+    return cudf::compute_column(inputView, expression, stream, get_temp_mr());
+  };
 
   if (cudfSplitReader_->shouldApplySubfieldFilterAfterRead()) {
     VELOX_CHECK_NOT_NULL(subfieldFilterExpr_);
-    auto predicate = cudf::compute_column(
-        cudfTable->view(), *subfieldFilterExpr_, stream, get_temp_mr());
-    cudfTable = cudf::apply_boolean_mask(
-        *cudfTable, predicate->view(), stream, get_output_mr());
+    auto predicate = evaluateScanPredicate(*subfieldFilterExpr_);
+    cudfTable = applyFilter(
+        inputView,
+        predicate->view(),
+        !optimizedRemainingFilter_ && !dynamicFilterExpr_);
+    inputView = cudfTable->view();
   }
 
   uint64_t filterTimeUs{0};
   if (optimizedRemainingFilter_) {
     MicrosecondWallTimer filterTimer(&filterTimeUs);
-    auto cudfTableColumns = cudfTable->release();
-    std::vector<cudf::column_view> inputViews;
-    inputViews.reserve(cudfTableColumns.size());
-    for (auto& col : cudfTableColumns) {
-      inputViews.push_back(col->view());
-    }
+    std::vector<cudf::column_view> inputViews(
+        inputView.begin(), inputView.end());
     auto filterResult =
         cudfRemainingFilterExpression_->eval(inputViews, stream, get_temp_mr());
-    auto originalTable =
-        std::make_unique<cudf::table>(std::move(cudfTableColumns));
-    cudfTable = cudf::apply_boolean_mask(
-        *originalTable, asView(filterResult), stream, get_output_mr());
+    cudfTable =
+        applyFilter(inputView, asView(filterResult), !dynamicFilterExpr_);
+    inputView = cudfTable->view();
   }
   totalRemainingFilterTime_.fetch_add(
       filterTimeUs * 1000, std::memory_order_relaxed);
 
+  if (dynamicFilterExpr_) {
+    auto predicate = evaluateScanPredicate(*dynamicFilterExpr_);
+    cudfTable = applyFilter(inputView, predicate->view(), true);
+  }
+
+  VELOX_CHECK_NOT_NULL(
+      cudfTable, "Borrowed cache input requires an owning filter output");
   const auto nRows = cudfTable->num_rows();
 
   if (outputType_->size() < cudfTable->num_columns()) {
@@ -337,12 +469,19 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   // TODO (dm): Should we only enable table scan if cudf is registered?
   // Earlier we could enable cudf table scans without using other cudf operators
   // We still can, but I'm wondering if this is the right thing to do
-  auto output = cudfIsRegistered()
+  const bool gpuOutput = cudfIsRegistered();
+  auto output = gpuOutput
       ? std::make_shared<CudfVector>(
             pool_, outputType_, nRows, std::move(cudfTable), stream)
       : with_arrow::toVeloxColumn(
             cudfTable->view(), pool_, outputType_, stream, get_temp_mr());
-  stream.synchronize();
+  if (!FLAGS_cudf_scan_async_output || !gpuOutput) {
+    stream.synchronize();
+  } else {
+    // CudfVector retains the producing stream; downstream GPU operators join
+    // streams before consuming it. CPU/Arrow conversion keeps the old fence.
+    asynchronousScanOutputs_.fetch_add(1, std::memory_order_relaxed);
+  }
 
   VELOX_CHECK_NOT_NULL(output, "Cudf to Velox conversion yielded a nullptr");
 
@@ -366,6 +505,18 @@ CudfHiveDataSource::getRuntimeStats() {
   const auto decodedColumnGpuCacheHits = decodedColumnGpuCacheHits_ +
       (cudfSplitReader_ ? cudfSplitReader_->decodedColumnGpuCacheHits() : 0);
   result.insert({
+      {"prunedFilterColumns",
+       RuntimeMetric(prunedFilterColumns_.load(std::memory_order_relaxed))},
+      {"asynchronousScanOutputs",
+       RuntimeMetric(asynchronousScanOutputs_.load(std::memory_order_relaxed))},
+      {"borrowedGpuCacheBatches",
+       RuntimeMetric(borrowedGpuCacheBatches_.load(std::memory_order_relaxed))},
+      {"jitSubfieldFilterBatches",
+       RuntimeMetric(
+           jitSubfieldFilterBatches_.load(std::memory_order_relaxed))},
+      {"borrowedUnfilteredGpuCacheBatches",
+       RuntimeMetric(
+           borrowedUnfilteredGpuCacheBatches_.load(std::memory_order_relaxed))},
       {std::string(connector::hive::HiveDataSource::kTotalScanTime),
        RuntimeMetric(
            ioStatistics_->totalScanTimeNs(), RuntimeCounter::Unit::kNanos)},

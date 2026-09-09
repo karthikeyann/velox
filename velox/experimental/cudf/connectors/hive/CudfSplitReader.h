@@ -90,6 +90,11 @@ class CudfSplitReader : public NvtxHelper {
   /// Read the next raw cudf table chunk. Returns nullopt when done.
   virtual std::optional<std::unique_ptr<cudf::table>> next(uint64_t size);
 
+  /// Consume the next range without copying only when every requested column
+  /// has one raw GPU-cache entry. A null result leaves the reader unchanged.
+  std::unique_ptr<CudfDecodedColumnCache::BorrowedGpuColumns>
+  tryNextBorrowedGpuColumns();
+
   /// Get the stream.
   rmm::cuda_stream_view stream() const {
     return stream_;

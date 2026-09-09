@@ -163,6 +163,14 @@ std::unique_ptr<cudf::table> CudfVector::release() {
     // Constructed from owned table - just move it out
     return std::move(*tablePtr);
   }
+  if (auto* borrowed = std::get_if<BorrowedStorage>(&tableStorage_)) {
+    VELOX_CHECK_NOT_NULL(borrowed->owner);
+    auto materialized = std::make_unique<cudf::table>(
+        tabView_, stream_, borrowed->materializationMr);
+    stream_.synchronize();
+    borrowed->owner.reset();
+    return materialized;
+  }
   // Constructed from packed_table - materialize a table from the view.
   // This copies the data since the view references the packed buffer.
   auto& packedPtr =
@@ -178,6 +186,16 @@ std::unique_ptr<cudf::table> CudfVector::release() {
 }
 
 bool CudfVector::rebindStream(rmm::cuda_stream_view stream) {
+  if (auto* borrowed = std::get_if<BorrowedStorage>(&tableStorage_)) {
+    if (!borrowed->owner) {
+      return false;
+    }
+    // Callers establish ordering with the previous logical stream. Cached
+    // allocations remain immutable and are never rebound by an individual
+    // reader.
+    stream_ = stream;
+    return true;
+  }
   if (auto* tablePtr =
           std::get_if<std::unique_ptr<cudf::table>>(&tableStorage_)) {
     if (!*tablePtr) {
@@ -215,6 +233,57 @@ bool CudfVector::rebindStream(rmm::cuda_stream_view stream) {
 
 uint64_t CudfVector::estimateFlatSize() const {
   return flatSize_;
+}
+
+CudfVector::CudfVector(
+    velox::memory::MemoryPool* pool,
+    TypePtr type,
+    vector_size_t size,
+    cudf::table_view view,
+    std::shared_ptr<const void> owner,
+    uint64_t retainedBytes,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref materializationMr,
+    std::function<void(rmm::cuda_stream_view)> orderRelease)
+    : RowVector(
+          pool,
+          std::move(type),
+          BufferPtr(nullptr),
+          size,
+          std::vector<VectorPtr>(),
+          std::nullopt),
+      tableStorage_{BorrowedStorage{
+          std::move(owner),
+          materializationMr,
+          std::move(orderRelease)}},
+      tabView_(view),
+      stream_(stream),
+      flatSize_(retainedBytes) {
+  VELOX_CHECK_NOT_NULL(std::get<BorrowedStorage>(tableStorage_).owner);
+  VELOX_CHECK_EQ(view.num_rows(), size);
+  VELOX_CHECK_EQ(view.num_columns(), asRowType(this->type())->size());
+  logDefaultStreamIfNeeded(stream_, "CudfVector(borrowed)");
+}
+
+CudfVector::~CudfVector() {
+  if (auto* borrowed = std::get_if<BorrowedStorage>(&tableStorage_);
+      borrowed && borrowed->owner) {
+    if (borrowed->orderRelease) {
+      try {
+        borrowed->orderRelease(stream_);
+        return;
+      } catch (const std::exception& error) {
+        LOG(ERROR)
+            << "Borrowed vector release event fell back to synchronization: "
+            << error.what();
+      }
+    }
+    const auto status = cudaStreamSynchronize(stream_.value());
+    if (status != cudaSuccess) {
+      LOG(ERROR) << "Borrowed CudfVector synchronization failed: "
+                 << cudaGetErrorString(status);
+    }
+  }
 }
 
 uint64_t CudfVector::retainedSizeImpl(

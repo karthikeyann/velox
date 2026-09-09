@@ -49,9 +49,20 @@
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
+#include <gflags/gflags.h>
+
 #include <algorithm>
 #include <memory>
 #include <ranges>
+
+DEFINE_bool(
+    cudf_gpu_cache_borrow_scaled_float,
+    false,
+    "Reconstruct scaled-float columns inside a mixed raw/decoded GPU cache lease");
+DEFINE_bool(
+    cudf_cache_composite_leases,
+    false,
+    "Keep raw GPU column views when other columns require host-cache restoration");
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -221,8 +232,7 @@ void CudfSplitReader::prepareSplit(dwio::common::RuntimeStats& runtimeStats) {
   stream_ = cudfGlobalStreamPool().get_stream();
 
   useDecodedColumnCache_ = shouldUseDecodedColumnCache();
-  useDecodedColumnGpuCache_ =
-      useDecodedColumnCache_ and
+  useDecodedColumnGpuCache_ = useDecodedColumnCache_ and
       cudfHiveConfig_->experimentalDecodedColumnGpuCacheEnabledSession(
           connectorQueryCtx_->sessionProperties());
   if (useDecodedColumnCache_) {
@@ -339,6 +349,46 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
   auto tableWithMetadata = exptSplitReader_->materialize_all_columns_chunk();
   return castDecimalColumnsToVeloxTypes(
       std::move(tableWithMetadata.tbl), outputType_, stream_, output_mr);
+}
+
+std::unique_ptr<CudfDecodedColumnCache::BorrowedGpuColumns>
+CudfSplitReader::tryNextBorrowedGpuColumns() {
+  if (!useDecodedColumnCache_ || !useDecodedColumnGpuCache_ ||
+      decodedColumnCacheRowGroupIndex_ >= decodedColumnCacheRowGroups_.size() ||
+      decodedColumnCacheRowGroupRuns_.size() != 1) {
+    return nullptr;
+  }
+  const auto& run = decodedColumnCacheRowGroupRuns_.front();
+  std::vector<CudfDecodedColumnCache::ColumnRangeRequest> requests;
+  for (const auto& name : readColumnNames_) {
+    requests.push_back(
+        {makeDecodedColumnCacheKey(name, readColumnType(name)),
+         {{run.firstRow, run.lastRow}}});
+  }
+  auto result = CudfDecodedColumnCache::instance().borrowGpuColumnRanges(
+      requests,
+      stream_,
+      FLAGS_cudf_gpu_cache_borrow_scaled_float
+          ? std::optional<rmm::device_async_resource_ref>{get_output_mr()}
+          : std::nullopt);
+  if (!result && FLAGS_cudf_cache_composite_leases) {
+    if (!decodedColumnCacheTransferStream_) {
+      decodedColumnCacheTransferStream_ = std::make_unique<rmm::cuda_stream>(
+          rmm::cuda_stream::flags::non_blocking);
+    }
+    result = CudfDecodedColumnCache::instance().borrowOrRestoreColumnRanges(
+        requests,
+        stream_,
+        decodedColumnCacheTransferStream_->view(),
+        determineCudfMemoryResource(),
+        get_temp_mr());
+  }
+  if (result) {
+    decodedColumnCacheRowGroupIndex_ = decodedColumnCacheRowGroups_.size();
+    decodedColumnCacheHits_ += requests.size();
+    decodedColumnGpuCacheHits_ += result->gpuColumns;
+  }
+  return result;
 }
 
 void CudfSplitReader::resetSplit() {
@@ -568,8 +618,7 @@ void CudfSplitReader::prepareDecodedColumnCache() {
     int64_t outputRow = 0;
     std::optional<cudf::size_type> previousRowGroup;
     for (const auto rowGroupIndex : decodedColumnCacheRowGroups_) {
-      const auto [firstRow, lastRow] =
-          decodedColumnRowRange(rowGroupIndex);
+      const auto [firstRow, lastRow] = decodedColumnRowRange(rowGroupIndex);
       VELOX_CHECK_LE(firstRow, lastRow);
       const auto outputLastRow = outputRow + (lastRow - firstRow);
       if (firstRow != lastRow) {
@@ -608,17 +657,18 @@ void CudfSplitReader::prepareDecodedColumnCache() {
 
   std::optional<CudfDecodedColumnCache::RowGroupSelectionKey> selectionKey;
   if (rowGroupSelectionFilterKey_.has_value()) {
-    selectionKey.emplace(CudfDecodedColumnCache::RowGroupSelectionKey{
-        .file = decodedColumnCacheFileKey_,
-        .splitStart = split_->start,
-        .splitSize = split_->size(),
-        .filterKey = rowGroupSelectionFilterKey_.value(),
-        .timestampType = cudfHiveConfig_->timestampType().id(),
-        .usePandasMetadata = cudfHiveConfig_->isUsePandasMetadata(),
-        .useArrowSchema = cudfHiveConfig_->isUseArrowSchema(),
-        .allowMismatchedSchemas =
-            cudfHiveConfig_->isAllowMismatchedCudfHiveSchemas(),
-    });
+    selectionKey.emplace(
+        CudfDecodedColumnCache::RowGroupSelectionKey{
+            .file = decodedColumnCacheFileKey_,
+            .splitStart = split_->start,
+            .splitSize = split_->size(),
+            .filterKey = rowGroupSelectionFilterKey_.value(),
+            .timestampType = cudfHiveConfig_->timestampType().id(),
+            .usePandasMetadata = cudfHiveConfig_->isUsePandasMetadata(),
+            .useArrowSchema = cudfHiveConfig_->isUseArrowSchema(),
+            .allowMismatchedSchemas =
+                cudfHiveConfig_->isAllowMismatchedCudfHiveSchemas(),
+        });
   }
   if (metadataHit and selectionKey.has_value()) {
     if (auto selected = cache.findRowGroupSelection(selectionKey.value())) {
@@ -630,12 +680,10 @@ void CudfSplitReader::prepareDecodedColumnCache() {
     }
   }
 
-  const bool fullFileSplit =
-      split_->start == 0 and
+  const bool fullFileSplit = split_->start == 0 and
       split_->size() == std::numeric_limits<uint64_t>::max();
   if (fullFileSplit) {
-    decodedColumnCacheRowGroups_ =
-        decodedColumnCacheMetadata_->allRowGroups;
+    decodedColumnCacheRowGroups_ = decodedColumnCacheMetadata_->allRowGroups;
     buildRowGroupRuns();
     const bool allRowGroupsCached = metadataHit and cacheCoversAllRuns();
     if (not readerOptions_.get_filter().has_value() or allRowGroupsCached) {
@@ -646,8 +694,7 @@ void CudfSplitReader::prepareDecodedColumnCache() {
       isFullyDecodedColumnCacheHit_ = allRowGroupsCached;
       if (selectionKey.has_value()) {
         cache.insertRowGroupSelectionIfAbsent(
-            std::move(selectionKey.value()),
-            decodedColumnCacheRowGroups_);
+            std::move(selectionKey.value()), decodedColumnCacheRowGroups_);
       }
       return;
     }
@@ -758,9 +805,8 @@ CudfSplitReader::readNextDecodedColumnCacheFileRange() {
 
     if (not cpuCachedColumnRequests.empty()) {
       if (not decodedColumnCacheTransferStream_) {
-        decodedColumnCacheTransferStream_ =
-            std::make_unique<rmm::cuda_stream>(
-                rmm::cuda_stream::flags::non_blocking);
+        decodedColumnCacheTransferStream_ = std::make_unique<rmm::cuda_stream>(
+            rmm::cuda_stream::flags::non_blocking);
       }
       auto cachedColumns = cache.materializeColumnRanges(
           cpuCachedColumnRequests,
@@ -769,10 +815,8 @@ CudfSplitReader::readNextDecodedColumnCacheFileRange() {
           determineCudfMemoryResource(),
           get_temp_mr());
       VELOX_CHECK(cachedColumns.has_value());
-      VELOX_CHECK_EQ(
-          cachedColumns->size(), cpuCachedColumnIndices.size());
-      for (size_t cachedIndex = 0;
-           cachedIndex < cpuCachedColumnIndices.size();
+      VELOX_CHECK_EQ(cachedColumns->size(), cpuCachedColumnIndices.size());
+      for (size_t cachedIndex = 0; cachedIndex < cpuCachedColumnIndices.size();
            ++cachedIndex) {
         columnStates[cpuCachedColumnIndices[cachedIndex]].output =
             std::move(cachedColumns.value()[cachedIndex]);
@@ -915,9 +959,7 @@ std::pair<int64_t, int64_t> CudfSplitReader::decodedColumnRowRange(
   VELOX_CHECK_NOT_NULL(decodedColumnCacheMetadata_);
   const auto& rowOffsets = decodedColumnCacheMetadata_->rowOffsets;
   VELOX_CHECK_LT(index + 1, rowOffsets.size());
-  return {
-      rowOffsets[index],
-      rowOffsets[index + 1]};
+  return {rowOffsets[index], rowOffsets[index + 1]};
 }
 
 TypePtr CudfSplitReader::readColumnType(const std::string& columnName) const {

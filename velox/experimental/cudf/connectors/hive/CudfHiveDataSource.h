@@ -63,12 +63,8 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   void addSplit(std::shared_ptr<ConnectorSplit> split) override;
 
   void addDynamicFilter(
-      column_index_t /*outputChannel*/,
-      const std::shared_ptr<facebook::velox::common::Filter>& /*filter*/)
-      override {
-    VELOX_NYI(
-        "Dynamic filters not yet implemented by cudf::CudfHiveConnector.");
-  }
+      column_index_t outputChannel,
+      const std::shared_ptr<facebook::velox::common::Filter>& filter) override;
 
   std::optional<RowVectorPtr> next(
       uint64_t size,
@@ -149,6 +145,11 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
       cudfRemainingFilterExpression_;
 
   std::atomic<uint64_t> totalRemainingFilterTime_{0};
+  std::atomic<uint64_t> prunedFilterColumns_{0};
+  std::atomic<uint64_t> asynchronousScanOutputs_{0};
+  std::atomic<uint64_t> borrowedGpuCacheBatches_{0};
+  std::atomic<uint64_t> jitSubfieldFilterBatches_{0};
+  std::atomic<uint64_t> borrowedUnfilteredGpuCacheBatches_{0};
 
   std::unordered_set<std::string> readColumnSet_;
 
@@ -160,6 +161,14 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   cudf::ast::tree subfieldTree_;
   common::SubfieldFilters subfieldFilters_;
   std::string rowGroupSelectionFilterKey_;
+
+  // Dynamic filters are applied after raw cache restoration and never become
+  // part of shared cache contents or row-group selection keys. Keep previously
+  // compiled scalars/expressions alive for any asynchronous scan consumers.
+  common::SubfieldFilters dynamicFilters_;
+  std::vector<std::unique_ptr<cudf::scalar>> dynamicFilterScalars_;
+  cudf::ast::tree dynamicFilterTree_;
+  cudf::ast::expression const* dynamicFilterExpr_{nullptr};
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

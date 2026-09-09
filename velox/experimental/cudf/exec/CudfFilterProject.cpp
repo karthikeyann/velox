@@ -30,15 +30,122 @@
 #include <cudf/aggregation.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/stream_compaction.hpp>
+#include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 
+#include <gflags/gflags.h>
+
 #include <algorithm>
+#include <cmath>
+#include <functional>
 #include <iostream>
 #include <unordered_map>
+
+DEFINE_bool(
+    cudf_fuse_double_projections,
+    false,
+    "Fuse non-null DOUBLE plus/minus/multiply projections into one GPU kernel");
+DEFINE_int64(
+    cudf_fuse_double_projections_min_rows,
+    100'000,
+    "Minimum rows for fused DOUBLE projection");
+DEFINE_bool(
+    cudf_project_borrowed_views,
+    false,
+    "Forward immutable borrowed input views through projections without copying unrelated columns");
 
 namespace facebook::velox::cudf_velox {
 
 namespace {
+
+std::string makeFusedDoubleProjection(
+    const std::vector<core::TypedExprPtr>& expressions,
+    const RowTypePtr& inputType,
+    std::vector<column_index_t>& inputs) {
+  if (expressions.size() < 2) {
+    return {};
+  }
+  // Deliberately narrow eligibility: no integer overflow, division errors,
+  // casts, functions, or null propagation are reimplemented here.
+  std::function<std::optional<std::string>(const core::TypedExprPtr&)> emit;
+  emit = [&](const core::TypedExprPtr& expr) -> std::optional<std::string> {
+    if (!expr->type()->isDouble()) {
+      return std::nullopt;
+    }
+    if (auto field = core::TypedExprs::asFieldAccess(expr)) {
+      if (!field->inputs().empty() &&
+          (field->inputs().size() != 1 ||
+           !dynamic_cast<const core::InputTypedExpr*>(
+               field->inputs()[0].get()))) {
+        return std::nullopt;
+      }
+      const auto channel = inputType->getChildIdx(field->name());
+      auto found = std::find(inputs.begin(), inputs.end(), channel);
+      if (found == inputs.end()) {
+        inputs.push_back(channel);
+        return fmt::format("in{}", inputs.size() - 1);
+      }
+      return fmt::format("in{}", found - inputs.begin());
+    }
+    if (auto constant = core::TypedExprs::asConstant(expr)) {
+      if (constant->isNull()) {
+        return std::nullopt;
+      }
+      const auto value = constant->hasValueVector()
+          ? constant->valueVector()->as<SimpleVector<double>>()->valueAt(0)
+          : constant->value().value<TypeKind::DOUBLE>();
+      if (!std::isfinite(value)) {
+        return std::nullopt;
+      }
+      // Scientific notation guarantees a DOUBLE literal, including -0.0.
+      return fmt::format("({:.17e})", value);
+    }
+    auto call = std::dynamic_pointer_cast<const core::CallTypedExpr>(expr);
+    if (!call || call->inputs().size() != 2) {
+      return std::nullopt;
+    }
+    std::string op;
+    if (call->name() == "plus" || call->name() == "add") {
+      op = "+";
+    } else if (call->name() == "minus" || call->name() == "subtract") {
+      op = "-";
+    } else if (call->name() == "multiply") {
+      op = "*";
+    } else {
+      return std::nullopt;
+    }
+    auto left = emit(call->inputs()[0]);
+    auto right = emit(call->inputs()[1]);
+    if (!left || !right) {
+      return std::nullopt;
+    }
+    return fmt::format("({} {} {})", *left, op, *right);
+  };
+  std::vector<std::string> outputs;
+  for (const auto& expr : expressions) {
+    auto output = emit(expr);
+    if (!output) {
+      inputs.clear();
+      return {};
+    }
+    outputs.push_back(std::move(*output));
+  }
+  if (inputs.empty()) {
+    return {};
+  }
+  std::string udf = "__device__ void fused_projection(";
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    udf += fmt::format("{}double* out{}", i == 0 ? "" : ", ", i);
+  }
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    udf += fmt::format(", double in{}", i);
+  }
+  udf += ") {\n";
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    udf += fmt::format("  *out{} = {};\n", i, outputs[i]);
+  }
+  return udf + "}\n";
+}
 
 void debugPrintTree(
     const core::TypedExprPtr& expr,
@@ -208,6 +315,15 @@ void CudfFilterProject::initialize() {
         optimizeAndCompile);
   }
 
+  if (FLAGS_cudf_fuse_double_projections) {
+    std::vector<core::TypedExprPtr> projections;
+    for (size_t i = hasFilter_ ? 1 : 0; i < allExprs.size(); ++i) {
+      projections.push_back(expression::optimize(allExprs[i], queryCtx, pool));
+    }
+    fusedDoubleProjection_ =
+        makeFusedDoubleProjection(projections, inputType, fusedDoubleInputs_);
+  }
+
   filter_.reset();
   project_.reset();
 }
@@ -228,6 +344,42 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
+  if (FLAGS_cudf_project_borrowed_views && !hasFilter_ &&
+      cudfInput->hasBorrowedStorage() && outputType_->size() > 0) {
+    struct ProjectionStorage {
+      RowVectorPtr input;
+      std::vector<ColumnOrView> computed;
+    };
+    const auto table = cudfInput->getTableView();
+    std::vector<cudf::column_view> inputs(table.begin(), table.end());
+    auto owner = std::make_shared<ProjectionStorage>();
+    owner->input = std::move(input_);
+    owner->computed = evaluateProjections(inputs, stream);
+    std::vector<cudf::column_view> views(outputType_->size());
+    auto retainedBytes = cudfInput->estimateFlatSize();
+    for (size_t i = 0; i < resultProjections_.size(); ++i) {
+      auto& value = owner->computed[i];
+      views[resultProjections_[i].outputChannel] = asView(value);
+      if (std::holds_alternative<std::unique_ptr<cudf::column>>(value)) {
+        retainedBytes +=
+            std::get<std::unique_ptr<cudf::column>>(value)->alloc_size();
+      }
+    }
+    for (const auto& identity : identityProjections_) {
+      views[identity.outputChannel] = inputs[identity.inputChannel];
+    }
+    auto output = std::make_shared<CudfVector>(
+        cudfInput->pool(),
+        outputType_,
+        cudfInput->size(),
+        cudf::table_view(views),
+        std::move(owner),
+        retainedBytes,
+        stream,
+        get_output_mr());
+    addRuntimeStat("borrowedProjectionBatches", RuntimeCounter(1));
+    return output;
+  }
   auto inputTableColumns = cudfInput->release()->release();
   auto outputSize = input_->size();
 
@@ -293,19 +445,65 @@ void CudfFilterProject::filter(
   }
 }
 
+std::vector<ColumnOrView> CudfFilterProject::evaluateProjections(
+    const std::vector<cudf::column_view>& inputViews,
+    rmm::cuda_stream_view stream) {
+  std::vector<ColumnOrView> columns;
+  bool fuse = !fusedDoubleProjection_.empty() && !inputViews.empty() &&
+      inputViews[0].size() >= FLAGS_cudf_fuse_double_projections_min_rows &&
+      std::all_of(
+          fusedDoubleInputs_.begin(),
+          fusedDoubleInputs_.end(),
+          [&](auto index) { return inputViews[index].null_count() == 0; });
+  if (fuse) {
+    std::vector<cudf::transform_input> inputs;
+    for (auto index : fusedDoubleInputs_) {
+      inputs.emplace_back(inputViews[index]);
+    }
+    std::vector<cudf::transform_output> outputs(
+        projectEvaluators_.size(),
+        {cudf::data_type{cudf::type_id::FLOAT64},
+         cudf::output_nullability::ALL_VALID});
+    auto result = cudf::multi_transform(
+        fusedDoubleProjection_,
+        cudf::udf_source_type::CUDA,
+        cudf::null_aware::NO,
+        std::nullopt,
+        inputs,
+        outputs,
+        {},
+        inputViews[0].size(),
+        stream,
+        get_output_mr());
+    for (auto& column : result->release()) {
+      columns.emplace_back(std::move(column));
+    }
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "fusedDoubleProjectionBatches", RuntimeCounter(1));
+    lockedStats->addRuntimeStat(
+        "fusedDoubleProjectionRows", RuntimeCounter(inputViews[0].size()));
+    lockedStats->addRuntimeStat(
+        "fusedDoubleProjectionOutputs", RuntimeCounter(outputs.size()));
+  } else {
+    for (auto& projectEvaluator : projectEvaluators_) {
+      columns.push_back(
+          projectEvaluator->eval(inputViews, stream, get_output_mr(), true));
+    }
+  }
+
+  return columns;
+}
+
 std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
     rmm::cuda_stream_view stream) {
   std::vector<cudf::column_view> inputViews;
   inputViews.reserve(inputTableColumns.size());
-  for (auto& col : inputTableColumns) {
-    inputViews.push_back(col->view());
+  for (const auto& column : inputTableColumns) {
+    inputViews.push_back(column->view());
   }
-  std::vector<ColumnOrView> columns;
-  for (auto& projectEvaluator : projectEvaluators_) {
-    columns.push_back(
-        projectEvaluator->eval(inputViews, stream, get_output_mr(), true));
-  }
+  auto columns = evaluateProjections(inputViews, stream);
 
   // Rearrange columns to match outputType_
   std::vector<std::unique_ptr<cudf::column>> outputColumns(outputType_->size());

@@ -30,8 +30,12 @@
 #include "velox/type/Time.h"
 
 #include <folly/ScopeGuard.h>
+#include <gflags/gflags.h>
 
 #include <limits>
+
+DECLARE_bool(cudf_fuse_double_projections);
+DECLARE_int64(cudf_fuse_double_projections_min_rows);
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -681,6 +685,57 @@ class CudfFilterProjectTest : public OperatorTestBase {
   folly::Random::DefaultGenerator rng_;
   RowTypePtr rowType_;
 };
+
+TEST_F(CudfFilterProjectTest, fusedDoubleProjectionsAndNullableFallback) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_fuse_double_projections = true;
+  FLAGS_cudf_fuse_double_projections_min_rows = 0;
+  for (bool nullable : {false, true}) {
+    for (bool special : {false, true}) {
+      auto data = makeRowVector(
+          {"x", "y", "z"},
+          {makeFlatVector<double>(
+               {-0.0,
+                0.0,
+                1.5,
+                -3.0,
+                special ? std::numeric_limits<double>::infinity() : 4.0,
+                special ? std::numeric_limits<double>::quiet_NaN() : 5.0}),
+           makeNullableFlatVector<double>(
+               {0.0,
+                0.25,
+                nullable ? std::nullopt : std::optional<double>{0.5},
+                0.75,
+                1.0,
+                2.0}),
+           makeFlatVector<double>({0.0, 0.01, 0.02, 0.03, 0.04, 0.05})});
+      createDuckDbTable({data});
+      auto plan = PlanBuilder()
+                      .values({data})
+                      .project(
+                          {"x",
+                           "x AS again",
+                           "x * (1.0 - y) AS a",
+                           "x * (1.0 - y) * (1.0 + z) AS b",
+                           "x + y AS c"})
+                      .planNode();
+      auto task =
+          AssertQueryBuilder(plan, duckDbQueryRunner_)
+              .assertResults(
+                  "SELECT x, x, x * (1.0 - y), x * (1.0 - y) * (1.0 + z), x + y FROM tmp");
+      int64_t fusedRows = 0;
+      for (const auto& pipeline : task->taskStats().pipelineStats) {
+        for (const auto& op : pipeline.operatorStats) {
+          if (auto it = op.runtimeStats.find("fusedDoubleProjectionRows");
+              it != op.runtimeStats.end()) {
+            fusedRows += it->second.sum;
+          }
+        }
+      }
+      EXPECT_EQ(fusedRows, nullable ? 0 : 6);
+    }
+  }
+}
 
 TEST_F(CudfFilterProjectTest, multiplyOperation) {
   vector_size_t batchSize = 1000;
@@ -1508,6 +1563,81 @@ TEST_F(CudfFilterProjectTest, likeOperation) {
   createDuckDbTable(vectors);
 
   testLikeOperation(vectors);
+}
+
+TEST_F(CudfFilterProjectTest, literalLikePatternEdgeCases) {
+  auto data = makeRowVector(
+      {"s"},
+      {makeNullableFlatVector<std::string>(
+          {std::nullopt,
+           "",
+           "special requests",
+           "requests special",
+           "requests special requests",
+           "specialspecialrequests",
+           "special",
+           "requests",
+           "aa",
+           "aaa",
+           "aaaa",
+           "abxcd",
+           "abcd",
+           "a%b",
+           "test",
+           "testtest",
+           "é special requests 界",
+           "界",
+           "a_b",
+           std::string("x\0special\0requests", 18),
+           std::string(150, 'x') + "special" + std::string(150, 'y') +
+               "requests",
+           std::string(150, 'x') + "requests" + std::string(150, 'y') +
+               "special"})});
+  // Exercise both small-vector fallback and cooperative/grid-stride kernels.
+  std::vector<std::optional<std::string>> expanded;
+  expanded.reserve(200'000);
+  auto strings = data->childAt(0)->as<FlatVector<StringView>>();
+  for (vector_size_t row = 0; row < 200'000; ++row) {
+    const auto source = row % data->size();
+    expanded.push_back(
+        strings->isNullAt(source)
+            ? std::nullopt
+            : std::optional<std::string>{strings->valueAt(source).str()});
+  }
+  // Unique row IDs avoid quadratic duplicate-run matching in the generic
+  // unordered comparator when 200000 outputs have only true/false/null.
+  data = makeRowVector(
+      {"s", "row_id"},
+      {data->childAt(0),
+       makeFlatVector<int64_t>(data->size(), folly::identity)});
+  auto large = makeRowVector(
+      {"s", "row_id"},
+      {makeNullableFlatVector<std::string>(expanded),
+       makeFlatVector<int64_t>(200'000, folly::identity)});
+  for (auto testData : {data, large}) {
+    createDuckDbTable({testData});
+    for (const std::string expression :
+         {"s LIKE '%special%requests%'",
+          "s LIKE '%%special%%requests%%'",
+          "s LIKE '%aa%aa%'",
+          "s LIKE '%ab%%cd%'",
+          "s LIKE '%test%'",
+          "s LIKE '%%'",
+          "s LIKE '%'",
+          "s LIKE ''",
+          "s LIKE '%_%'",
+          "s LIKE 'a%'",
+          "s LIKE '%a'",
+          "s LIKE '%界%'",
+          "s LIKE '%a@%b%' ESCAPE '@'",
+          "s NOT LIKE '%special%requests%'"}) {
+      auto plan = PlanBuilder()
+                      .values({testData})
+                      .project({"row_id", expression})
+                      .planNode();
+      runTest(plan, "SELECT row_id, " + expression + " FROM tmp");
+    }
+  }
 }
 
 TEST_F(CudfFilterProjectTest, lessThanOperation) {

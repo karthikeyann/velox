@@ -23,7 +23,9 @@
 #include <cudf/table/table.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
+#include <functional>
 #include <memory>
 #include <utility>
 #include <variant>
@@ -60,12 +62,35 @@ class CudfVector : public RowVector {
       std::unique_ptr<cudf::packed_table>&& packedTable,
       rmm::cuda_stream_view stream);
 
+  /// Retains immutable shared storage without copying. Callers establish
+  /// producer ordering as for the other constructors. release() materializes
+  /// private columns; destruction fences the current logical consumer stream
+  /// before dropping the owner, which may use a different allocation stream.
+  /// An optional ordering callback may enqueue equivalent allocation-stream
+  /// waits instead; it must keep all underlying storage safe through release.
+  CudfVector(
+      velox::memory::MemoryPool* pool,
+      TypePtr type,
+      vector_size_t size,
+      cudf::table_view view,
+      std::shared_ptr<const void> owner,
+      uint64_t retainedBytes,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref materializationMr,
+      std::function<void(rmm::cuda_stream_view)> orderRelease = {});
+
+  ~CudfVector() override;
+
   rmm::cuda_stream_view stream() const {
     return stream_;
   }
 
   cudf::table_view getTableView() const {
     return tabView_;
+  }
+
+  bool hasBorrowedStorage() const {
+    return std::holds_alternative<BorrowedStorage>(tableStorage_);
   }
 
   /// Releases ownership of the underlying table.
@@ -86,9 +111,15 @@ class CudfVector : public RowVector {
 
   // Storage for either an owned table or packed table.
   // Only one is active at a time - using variant enforces this at compile time.
+  struct BorrowedStorage {
+    std::shared_ptr<const void> owner;
+    rmm::device_async_resource_ref materializationMr;
+    std::function<void(rmm::cuda_stream_view)> orderRelease;
+  };
   using TableStorage = std::variant<
       std::unique_ptr<cudf::table>,
-      std::unique_ptr<cudf::packed_table>>;
+      std::unique_ptr<cudf::packed_table>,
+      BorrowedStorage>;
   TableStorage tableStorage_;
 
   // Table view - always valid, points to either table_->view() or

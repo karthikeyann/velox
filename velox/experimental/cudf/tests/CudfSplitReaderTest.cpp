@@ -25,16 +25,30 @@
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <cudf/ast/expressions.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <gflags/gflags.h>
+
 #include <algorithm>
+#include <bit>
+#include <cmath>
 #include <filesystem>
 #include <limits>
 #include <memory>
 #include <unordered_map>
 #include <vector>
+
+DECLARE_bool(cudf_decoded_cache_skip_full_range_slice);
+DECLARE_bool(cudf_gpu_cache_store_packed);
+DECLARE_bool(cudf_gpu_cache_scaled_float);
+DECLARE_bool(cudf_cache_restore_packed_views);
+DECLARE_bool(cudf_cache_stream_ordered_release);
+DECLARE_string(cudf_gpu_cache_packed_types);
+DECLARE_uint64(cudf_gpu_cache_raw_prefix_bytes);
+DECLARE_double(cudf_gpu_cache_min_host_fraction);
 
 namespace facebook::velox::cudf_velox::connector::hive {
 namespace {
@@ -269,21 +283,9 @@ TEST_F(CudfSplitReaderTest, gpuRangeCacheAssemblesOverlaps) {
   auto& cache = CudfDecodedColumnCache::instance();
   const auto gpuBytesBefore = cache.gpuBytes();
   ASSERT_TRUE(cache.insertGpuColumnRangeIfAbsent(
-      key,
-      0,
-      50,
-      ranges[0].column(0),
-      50 * sizeof(int64_t),
-      stream,
-      mr));
+      key, 0, 50, ranges[0].column(0), 50 * sizeof(int64_t), stream, mr));
   ASSERT_TRUE(cache.insertGpuColumnRangeIfAbsent(
-      key,
-      50,
-      100,
-      ranges[1].column(0),
-      50 * sizeof(int64_t),
-      stream,
-      mr));
+      key, 50, 100, ranges[1].column(0), 50 * sizeof(int64_t), stream, mr));
   EXPECT_GT(cache.gpuBytes(), gpuBytesBefore);
   EXPECT_LE(cache.gpuBytes(), cache.maxGpuBytes());
 
@@ -317,13 +319,7 @@ TEST_F(CudfSplitReaderTest, gpuRangeCacheAssemblesOverlaps) {
 
   const auto gpuBytes = cache.gpuBytes();
   EXPECT_FALSE(cache.insertGpuColumnRangeIfAbsent(
-      key,
-      0,
-      50,
-      ranges[0].column(0),
-      50 * sizeof(int64_t),
-      stream,
-      mr));
+      key, 0, 50, ranges[0].column(0), 50 * sizeof(int64_t), stream, mr));
   EXPECT_EQ(cache.gpuBytes(), gpuBytes);
 
   auto overCapKey = key;
@@ -337,8 +333,7 @@ TEST_F(CudfSplitReaderTest, gpuRangeCacheAssemblesOverlaps) {
       cache.maxGpuBytes() + 1,
       stream,
       mr));
-  EXPECT_EQ(
-      cache.stats().gpuAdmissionRejectedRanges - rejectedBefore, 1);
+  EXPECT_EQ(cache.stats().gpuAdmissionRejectedRanges - rejectedBefore, 1);
 }
 
 TEST_F(CudfSplitReaderTest, compressedPinnedRangeCacheRoundTrip) {
@@ -405,7 +400,759 @@ TEST_F(CudfSplitReaderTest, compressedPinnedRangeCacheRoundTrip) {
   EXPECT_GT(afterRestore.decompressionNanos, 0);
 }
 
+TEST_F(CudfSplitReaderTest, packedGpuCacheNullableMultiRangeAndHybrid) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_gpu_cache_store_packed = true;
+  FLAGS_cudf_decoded_cache_skip_full_range_slice = true;
+  constexpr int32_t kRows = 8192;
+  std::vector<std::optional<int64_t>> numbers;
+  std::vector<std::optional<StringView>> strings;
+  std::vector<std::optional<double>> doubles;
+  for (int i = 0; i < kRows; ++i) {
+    numbers.push_back(
+        i % 13 == 0 ? std::nullopt : std::optional<int64_t>{i % 7});
+    strings.push_back(
+        i % 17 == 0
+            ? std::nullopt
+            : std::optional<StringView>{i % 2 ? "tiny" : "a longer string"});
+    doubles.push_back(
+        i % 19 == 0 ? std::nullopt : std::optional<double>{i % 11 * 1.01});
+  }
+  auto input = makeRowVector(
+      {"numbers", "strings", "doubles", "smallstrings", "unique", "rare"},
+      {makeNullableFlatVector<int64_t>(numbers),
+       makeNullableFlatVector<StringView>(strings),
+       makeNullableFlatVector<double>(doubles),
+       makeFlatVector<std::string>(
+           kRows,
+           [](auto row) {
+             return row % 3 == 0 ? std::string("\0", 1)
+                 : row % 3 == 1  ? std::string("é")
+                                 : std::string("");
+           },
+           nullEvery(23)),
+       makeFlatVector<std::string>(
+           kRows, [](auto row) { return std::to_string(row); }),
+       makeFlatVector<std::string>(kRows, [](auto row) {
+         return row % 4096 == 2048 ? std::string("outside-initial-sample")
+                                   : std::string("common-long-label");
+       })});
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  auto table = with_arrow::toCudfTable(input, input->pool(), stream, mr);
+  int deviceId = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&deviceId));
+  auto& cache = CudfDecodedColumnCache::instance();
+  for (const std::string types :
+       {"all", "nonfloating", "integral", "smallstrings", "lowcardstrings"}) {
+    FLAGS_cudf_gpu_cache_packed_types = types;
+    for (uint64_t rawPrefix : {uint64_t{0}, uint64_t{8192}}) {
+      cache.clearForTesting();
+      FLAGS_cudf_gpu_cache_raw_prefix_bytes = rawPrefix;
+      for (int columnIndex = 0; columnIndex < table->num_columns();
+           ++columnIndex) {
+        const auto packedRestoresBefore = cache.stats().gpuPackedRestoreCalls;
+        auto column = table->view().column(columnIndex);
+        CudfDecodedColumnCache::ColumnKey key{
+            .file = {.connectorId = "test", .filePath = "packed-gpu-roundtrip"},
+            .deviceId = deviceId,
+            .columnName = std::to_string(columnIndex),
+            .veloxType = input->childAt(columnIndex)->type()->toString(),
+            .timestampType = cudf::type_id::TIMESTAMP_MILLISECONDS,
+            .usePandasMetadata = true,
+            .useArrowSchema = true,
+            .allowMismatchedSchemas = false};
+        for (int32_t first : {0, kRows / 2}) {
+          const auto last = first + kRows / 2;
+          auto piece = cudf::slice(column, {first, last}, stream).front();
+          ASSERT_TRUE(cache.insertColumnRangeIfAbsent(
+              key,
+              first,
+              last,
+              piece,
+              stream,
+              mr,
+              CudfDecodedColumnCache::CompressionMode::kColumn,
+              mr));
+        }
+        for (const auto& ranges :
+             std::vector<std::vector<std::pair<int64_t, int64_t>>>{
+                 {{0, kRows}}, {{123, 6012}}, {{4000, 5000}, {10, 20}}}) {
+          std::vector<cudf::column_view> expectedViews;
+          for (const auto& [first, last] : ranges) {
+            expectedViews.push_back(
+                cudf::slice(
+                    column,
+                    {static_cast<cudf::size_type>(first),
+                     static_cast<cudf::size_type>(last)},
+                    stream)
+                    .front());
+          }
+          auto expectedColumn = cudf::concatenate(expectedViews, stream, mr);
+          auto expected = with_arrow::toVeloxColumn(
+              cudf::table_view({expectedColumn->view()}),
+              pool_.get(),
+              "c",
+              stream,
+              mr);
+          auto restored =
+              cache.materializeGpuColumnRanges({{key, ranges}}, stream, mr);
+          ASSERT_EQ(restored.size(), 1);
+          ASSERT_NE(restored[0], nullptr);
+          auto actual = with_arrow::toVeloxColumn(
+              cudf::table_view({restored[0]->view()}),
+              pool_.get(),
+              "c",
+              stream,
+              mr);
+          facebook::velox::test::assertEqualVectors(expected, actual);
+        }
+        if ((types == "nonfloating" && columnIndex == 2) ||
+            (types == "integral" && columnIndex > 0) ||
+            (types == "smallstrings" && columnIndex != 3) ||
+            (types == "lowcardstrings" && columnIndex != 1 &&
+             columnIndex != 3)) {
+          EXPECT_EQ(cache.stats().gpuPackedRestoreCalls, packedRestoresBefore);
+        }
+      }
+      const auto stats = cache.stats();
+      EXPECT_GT(stats.gpuPackedInsertedBytes, 0);
+      EXPECT_GT(stats.gpuPackedRestoreCalls, 0);
+      EXPECT_GT(stats.gpuPackedDecompressionNanos, 0);
+      EXPECT_LT(stats.gpuPackedInsertedBytes, stats.insertedUncompressedBytes);
+      if (rawPrefix != 0) {
+        EXPECT_GT(stats.gpuBytes, stats.gpuPackedInsertedBytes);
+      }
+      stream.synchronize();
+    }
+  }
+}
+
+TEST_F(CudfSplitReaderTest, fullRangeCacheViewsPreserveNullsAndStrings) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_decoded_cache_skip_full_range_slice = true;
+  auto input = makeRowVector(
+      {"numbers", "strings"},
+      {makeNullableFlatVector<int64_t>({1, std::nullopt, 3, 4, std::nullopt}),
+       makeNullableFlatVector<StringView>(
+           {"one", std::nullopt, "", "four", "a longer string"})});
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  auto table = with_arrow::toCudfTable(input, input->pool(), stream, mr);
+  int deviceId = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&deviceId));
+  auto& cache = CudfDecodedColumnCache::instance();
+  for (int columnIndex = 0; columnIndex < table->num_columns(); ++columnIndex) {
+    auto column = table->view().column(columnIndex);
+    CudfDecodedColumnCache::ColumnKey key{
+        .file = {.connectorId = "test", .filePath = "full-range-nullable"},
+        .deviceId = deviceId,
+        .columnName = std::to_string(columnIndex),
+        .veloxType = input->childAt(columnIndex)->type()->toString(),
+        .timestampType = cudf::type_id::TIMESTAMP_MILLISECONDS,
+        .usePandasMetadata = true,
+        .useArrowSchema = true,
+        .allowMismatchedSchemas = false,
+    };
+    ASSERT_TRUE(cache.insertColumnRangeIfAbsent(
+        key,
+        0,
+        column.size(),
+        column,
+        stream,
+        mr,
+        CudfDecodedColumnCache::CompressionMode::kColumnAdvanced));
+    ASSERT_TRUE(cache.insertGpuColumnRangeIfAbsent(
+        key,
+        0,
+        column.size(),
+        column,
+        table->get_column(columnIndex).alloc_size(),
+        stream,
+        mr));
+    for (const auto& [first, last] :
+         std::vector<std::pair<int64_t, int64_t>>{{0, 5}, {1, 4}}) {
+      auto expectedView = cudf::slice(
+                              column,
+                              {static_cast<cudf::size_type>(first),
+                               static_cast<cudf::size_type>(last)},
+                              stream)
+                              .front();
+      auto expected = with_arrow::toVeloxColumn(
+          cudf::table_view({expectedView}), pool_.get(), "c", stream, mr);
+      const auto check = [&](const cudf::column& restored) {
+        auto actual = with_arrow::toVeloxColumn(
+            cudf::table_view({restored.view()}), pool_.get(), "c", stream, mr);
+        facebook::velox::test::assertEqualVectors(expected, actual);
+      };
+      auto single =
+          cache.materializeColumnRange(key, first, last, stream, mr, mr);
+      ASSERT_NE(single, nullptr);
+      check(*single);
+      std::vector<CudfDecodedColumnCache::ColumnRangeRequest> requests{
+          {key, {{first, last}}}};
+      auto batched =
+          cache.materializeColumnRanges(requests, stream, stream, mr, mr);
+      ASSERT_TRUE(batched.has_value());
+      ASSERT_EQ(batched->size(), 1);
+      check(*batched->front());
+      auto gpu = cache.materializeGpuColumnRanges(requests, stream, mr);
+      ASSERT_EQ(gpu.size(), 1);
+      ASSERT_NE(gpu.front(), nullptr);
+      check(*gpu.front());
+      auto borrowed = cache.borrowGpuColumnRanges(requests, stream);
+      ASSERT_NE(borrowed, nullptr);
+      ASSERT_EQ(borrowed->views.size(), 1);
+      auto borrowedActual = with_arrow::toVeloxColumn(
+          cudf::table_view(borrowed->views), pool_.get(), "c", stream, mr);
+      facebook::velox::test::assertEqualVectors(expected, borrowedActual);
+    }
+  }
+}
+
+TEST_F(CudfSplitReaderTest, scaledFloatGpuCacheIsBitExact) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_gpu_cache_scaled_float = true;
+  FLAGS_cudf_gpu_cache_store_packed = false;
+  FLAGS_cudf_decoded_cache_skip_full_range_slice = true;
+  const auto nan = std::numeric_limits<double>::quiet_NaN();
+  const auto inf = std::numeric_limits<double>::infinity();
+  const std::vector<std::vector<std::optional<double>>> values{
+      {1, 2, std::nullopt, 50, -4},
+      {.01, .1, .07, .08, std::nullopt},
+      {12345.67, 99999.99, -12345.67, std::nullopt, 0},
+      {.125, 2.5, -.375, std::nullopt, 0},
+      {std::sqrt(2.0), 3.141592653589793, 1e-15, std::nullopt, 1.0 / 3},
+      {-0.0, 0.0, 1.0, std::nullopt, -1.0},
+      {nan, inf, -inf, std::nullopt, 1.0},
+      {std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt}};
+  const std::vector<bool> expectEncoded{
+      true, true, true, true, false, false, false, false};
+  const auto stream = cudf::get_default_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+  auto& cache = CudfDecodedColumnCache::instance();
+  int deviceId = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&deviceId));
+  for (size_t index = 0; index < values.size(); ++index) {
+    SCOPED_TRACE(index);
+    auto input = makeRowVector({makeNullableFlatVector<double>(values[index])});
+    auto table = with_arrow::toCudfTable(input, pool_.get(), stream, mr);
+    CudfDecodedColumnCache::ColumnKey key{
+        .file = {.connectorId = "test", .filePath = "scaled-float-bitexact"},
+        .deviceId = deviceId,
+        .columnName = std::to_string(index),
+        .veloxType = "DOUBLE",
+        .timestampType = cudf::type_id::TIMESTAMP_MILLISECONDS,
+        .usePandasMetadata = true,
+        .useArrowSchema = true,
+        .allowMismatchedSchemas = false};
+    const auto before = cache.stats();
+    ASSERT_TRUE(cache.insertGpuColumnRangeIfAbsent(
+        key,
+        0,
+        5,
+        table->view().column(0),
+        table->get_column(0).alloc_size(),
+        stream,
+        mr));
+    EXPECT_EQ(
+        cache.stats().gpuScaledInsertedRanges - before.gpuScaledInsertedRanges,
+        expectEncoded[index] ? 1 : 0);
+    auto borrowed = cache.borrowGpuColumnRanges({{key, {{0, 5}}}}, stream);
+    EXPECT_EQ(borrowed == nullptr, expectEncoded[index]);
+    auto mixedLease =
+        cache.borrowGpuColumnRanges({{key, {{1, 4}}}}, stream, mr);
+    ASSERT_NE(mixedLease, nullptr);
+    ASSERT_EQ(mixedLease->views.size(), 1);
+    EXPECT_EQ(mixedLease->decodedColumns.size(), expectEncoded[index] ? 1 : 0);
+    auto mixedActual = with_arrow::toVeloxColumn(
+        cudf::table_view(mixedLease->views), pool_.get(), "c", stream, mr);
+    auto mixedFlat = mixedActual->childAt(0)->as<FlatVector<double>>();
+    for (int row = 1; row < 4; ++row) {
+      EXPECT_EQ(mixedFlat->isNullAt(row - 1), !values[index][row].has_value());
+      if (values[index][row]) {
+        EXPECT_EQ(
+            std::bit_cast<uint64_t>(mixedFlat->valueAt(row - 1)),
+            std::bit_cast<uint64_t>(*values[index][row]));
+      }
+    }
+    for (const std::vector<std::pair<int64_t, int64_t>>& ranges :
+         {std::vector<std::pair<int64_t, int64_t>>{{0, 5}},
+          std::vector<std::pair<int64_t, int64_t>>{{1, 4}},
+          std::vector<std::pair<int64_t, int64_t>>{{0, 2}, {3, 5}}}) {
+      auto restored =
+          cache.materializeGpuColumnRanges({{key, ranges}}, stream, mr);
+      ASSERT_EQ(restored.size(), 1);
+      ASSERT_NE(restored.front(), nullptr);
+      EXPECT_EQ(restored.front()->type().id(), cudf::type_id::FLOAT64);
+      auto actual = with_arrow::toVeloxColumn(
+          cudf::table_view({restored.front()->view()}),
+          pool_.get(),
+          "c",
+          stream,
+          mr);
+      auto flat = actual->childAt(0)->as<FlatVector<double>>();
+      ASSERT_NE(flat, nullptr);
+      int outputRow = 0;
+      for (const auto& [first, last] : ranges) {
+        for (int64_t row = first; row < last; ++row, ++outputRow) {
+          EXPECT_EQ(flat->isNullAt(outputRow), !values[index][row].has_value());
+          if (values[index][row]) {
+            EXPECT_EQ(
+                std::bit_cast<uint64_t>(flat->valueAt(outputRow)),
+                std::bit_cast<uint64_t>(*values[index][row]));
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_F(CudfSplitReaderTest, borrowedGpuCacheLeaseSurvivesClear) {
+  gflags::FlagSaver flags;
+  FLAGS_cudf_gpu_cache_store_packed = false;
+  auto input =
+      makeRowVector({makeNullableFlatVector<int64_t>({1, std::nullopt, 3})});
+  rmm::cuda_stream consumer;
+  auto stream = consumer.view();
+  auto mr = cudf::get_current_device_resource_ref();
+  auto table = with_arrow::toCudfTable(input, pool_.get(), stream, mr);
+  int deviceId = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&deviceId));
+  CudfDecodedColumnCache::ColumnKey key{
+      .file = {.connectorId = "test", .filePath = "borrowed-lease-clear"},
+      .deviceId = deviceId,
+      .columnName = "c0",
+      .veloxType = "BIGINT",
+      .timestampType = cudf::type_id::TIMESTAMP_MILLISECONDS,
+      .usePandasMetadata = true,
+      .useArrowSchema = true,
+      .allowMismatchedSchemas = false};
+  auto& cache = CudfDecodedColumnCache::instance();
+  ASSERT_TRUE(cache.insertGpuColumnRangeIfAbsent(
+      key,
+      0,
+      3,
+      table->view().column(0),
+      table->get_column(0).alloc_size(),
+      stream,
+      mr));
+  EXPECT_EQ(cache.borrowGpuColumnRanges({{key, {{0, 4}}}}, stream), nullptr);
+  EXPECT_EQ(
+      cache.borrowGpuColumnRanges({{key, {{0, 1}, {2, 3}}}}, stream), nullptr);
+  auto lease = cache.borrowGpuColumnRanges({{key, {{0, 3}}}}, stream);
+  ASSERT_NE(lease, nullptr);
+  auto leaseAgain = cache.borrowGpuColumnRanges({{key, {{0, 3}}}}, stream);
+  ASSERT_NE(leaseAgain, nullptr);
+  EXPECT_EQ(
+      lease->views[0].head<int64_t>(), leaseAgain->views[0].head<int64_t>());
+  leaseAgain.reset();
+  cache.clearForTesting();
+  auto copy = std::make_unique<cudf::column>(lease->views[0], stream, mr);
+  // No explicit synchronization: lease destruction must fence the queued copy
+  // before releasing the last reference to the cached allocation.
+  lease.reset();
+  auto actual = with_arrow::toVeloxColumn(
+      cudf::table_view({copy->view()}), pool_.get(), "c", stream, mr);
+  facebook::velox::test::assertEqualVectors(input, actual);
+}
+
+TEST_F(CudfSplitReaderTest, streamOrderedRawCacheLeaseSurvivesClear) {
+  gflags::FlagSaver flags;
+  FLAGS_cudf_gpu_cache_store_packed = false;
+  FLAGS_cudf_gpu_cache_scaled_float = false;
+  FLAGS_cudf_cache_stream_ordered_release = true;
+  constexpr vector_size_t kRows = 65536;
+  auto input = makeRowVector(
+      {makeFlatVector<int64_t>(kRows, folly::identity, nullEvery(11))});
+  rmm::cuda_stream allocation;
+  rmm::cuda_stream consumer;
+  const auto stream = consumer.view();
+  const auto mr = cudf::get_current_device_resource_ref();
+  auto table =
+      with_arrow::toCudfTable(input, pool_.get(), allocation.view(), mr);
+  int deviceId = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&deviceId));
+  CudfDecodedColumnCache::ColumnKey key{
+      .file = {.connectorId = "test", .filePath = "stream-ordered-lease"},
+      .deviceId = deviceId,
+      .columnName = "c0",
+      .veloxType = "BIGINT",
+      .timestampType = cudf::type_id::TIMESTAMP_MILLISECONDS,
+      .usePandasMetadata = true,
+      .useArrowSchema = true,
+      .allowMismatchedSchemas = false};
+  auto& cache = CudfDecodedColumnCache::instance();
+  ASSERT_TRUE(cache.insertGpuColumnRangeIfAbsent(
+      key,
+      0,
+      kRows,
+      table->view().column(0),
+      table->get_column(0).alloc_size(),
+      allocation.view(),
+      mr));
+  auto lease = cache.borrowGpuColumnRanges({{key, {{0, kRows}}}}, stream);
+  ASSERT_NE(lease, nullptr);
+  ASSERT_TRUE(lease->orderRelease);
+  cache.clearForTesting();
+  auto copy = std::make_unique<cudf::column>(lease->views[0], stream, mr);
+  lease.reset();
+  // Event ordering, not a host-side fence, must protect the outstanding copy.
+  auto actual = with_arrow::toVeloxColumn(
+      cudf::table_view({copy->view()}), pool_.get(), "c", stream, mr);
+  facebook::velox::test::assertEqualVectors(input, actual);
+  allocation.view().synchronize();
+}
+
+TEST_F(CudfSplitReaderTest, compositeGpuHostCacheLease) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_gpu_cache_scaled_float = true;
+  FLAGS_cudf_gpu_cache_store_packed = false;
+  auto input = makeRowVector(
+      {makeNullableFlatVector<int64_t>({1, std::nullopt, 3, 4, 5, 6}),
+       makeNullableFlatVector<double>({.01, .10, std::nullopt, .50, .07, -.02}),
+       makeNullableFlatVector<std::string>(
+           {"a",
+            std::nullopt,
+            "b",
+            "c",
+            std::string("long\0tail", 9),
+            "last"})});
+  rmm::cuda_stream consumer;
+  rmm::cuda_stream transfer;
+  const auto stream = consumer.view();
+  const auto mr = cudf::get_current_device_resource_ref();
+  auto table = with_arrow::toCudfTable(input, pool_.get(), stream, mr);
+  int deviceId = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&deviceId));
+  auto& cache = CudfDecodedColumnCache::instance();
+  std::vector<CudfDecodedColumnCache::ColumnKey> keys;
+  for (int index = 0; index < 3; ++index) {
+    keys.push_back(
+        {.file = {.connectorId = "test", .filePath = "composite-lease"},
+         .deviceId = deviceId,
+         .columnName = std::to_string(index),
+         .veloxType = input->type()->childAt(index)->toString(),
+         .timestampType = cudf::type_id::TIMESTAMP_MILLISECONDS,
+         .usePandasMetadata = true,
+         .useArrowSchema = true,
+         .allowMismatchedSchemas = false});
+    if (index < 2) {
+      ASSERT_TRUE(cache.insertGpuColumnRangeIfAbsent(
+          keys.back(),
+          0,
+          6,
+          table->view().column(index),
+          table->get_column(index).alloc_size(),
+          stream,
+          mr));
+    } else {
+      ASSERT_TRUE(cache.insertColumnRangeIfAbsent(
+          keys.back(),
+          0,
+          6,
+          table->view().column(index),
+          stream,
+          mr,
+          CudfDecodedColumnCache::CompressionMode::kColumn));
+    }
+  }
+  EXPECT_EQ(
+      cache.borrowOrRestoreColumnRanges(
+          {{keys[2], {{0, 7}}}}, stream, transfer.view(), mr, mr),
+      nullptr);
+  std::unique_ptr<CudfDecodedColumnCache::BorrowedGpuColumns> lease;
+  for (const std::vector<std::pair<int64_t, int64_t>>& ranges :
+       {std::vector<std::pair<int64_t, int64_t>>{{0, 6}},
+        std::vector<std::pair<int64_t, int64_t>>{{1, 5}},
+        std::vector<std::pair<int64_t, int64_t>>{{0, 2}, {4, 6}}}) {
+    std::vector<CudfDecodedColumnCache::ColumnRangeRequest> requests;
+    for (const auto& key : keys) {
+      requests.push_back({key, ranges});
+    }
+    lease = cache.borrowOrRestoreColumnRanges(
+        requests, stream, transfer.view(), mr, mr);
+    ASSERT_NE(lease, nullptr);
+    EXPECT_EQ(lease->gpuColumns, 2);
+    EXPECT_EQ(lease->decodedColumns.size(), ranges.size() == 1 ? 2 : 3);
+    if (ranges.size() == 1) {
+      auto raw = cache.borrowGpuColumnRanges({requests[0]}, stream);
+      ASSERT_NE(raw, nullptr);
+      EXPECT_EQ(lease->views[0].head<int64_t>(), raw->views[0].head<int64_t>());
+    }
+    std::vector<cudf::table_view> slices;
+    for (const auto& [first, last] : ranges) {
+      slices.push_back(
+          cudf::slice(
+              table->view(),
+              {static_cast<cudf::size_type>(first),
+               static_cast<cudf::size_type>(last)},
+              stream)
+              .front());
+    }
+    auto expectedTable = cudf::concatenate(slices, stream, mr);
+    auto expected = with_arrow::toVeloxColumn(
+        expectedTable->view(),
+        pool_.get(),
+        asRowType(input->type()),
+        stream,
+        mr);
+    auto actual = with_arrow::toVeloxColumn(
+        cudf::table_view(lease->views),
+        pool_.get(),
+        asRowType(input->type()),
+        stream,
+        mr);
+    facebook::velox::test::assertEqualVectors(expected, actual);
+  }
+  cache.clearForTesting();
+  auto afterClear =
+      std::make_unique<cudf::table>(cudf::table_view(lease->views), stream, mr);
+  lease.reset(); // Last-owner fence protects this outstanding read on the
+                 // stream.
+  EXPECT_EQ(afterClear->num_rows(), 4);
+}
+
+TEST_F(CudfSplitReaderTest, restoredPackedViewsLease) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_cache_restore_packed_views = true;
+  constexpr vector_size_t kRows = 8192;
+  auto input = makeRowVector(
+      {makeFlatVector<int64_t>(
+           kRows, [](auto row) { return row % 7; }, nullEvery(11)),
+       makeFlatVector<double>(
+           kRows, [](auto row) { return (row % 10) * .01; }, nullEvery(13)),
+       makeFlatVector<std::string>(
+           kRows,
+           [](auto row) {
+             return row % 3 ? std::string("abc\0def", 7)
+                            : std::string(100, 'x');
+           },
+           nullEvery(17))});
+  rmm::cuda_stream consumer;
+  rmm::cuda_stream transfer;
+  const auto stream = consumer.view();
+  const auto mr = cudf::get_current_device_resource_ref();
+  auto table = with_arrow::toCudfTable(input, pool_.get(), stream, mr);
+  int deviceId = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&deviceId));
+  auto& cache = CudfDecodedColumnCache::instance();
+  for (auto mode :
+       {CudfDecodedColumnCache::CompressionMode::kNone,
+        CudfDecodedColumnCache::CompressionMode::kColumn}) {
+    cache.clearForTesting();
+    std::vector<CudfDecodedColumnCache::ColumnKey> keys;
+    for (int index = 0; index < 3; ++index) {
+      keys.push_back(
+          {.file = {.connectorId = "test", .filePath = "restored-views"},
+           .deviceId = deviceId,
+           .columnName = std::to_string(index),
+           .veloxType = input->type()->childAt(index)->toString(),
+           .timestampType = cudf::type_id::TIMESTAMP_MILLISECONDS,
+           .usePandasMetadata = true,
+           .useArrowSchema = true,
+           .allowMismatchedSchemas = false});
+      ASSERT_TRUE(cache.insertColumnRangeIfAbsent(
+          keys.back(),
+          0,
+          kRows,
+          table->view().column(index),
+          stream,
+          mr,
+          mode));
+    }
+    EXPECT_EQ(
+        cache.restoreColumnRangeViews(
+            {{keys[0], {{0, kRows + 1}}}}, stream, transfer.view(), mr, mr),
+        nullptr);
+    EXPECT_EQ(
+        cache.restoreColumnRangeViews(
+            {{keys[0], {}}}, stream, transfer.view(), mr, mr),
+        nullptr);
+    for (const auto& ranges :
+         {std::vector<std::pair<int64_t, int64_t>>{{0, kRows}},
+          std::vector<std::pair<int64_t, int64_t>>{{1, kRows - 1}},
+          std::vector<std::pair<int64_t, int64_t>>{{0, 100}, {1000, 1400}}}) {
+      std::vector<CudfDecodedColumnCache::ColumnRangeRequest> requests;
+      for (const auto& key : keys) {
+        requests.push_back({key, ranges});
+      }
+      auto lease = cache.borrowOrRestoreColumnRanges(
+          requests, stream, transfer.view(), mr, mr);
+      ASSERT_NE(lease, nullptr);
+      EXPECT_EQ(lease->gpuColumns, 0);
+      EXPECT_EQ(lease->decodedBuffers.size(), ranges.size() == 1 ? 3 : 0);
+      EXPECT_EQ(lease->decodedColumns.size(), ranges.size() == 1 ? 0 : 3);
+      std::vector<cudf::table_view> slices;
+      for (const auto& [first, last] : ranges) {
+        slices.push_back(
+            cudf::slice(
+                table->view(),
+                {static_cast<cudf::size_type>(first),
+                 static_cast<cudf::size_type>(last)},
+                stream)
+                .front());
+      }
+      auto expectedTable = cudf::concatenate(slices, stream, mr);
+      auto expected = with_arrow::toVeloxColumn(
+          expectedTable->view(),
+          pool_.get(),
+          asRowType(input->type()),
+          stream,
+          mr);
+      auto actual = with_arrow::toVeloxColumn(
+          cudf::table_view(lease->views),
+          pool_.get(),
+          asRowType(input->type()),
+          stream,
+          mr);
+      facebook::velox::test::assertEqualVectors(expected, actual);
+    }
+    auto lease = cache.borrowOrRestoreColumnRanges(
+        {{keys[0], {{1, kRows - 1}}},
+         {keys[1], {{1, kRows - 1}}},
+         {keys[2], {{1, kRows - 1}}}},
+        stream,
+        transfer.view(),
+        mr,
+        mr);
+    ASSERT_NE(lease, nullptr);
+    cache.clearForTesting();
+    auto afterClear = std::make_unique<cudf::table>(
+        cudf::table_view(lease->views), stream, mr);
+    lease.reset();
+    auto actual = with_arrow::toVeloxColumn(
+        afterClear->view(), pool_.get(), asRowType(input->type()), stream, mr);
+    auto expected = with_arrow::toVeloxColumn(
+        cudf::slice(table->view(), {1, kRows - 1}, stream).front(),
+        pool_.get(),
+        asRowType(input->type()),
+        stream,
+        mr);
+    facebook::velox::test::assertEqualVectors(expected, actual);
+  }
+}
+
+TEST_F(CudfSplitReaderTest, gpuAdmissionHostFractionPreservesFallback) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_gpu_cache_store_packed = false;
+  FLAGS_cudf_gpu_cache_scaled_float = false;
+  constexpr vector_size_t kRows = 65536;
+  auto input = makeRowVector({makeFlatVector<int64_t>(
+      kRows, [](auto row) { return row % 7; }, nullEvery(11))});
+  // Unspecified NULL payloads must not leak into neighboring valid values.
+  // Poison them deterministically instead of relying on allocator contents.
+  auto* rawValues =
+      input->childAt(0)->asFlatVector<int64_t>()->mutableRawValues();
+  for (vector_size_t row = 0; row < kRows; ++row) {
+    if (input->childAt(0)->isNullAt(row)) {
+      rawValues[row] = 0x7878787878787878LL;
+    }
+  }
+  const auto stream = cudf::get_default_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+  auto table = with_arrow::toCudfTable(input, pool_.get(), stream, mr);
+  auto imported = with_arrow::toVeloxColumn(
+      table->view(), pool_.get(), asRowType(input->type()), stream, mr);
+  facebook::velox::test::assertEqualVectors(input, imported);
+  int deviceId = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&deviceId));
+  CudfDecodedColumnCache::ColumnKey key{
+      .file = {.connectorId = "test", .filePath = "host-fraction-policy"},
+      .deviceId = deviceId,
+      .columnName = "c0",
+      .veloxType = BIGINT()->toString(),
+      .timestampType = cudf::type_id::TIMESTAMP_MILLISECONDS,
+      .usePandasMetadata = true,
+      .useArrowSchema = true,
+      .allowMismatchedSchemas = false};
+  auto& cache = CudfDecodedColumnCache::instance();
+  for (const auto mode :
+       {CudfDecodedColumnCache::CompressionMode::kNone,
+        CudfDecodedColumnCache::CompressionMode::kColumn}) {
+    for (const double fraction : {0.0, 0.75}) {
+      SCOPED_TRACE(
+          fmt::format("mode={} fraction={}", static_cast<int>(mode), fraction));
+      cache.clearForTesting();
+      FLAGS_cudf_gpu_cache_min_host_fraction = fraction;
+      ASSERT_TRUE(cache.insertColumnRangeIfAbsent(
+          key, 0, kRows, table->view().column(0), stream, mr, mode, mr));
+      const auto host = cache.findColumnRanges(key, 0, kRows);
+      ASSERT_TRUE(host.has_value());
+      ASSERT_EQ(host->size(), 1);
+      const bool skip =
+          mode == CudfDecodedColumnCache::CompressionMode::kColumn &&
+          fraction > 0;
+      if (mode == CudfDecodedColumnCache::CompressionMode::kColumn) {
+        ASSERT_TRUE(host->front().chunk->compressed());
+        ASSERT_LT(
+            host->front().chunk->packedSize(),
+            host->front().chunk->uncompressedPackedSize() * 0.75);
+      }
+      auto gpu =
+          cache.materializeGpuColumnRanges({{key, {{0, kRows}}}}, stream, mr);
+      ASSERT_EQ(gpu.size(), 1);
+      EXPECT_EQ(gpu[0] == nullptr, skip);
+      if (gpu[0]) {
+        auto gpuActual = with_arrow::toVeloxColumn(
+            cudf::table_view({gpu[0]->view()}),
+            pool_.get(),
+            asRowType(input->type()),
+            stream,
+            mr);
+        facebook::velox::test::assertEqualVectors(input, gpuActual);
+      }
+      EXPECT_EQ(cache.stats().gpuAdmissionPolicySkippedRanges, skip ? 1 : 0);
+      EXPECT_EQ(cache.stats().gpuAdmissionRejectedRanges, 0);
+      auto restored =
+          cache.materializeColumnRange(key, 0, kRows, stream, mr, mr);
+      ASSERT_NE(restored, nullptr);
+      auto actual = with_arrow::toVeloxColumn(
+          cudf::table_view({restored->view()}),
+          pool_.get(),
+          asRowType(input->type()),
+          stream,
+          mr);
+      facebook::velox::test::assertEqualVectors(input, actual);
+
+      if (skip) {
+        // Host coverage for a larger range is not an exact metadata pair.
+        const auto half =
+            cudf::slice(table->view().column(0), {0, kRows / 2}, stream)
+                .front();
+        EXPECT_TRUE(cache.insertGpuColumnRangeIfAbsent(
+            key, 0, kRows / 2, half, kRows * sizeof(int64_t) / 2, stream, mr));
+      }
+      auto standalone = key;
+      standalone.columnName = "standalone";
+      EXPECT_TRUE(cache.insertGpuColumnRangeIfAbsent(
+          standalone,
+          0,
+          kRows,
+          table->view().column(0),
+          kRows * sizeof(int64_t),
+          stream,
+          mr));
+      EXPECT_EQ(cache.stats().gpuAdmissionPolicySkippedRanges, skip ? 1 : 0);
+    }
+  }
+  cache.clearForTesting();
+  FLAGS_cudf_gpu_cache_min_host_fraction = 1.01;
+  EXPECT_THROW(
+      cache.insertGpuColumnRangeIfAbsent(
+          key,
+          0,
+          kRows,
+          table->view().column(0),
+          kRows * sizeof(int64_t),
+          stream,
+          mr),
+      VeloxUserError);
+}
+
 TEST_F(CudfSplitReaderTest, compressedIntegerWideDomainRoundTrip) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_gpu_cache_min_host_fraction = 0;
   constexpr vector_size_t kRows = 65536;
   const auto stream = cudf::get_default_stream();
   const auto mr = cudf::get_current_device_resource_ref();
@@ -494,8 +1241,7 @@ TEST_F(CudfSplitReaderTest, readerPrefersGpuTierOverPinnedTier) {
   auto dataFile = common::testutil::TempFilePath::create();
   writeToFile(
       dataFile->getPath(),
-      makeRowVector(
-          {"c0"}, {makeFlatVector<int64_t>(kRows, folly::identity)}));
+      makeRowVector({"c0"}, {makeFlatVector<int64_t>(kRows, folly::identity)}));
 
   auto properties = std::make_shared<config::ConfigBase>(
       std::unordered_map<std::string, std::string>{
@@ -536,8 +1282,7 @@ TEST_F(CudfSplitReaderTest, readerPrefersGpuTierOverPinnedTier) {
     auto split =
         CudfHiveConnectorSplitBuilder(dataFile->getPath())
             .connectorId(
-                ::facebook::velox::cudf_velox::exec::test::
-                    kCudfHiveConnectorId)
+                ::facebook::velox::cudf_velox::exec::test::kCudfHiveConnectorId)
             .build();
     CudfSplitReader reader(
         std::move(split),

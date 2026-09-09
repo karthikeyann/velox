@@ -293,9 +293,11 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerInListExpr(
     using Op = cudf::ast::ast_operator;
     using Operation = cudf::ast::operation;
 
-    auto* valuesFilter =
-        static_cast<const common::BigintValuesUsingBitmask*>(&filter);
-    const auto& values = valuesFilter->values();
+    const auto& values =
+        filter.kind() == common::FilterKind::kBigintValuesUsingBitmask
+        ? static_cast<const common::BigintValuesUsingBitmask&>(filter).values()
+        : static_cast<const common::BigintValuesUsingHashTable&>(filter)
+              .values();
 
     std::vector<const cudf::ast::expression*> exprVec;
     exprVec.reserve(values.size());
@@ -368,6 +370,16 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
   auto mr = get_temp_mr();
 
   switch (filter.kind()) {
+    case common::FilterKind::kAlwaysFalse:
+    case common::FilterKind::kAlwaysTrue: {
+      // Empty dynamic build-key sets produce AlwaysFalse. Literal booleans
+      // also preserve true/false for null input rows, unlike col == col.
+      return tree.push(
+          makeScalarAndLiteral<TypeKind::BOOLEAN>(
+              BOOLEAN(),
+              variant(filter.kind() == common::FilterKind::kAlwaysTrue),
+              scalars));
+    }
     case common::FilterKind::kBigintRange: {
       auto const& columnType = inputRowSchema->childAt(columnIndex);
       auto result = VELOX_DYNAMIC_TYPE_DISPATCH(
@@ -388,14 +400,7 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
       return expr.get();
     }
 
-    case common::FilterKind::kBigintValuesUsingHashTable: {
-      auto const& columnType = inputRowSchema->childAt(columnIndex);
-      return buildValuesListExpr<
-          TypeKind::BIGINT,
-          common::BigintValuesUsingHashTable,
-          int64_t>(filter, tree, columnRef, scalars, columnType);
-    }
-
+    case common::FilterKind::kBigintValuesUsingHashTable:
     case common::FilterKind::kBigintValuesUsingBitmask: {
       auto const& columnType = inputRowSchema->childAt(columnIndex);
       // Dispatch by the column's integer kind and cast filter values to it.

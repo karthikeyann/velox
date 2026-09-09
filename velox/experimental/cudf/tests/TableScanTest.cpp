@@ -49,8 +49,17 @@
 #include <cudf/io/parquet.hpp>
 
 #include <fmt/ranges.h>
+#include <gflags/gflags.h>
 
 #include <filesystem>
+
+DECLARE_bool(cudf_scan_prune_before_filter);
+DECLARE_bool(cudf_scan_borrow_gpu_cache);
+DECLARE_bool(cudf_scan_borrow_gpu_cache_unfiltered);
+DECLARE_bool(cudf_scan_async_output);
+DECLARE_bool(cudf_project_borrowed_views);
+DECLARE_bool(cudf_scan_jit_subfield_filters);
+DECLARE_uint64(cudf_scan_jit_subfield_min_rows);
 
 using namespace facebook::velox;
 using namespace facebook::velox::common::testutil;
@@ -556,6 +565,8 @@ TEST_F(TableScanTest, filterPushdown) {
 }
 
 TEST_F(TableScanTest, filteredDecodedCacheHitNeedsNoFile) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_scan_borrow_gpu_cache = true;
   auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
   auto vector = makeRowVector(
       {"c0", "c1"},
@@ -572,6 +583,9 @@ TEST_F(TableScanTest, filteredDecodedCacheHitNeedsNoFile) {
        "true"},
       {facebook::velox::cudf_velox::connector::hive::CudfHiveConfig::
            kExperimentalDecodedColumnCacheEnabled,
+       "true"},
+      {facebook::velox::cudf_velox::connector::hive::CudfHiveConfig::
+           kExperimentalDecodedColumnGpuCacheEnabled,
        "true"},
       {facebook::velox::cudf_velox::connector::hive::CudfHiveConfig::
            kImmutableFiles,
@@ -600,13 +614,25 @@ TEST_F(TableScanTest, filteredDecodedCacheHitNeedsNoFile) {
                   .planNode();
   const auto sql = "SELECT c1 FROM tmp WHERE c0 BETWEEN 25 AND 74";
 
-  assertQuery(plan, {filePath}, sql);
+  auto cold = assertQuery(plan, {filePath}, sql);
+  EXPECT_EQ(
+      toPlanStats(cold->taskStats())
+          .at(plan->id())
+          .customStats.at("borrowedGpuCacheBatches")
+          .sum,
+      0);
 
   // A filtered hot hit must restore the unfiltered decoded columns, apply the
   // subfield filter, and project away the filter-only column without reopening
   // the Parquet file.
   ASSERT_TRUE(std::filesystem::remove(filePath->getPath()));
-  assertQuery(plan, {filePath}, sql);
+  auto hot = assertQuery(plan, {filePath}, sql);
+  EXPECT_GT(
+      toPlanStats(hot->taskStats())
+          .at(plan->id())
+          .customStats.at("borrowedGpuCacheBatches")
+          .sum,
+      0);
 }
 
 // Disable this test and the one below for now, pending a CUDF fix.
@@ -811,6 +837,180 @@ TEST_F(TableScanTest, splitOffsetAndLength) {
 // cudfRemainingFilterExpression_ is null and totalRemainingFilterWallNanos is
 // 0. Without extraction, the filter runs post-read on the GPU and the stat is
 // > 0.
+TEST_F(TableScanTest, pruneFilterOnlyColumns) {
+  gflags::FlagSaver projectionFlags;
+  FLAGS_cudf_project_borrowed_views = true;
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_scan_prune_before_filter = true;
+  FLAGS_cudf_scan_async_output = true;
+  using CacheConfig =
+      facebook::velox::cudf_velox::connector::hive::CudfHiveConfig;
+  resetCudfHiveConnector(
+      std::make_shared<config::ConfigBase>(
+          std::unordered_map<std::string, std::string>{
+              {CacheConfig::kUseExperimentalCudfReader, "true"},
+              {CacheConfig::kExperimentalDecodedColumnCacheEnabled, "true"},
+              {CacheConfig::kExperimentalDecodedColumnGpuCacheEnabled, "true"},
+              {CacheConfig::kImmutableFiles, "true"}}));
+  auto vector = makeRowVector(
+      {"k", "v", "comment"},
+      {makeFlatVector<int64_t>({1, 2, 3, 4, 5, 6}),
+       makeNullableFlatVector<double>({1, std::nullopt, 3, 4, std::nullopt, 6}),
+       makeNullableFlatVector<std::string>(
+           {"special requests",
+            "ordinary",
+            std::nullopt,
+            "requests special",
+            "special other requests",
+            "special"})});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), {vector});
+  createDuckDbTable({vector});
+  auto outputType = ROW({"v", "k"}, {DOUBLE(), BIGINT()});
+  auto assignments =
+      HiveConnectorTestBase::allRegularColumns(asRowType(vector->type()));
+  for (const std::string filter :
+       {"comment not like '%special%requests%'",
+        "k > 2 AND comment not like '%special%requests%'",
+        "k > 100 AND comment not like '%special%requests%'"}) {
+    auto plan = PlanBuilder(pool_.get())
+                    .startTableScan()
+                    .connectorId(kCudfHiveConnectorId)
+                    .outputType(outputType)
+                    .dataColumns(asRowType(vector->type()))
+                    .assignments(assignments)
+                    .remainingFilter(filter)
+                    .endTableScan()
+                    .planNode();
+    FLAGS_cudf_scan_borrow_gpu_cache = false;
+    assertQuery(plan, {filePath}, "SELECT v, k FROM tmp WHERE " + filter);
+    FLAGS_cudf_scan_borrow_gpu_cache = true;
+    auto task =
+        assertQuery(plan, {filePath}, "SELECT v, k FROM tmp WHERE " + filter);
+    if (filter.find("100") == std::string::npos) {
+      auto stats = toPlanStats(task->taskStats());
+      EXPECT_GT(
+          stats.at(plan->id()).customStats.at("prunedFilterColumns").sum, 0);
+      EXPECT_GT(
+          stats.at(plan->id()).customStats.at("asynchronousScanOutputs").sum,
+          0);
+      EXPECT_GT(
+          stats.at(plan->id()).customStats.at("borrowedGpuCacheBatches").sum,
+          0);
+    }
+  }
+  FLAGS_cudf_scan_borrow_gpu_cache_unfiltered = true;
+  for (const bool project : {false, true}) {
+    auto builder = PlanBuilder(pool_.get());
+    core::PlanNodeId scanId;
+    builder.startTableScan()
+        .connectorId(kCudfHiveConnectorId)
+        .outputType(outputType)
+        .dataColumns(asRowType(vector->type()))
+        .assignments(assignments)
+        .endTableScan()
+        .capturePlanNodeId(scanId);
+    if (project) {
+      builder.project({"v + 1.0 as v", "k", "k as again"});
+    }
+    auto task = assertQuery(
+        builder.planNode(),
+        {filePath},
+        project ? "SELECT v + 1.0, k, k FROM tmp" : "SELECT v, k FROM tmp");
+    if (project) {
+      EXPECT_GT(
+          toPlanStats(task->taskStats())
+              .at(builder.planNode()->id())
+              .customStats.at("borrowedProjectionBatches")
+              .sum,
+          0);
+    }
+    EXPECT_GT(
+        toPlanStats(task->taskStats())
+            .at(scanId)
+            .customStats.at("borrowedUnfilteredGpuCacheBatches")
+            .sum,
+        0);
+  }
+}
+
+TEST_F(TableScanTest, jitCachedSubfieldPredicates) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_scan_prune_before_filter = true;
+  FLAGS_cudf_scan_jit_subfield_filters = true;
+  FLAGS_cudf_scan_jit_subfield_min_rows = 0;
+  using CacheConfig =
+      facebook::velox::cudf_velox::connector::hive::CudfHiveConfig;
+  resetCudfHiveConnector(
+      std::make_shared<config::ConfigBase>(
+          std::unordered_map<std::string, std::string>{
+              {CacheConfig::kUseExperimentalCudfReader, "true"},
+              {CacheConfig::kExperimentalDecodedColumnCacheEnabled, "true"},
+              {CacheConfig::kExperimentalDecodedColumnGpuCacheEnabled, "true"},
+              {CacheConfig::kImmutableFiles, "true"}}));
+  auto vector = makeRowVector(
+      {"k", "v", "label"},
+      {makeNullableFlatVector<int64_t>(
+           {1, 2, 3, std::nullopt, 5, 6, 7, 8, 9, 10}),
+       makeNullableFlatVector<double>(
+           {-1, 0, 1, 2, std::nullopt, 4, 5, 6, 7, 8}),
+       makeNullableFlatVector<std::string>(
+           {"AIR",
+            "AIR REG",
+            "",
+            "AIR",
+            "AIR REG",
+            std::nullopt,
+            "AIRX",
+            "\xc3\xa9",
+            "AIR",
+            "AIR REG"})});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), {vector});
+  createDuckDbTable({vector});
+  const auto outputType = ROW({"v", "k"}, {DOUBLE(), BIGINT()});
+  const auto assignments =
+      HiveConnectorTestBase::allRegularColumns(asRowType(vector->type()));
+  for (const std::string filter :
+       {"label IN ('AIR', 'AIR REG') AND v BETWEEN 0.0 AND 8.0",
+        "label <> 'AIR' AND v > 0.0 AND v < 8.0",
+        "k IN (1, 3, 5, 9) AND label IS NOT NULL",
+        "k IS NULL OR k = 9",
+        "label IS NULL OR label = 'AIR'",
+        "k > 100",
+        "v IS NULL"}) {
+    auto plan = PlanBuilder(pool_.get())
+                    .startTableScan()
+                    .connectorId(kCudfHiveConnectorId)
+                    .outputType(outputType)
+                    .dataColumns(asRowType(vector->type()))
+                    .assignments(assignments)
+                    .remainingFilter(filter)
+                    .endTableScan()
+                    .planNode();
+    for (bool borrow : {false, true}) {
+      SCOPED_TRACE(filter + " borrowed=" + std::to_string(borrow));
+      FLAGS_cudf_scan_borrow_gpu_cache = borrow;
+      auto task =
+          assertQuery(plan, {filePath}, "SELECT v, k FROM tmp WHERE " + filter);
+      if (filter != "k > 100") {
+        const auto stats = toPlanStats(task->taskStats());
+        const auto& custom = stats.at(plan->id()).customStats;
+        // Null-allowed OR expressions may remain in the existing remaining-
+        // filter evaluator rather than being extracted as subfield filters.
+        // Require the corresponding predicate path to have executed.
+        if (filter.find(" OR ") != std::string::npos) {
+          EXPECT_TRUE(
+              custom.at("jitSubfieldFilterBatches").sum > 0 ||
+              custom.at("totalRemainingFilterWallNanos").sum > 0);
+        } else {
+          EXPECT_GT(custom.at("jitSubfieldFilterBatches").sum, 0);
+        }
+      }
+    }
+  }
+}
+
 TEST_F(TableScanTest, remainingFilterExtraction) {
   auto rowType = ROW({"c0", "c1", "c2"}, {BIGINT(), BIGINT(), DOUBLE()});
   auto vectors = makeVectors(5, 1'000, rowType);

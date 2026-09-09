@@ -273,4 +273,122 @@ TEST_F(CudfVectorTest, packedTableReleaseUsesMaterializationStream) {
   EXPECT_EQ(materialized->num_rows(), 4);
 }
 
+TEST_F(CudfVectorTest, borrowedViewsMaterializePrivateColumns) {
+  TestCudaStream stream;
+  auto mr = cudf::get_current_device_resource_ref();
+  std::shared_ptr<cudf::table> owner = makeTable(stream.view(), mr);
+  stream.view().synchronize();
+  auto sourcePointer = owner->view().column(0).head<int32_t>();
+  CudfVector vector(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      4,
+      owner->view(),
+      owner,
+      16,
+      stream.view(),
+      mr);
+  EXPECT_EQ(vector.getTableView().column(0).head<int32_t>(), sourcePointer);
+  EXPECT_EQ(vector.estimateFlatSize(), 16);
+  auto materialized = vector.release();
+  EXPECT_NE(materialized->view().column(0).head<int32_t>(), sourcePointer);
+  EXPECT_EQ(vector.estimateFlatSize(), 0);
+  EXPECT_FALSE(vector.rebindStream(stream.view()));
+  CUDF_CUDA_TRY(cudaMemsetAsync(
+      materialized->get_column(0).mutable_view().data<int32_t>(),
+      0,
+      16,
+      stream.value()));
+  std::array<int32_t, 4> values{};
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      values.data(),
+      sourcePointer,
+      16,
+      cudaMemcpyDeviceToHost,
+      stream.value()));
+  stream.view().synchronize();
+  EXPECT_EQ(values, (std::array<int32_t, 4>{1, 2, 3, 4}));
+}
+
+TEST_F(CudfVectorTest, borrowedViewsRebindAndFenceLastOwner) {
+  TestCudaStream producer;
+  TestCudaStream consumer;
+  RecordingAsyncDeviceResource resource;
+  auto mr = rmm::to_device_async_resource_ref_checked(&resource);
+  std::shared_ptr<cudf::table> owner = makeTable(producer.view(), mr);
+  producer.view().synchronize();
+  std::weak_ptr<cudf::table> weakOwner = owner;
+  auto vector = std::make_shared<CudfVector>(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      4,
+      owner->view(),
+      owner,
+      16,
+      producer.view(),
+      mr);
+  owner.reset();
+  ASSERT_FALSE(weakOwner.expired());
+  ASSERT_TRUE(vector->rebindStream(consumer.view()));
+  EXPECT_EQ(vector->stream().value(), consumer.value());
+  std::array<int32_t, 4> values{};
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      values.data(),
+      vector->getTableView().column(0).head<int32_t>(),
+      16,
+      cudaMemcpyDeviceToHost,
+      consumer.value()));
+  vector.reset();
+  EXPECT_TRUE(weakOwner.expired());
+  EXPECT_EQ(values, (std::array<int32_t, 4>{1, 2, 3, 4}));
+  EXPECT_GT(resource.deallocationCount(), 0);
+  EXPECT_EQ(resource.lastDeallocationStream(), producer.value());
+}
+
+TEST_F(CudfVectorTest, borrowedViewsRebindAndOrderReleaseWithEvent) {
+  TestCudaStream producer;
+  TestCudaStream consumer;
+  RecordingAsyncDeviceResource resource;
+  auto mr = rmm::to_device_async_resource_ref_checked(&resource);
+  std::shared_ptr<cudf::table> owner = makeTable(producer.view(), mr);
+  producer.view().synchronize();
+  std::weak_ptr<cudf::table> weakOwner = owner;
+  bool ordered = false;
+  auto vector = std::make_shared<CudfVector>(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      4,
+      owner->view(),
+      owner,
+      16,
+      producer.view(),
+      mr,
+      [&](rmm::cuda_stream_view finalConsumer) {
+        EXPECT_EQ(finalConsumer.value(), consumer.value());
+        cudaEvent_t event;
+        CUDF_CUDA_TRY(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        CUDF_CUDA_TRY(cudaEventRecord(event, finalConsumer.value()));
+        CUDF_CUDA_TRY(cudaStreamWaitEvent(producer.value(), event, 0));
+        CUDF_CUDA_TRY(cudaEventDestroy(event));
+        ordered = true;
+      });
+  owner.reset();
+  ASSERT_TRUE(vector->rebindStream(consumer.view()));
+  std::array<int32_t, 4> values{};
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      values.data(),
+      vector->getTableView().column(0).head<int32_t>(),
+      16,
+      cudaMemcpyDeviceToHost,
+      consumer.value()));
+  vector.reset();
+  EXPECT_TRUE(ordered);
+  EXPECT_TRUE(weakOwner.expired());
+  consumer.view().synchronize();
+  producer.view().synchronize();
+  EXPECT_EQ(values, (std::array<int32_t, 4>{1, 2, 3, 4}));
+  EXPECT_GT(resource.deallocationCount(), 0);
+  EXPECT_EQ(resource.lastDeallocationStream(), producer.value());
+}
+
 } // namespace

@@ -68,6 +68,10 @@ class CudfFilterProject : public CudfOperatorBase {
  private:
   bool allInputProcessed();
 
+  std::vector<ColumnOrView> evaluateProjections(
+      const std::vector<cudf::column_view>& inputViews,
+      rmm::cuda_stream_view stream);
+
   // If true exprs_[0] is a filter and the other expressions are projections
   const bool hasFilter_{false};
 
@@ -78,9 +82,12 @@ class CudfFilterProject : public CudfOperatorBase {
 
   std::vector<CudfExpressionPtr> projectEvaluators_;
   CudfExpressionPtr filterEvaluator_;
+  std::string fusedDoubleProjection_;
+  std::vector<column_index_t> fusedDoubleInputs_;
 
   std::vector<velox::exec::IdentityProjection> resultProjections_;
-  std::vector<velox::exec::IdentityProjection> identityProjections_;
+  // Use Operator::identityProjections_ so Driver can propagate dynamic filters
+  // through identity/alias projections on the GPU path as on the CPU path.
 };
 
 } // namespace facebook::velox::cudf_velox

@@ -21,9 +21,11 @@
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -96,6 +98,8 @@ class CudfDecodedColumnCache {
   struct Stats {
     uint64_t maxPinnedBytes{0};
     uint64_t pinnedBytes{0};
+    uint64_t hostAdmissionRejectedAllocations{0};
+    uint64_t hostAdmissionRejectedBytes{0};
     uint64_t insertedUncompressedBytes{0};
     uint64_t insertedStoredBytes{0};
     uint64_t insertedCompressedRanges{0};
@@ -112,9 +116,17 @@ class CudfDecodedColumnCache {
     uint64_t gpuInsertedBytes{0};
     uint64_t gpuInsertedRanges{0};
     uint64_t gpuAdmissionRejectedRanges{0};
+    uint64_t gpuAdmissionPolicySkippedRanges{0};
     uint64_t gpuRestoreCalls{0};
     uint64_t gpuRestoredBytes{0};
     uint64_t gpuRestoreBatches{0};
+    uint64_t gpuPackedInsertedBytes{0};
+    uint64_t gpuPackedRestoreCalls{0};
+    uint64_t gpuPackedRestoredStoredBytes{0};
+    uint64_t gpuPackedDecompressionNanos{0};
+    uint64_t gpuScaledInsertedBytes{0};
+    uint64_t gpuScaledInsertedRanges{0};
+    uint64_t gpuScaledRestoreCalls{0};
   };
 
   struct FileKey {
@@ -163,6 +175,58 @@ class CudfDecodedColumnCache {
     std::vector<std::pair<int64_t, int64_t>> ranges;
   };
 
+  /// Read-only leases on raw GPU entries. Destruction fences the consumer
+  /// stream before releasing ownership, including on exceptions/cache clear.
+  /// Only enqueue readers on the stream passed to borrowGpuColumnRanges().
+  struct BorrowedGpuColumns {
+    explicit BorrowedGpuColumns(rmm::cuda_stream_view stream)
+        : stream(stream) {}
+    ~BorrowedGpuColumns();
+    BorrowedGpuColumns(const BorrowedGpuColumns&) = delete;
+    BorrowedGpuColumns& operator=(const BorrowedGpuColumns&) = delete;
+    rmm::cuda_stream_view stream;
+    std::vector<std::shared_ptr<const void>> owners;
+    std::vector<std::unique_ptr<cudf::column>> decodedColumns;
+    std::vector<rmm::device_buffer> decodedBuffers;
+    // Optional raw-cache release ordering. Enqueues allocation-stream waits
+    // instead of blocking the CPU; callers must also order the final logical
+    // consumer stream when ownership is rebound to a different stream.
+    std::function<void(rmm::cuda_stream_view)> orderRelease;
+    std::vector<cudf::column_view> views;
+    uint64_t retainedBytes{0};
+    size_t gpuColumns{0};
+  };
+
+  /// All-or-nothing, single-contiguous-raw-entry fast path. Missing, packed or
+  /// fragmented requests fall back without changing cache state. When decodeMr
+  /// is supplied, scaled-float entries may be reconstructed into lease-owned
+  /// columns while other columns retain their original zero-copy views.
+  std::unique_ptr<BorrowedGpuColumns> borrowGpuColumnRanges(
+      const std::vector<ColumnRangeRequest>& requests,
+      rmm::cuda_stream_view stream,
+      std::optional<rmm::device_async_resource_ref> decodeMr =
+          std::nullopt) const;
+
+  /// Compose raw GPU views with lease-owned restorations for the other cached
+  /// columns. Missing coverage returns nullptr; shared cache data is not
+  /// changed.
+  std::unique_ptr<BorrowedGpuColumns> borrowOrRestoreColumnRanges(
+      const std::vector<ColumnRangeRequest>& requests,
+      rmm::cuda_stream_view stream,
+      rmm::cuda_stream_view transferStream,
+      rmm::device_async_resource_ref outputMr,
+      rmm::device_async_resource_ref tempMr) const;
+
+  /// Restore host entries, retaining packed buffers instead of copying single
+  /// contiguous columns. Fragmented requests still concatenate into owned
+  /// columns. The lease fences the consumer stream before releasing storage.
+  std::unique_ptr<BorrowedGpuColumns> restoreColumnRangeViews(
+      const std::vector<ColumnRangeRequest>& requests,
+      rmm::cuda_stream_view stream,
+      rmm::cuda_stream_view transferStream,
+      rmm::device_async_resource_ref outputMr,
+      rmm::device_async_resource_ref tempMr) const;
+
   using ParquetMetadataPtr =
       std::shared_ptr<const cudf::io::parquet::FileMetaData>;
   using MetadataPtr = std::shared_ptr<const CachedParquetFileMetadata>;
@@ -184,9 +248,7 @@ class CudfDecodedColumnCache {
   static CompressionMode compressionModeFromString(std::string_view value);
 
   MetadataPtr findMetadata(const FileKey& key) const;
-  MetadataPtr insertMetadataIfAbsent(
-      FileKey key,
-      ParquetMetadataPtr metadata);
+  MetadataPtr insertMetadataIfAbsent(FileKey key, ParquetMetadataPtr metadata);
 
   RowGroupSelectionPtr findRowGroupSelection(
       const RowGroupSelectionKey& key) const;
@@ -217,8 +279,7 @@ class CudfDecodedColumnCache {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref tempMr,
       CompressionMode compressionMode,
-      std::optional<rmm::device_async_resource_ref> gpuCacheMr =
-          std::nullopt);
+      std::optional<rmm::device_async_resource_ref> gpuCacheMr = std::nullopt);
 
   /// Copies and inserts a decoded range into the non-evicting GPU tier.
   /// Returns false when the range is already covered, the tier is disabled,
