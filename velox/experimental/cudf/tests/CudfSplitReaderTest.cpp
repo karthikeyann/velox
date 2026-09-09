@@ -22,6 +22,7 @@
 #include "velox/common/caching/FileHandle.h"
 #include "velox/common/config/Config.h"
 #include "velox/type/tests/SubfieldFiltersBuilder.h"
+#include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/copying.hpp>
@@ -30,6 +31,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -401,6 +403,89 @@ TEST_F(CudfSplitReaderTest, compressedPinnedRangeCacheRoundTrip) {
       afterRestore.restoredUncompressedBytes,
       afterInsert.insertedUncompressedBytes);
   EXPECT_GT(afterRestore.decompressionNanos, 0);
+}
+
+TEST_F(CudfSplitReaderTest, compressedIntegerWideDomainRoundTrip) {
+  constexpr vector_size_t kRows = 65536;
+  const auto stream = cudf::get_default_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+  int deviceId = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&deviceId));
+  auto& cache = CudfDecodedColumnCache::instance();
+  const auto run = [&]<typename Key>() {
+    for (int pattern : {0, 1}) {
+      SCOPED_TRACE(fmt::format("keyBytes={} pattern={}", sizeof(Key), pattern));
+      auto input =
+          makeRowVector({makeFlatVector<Key>(kRows, [=](auto row) -> Key {
+            const auto low = std::numeric_limits<Key>::min();
+            const auto high = std::numeric_limits<Key>::max();
+            if (pattern == 1) {
+              // A short modulo ramp across the signed boundary selects delta
+              // compression and must reconstruct without signed overflow.
+              return static_cast<Key>(
+                  static_cast<uint64_t>(high) - 31 + row % 64);
+            }
+            switch (row % 6) {
+              case 0:
+                return low;
+              case 1:
+                return high;
+              case 2:
+                return -1;
+              case 3:
+                return 0;
+              case 4:
+                return 1;
+              default:
+                return static_cast<Key>(0x7878787878787878ULL);
+            }
+          })});
+      auto table = with_arrow::toCudfTable(input, pool_.get(), stream, mr);
+      for (const auto mode :
+           {CudfDecodedColumnCache::CompressionMode::kColumn,
+            CudfDecodedColumnCache::CompressionMode::kColumnAdvanced}) {
+        SCOPED_TRACE(fmt::format("mode={}", static_cast<int>(mode)));
+        cache.clearForTesting();
+        CudfDecodedColumnCache::ColumnKey key{
+            .file = {.connectorId = "test", .filePath = "wide-integer-codec"},
+            .deviceId = deviceId,
+            .columnName = "c0",
+            .veloxType = input->type()->childAt(0)->toString(),
+            .timestampType = cudf::type_id::TIMESTAMP_MILLISECONDS,
+            .usePandasMetadata = true,
+            .useArrowSchema = true,
+            .allowMismatchedSchemas = false};
+        ASSERT_TRUE(cache.insertColumnRangeIfAbsent(
+            key, 0, kRows, table->view().column(0), stream, mr, mode));
+        const auto coverage = cache.findColumnRanges(key, 0, kRows);
+        ASSERT_TRUE(coverage && coverage->size() == 1);
+        EXPECT_TRUE(coverage->front().chunk->compressed());
+        auto column =
+            cache.materializeColumnRange(key, 0, kRows, stream, mr, mr);
+        ASSERT_NE(column, nullptr);
+        auto actual = with_arrow::toVeloxColumn(
+            cudf::table_view({column->view()}),
+            pool_.get(),
+            asRowType(input->type()),
+            stream,
+            mr);
+        facebook::velox::test::assertEqualVectors(input, actual);
+        auto batched = cache.materializeColumnRanges(
+            {{key, {{0, kRows}}}}, stream, stream, mr, mr);
+        ASSERT_TRUE(batched && batched->size() == 1);
+        actual = with_arrow::toVeloxColumn(
+            cudf::table_view({batched->front()->view()}),
+            pool_.get(),
+            asRowType(input->type()),
+            stream,
+            mr);
+        facebook::velox::test::assertEqualVectors(input, actual);
+      }
+    }
+  };
+  run.template operator()<int32_t>();
+  run.template operator()<int64_t>();
+  cache.clearForTesting();
 }
 
 TEST_F(CudfSplitReaderTest, readerPrefersGpuTierOverPinnedTier) {

@@ -169,8 +169,8 @@ __global__ void subSplitKernel(
   if (i >= n) {
     return;
   }
-  uint64_t adjusted =
-      static_cast<uint64_t>(static_cast<int64_t>(values[i]) - base);
+  uint64_t adjusted = static_cast<uint64_t>(static_cast<int64_t>(values[i])) -
+      static_cast<uint64_t>(base);
   for (int k = 0; k < width; ++k) {
     planes[static_cast<uint64_t>(k) * stride + i] =
         static_cast<uint8_t>((adjusted >> (8 * k)) & 0xff);
@@ -483,7 +483,8 @@ __global__ void recombAddKernel(
         static_cast<uint64_t>(planes[static_cast<uint64_t>(k) * stride + i])
         << (8 * k);
   }
-  out[i] = static_cast<T>(static_cast<int64_t>(adjusted) + base);
+  out[i] = static_cast<T>(
+      static_cast<int64_t>(adjusted + static_cast<uint64_t>(base)));
 }
 
 template <typename T>
@@ -514,11 +515,11 @@ __global__ void zigzagDeltaKernel(const T* values, int64_t* out, uint32_t n) {
   if (i >= n) {
     return;
   }
-  int64_t delta = (i == 0)
+  const uint64_t delta = (i == 0)
       ? 0
-      : static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1]);
-  out[i] = static_cast<int64_t>(
-      (static_cast<uint64_t>(delta) << 1) ^ static_cast<uint64_t>(delta >> 63));
+      : static_cast<uint64_t>(static_cast<int64_t>(values[i])) -
+          static_cast<uint64_t>(static_cast<int64_t>(values[i - 1]));
+  out[i] = static_cast<int64_t>((delta << 1) ^ (uint64_t{0} - (delta >> 63)));
 }
 
 // Un-zigzags in place (int64 zigzag values -> signed deltas).
@@ -539,7 +540,8 @@ finalizeDeltaKernel(const int64_t* summed, int64_t first, T* out, uint32_t n) {
   if (i >= n) {
     return;
   }
-  out[i] = static_cast<T>(summed[i] + first);
+  out[i] = static_cast<T>(static_cast<int64_t>(
+      static_cast<uint64_t>(summed[i]) + static_cast<uint64_t>(first)));
 }
 
 // Pinned host staging for tiny D2H readbacks (pageable D2H pays ~50-100us
@@ -565,7 +567,7 @@ PinnedStage& pinnedStage() {
 
 int planesForRange(uint64_t range) {
   int width = 1;
-  while ((range >> (8 * width)) != 0 && width < 8) {
+  while (width < 8 && (range >> (8 * width)) != 0) {
     ++width;
   }
   return width;
@@ -1499,8 +1501,9 @@ void encodeTypedRegion(
   UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
   const int64_t base =
       static_cast<int64_t>(*reinterpret_cast<T*>(stage.values));
-  const uint64_t forRange = static_cast<uint64_t>(
-      static_cast<int64_t>(*reinterpret_cast<T*>(stage.values + 1)) - base);
+  const uint64_t forRange = static_cast<uint64_t>(static_cast<int64_t>(
+                                *reinterpret_cast<T*>(stage.values + 1))) -
+      static_cast<uint64_t>(base);
   const int forWidth = planesForRange(forRange);
 
   EncodedRegion out;
@@ -1512,7 +1515,8 @@ void encodeTypedRegion(
       static_cast<std::size_t>(out.rawBytes) >= advancedCodecMinBytes;
   FrequencyPforEncoding frequency;
   int64_t frequencyBase = base;
-  if (!forOnly && enableAdvanced && n >= kMinFreqPforElems && forWidth >= 2) {
+  if (!forOnly && enableAdvanced && n >= kMinFreqPforElems && forWidth >= 2 &&
+      forRange <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
     frequencyBase = frequencyPforBase(values, n, base, forRange, stream);
     frequency = tryEncodeFrequencyPfor(values, n, frequencyBase, arena, stream);
   }
@@ -1571,7 +1575,9 @@ void encodeTypedRegion(
       forOnly ? 0 : static_cast<std::size_t>(n) * 8, stream);
   auto* deltasPtr = static_cast<int64_t*>(deltas.data());
   if (!forOnly) {
-    // Zigzag deltas + their max (min is >= 0 by construction).
+    // Zigzag occupies the entire UINT64 domain, even though the storage is
+    // int64_t. Signed max silently ignores large encoded deltas and can select
+    // too few byte planes (including when arbitrary NULL payloads are present).
     zigzagDeltaKernel<T>
         <<<blocks, threads, 0, stream.value()>>>(values, deltasPtr, n);
     rmm::device_buffer deltaMaxDev(sizeof(int64_t), stream);
@@ -1579,16 +1585,16 @@ void encodeTypedRegion(
     cub::DeviceReduce::Max(
         nullptr,
         dTempBytes,
-        deltasPtr,
-        static_cast<int64_t*>(deltaMaxDev.data()),
+        reinterpret_cast<const uint64_t*>(deltasPtr),
+        static_cast<uint64_t*>(deltaMaxDev.data()),
         n,
         stream.value());
     rmm::device_buffer dTemp(dTempBytes, stream);
     cub::DeviceReduce::Max(
         dTemp.data(),
         dTempBytes,
-        deltasPtr,
-        static_cast<int64_t*>(deltaMaxDev.data()),
+        reinterpret_cast<const uint64_t*>(deltasPtr),
+        static_cast<uint64_t*>(deltaMaxDev.data()),
         n,
         stream.value());
     UCX_CUDA_CHECK(cudaMemcpyAsync(
@@ -1604,11 +1610,13 @@ void encodeTypedRegion(
         cudaMemcpyDeviceToHost,
         stream.value()));
     UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
-    const int64_t deltaMax = stage.values[2];
+    const uint64_t deltaMax = static_cast<uint64_t>(stage.values[2]);
     firstValue =
         static_cast<int64_t>(*reinterpret_cast<const T*>(stage.values + 3));
-    deltaWidth = planesForRange(static_cast<uint64_t>(deltaMax));
-    if (enableAdvanced && n >= kMinFreqPforElems && deltaWidth >= 2) {
+    deltaWidth = planesForRange(deltaMax);
+    if (enableAdvanced && n >= kMinFreqPforElems && deltaWidth >= 2 &&
+        deltaMax <=
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
       deltaFrequencyBase =
           frequencyPforBase(deltasPtr, n, int64_t{0}, deltaMax, stream);
       deltaFrequency = tryEncodeFrequencyPfor(
@@ -1780,11 +1788,17 @@ void decodeTypedRegion(
     UCX_CUDA_CHECK(cudaGetLastError());
     unZigzagKernel<<<blocks, threads, 0, stream.value()>>>(deltasPtr, n);
     std::size_t tempBytes = 0;
+    auto* unsignedDeltas = reinterpret_cast<uint64_t*>(deltasPtr);
     cub::DeviceScan::InclusiveSum(
-        nullptr, tempBytes, deltasPtr, deltasPtr, n, stream.value());
+        nullptr, tempBytes, unsignedDeltas, unsignedDeltas, n, stream.value());
     rmm::device_buffer temp(tempBytes, stream);
     cub::DeviceScan::InclusiveSum(
-        temp.data(), tempBytes, deltasPtr, deltasPtr, n, stream.value());
+        temp.data(),
+        tempBytes,
+        unsignedDeltas,
+        unsignedDeltas,
+        n,
+        stream.value());
     finalizeDeltaKernel<T><<<blocks, threads, 0, stream.value()>>>(
         deltasPtr, region.first, out, n);
     UCX_CUDA_CHECK(cudaGetLastError());
@@ -1849,11 +1863,17 @@ void decodeTypedRegion(
       region.segSizes.size());
   unZigzagKernel<<<blocks, threads, 0, stream.value()>>>(deltasPtr, n);
   std::size_t tempBytes = 0;
+  auto* unsignedDeltas = reinterpret_cast<uint64_t*>(deltasPtr);
   cub::DeviceScan::InclusiveSum(
-      nullptr, tempBytes, deltasPtr, deltasPtr, n, stream.value());
+      nullptr, tempBytes, unsignedDeltas, unsignedDeltas, n, stream.value());
   rmm::device_buffer temp(tempBytes, stream);
   cub::DeviceScan::InclusiveSum(
-      temp.data(), tempBytes, deltasPtr, deltasPtr, n, stream.value());
+      temp.data(),
+      tempBytes,
+      unsignedDeltas,
+      unsignedDeltas,
+      n,
+      stream.value());
   finalizeDeltaKernel<T>
       <<<blocks, threads, 0, stream.value()>>>(deltasPtr, region.first, out, n);
 }
