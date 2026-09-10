@@ -41,6 +41,7 @@
 #include <cudf/reduction/unique_count.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/structs/structs_column_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 
@@ -216,8 +217,9 @@ struct SimpleStreamingGroupbyAggregator final : StreamingGroupbyAggregator {
 
   void prepareInput(
       cudf::table_view input,
-      std::vector<cudf::column_view>& preparedColumns) override {
-    preparedInputIndex_ = prepareColumn(input, preparedColumns);
+      std::vector<cudf::column_view>& preparedColumns,
+      rmm::cuda_stream_view stream) override {
+    preparedInputIndex_ = prepareColumn(input, preparedColumns, stream);
   }
 
   void addStreamingRequest(
@@ -262,9 +264,10 @@ struct StreamingGroupbyAverageAggregator final : StreamingGroupbyAggregator {
 
   void prepareInput(
       cudf::table_view input,
-      std::vector<cudf::column_view>& preparedColumns) override {
-    sumInputIndex_ = prepareColumn(input, preparedColumns, 0);
-    countInputIndex_ = prepareColumn(input, preparedColumns, 1);
+      std::vector<cudf::column_view>& preparedColumns,
+      rmm::cuda_stream_view stream) override {
+    sumInputIndex_ = prepareColumn(input, preparedColumns, stream, 0);
+    countInputIndex_ = prepareColumn(input, preparedColumns, stream, 1);
   }
 
   void addStreamingRequest(
@@ -755,7 +758,7 @@ struct GroupbyMeanAggregator : GroupbyAggregator {
   void addGroupbyRequest(
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
-      rmm::cuda_stream_view /*stream*/,
+      rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref /*mr*/) override {
     VELOX_CHECK(!maskIndex.has_value(), "avg does not support masks");
     switch (step) {
@@ -781,16 +784,18 @@ struct GroupbyMeanAggregator : GroupbyAggregator {
       case core::AggregationNode::Step::kIntermediate:
       case core::AggregationNode::Step::kFinal: {
         // In intermediate and final aggregation, the previously computed sum
-        // and count are in the child columns of the input column.
+        // and count are in the child columns of the input column. A borrowed
+        // partition may slice the struct without slicing its children.
+        const cudf::structs_column_view state(tbl.column(inputIndex));
         auto& request = requests.emplace_back();
         sumIdx_ = requests.size() - 1;
-        request.values = tbl.column(inputIndex).child(0);
+        request.values = state.get_sliced_child(0, stream);
         request.aggregations.push_back(
             cudf::make_sum_aggregation<cudf::groupby_aggregation>());
 
         auto& request2 = requests.emplace_back();
         countIdx_ = requests.size() - 1;
-        request2.values = tbl.column(inputIndex).child(1);
+        request2.values = state.get_sliced_child(1, stream);
         // The counts are already computed in partial aggregation, so we just
         // need to sum them up again.
         request2.aggregations.push_back(
@@ -1223,12 +1228,14 @@ namespace facebook::velox::cudf_velox {
 column_index_t StreamingGroupbyAggregator::prepareColumn(
     cudf::table_view input,
     std::vector<cudf::column_view>& preparedColumns,
+    rmm::cuda_stream_view stream,
     std::optional<column_index_t> childIndex) const {
   VELOX_CHECK_LT(inputIndex, input.num_columns());
   auto column = input.column(inputIndex);
   if (childIndex.has_value()) {
     VELOX_CHECK_LT(*childIndex, column.num_children());
-    column = column.child(*childIndex);
+    column =
+        cudf::structs_column_view(column).get_sliced_child(*childIndex, stream);
   }
   VELOX_CHECK_EQ(column.size(), input.num_rows());
   preparedColumns.push_back(column);
@@ -1434,7 +1441,8 @@ bool CudfGroupby::initializeStreamingGroupby(
 }
 
 cudf::table_view CudfGroupby::makeStreamingGroupbyInputView(
-    cudf::table_view input) {
+    cudf::table_view input,
+    rmm::cuda_stream_view stream) {
   std::vector<cudf::column_view> columns;
   columns.reserve(
       groupingKeyOutputChannels_.size() +
@@ -1448,7 +1456,7 @@ cudf::table_view CudfGroupby::makeStreamingGroupbyInputView(
     columns.push_back(input.column(inputIndex));
   }
   for (auto& aggregator : streamingGroupbyAggregators_) {
-    aggregator->prepareInput(input, columns);
+    aggregator->prepareInput(input, columns, stream);
   }
   return cudf::table_view{columns};
 }
@@ -1517,7 +1525,8 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr input) {
     }
   };
 
-  auto preparedInput = makeStreamingGroupbyInputView(input->getTableView());
+  auto preparedInput =
+      makeStreamingGroupbyInputView(input->getTableView(), stateStream);
   try {
     if (!streamingGroupby_) {
       // max_distinct_keys is a logical capacity. libcudf's 0.5 cuco load

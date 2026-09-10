@@ -50,7 +50,8 @@ struct StreamingGroupbyAggregator {
   // positions in the prepared streaming_groupby input table.
   virtual void prepareInput(
       cudf::table_view input,
-      std::vector<cudf::column_view>& preparedColumns) = 0;
+      std::vector<cudf::column_view>& preparedColumns,
+      rmm::cuda_stream_view stream) = 0;
 
   // Appends requests using the positions recorded by prepareInput() and records
   // their result positions.
@@ -72,6 +73,7 @@ struct StreamingGroupbyAggregator {
   column_index_t prepareColumn(
       cudf::table_view input,
       std::vector<cudf::column_view>& preparedColumns,
+      rmm::cuda_stream_view stream,
       std::optional<column_index_t> childIndex = std::nullopt) const;
 };
 
@@ -200,7 +202,9 @@ class CudfGroupby : public CudfOperatorBase {
       const std::vector<VectorPtr>& constants,
       const std::vector<std::optional<uint32_t>>& maskChannels);
 
-  cudf::table_view makeStreamingGroupbyInputView(cudf::table_view input);
+  cudf::table_view makeStreamingGroupbyInputView(
+      cudf::table_view input,
+      rmm::cuda_stream_view stream);
 
   std::unique_ptr<cudf::groupby::streaming_groupby> createStreamingGroupby(
       size_t capacity);

@@ -47,6 +47,7 @@ DECLARE_uint64(cudf_dense_integer_count_32_max_rows);
 DECLARE_bool(cudf_final_groupby_unique_batches);
 DECLARE_uint64(cudf_final_groupby_unique_max_bytes);
 DECLARE_int64(cudf_final_groupby_unique_min_rows);
+DECLARE_bool(cudf_local_partition_borrowed_views);
 
 namespace facebook::velox::exec::test {
 
@@ -600,6 +601,56 @@ TEST_F(
         streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyBufferedBatches"),
         0);
     EXPECT_EQ(streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyRows"), 0);
+  }
+}
+
+TEST_F(AggregationTest, slicedAverageStatesAfterHashPartition) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_local_partition_borrowed_views = true;
+  std::vector<RowVectorPtr> vectors;
+  for (int64_t batch = 0; batch < 5; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(
+             4096, [](auto row) { return row % 17; }, nullEvery(19)),
+         makeFlatVector<double>(
+             4096,
+             [batch](auto row) { return row * 0.5 - batch * 23; },
+             [](auto row) { return row % 17 == 3 || row % 7 == 0; }),
+         makeFlatVector<int64_t>(
+             4096,
+             [batch](auto row) { return row * 13 - batch * 29; },
+             nullEvery(11))}));
+  }
+  createDuckDbTable(vectors);
+  for (bool streaming : {false, true}) {
+    cudf_velox::CudfConfig::getInstance().streamingGroupbyEnabled = streaming;
+    for (bool intermediate : {false, true}) {
+      SCOPED_TRACE(fmt::format(
+          "streaming={}, intermediate={}", streaming, intermediate));
+      auto builder = PlanBuilder();
+      core::PlanNodeId exchangeId;
+      builder.values(vectors)
+          .partialAggregation(
+              {"c0"}, {"avg(c1)", "avg(c2)", "sum(c1)", "count(c2)"})
+          .localPartition({"c0"})
+          .capturePlanNodeId(exchangeId);
+      if (intermediate) {
+        builder.intermediateAggregation().localPartition({"c0"});
+      }
+      auto task =
+          AssertQueryBuilder(
+              builder.finalAggregation().planNode(), duckDbQueryRunner_)
+              .maxDrivers(3)
+              .config(QueryConfig::kMaxLocalExchangePartitionCount, 3)
+              .config(QueryConfig::kMaxLocalExchangeBufferSize, 4096)
+              .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 1024)
+              .assertResults(
+                  "SELECT c0,avg(c1),avg(c2),sum(c1),count(c2) "
+                  "FROM tmp GROUP BY c0");
+      const auto stats = toPlanStats(task->taskStats());
+      EXPECT_GT(
+          stats.at(exchangeId).customStats.at("borrowedPartitionRows").sum, 0);
+    }
   }
 }
 
