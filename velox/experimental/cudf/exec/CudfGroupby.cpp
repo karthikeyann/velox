@@ -37,6 +37,8 @@
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/reduction/distinct_count.hpp>
+#include <cudf/reduction/unique_count.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/transform.hpp>
@@ -75,6 +77,18 @@ DEFINE_bool(
     cudf_groupby_stream_raw_single,
     false,
     "Use persistent streaming groupby for single-step raw SUM/MIN/MAX fields");
+DEFINE_bool(
+    cudf_final_groupby_unique_batches,
+    false,
+    "Bypass final integer MIN/MAX aggregation after proving all input keys unique");
+DEFINE_uint64(
+    cudf_final_groupby_unique_max_bytes,
+    uint64_t{16} << 30,
+    "Maximum retained input bytes per driver for checked unique final aggregation");
+DEFINE_int64(
+    cudf_final_groupby_unique_min_rows,
+    1'000'000,
+    "Minimum first-batch rows for checked unique final aggregation");
 DEFINE_uint64(
     cudf_dense_integer_sum_max_range,
     0,
@@ -1695,6 +1709,32 @@ void CudfGroupby::initialize() {
           aggregationInput.constants,
           aggregationInput.maskChannels);
 
+  if (FLAGS_cudf_final_groupby_unique_batches &&
+      aggregationNode_->step() == core::AggregationNode::Step::kFinal &&
+      incrementalAggregationEnabled_ && groupingKeyInputChannels_.size() == 1 &&
+      numAggregates_ > 0 &&
+      aggregationInputChannels_.size() == numAggregates_ + 1) {
+    const auto keyType = inputRowSchema->childAt(groupingKeyInputChannels_[0]);
+    const auto prefix = CudfConfig::getInstance().functionNamePrefix;
+    // Match logical types, not just their storage kind: DATE and short
+    // DECIMAL also use integer storage but have different cuDF representations.
+    uniqueFinalBatchesEligible_ =
+        INTEGER()->equivalent(*keyType) || BIGINT()->equivalent(*keyType);
+    for (size_t i = 0; i < numAggregates_; ++i) {
+      const auto& aggregate = aggregationNode_->aggregates()[i];
+      const auto& call = aggregate.call;
+      // A single nullable integer MIN/MAX state is already its final value.
+      // Exclude other functions, companions, masks, constants and type changes.
+      uniqueFinalBatchesEligible_ = uniqueFinalBatchesEligible_ &&
+          (call->name() == prefix + "min" || call->name() == prefix + "max") &&
+          BIGINT()->equivalent(*call->type()) && call->inputs().size() == 1 &&
+          BIGINT()->equivalent(
+              *inputRowSchema->childAt(aggregationInputChannels_[i + 1])) &&
+          !aggregationInput.constants[i] && !aggregate.mask &&
+          !aggregate.distinct && aggregate.sortingKeys.empty();
+    }
+  }
+
   if (FLAGS_cudf_dense_integer_sum_max_range > 0 && isSingleStep_ &&
       incrementalAggregationEnabled_ && !disjointGroupRanges_ &&
       groupingKeyInputChannels_.size() == 1 && numAggregates_ == 1 &&
@@ -1992,6 +2032,85 @@ bool CudfGroupby::tryAddDenseIntegerSum(CudfVectorPtr input) {
   return false;
 }
 
+bool CudfGroupby::tryBufferUniqueFinalBatch(const CudfVectorPtr& input) {
+  const auto bytes = input->estimateFlatSize();
+  const auto limit = FLAGS_cudf_final_groupby_unique_max_bytes;
+  if ((uniqueFinalBatches_.empty() &&
+       input->size() < FLAGS_cudf_final_groupby_unique_min_rows) ||
+      uniqueFinalBytes_ > limit || bytes > limit - uniqueFinalBytes_) {
+    return false;
+  }
+  const auto stream = input->stream();
+  const auto key = input->getTableView().column(groupingKeyInputChannels_[0]);
+  // Null keys and any uncertain range overlap take the ordinary path.
+  if (key.null_count() != 0) {
+    return false;
+  }
+  auto [minimum, maximum] = cudf::minmax(key, stream, get_temp_mr());
+  const auto value =
+      [stream](const std::unique_ptr<cudf::scalar>& scalar) -> int64_t {
+    if (scalar->type().id() == cudf::type_id::INT32) {
+      return static_cast<const cudf::numeric_scalar<int32_t>*>(scalar.get())
+          ->value(stream);
+    }
+    return static_cast<const cudf::numeric_scalar<int64_t>*>(scalar.get())
+        ->value(stream);
+  };
+  const auto low = value(minimum);
+  const auto high = value(maximum);
+  const auto next = uniqueFinalRanges_.lower_bound(low);
+  if ((next != uniqueFinalRanges_.end() && high >= next->first) ||
+      (next != uniqueFinalRanges_.begin() && std::prev(next)->second >= low)) {
+    return false;
+  }
+  // Hash exchanges need not preserve order. Count adjacent groups only after
+  // verifying ordering; otherwise prove exact distinctness with a temporary
+  // per-batch set instead of retaining a hash state for the entire operator.
+  const bool sorted = cudf::is_sorted(cudf::table_view{{key}}, {}, {}, stream);
+  const auto distinct = sorted ? cudf::unique_count(
+                                     key,
+                                     cudf::null_policy::INCLUDE,
+                                     cudf::nan_policy::NAN_IS_VALID,
+                                     stream)
+                               : cudf::distinct_count(
+                                     key,
+                                     cudf::null_policy::INCLUDE,
+                                     cudf::nan_policy::NAN_IS_VALID,
+                                     stream);
+  if (distinct != key.size()) {
+    return false;
+  }
+  uniqueFinalRanges_.emplace(low, high);
+  uniqueFinalBatches_.push_back(input);
+  uniqueFinalBytes_ += bytes;
+  auto lockedStats = stats_.wlock();
+  lockedStats->addRuntimeStat(
+      "uniqueFinalGroupbyBufferedBatches", RuntimeCounter(1));
+  lockedStats->addRuntimeStat(
+      "uniqueFinalGroupbyBufferedBytes",
+      RuntimeCounter(bytes, RuntimeCounter::Unit::kBytes));
+  lockedStats->addRuntimeStat(
+      "uniqueFinalGroupbyUnsortedBatches", RuntimeCounter(sorted ? 0 : 1));
+  return true;
+}
+
+void CudfGroupby::abandonUniqueFinalBatches() {
+  uniqueFinalBatchesEligible_ = false;
+  uniqueFinalRanges_.clear();
+  uniqueFinalBytes_ = 0;
+  while (!uniqueFinalBatches_.empty()) {
+    auto input = std::move(uniqueFinalBatches_.front());
+    uniqueFinalBatches_.pop_front();
+    if (streamingGroupbyEnabled_) {
+      computeFinalGroupbyStreaming(std::move(input));
+    } else {
+      computeFinalGroupbyIncrementally(std::move(input));
+    }
+  }
+  auto lockedStats = stats_.wlock();
+  lockedStats->addRuntimeStat("uniqueFinalGroupbyFallbacks", RuntimeCounter(1));
+}
+
 void CudfGroupby::doAddInput(RowVectorPtr input) {
   if (input->size() == 0) {
     return;
@@ -2000,6 +2119,13 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
 
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
+
+  if (uniqueFinalBatchesEligible_) {
+    if (tryBufferUniqueFinalBatch(cudfInput)) {
+      return;
+    }
+    abandonUniqueFinalBatches();
+  }
 
   if (tryAddDenseIntegerSum(cudfInput)) {
     return;
@@ -2229,6 +2355,31 @@ RowVectorPtr CudfGroupby::doGetOutput() {
                      : std::make_shared<CudfVector>(
                            pool(), outputType_, rows, std::move(table), stream);
   }
+  if (uniqueFinalBatchesEligible_) {
+    if (uniqueFinalBatches_.empty()) {
+      finished_ = true;
+      return nullptr;
+    }
+    auto input = std::move(uniqueFinalBatches_.front());
+    uniqueFinalBatches_.pop_front();
+    finished_ = uniqueFinalBatches_.empty();
+    const auto view = input->getTableView().select(
+        aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+    auto result = std::make_shared<CudfVector>(
+        pool(),
+        outputType_,
+        input->size(),
+        view,
+        input,
+        input->estimateFlatSize(),
+        input->stream(),
+        get_output_mr());
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat("uniqueFinalGroupbyBatches", RuntimeCounter(1));
+    lockedStats->addRuntimeStat(
+        "uniqueFinalGroupbyRows", RuntimeCounter(input->size()));
+    return result;
+  }
   if (streamingGroupbyEnabled_) {
     finished_ = true;
     return finalizeStreamingGroupby();
@@ -2295,6 +2446,10 @@ void CudfGroupby::doNoMoreInput() {
 }
 
 void CudfGroupby::doClose() {
+  uniqueFinalBatches_.clear();
+  uniqueFinalRanges_.clear();
+  uniqueFinalBytes_ = 0;
+  uniqueFinalBatchesEligible_ = false;
   denseIntegerSum_.reset();
   denseIntegerSumEligible_ = false;
   if (streamingGroupby_ && streamingGroupbyStream_.has_value()) {

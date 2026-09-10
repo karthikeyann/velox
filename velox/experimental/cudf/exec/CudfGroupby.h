@@ -20,6 +20,8 @@
 
 #include <cudf/groupby.hpp>
 
+#include <deque>
+#include <map>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -207,6 +209,8 @@ class CudfGroupby : public CudfOperatorBase {
 
   CudfVectorPtr finalizeStreamingGroupby();
   bool tryAddDenseIntegerSum(CudfVectorPtr input);
+  bool tryBufferUniqueFinalBatch(const CudfVectorPtr& input);
+  void abandonUniqueFinalBatches();
 
   void computePartialGroupbyIncrementally(CudfVectorPtr tbl);
   void flushPendingPartialResults();
@@ -236,6 +240,12 @@ class CudfGroupby : public CudfOperatorBase {
   std::unique_ptr<DenseIntegerSum> denseIntegerSum_;
   std::shared_ptr<DisjointGroupbyRanges> disjointGroupRanges_;
   CudfVectorPtr disjointBatchOutput_;
+  // No output is emitted until all ranges have been checked. A failed proof
+  // replays these immutable inputs through the ordinary final aggregation.
+  bool uniqueFinalBatchesEligible_{false};
+  std::deque<CudfVectorPtr> uniqueFinalBatches_;
+  std::map<int64_t, int64_t> uniqueFinalRanges_;
+  uint64_t uniqueFinalBytes_{0};
   const int64_t maxPartialAggregationMemoryUsage_;
   int64_t numInputRows_ = 0;
 

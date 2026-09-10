@@ -36,6 +36,28 @@ Velox-cuDF builds are included in Velox CI as part of the [adapters build](https
 
 Velox-cuDF provides several configuration properties to control GPU execution behavior, memory management, and debugging. These configurations are available when compiled with cuDF support and can be set via Velox's configuration system. For a complete list of cuDF-specific configuration properties and their descriptions, see the [Cudf-specific Configuration section](https://facebookincubator.github.io/velox/configs.html#cudf-specific-configuration-experimental) in the Velox configuration documentation.
 
+#### Checked unique final aggregation (experimental)
+
+`--cudf_final_groupby_unique_batches=true` can avoid rebuilding a final hash
+aggregation when its input states already have globally unique keys. It is off
+by default and supports only one INT32/INT64 key and BIGINT MIN/MAX states.
+Every batch must have unique, non-null keys, and batch key ranges must be
+disjoint within each final-aggregation driver. Sorted batches use an adjacent
+group count; unsorted batches use an exact temporary distinct set, since hash
+exchanges need not preserve ordering. No output is released until
+all batches have been checked. A failed check replays the retained inputs
+through the normal aggregation; no catalog uniqueness assumptions are required.
+
+The default first-batch threshold is 1,000,000 rows
+(`--cudf_final_groupby_unique_min_rows`). Retained input is limited to 16 GiB per
+driver (`--cudf_final_groupby_unique_max_bytes`); exceeding this limit also falls
+back. Account for concurrent drivers and operators when sizing GPU memory.
+Runtime counters `uniqueFinalGroupbyRows`, `uniqueFinalGroupbyBatches`,
+`uniqueFinalGroupbyBufferedBatches`, `uniqueFinalGroupbyBufferedBytes`, and
+`uniqueFinalGroupbyFallbacks` distinguish
+successful bypasses from attempted proofs and normal fallbacks.
+`uniqueFinalGroupbyUnsortedBatches` records use of the temporary distinct set.
+
 ### Testing Velox with cuDF
 
 Tests with Velox-cuDF can only be run on GPU-enabled hardware. The Velox-cuDF tests in [experimental/cudf/tests](https://github.com/facebookincubator/velox/blob/main/velox/experimental/cudf/tests) include several types of tests:

@@ -44,6 +44,9 @@ DECLARE_uint64(cudf_dense_integer_sum_max_range);
 DECLARE_int64(cudf_dense_integer_sum_min_rows);
 DECLARE_bool(cudf_dense_integer_count_rows);
 DECLARE_uint64(cudf_dense_integer_count_32_max_rows);
+DECLARE_bool(cudf_final_groupby_unique_batches);
+DECLARE_uint64(cudf_final_groupby_unique_max_bytes);
+DECLARE_int64(cudf_final_groupby_unique_min_rows);
 
 namespace facebook::velox::exec::test {
 
@@ -307,6 +310,297 @@ int64_t streamingGroupbyStatSum(
   }
   const auto statIt = planIt->second.customStats.find(std::string{name});
   return statIt == planIt->second.customStats.end() ? 0 : statIt->second.sum;
+}
+
+TEST_F(StreamingGroupbyAggregationTest, uniqueFinalIntegerMinMaxBatches) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_final_groupby_unique_batches = true;
+  FLAGS_cudf_final_groupby_unique_min_rows = 0;
+  const auto run = [&]<typename Key>() {
+    std::vector<RowVectorPtr> vectors;
+    for (const auto offset :
+         {std::numeric_limits<Key>::min(),
+          Key(std::numeric_limits<Key>::max() - 2),
+          Key{0}}) {
+      vectors.push_back(makeRowVector(
+          {"v", "junk", "k"},
+          {makeNullableFlatVector<int64_t>(
+               {std::numeric_limits<int64_t>::min(),
+                std::nullopt,
+                std::numeric_limits<int64_t>::max()}),
+           makeFlatVector<int64_t>({1, 2, 3}),
+           makeFlatVector<Key>({offset, Key(offset + 1), Key(offset + 2)})}));
+    }
+    createDuckDbTable(vectors);
+    core::PlanNodeId id;
+    auto task =
+        AssertQueryBuilder(duckDbQueryRunner_)
+            .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 3)
+            .plan(PlanBuilder()
+                      .values(vectors)
+                      .finalAggregation(
+                          {"k"}, {"min(v)", "max(v)"}, {{BIGINT()}, {BIGINT()}})
+                      .capturePlanNodeId(id)
+                      .planNode())
+            .assertResults("SELECT k,min(v),max(v) FROM tmp GROUP BY k");
+    EXPECT_EQ(streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyRows"), 9);
+    EXPECT_EQ(
+        streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyFallbacks"), 0);
+    EXPECT_FALSE(hasStreamingGroupbyStat(
+        task, id, cudf_velox::kStreamingGroupbyUsedStat));
+  };
+  run.template operator()<int32_t>();
+  run.template operator()<int64_t>();
+}
+
+TEST_F(
+    StreamingGroupbyAggregationTest,
+    uniqueFinalFallsBackWithoutEarlyOutput) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_final_groupby_unique_batches = true;
+  FLAGS_cudf_final_groupby_unique_min_rows = 0;
+  const std::vector<std::vector<std::optional<int64_t>>> laterKeys{
+      {6, 6, 7}, {6, 7, 6}, {6, std::nullopt, 8}, {4, 5, 6}, {1, 3, 5}};
+  for (bool streaming : {false, true}) {
+    cudf_velox::CudfConfig::getInstance().streamingGroupbyEnabled = streaming;
+    for (const auto& keys : laterKeys) {
+      std::vector<RowVectorPtr> vectors{
+          makeRowVector(
+              {makeFlatVector<int64_t>({0, 2, 4}),
+               makeNullableFlatVector<int64_t>({1, std::nullopt, 3})}),
+          makeRowVector(
+              {makeNullableFlatVector<int64_t>(keys),
+               makeNullableFlatVector<int64_t>({-2, 5, std::nullopt})})};
+      createDuckDbTable(vectors);
+      core::PlanNodeId id;
+      auto task =
+          AssertQueryBuilder(duckDbQueryRunner_)
+              .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 3)
+              .plan(PlanBuilder()
+                        .values(vectors)
+                        .finalAggregation(
+                            {"c0"},
+                            {"min(c1)", "max(c1)"},
+                            {{BIGINT()}, {BIGINT()}})
+                        .capturePlanNodeId(id)
+                        .planNode())
+              .assertResults("SELECT c0,min(c1),max(c1) FROM tmp GROUP BY c0");
+      EXPECT_EQ(
+          streamingGroupbyStatSum(
+              task, id, "uniqueFinalGroupbyBufferedBatches"),
+          1);
+      EXPECT_EQ(
+          streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyFallbacks"), 1);
+      EXPECT_EQ(streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyRows"), 0);
+    }
+  }
+}
+
+TEST_F(StreamingGroupbyAggregationTest, uniqueFinalUnsortedDistinctBatches) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_final_groupby_unique_batches = true;
+  FLAGS_cudf_final_groupby_unique_min_rows = 0;
+  std::vector<RowVectorPtr> vectors;
+  for (int64_t offset : {0, 3}) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>({offset + 2, offset, offset + 1}),
+         makeNullableFlatVector<int64_t>({7, std::nullopt, -9})}));
+  }
+  createDuckDbTable(vectors);
+  core::PlanNodeId id;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 3)
+          .plan(
+              PlanBuilder()
+                  .values(vectors)
+                  .finalAggregation(
+                      {"c0"}, {"min(c1)", "max(c1)"}, {{BIGINT()}, {BIGINT()}})
+                  .capturePlanNodeId(id)
+                  .planNode())
+          .assertResults("SELECT c0,min(c1),max(c1) FROM tmp GROUP BY c0");
+  EXPECT_EQ(streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyRows"), 6);
+  EXPECT_EQ(
+      streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyUnsortedBatches"),
+      2);
+  EXPECT_EQ(
+      streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyFallbacks"), 0);
+}
+
+TEST_F(StreamingGroupbyAggregationTest, uniqueFinalRetainedByteLimit) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_final_groupby_unique_batches = true;
+  FLAGS_cudf_final_groupby_unique_min_rows = 0;
+  FLAGS_cudf_final_groupby_unique_max_bytes = 1 << 20;
+  auto vectors = makeHighCardinalityBatches(3, 2);
+  core::PlanNodeId id;
+  const auto run = [&](const std::vector<RowVectorPtr>& input) {
+    createDuckDbTable(input);
+    return AssertQueryBuilder(duckDbQueryRunner_)
+        .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 3)
+        .plan(PlanBuilder()
+                  .values(input)
+                  .finalAggregation({"c0"}, {"min(c1)"}, {{BIGINT()}})
+                  .capturePlanNodeId(id)
+                  .planNode())
+        .assertResults("SELECT c0,min(c1) FROM tmp GROUP BY c0");
+  };
+  // Use the actual retained allocation size, including alignment and masks,
+  // rather than assuming a packed sizeof(value) * row count allocation.
+  auto first = run({vectors.front()});
+  FLAGS_cudf_final_groupby_unique_max_bytes =
+      streamingGroupbyStatSum(first, id, "uniqueFinalGroupbyBufferedBytes");
+  ASSERT_GT(FLAGS_cudf_final_groupby_unique_max_bytes, 0);
+  auto task = run(vectors);
+  EXPECT_EQ(
+      streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyBufferedBatches"),
+      1);
+  EXPECT_EQ(
+      streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyFallbacks"), 1);
+  EXPECT_EQ(streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyRows"), 0);
+}
+
+TEST_F(StreamingGroupbyAggregationTest, uniqueFinalUnsupportedAggregates) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_final_groupby_unique_batches = true;
+  FLAGS_cudf_final_groupby_unique_min_rows = 0;
+  auto vectors = makeHighCardinalityBatches(3, 2);
+  createDuckDbTable(vectors);
+  core::PlanNodeId id;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 3)
+          .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+          .plan(PlanBuilder()
+                    .values(vectors)
+                    .partialAggregation(
+                        {"c0"}, {"min(c1)", "sum(c1)", "count(c1)", "avg(c1)"})
+                    .finalAggregation()
+                    .capturePlanNodeId(id)
+                    .planNode())
+          .assertResults(
+              "SELECT c0,min(c1),sum(c1),count(c1),avg(c1) FROM tmp GROUP BY c0");
+  EXPECT_EQ(
+      streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyBufferedBatches"),
+      0);
+  EXPECT_EQ(streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyRows"), 0);
+}
+
+TEST_F(StreamingGroupbyAggregationTest, uniqueFinalPartitionedDrivers) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_final_groupby_unique_batches = true;
+  FLAGS_cudf_final_groupby_unique_min_rows = 0;
+  auto vectors = makeHighCardinalityBatches(1024, 3);
+  createDuckDbTable(vectors);
+  core::PlanNodeId id;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .maxDrivers(3)
+          .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 1024)
+          .plan(
+              PlanBuilder()
+                  .values(vectors)
+                  .localPartition({"c0"})
+                  .finalAggregation(
+                      {"c0"}, {"min(c1)", "max(c1)"}, {{BIGINT()}, {BIGINT()}})
+                  .capturePlanNodeId(id)
+                  .planNode())
+          .assertResults("SELECT c0,min(c1),max(c1) FROM tmp GROUP BY c0");
+  EXPECT_EQ(streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyRows"), 3072);
+  EXPECT_EQ(
+      streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyFallbacks"), 0);
+}
+
+TEST_F(StreamingGroupbyAggregationTest, uniqueFinalSmallOrEmptyInput) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_final_groupby_unique_batches = true;
+  FLAGS_cudf_final_groupby_unique_min_rows = 4;
+  for (const int32_t rows : {0, 3}) {
+    auto vectors = makeHighCardinalityBatches(rows, 1);
+    createDuckDbTable(vectors);
+    core::PlanNodeId id;
+    auto task =
+        AssertQueryBuilder(duckDbQueryRunner_)
+            .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 3)
+            .plan(PlanBuilder()
+                      .values(vectors)
+                      .finalAggregation({"c0"}, {"min(c1)"}, {{BIGINT()}})
+                      .capturePlanNodeId(id)
+                      .planNode())
+            .assertResults("SELECT c0,min(c1) FROM tmp GROUP BY c0");
+    EXPECT_EQ(streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyRows"), 0);
+    EXPECT_EQ(
+        streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyFallbacks"),
+        rows == 0 ? 0 : 1);
+  }
+}
+
+TEST_F(
+    StreamingGroupbyAggregationTest,
+    uniqueFinalFloatingKeyOrStateFallsBack) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_final_groupby_unique_batches = true;
+  FLAGS_cudf_final_groupby_unique_min_rows = 0;
+  for (bool floatingKey : {false, true}) {
+    auto vector = makeRowVector(
+        {makeFlatVector<double>({1.0, 2.0, 3.0}),
+         makeFlatVector<int64_t>({1, 2, 3})});
+    createDuckDbTable({vector});
+    const auto key = floatingKey ? "c0" : "c1";
+    const auto value = floatingKey ? "c1" : "c0";
+    core::PlanNodeId id;
+    auto task =
+        AssertQueryBuilder(duckDbQueryRunner_)
+            .plan(PlanBuilder()
+                      .values({vector})
+                      .finalAggregation(
+                          {key},
+                          {fmt::format("min({})", value)},
+                          {{vector->childAt(floatingKey ? 1 : 0)->type()}})
+                      .capturePlanNodeId(id)
+                      .planNode())
+            .assertResults(fmt::format(
+                "SELECT {},min({}) FROM tmp GROUP BY {}", key, value, key));
+    EXPECT_EQ(
+        streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyBufferedBatches"),
+        0);
+    EXPECT_EQ(streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyRows"), 0);
+  }
+}
+
+TEST_F(
+    StreamingGroupbyAggregationTest,
+    uniqueFinalLogicalIntegerTypesFallBack) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_final_groupby_unique_batches = true;
+  FLAGS_cudf_final_groupby_unique_min_rows = 0;
+  std::vector<RowVectorPtr> vectors{
+      makeRowVector(
+          {makeFlatVector<int64_t>({100, 200, 300}, DECIMAL(12, 2)),
+           makeFlatVector<int64_t>({1, 2, 3})}),
+      makeRowVector(
+          {makeFlatVector<int32_t>({1, 2, 3}, DATE()),
+           makeFlatVector<int64_t>({1, 2, 3})}),
+      makeRowVector(
+          {makeFlatVector<int64_t>({1, 2, 3}),
+           makeFlatVector<int64_t>({100, 200, 300}, DECIMAL(12, 2))})};
+  for (const auto& vector : vectors) {
+    createDuckDbTable({vector});
+    core::PlanNodeId id;
+    auto task =
+        AssertQueryBuilder(duckDbQueryRunner_)
+            .plan(PlanBuilder()
+                      .values({vector})
+                      .finalAggregation(
+                          {"c0"}, {"min(c1)"}, {{vector->childAt(1)->type()}})
+                      .capturePlanNodeId(id)
+                      .planNode())
+            .assertResults("SELECT c0,min(c1) FROM tmp GROUP BY c0");
+    EXPECT_EQ(
+        streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyBufferedBatches"),
+        0);
+    EXPECT_EQ(streamingGroupbyStatSum(task, id, "uniqueFinalGroupbyRows"), 0);
+  }
 }
 
 TEST_F(AggregationTest, verifiedSortedIntegerKeysAndUnsortedFallback) {
