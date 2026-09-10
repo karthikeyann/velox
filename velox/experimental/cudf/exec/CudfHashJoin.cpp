@@ -760,6 +760,42 @@ void CudfHashJoinProbe::doNoMoreInput() {
       stream);
 }
 
+void CudfHashJoinProbe::appendUnfilteredOutputs(
+    std::vector<JoinOutput>& outputs,
+    cudf::table_view leftTableView,
+    cudf::column_view leftIndicesCol,
+    cudf::table_view rightTableView,
+    cudf::column_view rightIndicesCol,
+    cuda::stream_ref stream) {
+  const auto& maxThreshold = CudfConfig::getInstance().batchSizeMaxThreshold;
+  const auto numLeft = leftIndicesCol.size();
+  const auto numRight = rightIndicesCol.size();
+  // Splitting is only meaningful when both index columns describe the same
+  // output rows. Join shapes that leave one side empty (semi, anti) already
+  // emit at most one row per probe row, so they take the single-shot path.
+  const bool splittable = maxThreshold.has_value() && numLeft == numRight &&
+      numLeft > maxThreshold.value();
+  if (!splittable) {
+    outputs.push_back(unfilteredOutput(
+        leftTableView,
+        leftIndicesCol,
+        rightTableView,
+        rightIndicesCol,
+        stream));
+    return;
+  }
+
+  const auto batchRows = maxThreshold.value();
+  for (cudf::size_type offset = 0; offset < numLeft; offset += batchRows) {
+    const auto length = std::min(batchRows, numLeft - offset);
+    const std::vector<cudf::size_type> bounds{offset, offset + length};
+    auto leftSlice = cudf::slice(leftIndicesCol, bounds, stream).front();
+    auto rightSlice = cudf::slice(rightIndicesCol, bounds, stream).front();
+    outputs.push_back(unfilteredOutput(
+        leftTableView, leftSlice, rightTableView, rightSlice, stream));
+  }
+}
+
 CudfHashJoinProbe::JoinOutput CudfHashJoinProbe::unfilteredOutput(
     cudf::table_view leftTableView,
     cudf::column_view leftIndicesCol,
@@ -985,12 +1021,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
             stream));
       }
     } else {
-      cudfOutputs.push_back(unfilteredOutput(
+      appendUnfilteredOutputs(
+          cudfOutputs,
           leftTableView,
           leftIndicesCol,
           rightTableView,
           rightIndicesCol,
-          stream));
+          stream);
     }
   }
   return cudfOutputs;
@@ -1060,12 +1097,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::leftJoin(
 
           probeTracker.update(filteredLeftCol, stream, get_temp_mr());
 
-          cudfOutputs.push_back(unfilteredOutput(
+          appendUnfilteredOutputs(
+              cudfOutputs,
               leftTableView,
               filteredLeftCol,
               rightTableView,
               filteredRightCol,
-              stream));
+              stream);
         }
       } else {
         auto leftIndicesSpanCopy =
@@ -1105,12 +1143,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::leftJoin(
       }
     } else {
       probeTracker.update(leftIndicesCol, stream, get_temp_mr());
-      cudfOutputs.push_back(unfilteredOutput(
+      appendUnfilteredOutputs(
+          cudfOutputs,
           leftTableView,
           leftIndicesCol,
           rightTableView,
           rightIndicesCol,
-          stream));
+          stream);
     }
   };
 
@@ -1164,12 +1203,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::leftJoin(
     //     JoinNoMatch. Per filter_join_indices semantics, input pairs with
     //     JoinNoMatch in either position pass through unchanged (the predicate
     //     cannot be evaluated), so filtering would be a no-op anyway.
-    cudfOutputs.push_back(unfilteredOutput(
+    appendUnfilteredOutputs(
+        cudfOutputs,
         leftTableView,
         unmatchedLeftCol,
         rightTables[0]->view(),
         unmatchedRightCol,
-        stream));
+        stream);
   }
 
   return cudfOutputs;
@@ -1300,12 +1340,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::rightJoin(
           filterFunc,
           stream));
     } else {
-      cudfOutputs.push_back(unfilteredOutput(
+      appendUnfilteredOutputs(
+          cudfOutputs,
           leftTableView,
           leftIndicesCol,
           rightTableView,
           rightIndicesCol,
-          stream));
+          stream);
     }
   }
   return cudfOutputs;
@@ -1402,23 +1443,25 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::fullJoin(
         probeTracker.update(filteredLeftCol, stream, get_temp_mr());
         updateRightMatchedFlags(i, filteredRightCol, rightTableView.num_rows());
 
-        cudfOutputs.push_back(unfilteredOutput(
+        appendUnfilteredOutputs(
+            cudfOutputs,
             leftTableView,
             filteredLeftCol,
             rightTableView,
             filteredRightCol,
-            stream));
+            stream);
       }
     } else {
       probeTracker.update(leftIndicesCol, stream, get_temp_mr());
       updateRightMatchedFlags(i, rightIndicesCol, rightTableView.num_rows());
 
-      cudfOutputs.push_back(unfilteredOutput(
+      appendUnfilteredOutputs(
+          cudfOutputs,
           leftTableView,
           leftIndicesCol,
           rightTableView,
           rightIndicesCol,
-          stream));
+          stream);
     }
   }
 
@@ -1437,12 +1480,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::fullJoin(
 
     // Use unfilteredOutput directly — see the matching comment in leftJoin()
     // for why filteredOutputIndices cannot be used here.
-    cudfOutputs.push_back(unfilteredOutput(
+    appendUnfilteredOutputs(
+        cudfOutputs,
         leftTableView,
         unmatchedLeftCol,
         rightTables[0]->view(),
         unmatchedRightCol,
-        stream));
+        stream);
   }
 
   return cudfOutputs;
@@ -1503,12 +1547,13 @@ CudfHashJoinProbe::leftSemiFilterJoin(
     auto matchedRightIndices = cudf::make_column_from_scalar(
         sentinelScalar, matchedIndices->size(), stream, get_temp_mr());
 
-    cudfOutputs.push_back(unfilteredOutput(
+    appendUnfilteredOutputs(
+        cudfOutputs,
         leftTableView,
         matchedLeftCol,
         rightTables[0]->view(),
         matchedRightIndices->view(),
-        stream));
+        stream);
   }
 
   return cudfOutputs;
@@ -2059,12 +2104,13 @@ CudfHashJoinProbe::rightSemiFilterJoin(
       cudf::device_span<cudf::size_type const>{*rightJoinIndices};
   auto rightIndicesCol = cudf::column_view{rightIndicesSpan};
   auto leftIndicesCol = cudf::empty_like(rightIndicesCol);
-  cudfOutputs.push_back(unfilteredOutput(
+  appendUnfilteredOutputs(
+      cudfOutputs,
       leftTableView,
       leftIndicesCol->view(),
       rightTableView,
       rightIndicesCol,
-      stream));
+      stream);
 
   return cudfOutputs;
 }
@@ -2136,12 +2182,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::antiJoin(
       cudf::device_span<cudf::size_type const>{*leftJoinIndices};
   auto leftIndicesCol = cudf::column_view{leftIndicesSpan};
   auto rightIndicesCol = cudf::empty_like(leftIndicesCol);
-  cudfOutputs.push_back(unfilteredOutput(
+  appendUnfilteredOutputs(
+      cudfOutputs,
       leftTableView,
       leftIndicesCol,
       rightTableView,
       rightIndicesCol->view(),
-      stream));
+      stream);
 
   return cudfOutputs;
 }

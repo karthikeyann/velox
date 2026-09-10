@@ -360,6 +360,24 @@ class CudfHashJoinProbe : public CudfOperatorBase {
       cudf::table_view rightTableView,
       cudf::column_view rightIndicesCol,
       cuda::stream_ref stream);
+
+  /**
+   * @brief Appends the unfiltered join output, split into batches whose row
+   * count is bounded by cudf.batch_size_max_threshold.
+   *
+   * A join whose probe batch matches many build rows gathers an output far
+   * larger than either input, and gathering it in one piece is the largest
+   * allocation the probe makes. Emitting it as several bounded batches keeps
+   * that allocation proportional to the configured batch size instead of to
+   * the match multiplicity, without changing the rows produced.
+   */
+  void appendUnfilteredOutputs(
+      std::vector<JoinOutput>& outputs,
+      cudf::table_view leftTableView,
+      cudf::column_view leftIndicesCol,
+      cudf::table_view rightTableView,
+      cudf::column_view rightIndicesCol,
+      cuda::stream_ref stream);
   /**
    * @brief Constructs join output table with filter condition applied.
    * @param leftTableView Input probe table view
