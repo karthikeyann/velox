@@ -1548,6 +1548,14 @@ Note: These configurations are experimental and subject to change.
      - integer
      - 50
      - The initial percent of GPU memory to allocate for pool or arena memory resources.
+   * - cudf.decoded_column_cache_max_pinned_bytes
+     - integer
+     - unset
+     - Optional positive byte limit for the experimental decoded-column cache's process-lifetime pinned host pool. Applied before first cache use by ``registerCudf()``. Unset preserves the cache's 70 GiB default or an explicit application override. Does not enable caching; the Hive reader cache options and immutable-file contract are still required.
+   * - cudf.decoded_column_cache_max_gpu_bytes
+     - integer
+     - unset
+     - Optional non-negative byte limit for the experimental decoded-column cache's non-evicting GPU tier. Zero disables admission to that tier. Unset preserves its 40 GiB default or an explicit application override. Configure before ``registerCudf()`` and reserve GPU memory for query execution in addition to the cache budget.
    * - cudf.function_name_prefix
      - string
      - ""

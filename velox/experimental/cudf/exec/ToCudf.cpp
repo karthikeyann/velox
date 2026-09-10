@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/connectors/hive/CudfDecodedColumnCache.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
@@ -299,6 +300,19 @@ void registerCudf() {
     return;
   }
 
+  // Configure process-wide cache budgets before any connector can first use
+  // the cache. Do not overwrite limits explicitly set by an embedding client
+  // when the corresponding configuration property is absent.
+  const auto& config = CudfConfig::getInstance();
+  if (config.decodedColumnCacheMaxPinnedBytes) {
+    connector::hive::CudfDecodedColumnCache::configureMaxPinnedBytes(
+        *config.decodedColumnCacheMaxPinnedBytes);
+  }
+  if (config.decodedColumnCacheMaxGpuBytes) {
+    connector::hive::CudfDecodedColumnCache::configureMaxGpuBytes(
+        *config.decodedColumnCacheMaxGpuBytes);
+  }
+
   // Register operator adapters
   registerAllOperatorAdapters();
 
@@ -375,6 +389,20 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfMemoryPercent) != config.end()) {
     memoryPercent = folly::to<int32_t>(config[kCudfMemoryPercent]);
+  }
+  if (auto it = config.find(kCudfDecodedColumnCacheMaxPinnedBytes);
+      it != config.end()) {
+    const auto bytes = folly::to<uint64_t>(it->second);
+    VELOX_USER_CHECK_GT(
+        bytes,
+        0,
+        "{} must be greater than zero",
+        kCudfDecodedColumnCacheMaxPinnedBytes);
+    decodedColumnCacheMaxPinnedBytes = bytes;
+  }
+  if (auto it = config.find(kCudfDecodedColumnCacheMaxGpuBytes);
+      it != config.end()) {
+    decodedColumnCacheMaxGpuBytes = folly::to<uint64_t>(it->second);
   }
   if (config.find(kCudfOutputMr) != config.end()) {
     outputMemoryResource = config[kCudfOutputMr];

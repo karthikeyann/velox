@@ -15,12 +15,16 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/connectors/hive/CudfDecodedColumnCache.h"
+#include "velox/experimental/cudf/exec/ToCudf.h"
 #if defined(VELOX_CUDF_HAS_UCX)
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
+
 #include "velox/exec/OutputTransportRegistry.h"
 #endif
 
+#include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
 namespace facebook::velox::cudf_velox::test {
@@ -72,12 +76,61 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_DOUBLE_EQ(config.exchangeCompressionSafetyMargin, 1.5);
 }
 
+TEST(ConfigTest, decodedColumnCacheBudgets) {
+  CudfConfig config;
+  EXPECT_FALSE(config.decodedColumnCacheMaxPinnedBytes.has_value());
+  EXPECT_FALSE(config.decodedColumnCacheMaxGpuBytes.has_value());
+
+  config.initialize({
+      {CudfConfig::kCudfDecodedColumnCacheMaxPinnedBytes, "137438953472"},
+      {CudfConfig::kCudfDecodedColumnCacheMaxGpuBytes, "223338299392"},
+  });
+  EXPECT_EQ(config.decodedColumnCacheMaxPinnedBytes, uint64_t{128} << 30);
+  EXPECT_EQ(config.decodedColumnCacheMaxGpuBytes, uint64_t{208} << 30);
+
+  // Reinitializing other options must not reset explicit application budgets.
+  config.initialize({});
+  EXPECT_EQ(config.decodedColumnCacheMaxPinnedBytes, uint64_t{128} << 30);
+  EXPECT_EQ(config.decodedColumnCacheMaxGpuBytes, uint64_t{208} << 30);
+  config.initialize({{CudfConfig::kCudfDecodedColumnCacheMaxGpuBytes, "0"}});
+  EXPECT_EQ(config.decodedColumnCacheMaxGpuBytes, 0);
+
+  EXPECT_ANY_THROW(config.initialize(
+      {{CudfConfig::kCudfDecodedColumnCacheMaxPinnedBytes, "0"}}));
+  for (const auto* key :
+       {CudfConfig::kCudfDecodedColumnCacheMaxPinnedBytes,
+        CudfConfig::kCudfDecodedColumnCacheMaxGpuBytes}) {
+    for (const auto* value : {"-1", "1GiB", "", "18446744073709551616"}) {
+      SCOPED_TRACE(std::string(key) + "=" + value);
+      EXPECT_ANY_THROW(config.initialize({{key, value}}));
+    }
+  }
+}
+
+TEST(ConfigTest, decodedColumnCacheStartupBudgets) {
+  auto& config = CudfConfig::getInstance();
+  const auto saved = config;
+  SCOPE_EXIT {
+    unregisterCudf();
+    config = saved;
+  };
+  config.initialize({
+      {CudfConfig::kCudfDecodedColumnCacheMaxPinnedBytes, "134217728"},
+      {CudfConfig::kCudfDecodedColumnCacheMaxGpuBytes, "67108864"},
+  });
+  registerCudf();
+  auto& cache = connector::hive::CudfDecodedColumnCache::instance();
+  EXPECT_EQ(cache.maxPinnedBytes(), uint64_t{128} << 20);
+  EXPECT_EQ(cache.maxGpuBytes(), uint64_t{64} << 20);
+  // Registration is idempotent even after the cache has been constructed.
+  EXPECT_NO_THROW(registerCudf());
+}
+
 #if defined(VELOX_CUDF_HAS_UCX)
 TEST(ConfigTest, ucxTransportRegistration) {
   auto& config = CudfConfig::getInstance();
   std::unordered_map<std::string, std::string> options = {
-      {CudfConfig::kCudfEnabled, "true"},
-      {CudfConfig::kUcxExchange, "true"}};
+      {CudfConfig::kCudfEnabled, "true"}, {CudfConfig::kUcxExchange, "true"}};
   config.initialize(std::move(options));
 
   exec::OutputTransportRegistry::unregisterAll();

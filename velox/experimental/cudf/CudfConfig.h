@@ -18,6 +18,7 @@
 
 #include <cudf/types.hpp>
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -30,6 +31,10 @@ struct CudfConfig {
   static constexpr const char* kCudfDebugEnabled{"cudf.debug_enabled"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
+  static constexpr const char* kCudfDecodedColumnCacheMaxPinnedBytes{
+      "cudf.decoded_column_cache_max_pinned_bytes"};
+  static constexpr const char* kCudfDecodedColumnCacheMaxGpuBytes{
+      "cudf.decoded_column_cache_max_gpu_bytes"};
   static constexpr const char* kCudfFunctionNamePrefix{
       "cudf.function_name_prefix"};
   static constexpr const char* kCudfAstExpressionEnabled{
@@ -146,6 +151,14 @@ struct CudfConfig {
   /// The initial percent of GPU memory to allocate for pool or arena memory
   /// resources.
   int32_t memoryPercent{50};
+
+  /// Optional process-lifetime budgets for the experimental decoded-column
+  /// cache. Applied at registerCudf(), before the cache is first used. Unset
+  /// values preserve the cache defaults or explicit application overrides.
+  /// The pinned budget must be positive; zero disables GPU-tier admission.
+  /// These budgets do not enable caching: reader-level options are separate.
+  std::optional<uint64_t> decodedColumnCacheMaxPinnedBytes;
+  std::optional<uint64_t> decodedColumnCacheMaxGpuBytes;
 
   /// Memory resource for output vectors. When set to a value different from
   /// memoryResource, a separate MR is created for output allocations.
