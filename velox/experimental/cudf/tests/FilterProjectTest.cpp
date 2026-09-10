@@ -737,6 +737,72 @@ TEST_F(CudfFilterProjectTest, fusedDoubleProjectionsAndNullableFallback) {
   }
 }
 
+TEST_F(CudfFilterProjectTest, fusedDoubleProjectionsWithFunctionPrefix) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_cudf_fuse_double_projections = true;
+  FLAGS_cudf_fuse_double_projections_min_rows = 0;
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto originalPrefix = config.functionNamePrefix;
+  SCOPE_EXIT {
+    config.functionNamePrefix = originalPrefix;
+  };
+  config.functionNamePrefix = "presto.default.";
+
+  for (const std::string prefix : {"presto.default.", "other.default."}) {
+    functions::prestosql::registerArithmeticFunctions(prefix);
+    cudf_velox::registerBuiltinFunctions(prefix);
+    for (bool nullable : {false, true}) {
+      SCOPED_TRACE(prefix + (nullable ? "nullable" : "non-null"));
+      auto data = makeRowVector(
+          {"x", "y"},
+          {makeFlatVector<double>({-0.0, 1.5, -3.0, 4.0}),
+           makeNullableFlatVector<double>(
+               {0.0,
+                0.25,
+                nullable ? std::nullopt : std::optional<double>{0.5},
+                1.0})});
+      createDuckDbTable({data});
+      auto x = std::make_shared<core::FieldAccessTypedExpr>(DOUBLE(), "x");
+      auto y = std::make_shared<core::FieldAccessTypedExpr>(DOUBLE(), "y");
+      auto one =
+          std::make_shared<core::ConstantTypedExpr>(DOUBLE(), variant(1.0));
+      auto call = [&](const std::string& name,
+                      std::vector<core::TypedExprPtr> inputs) {
+        return std::make_shared<core::CallTypedExpr>(
+            DOUBLE(), std::move(inputs), prefix + name);
+      };
+      auto product = call("multiply", {x, call("minus", {one, y})});
+      auto sum = call("plus", {x, y});
+      auto plan = PlanBuilder()
+                      .values({data})
+                      .addNode([&](auto id, auto source) {
+                        return std::make_shared<core::ProjectNode>(
+                            id,
+                            std::vector<std::string>{"product", "sum"},
+                            std::vector<core::TypedExprPtr>{product, sum},
+                            source);
+                      })
+                      .planNode();
+      auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                      .assertResults("SELECT x * (1.0 - y), x + y FROM tmp");
+      int64_t fusedRows = 0;
+      for (const auto& pipeline : task->taskStats().pipelineStats) {
+        for (const auto& op : pipeline.operatorStats) {
+          if (auto it = op.runtimeStats.find("fusedDoubleProjectionRows");
+              it != op.runtimeStats.end()) {
+            fusedRows += it->second.sum;
+          }
+        }
+      }
+      // An unrelated registered namespace must not be interpreted as the
+      // configured built-in namespace, even when its function names match.
+      EXPECT_EQ(
+          fusedRows,
+          !nullable && prefix == config.functionNamePrefix ? data->size() : 0);
+    }
+  }
+}
+
 TEST_F(CudfFilterProjectTest, multiplyOperation) {
   vector_size_t batchSize = 1000;
   auto vectors = makeVectors(rowType_, 2, batchSize);

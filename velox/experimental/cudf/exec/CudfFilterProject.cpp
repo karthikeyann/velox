@@ -39,6 +39,7 @@
 #include <cmath>
 #include <functional>
 #include <iostream>
+#include <string_view>
 #include <unordered_map>
 
 DEFINE_bool(
@@ -104,12 +105,17 @@ std::string makeFusedDoubleProjection(
     if (!call || call->inputs().size() != 2) {
       return std::nullopt;
     }
+    std::string_view name = call->name();
+    const auto& prefix = CudfConfig::getInstance().functionNamePrefix;
+    if (!prefix.empty() && name.starts_with(prefix)) {
+      name.remove_prefix(prefix.size());
+    }
     std::string op;
-    if (call->name() == "plus" || call->name() == "add") {
+    if (name == "plus" || name == "add") {
       op = "+";
-    } else if (call->name() == "minus" || call->name() == "subtract") {
+    } else if (name == "minus" || name == "subtract") {
       op = "-";
-    } else if (call->name() == "multiply") {
+    } else if (name == "multiply") {
       op = "*";
     } else {
       return std::nullopt;
