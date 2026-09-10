@@ -60,6 +60,12 @@
 #include <optional>
 
 namespace facebook::velox::cudf_velox {
+namespace {
+// libcudf's own default occupancy (CUCO_DESIRED_LOAD_FACTOR); used for builds
+// small enough that shrinking the hash table would not change whether the
+// query fits.
+constexpr double kCudfDefaultHashJoinLoadFactor = 0.5;
+} // namespace
 
 namespace {
 
@@ -370,14 +376,25 @@ void CudfHashJoinBuild::doNoMoreInput() {
        joinNode_->isRightJoin() || joinNode_->isFullJoin() ||
        joinNode_->isLeftSemiProjectJoin());
 
+  // A denser hash table costs probe time, so only spend that where it buys
+  // something: the table's size is what threatens the device, and it is
+  // proportional to the build row count. Small builds keep libcudf's default
+  // occupancy and run at full speed; only a build large enough to matter pays
+  // for the extra density.
+  const auto& cudfConfig = CudfConfig::getInstance();
   std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
   for (auto i = 0; i < tbls.size(); i++) {
+    const auto buildRows = static_cast<uint64_t>(tbls[i]->num_rows());
+    const auto loadFactor =
+        buildRows >= cudfConfig.hashJoinDenseLoadFactorMinRows
+        ? cudfConfig.hashJoinLoadFactor
+        : kCudfDefaultHashJoinLoadFactor;
     hashObjects.push_back(
         (buildHashJoin) ? std::make_shared<cudf::hash_join>(
                               tbls[i]->view().select(buildKeyIndices),
                               cudf::nullable_join::YES,
                               cudf::null_equality::UNEQUAL,
-                              CudfConfig::getInstance().hashJoinLoadFactor,
+                              loadFactor,
                               stream,
                               get_temp_mr())
                         : nullptr);

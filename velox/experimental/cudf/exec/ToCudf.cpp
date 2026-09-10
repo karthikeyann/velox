@@ -416,6 +416,10 @@ void CudfConfig::initialize(
         kCudfHashJoinLoadFactor,
         hashJoinLoadFactor);
   }
+  if (config.find(kCudfHashJoinDenseLoadFactorMinRows) != config.end()) {
+    hashJoinDenseLoadFactorMinRows =
+        folly::to<uint64_t>(config[kCudfHashJoinDenseLoadFactorMinRows]);
+  }
   if (config.find(kCudfBatchSizeMaxThreshold) != config.end()) {
     batchSizeMaxThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMaxThreshold]);

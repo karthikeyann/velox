@@ -35,7 +35,9 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/types.hpp>
 
+#include <atomic>
 #include <functional>
+#include <memory>
 #include <utility>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -64,7 +66,9 @@ class CudfSplitReader : public NvtxHelper {
       const std::shared_ptr<io::IoStatistics>& ioStatistics,
       const std::shared_ptr<IoStats>& ioStats,
       bool useExperimentalCudfReader,
-      const cudf::ast::expression* subfieldFilterAst);
+      const cudf::ast::expression* subfieldFilterAst,
+      std::shared_ptr<std::atomic<std::size_t>> degradedChunkReadLimit =
+          nullptr);
 
   virtual ~CudfSplitReader() = default;
 
@@ -159,6 +163,10 @@ class CudfSplitReader : public NvtxHelper {
   // reached the floor and retrying can no longer help.
   bool halveChunkReadLimitAndRebuild();
 
+  // Chunk read limit to use now: the learned reduced limit if this query has
+  // already hit memory pressure, otherwise the configured one.
+  std::size_t currentChunkReadLimit() const;
+
   // Create the experimental hybrid scan reader.
   void createExperimentalReader();
 
@@ -169,15 +177,17 @@ class CudfSplitReader : public NvtxHelper {
   std::shared_ptr<cudf::io::datasource> dataSource_;
   cudf::io::parquet_reader_options readerOptions_;
   CudfParquetReaderPtr splitReader_;
-  // Chunk read limit currently in force for this split. Zero means the
-  // configured limit is used as-is; a non-zero value is a reduced limit
-  // installed by halveChunkReadLimitAndRebuild() after an allocation failure.
-  std::size_t degradedChunkReadLimit_{0};
   CudfHybridScanReaderPtr exptSplitReader_;
   std::unique_ptr<HybridScanState> hybridScanState_;
   bool useExperimentalCudfReader_;
 
   dwio::common::ReaderOptions baseReaderOpts_;
+  // Reduced chunk read limit learned from an allocation failure, shared with
+  // the owning data source so it survives this split. A scan that hits memory
+  // pressure once keeps the smaller chunk for the rest of the query instead of
+  // rediscovering the failure on every split, and a scan that never hits
+  // pressure never pays anything. Zero means the configured limit applies.
+  std::shared_ptr<std::atomic<std::size_t>> degradedChunkReadLimit_;
   const cudf::ast::expression* subfieldFilterAst_;
   cudf::ast::expression const* pushdownFilterExpr_;
   PushdownFilterBuilder pushdownFilterBuilder_;

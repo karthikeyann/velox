@@ -54,6 +54,9 @@ struct CudfConfig {
   /// Hash table occupancy for cudf::hash_join build tables.
   static constexpr const char* kCudfHashJoinLoadFactor{
       "cudf.hash_join_load_factor"};
+  /// Build row count at or above which hashJoinLoadFactor is applied.
+  static constexpr const char* kCudfHashJoinDenseLoadFactorMinRows{
+      "cudf.hash_join_dense_load_factor_min_rows"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
   static constexpr const char* kCudfStreamingGroupbyEnabled{
@@ -199,6 +202,12 @@ struct CudfConfig {
   /// the table for large builds at a small probe cost, which is what lets a
   /// 1.5 B-row build fit next to its own data on a 48 GiB GPU.
   double hashJoinLoadFactor{0.5};
+
+  /// Builds with fewer rows than this keep libcudf's default occupancy, so a
+  /// query whose joins comfortably fit is never slowed down by a denser table.
+  /// The default is high enough that only multi-hundred-million-row builds -
+  /// the ones whose hash table is a material fraction of the device - opt in.
+  uint64_t hashJoinDenseLoadFactorMinRows{100'000'000};
   // Query config key for the TopN batch size in the cuDF TopN operator.
   int32_t topNBatchSize{5};
 
