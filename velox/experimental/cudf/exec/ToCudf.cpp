@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
@@ -323,6 +324,35 @@ void registerCudf() {
   VELOX_CHECK_GE(contextDevice, 0, "Failed to get current CUDA device ordinal");
   setCudfContextDevice(contextDevice);
 
+  // Read the device before anything derives a default from it. The context
+  // exists by this point, and every memory-related default below is a size that
+  // only means something relative to the device it will live on.
+  initializeGpuCapabilities();
+
+  // Fill in any memory default the deployment did not set from what the device
+  // actually is. A byte count that suits a 48 GiB board is wrong on a 16 GiB
+  // one and leaves most of a 180 GiB one unused, so the fixed values are only
+  // a fallback for a device that could not be queried. An explicitly
+  // configured value always wins.
+  {
+    auto& cudfConfig = CudfConfig::getInstance();
+    constexpr uint64_t kFixedBatchSizeMinBytes = 256ULL << 20;
+    constexpr uint64_t kFixedHashJoinDenseMinRows = 100'000'000;
+    if (!cudfConfig.batchSizeMinBytes.has_value()) {
+      cudfConfig.batchSizeMinBytes = gpu_defaults::batchSizeMinBytes(
+          kFixedBatchSizeMinBytes, cudfConfig.maxDriversPerTaskHint);
+    }
+    if (cudfConfig.hashJoinDenseLoadFactorMinRows == 0) {
+      cudfConfig.hashJoinDenseLoadFactorMinRows =
+          gpu_defaults::hashJoinDenseLoadFactorMinRows(
+              kFixedHashJoinDenseMinRows);
+    }
+    LOG(INFO) << "cuDF memory defaults: batch_size_min_bytes="
+              << cudfConfig.batchSizeMinBytes.value_or(0)
+              << " hash_join_dense_load_factor_min_rows="
+              << cudfConfig.hashJoinDenseLoadFactorMinRows;
+  }
+
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
   auto mr = cudf_velox::createMemoryResource(
       mrMode, CudfConfig::getInstance().memoryPercent);
@@ -415,6 +445,10 @@ void CudfConfig::initialize(
         "{} must be in (0, 1], got {}",
         kCudfHashJoinLoadFactor,
         hashJoinLoadFactor);
+  }
+  if (config.find(kCudfMaxDriversPerTaskHint) != config.end()) {
+    maxDriversPerTaskHint =
+        folly::to<int32_t>(config[kCudfMaxDriversPerTaskHint]);
   }
   if (config.find(kCudfHashJoinDenseLoadFactorMinRows) != config.end()) {
     hashJoinDenseLoadFactorMinRows =

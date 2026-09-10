@@ -57,6 +57,10 @@ struct CudfConfig {
   /// Build row count at or above which hashJoinLoadFactor is applied.
   static constexpr const char* kCudfHashJoinDenseLoadFactorMinRows{
       "cudf.hash_join_dense_load_factor_min_rows"};
+  /// Hint for how many drivers share the device, used to size per-driver
+  /// device-derived budgets.
+  static constexpr const char* kCudfMaxDriversPerTaskHint{
+      "cudf.max_drivers_per_task_hint"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
   static constexpr const char* kCudfStreamingGroupbyEnabled{
@@ -207,7 +211,16 @@ struct CudfConfig {
   /// query whose joins comfortably fit is never slowed down by a denser table.
   /// The default is high enough that only multi-hundred-million-row builds -
   /// the ones whose hash table is a material fraction of the device - opt in.
-  uint64_t hashJoinDenseLoadFactorMinRows{100'000'000};
+  /// Zero means "derive from the device" (see gpu_defaults); a non-zero value
+  /// is taken as configured and used as-is.
+  uint64_t hashJoinDenseLoadFactorMinRows{0};
+
+  /// Drivers expected to share the device per task, used only to divide a
+  /// device-derived per-driver budget. This is a hint: the real count is a
+  /// query property (task.max-drivers-per-task) not known when the process
+  /// starts, and getting it wrong only makes a budget slightly generous or
+  /// slightly tight, never incorrect.
+  int32_t maxDriversPerTaskHint{2};
   // Query config key for the TopN batch size in the cuDF TopN operator.
   int32_t topNBatchSize{5};
 
