@@ -134,6 +134,10 @@ block(SCOPE_FOR VARIABLES)
     cudf
     URL ${VELOX_cudf_SOURCE_URL}
     URL_HASH ${VELOX_cudf_BUILD_SHA256_CHECKSUM}
+    # PRESTO: keep null-aware JIT warp membership uniform across grid-stride
+    # iterations. The pinned dependency otherwise drops valid rows in large
+    # nullable Boolean expressions with a partial final warp.
+    PATCH_COMMAND git apply ${CMAKE_CURRENT_LIST_DIR}/cudf/jit-warp-validity.patch
     SOURCE_SUBDIR
     cpp
     UPDATE_DISCONNECTED 1

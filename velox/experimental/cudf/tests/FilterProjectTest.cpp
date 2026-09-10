@@ -803,6 +803,39 @@ TEST_F(CudfFilterProjectTest, fusedDoubleProjectionsWithFunctionPrefix) {
   }
 }
 
+TEST_F(CudfFilterProjectTest, jitNullPredicatesAcrossPartialWarpIterations) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto originalJitEnabled = config.jitExpressionEnabled;
+  SCOPE_EXIT {
+    config.jitExpressionEnabled = originalJitEnabled;
+  };
+  config.jitExpressionEnabled = true;
+
+  // Large batches force grid-stride iterations. A partial final warp must not
+  // change which lanes contribute to the previous iteration's validity word.
+  for (vector_size_t size : {31, 32, 33, 1'048'579, 1'048'607}) {
+    for (bool nullable : {false, true}) {
+      SCOPED_TRACE(fmt::format("size={}, nullable={}", size, nullable));
+      auto a = makeFlatVector<int64_t>(size, [](auto row) { return row; });
+      auto b = makeFlatVector<int64_t>(size, [](auto row) { return row % 17; });
+      if (nullable) {
+        for (vector_size_t row = 0; row < size; ++row) {
+          a->setNull(row, row % 7 == 0);
+          b->setNull(row, row % 11 == 0);
+        }
+      }
+      auto data = makeRowVector({"a", "b"}, {a, b});
+      assertFilterMatchesVelox(
+          {data}, "a IS NOT NULL AND b IS NOT NULL", {"a", "b"});
+      assertProjectMatchesVelox(
+          {data},
+          {"a IS NOT NULL AND b IS NOT NULL",
+           "a < 10 AND b > 3",
+           "a < 10 OR b > 3"});
+    }
+  }
+}
+
 TEST_F(CudfFilterProjectTest, multiplyOperation) {
   vector_size_t batchSize = 1000;
   auto vectors = makeVectors(rowType_, 2, batchSize);
