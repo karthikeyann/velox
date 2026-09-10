@@ -27,7 +27,14 @@
 #include <cudf/copying.hpp>
 #include <cudf/partitioning.hpp>
 
+#include <gflags/gflags.h>
+
 #include <limits>
+
+DEFINE_bool(
+    cudf_local_partition_borrowed_views,
+    false,
+    "Retain shared partition buffers instead of copying each local GPU partition");
 
 namespace facebook::velox::cudf_velox {
 
@@ -204,6 +211,11 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
       enqueuePartition(partition, cudfVector);
       return;
     }
+    // Shared partitions are operator output, not scratch storage. Respect the
+    // configured output resource when the partitioned buffer will be retained.
+    const auto partitionMr = FLAGS_cudf_local_partition_borrowed_views
+        ? get_output_mr()
+        : get_temp_mr();
     auto [partitionedTable, partitionOffsets] = [&]() {
       auto tableView = cudfVector->getTableView();
       // Use cudf hash partitioning
@@ -220,11 +232,11 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
             cudf::hash_id::HASH_MURMUR3,
             cudf::DEFAULT_HASH_SEED,
             stream,
-            get_temp_mr());
+            partitionMr);
       } else if (
           partitionFunctionType_ == PartitionFunctionType::kRoundRobinRow) {
         auto result = cudf::round_robin_partition(
-            tableView, numPartitions_, counter_, stream, get_temp_mr());
+            tableView, numPartitions_, counter_, stream, partitionMr);
         counter_ = (counter_ + cudfVector->size()) % numPartitions_;
         return result;
       }
@@ -245,23 +257,55 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
     auto partitionedTables =
         cudf::split(partitionedTable->view(), partitionOffsets, stream);
 
-    // DM: We should investigate if keeping partitionedTables alive and using
-    // the table view in partitionData is more efficient than creating a new
-    // table each time. Currently out of scope because it would need a new
-    // type of RowVector that can hold a table view and shared_ptr to the
-    // table.
+    CudfVectorPtr partitionOwner;
+    if (FLAGS_cudf_local_partition_borrowed_views) {
+      const auto rows = partitionedTable->num_rows();
+      partitionOwner = std::make_shared<CudfVector>(
+          pool(), outputType_, rows, std::move(partitionedTable), stream);
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat("borrowedPartitionInputs", RuntimeCounter(1));
+      lockedStats->addRuntimeStat(
+          "borrowedPartitionInputBytes",
+          RuntimeCounter(
+              partitionOwner->estimateFlatSize(),
+              RuntimeCounter::Unit::kBytes));
+    }
     for (int i = 0; i < numPartitions_; ++i) {
       auto partitionData = partitionedTables[i];
       if (partitionData.num_rows() == 0) {
         continue;
       }
 
-      auto partitionCudfVector = std::make_shared<CudfVector>(
-          pool(),
-          outputType_,
-          partitionData.num_rows(),
-          std::make_unique<cudf::table>(partitionData, stream, get_output_mr()),
-          stream);
+      CudfVectorPtr partitionCudfVector;
+      if (partitionOwner) {
+        // Every view retains the complete allocation. CudfVector fences each
+        // consumer stream before releasing its owner, including on
+        // cancellation. Charge the complete owner to each view conservatively:
+        // the final live partition can retain all buffers, even after other
+        // consumers finish.
+        partitionCudfVector = std::make_shared<CudfVector>(
+            pool(),
+            outputType_,
+            partitionData.num_rows(),
+            partitionData,
+            partitionOwner,
+            partitionOwner->estimateFlatSize(),
+            stream,
+            get_output_mr());
+        auto lockedStats = stats_.wlock();
+        lockedStats->addRuntimeStat(
+            "borrowedPartitionBatches", RuntimeCounter(1));
+        lockedStats->addRuntimeStat(
+            "borrowedPartitionRows", RuntimeCounter(partitionData.num_rows()));
+      } else {
+        partitionCudfVector = std::make_shared<CudfVector>(
+            pool(),
+            outputType_,
+            partitionData.num_rows(),
+            std::make_unique<cudf::table>(
+                partitionData, stream, get_output_mr()),
+            stream);
+      }
       enqueuePartition(i, partitionCudfVector);
     }
   } else {

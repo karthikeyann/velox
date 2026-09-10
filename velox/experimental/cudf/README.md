@@ -58,6 +58,18 @@ Runtime counters `uniqueFinalGroupbyRows`, `uniqueFinalGroupbyBatches`,
 successful bypasses from attempted proofs and normal fallbacks.
 `uniqueFinalGroupbyUnsortedBatches` records use of the temporary distinct set.
 
+#### Shared local partition buffers (experimental)
+
+`--cudf_local_partition_borrowed_views=true` retains the hash/row-round-robin
+partition output allocation and sends read-only views to local consumers,
+avoiding a second copy of each partition. It is off by default. Views retain
+their owner, fence consumer work before releasing it, and materialize private
+storage if a consumer requests ownership. Exchange byte accounting charges the
+complete owner to each view conservatively; this can increase backpressure or
+retained memory with uneven consumers. Tune only after measuring those effects.
+Counters `borrowedPartitionInputs`, `borrowedPartitionInputBytes`,
+`borrowedPartitionBatches` and `borrowedPartitionRows` identify actual use.
+
 ### Testing Velox with cuDF
 
 Tests with Velox-cuDF can only be run on GPU-enabled hardware. The Velox-cuDF tests in [experimental/cudf/tests](https://github.com/facebookincubator/velox/blob/main/velox/experimental/cudf/tests) include several types of tests:

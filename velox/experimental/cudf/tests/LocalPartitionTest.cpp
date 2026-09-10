@@ -22,6 +22,10 @@
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
+#include <gflags/gflags.h>
+
+DECLARE_bool(cudf_local_partition_borrowed_views);
+
 namespace facebook::velox::exec::test {
 using namespace facebook::velox::common::testutil;
 namespace {
@@ -503,6 +507,95 @@ TEST_F(LocalPartitionTest, roundRobinDistributionVerification) {
   ASSERT_EQ(partitionCounts[0], 1);
   ASSERT_EQ(partitionCounts[1], 1);
   ASSERT_EQ(partitionCounts[2], 1);
+}
+
+TEST_F(LocalPartitionTest, borrowedPartitionPayloads) {
+  gflags::FlagSaver restore;
+  std::vector<RowVectorPtr> vectors;
+  for (int64_t batch = 0; batch < 4; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(
+             1024,
+             [batch](auto row) { return batch * 1024 + row; },
+             nullEvery(13)),
+         makeFlatVector<std::string>(
+             1024,
+             [](auto row) {
+               return std::string(20 + row % 31, 'a' + row % 20);
+             },
+             nullEvery(7)),
+         makeFlatVector<double>(
+             1024, [](auto row) { return row * 0.5; }, nullEvery(11))}));
+  }
+  createDuckDbTable(vectors);
+  for (bool borrowed : {false, true}) {
+    FLAGS_cudf_local_partition_borrowed_views = borrowed;
+    for (bool roundRobin : {false, true}) {
+      for (int32_t drivers : {2, 3}) {
+        SCOPED_TRACE(fmt::format(
+            "borrowed={}, roundRobin={}, drivers={}",
+            borrowed,
+            roundRobin,
+            drivers));
+        auto builder = PlanBuilder();
+        builder.values(vectors);
+        if (roundRobin) {
+          builder.localPartitionRoundRobinRow();
+        } else {
+          builder.localPartition({"c0"});
+        }
+        core::PlanNodeId id;
+        auto plan = builder.capturePlanNodeId(id)
+                        .project({"c0", "c1", "c2 + CAST(1 AS DOUBLE) AS x"})
+                        .planNode();
+        auto task =
+            AssertQueryBuilder(plan, duckDbQueryRunner_)
+                .maxDrivers(drivers)
+                .config(
+                    core::QueryConfig::kMaxLocalExchangePartitionCount, drivers)
+                .config(core::QueryConfig::kMaxLocalExchangeBufferSize, 4096)
+                .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 1024)
+                .assertResults("SELECT c0,c1,c2 + 1 FROM tmp");
+        const auto stats = toPlanStats(task->taskStats());
+        const auto& custom = stats.at(id).customStats;
+        const auto rows = custom.find("borrowedPartitionRows");
+        if (borrowed) {
+          ASSERT_NE(rows, custom.end());
+          EXPECT_EQ(rows->second.sum, 4096);
+          EXPECT_GT(custom.at("borrowedPartitionInputBytes").sum, 0);
+        } else {
+          EXPECT_EQ(rows, custom.end());
+        }
+      }
+    }
+  }
+}
+
+TEST_F(LocalPartitionTest, borrowedPartitionEarlyFinish) {
+  gflags::FlagSaver restore;
+  FLAGS_cudf_local_partition_borrowed_views = true;
+  std::vector<RowVectorPtr> vectors;
+  for (int64_t batch = 0; batch < 16; ++batch) {
+    vectors.push_back(makeRowVector({makeFlatVector<int64_t>(
+        1024, [batch](auto row) { return batch * 1024 + row; })}));
+  }
+  core::PlanNodeId id;
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .localPartition({"c0"})
+                  .capturePlanNodeId(id)
+                  .localPartition({})
+                  .limit(0, 17, false)
+                  .singleAggregation({}, {"count(1)"})
+                  .planNode();
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                  .maxDrivers(3)
+                  .config(core::QueryConfig::kMaxLocalExchangePartitionCount, 3)
+                  .config(core::QueryConfig::kMaxLocalExchangeBufferSize, 4096)
+                  .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 1024)
+                  .assertResults("SELECT 17::BIGINT");
+  const auto stats = toPlanStats(task->taskStats());
+  EXPECT_GT(stats.at(id).customStats.at("borrowedPartitionRows").sum, 0);
 }
 
 TEST_F(LocalPartitionTest, gpuBytesTriggerBackpressure) {
