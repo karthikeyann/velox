@@ -154,6 +154,11 @@ class CudfSplitReader : public NvtxHelper {
   // Create the chunked parquet reader.
   void createCudfReader();
 
+  // Rebuild the chunked parquet reader with a smaller chunk read limit after an
+  // allocation failure, restarting the split. Returns false once the limit has
+  // reached the floor and retrying can no longer help.
+  bool halveChunkReadLimitAndRebuild();
+
   // Create the experimental hybrid scan reader.
   void createExperimentalReader();
 
@@ -164,6 +169,10 @@ class CudfSplitReader : public NvtxHelper {
   std::shared_ptr<cudf::io::datasource> dataSource_;
   cudf::io::parquet_reader_options readerOptions_;
   CudfParquetReaderPtr splitReader_;
+  // Chunk read limit currently in force for this split. Zero means the
+  // configured limit is used as-is; a non-zero value is a reduced limit
+  // installed by halveChunkReadLimitAndRebuild() after an allocation failure.
+  std::size_t degradedChunkReadLimit_{0};
   CudfHybridScanReaderPtr exptSplitReader_;
   std::unique_ptr<HybridScanState> hybridScanState_;
   bool useExperimentalCudfReader_;

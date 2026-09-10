@@ -27,6 +27,8 @@
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/connectors/hive/HiveDataSource.h"
 #include "velox/connectors/hive/TableHandle.h"
+
+#include <rmm/error.hpp>
 #ifdef VELOX_ENABLE_ABFS
 #include "velox/connectors/hive/storage_adapters/abfs/AbfsUtil.h"
 #endif
@@ -264,9 +266,22 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
       return std::nullopt;
     }
 
-    auto tableWithMetadata = splitReader_->read_chunk();
-    return castDecimalColumnsToVeloxTypes(
-        std::move(tableWithMetadata.tbl), outputType_, stream_, output_mr);
+    // Reading a chunk is the largest transient allocation a scan makes, and on
+    // a GPU that also holds operator state it is the allocation most likely to
+    // fail. Rather than bounding every scan up front - which costs scan-heavy
+    // queries that are never under pressure - degrade only the scans that
+    // actually fail: halve this split's chunk read limit and read it again.
+    while (true) {
+      try {
+        auto tableWithMetadata = splitReader_->read_chunk();
+        return castDecimalColumnsToVeloxTypes(
+            std::move(tableWithMetadata.tbl), outputType_, stream_, output_mr);
+      } catch (const rmm::out_of_memory&) {
+        if (!halveChunkReadLimitAndRebuild()) {
+          throw;
+        }
+      }
+    }
   }
 
   // Read table using the experimental parquet reader
@@ -542,8 +557,10 @@ void CudfSplitReader::createCudfReader() {
 
   // Create a parquet reader
   splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
-      cudfHiveConfig_->maxChunkReadLimitSession(
-          connectorQueryCtx_->sessionProperties()),
+      degradedChunkReadLimit_ != 0
+          ? degradedChunkReadLimit_
+          : cudfHiveConfig_->maxChunkReadLimitSession(
+                connectorQueryCtx_->sessionProperties()),
       cudfHiveConfig_->maxPassReadLimitSession(
           connectorQueryCtx_->sessionProperties()),
       std::move(sources),
@@ -554,6 +571,30 @@ void CudfSplitReader::createCudfReader() {
 
   // Metadata ingested
   fileMetaData_.clear();
+}
+
+bool CudfSplitReader::halveChunkReadLimitAndRebuild() {
+  // Floor chosen so a split still makes forward progress; below this the chunk
+  // is small enough that the failure is not the scan's to solve.
+  constexpr std::size_t kMinChunkReadLimit = 32UL << 20;
+  const auto current = degradedChunkReadLimit_ != 0
+      ? degradedChunkReadLimit_
+      : cudfHiveConfig_->maxChunkReadLimitSession(
+            connectorQueryCtx_->sessionProperties());
+  // An unlimited chunk has no size to halve, so start from a bound that is
+  // large enough to stay efficient but small enough to relieve the pressure.
+  const auto next = current == 0 ? (1UL << 30) : current / 2;
+  if (next < kMinChunkReadLimit) {
+    return false;
+  }
+  degradedChunkReadLimit_ = next;
+  LOG(WARNING) << "cuDF scan hit an allocation failure; retrying this split "
+               << "with a " << next << " byte chunk read limit";
+  // read_chunk() has no partial-consumption contract, so the split is restarted
+  // from the beginning with the reduced limit.
+  splitReader_.reset();
+  createCudfReader();
+  return splitReader_ != nullptr;
 }
 
 void CudfSplitReader::createExperimentalReader() {
