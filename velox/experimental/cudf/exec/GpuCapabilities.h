@@ -154,6 +154,19 @@ uint64_t partitionedGroupbyMinGroups(uint64_t fallback);
 /// fraction of it, so the threshold follows device capacity.
 uint64_t hashJoinDenseLoadFactorMinRows(uint64_t fallback);
 
+/// Rows in one join probe output batch.
+///
+/// The gather that materialises join output is the largest allocation a probe
+/// makes, and unlike the build it is sized by how many rows matched rather than
+/// by anything the plan declared. Bounding it at a small fraction of the device
+/// keeps it proportional to the machine instead of to the match multiplicity.
+uint64_t joinOutputBatchRows(uint64_t fallback);
+
+/// The output row width joinOutputBatchRows() assumes when it turns a byte
+/// budget into a row count. Published so the probe can undo the assumption and
+/// redo it against the width its own output actually has.
+inline constexpr uint64_t kAssumedBytesPerOutputRow = 48;
+
 } // namespace gpu_defaults
 
 } // namespace facebook::velox::cudf_velox

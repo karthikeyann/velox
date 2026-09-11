@@ -249,7 +249,10 @@ struct CudfConfig {
   /// opposite things. Splitting probe output finely is cheap, while splitting
   /// the build into many tables makes the probe loop over every one of them, so
   /// a single knob cannot serve both. Unset falls back to
-  /// batchSizeMaxThreshold.
+  /// batchSizeMaxThreshold. Unset derives a value from the device (see
+  /// gpu_defaults), which is what makes a large join fit without hand-tuning:
+  /// inheriting the build cap gave batches sized for a table rather than for a
+  /// gather, and a single one of those could be most of the device.
   std::optional<int32_t> joinOutputBatchRows;
 
   /// Drivers expected to share the device per task, used only to divide a

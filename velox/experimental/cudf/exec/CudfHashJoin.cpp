@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
+#include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -47,6 +48,7 @@
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/search.hpp>
 #include <cudf/stream_compaction.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
 
 #include <rmm/device_uvector.hpp>
@@ -760,6 +762,49 @@ void CudfHashJoinProbe::doNoMoreInput() {
       stream);
 }
 
+namespace {
+
+// Bytes one row of `table` occupies, averaged over the rows it has.
+//
+// The join output bound has to be a row count, because that is what slicing the
+// index columns takes, but what actually has to fit is bytes. A row count that
+// suits an output of two integers is wrong by an order of magnitude for one
+// carrying a comment string, and TPC-H has both. Converting a byte budget
+// through the width measured here gives each join a bound in the units that
+// matter.
+//
+// Fixed-width columns are exact. Strings are measured, which costs one small
+// device read per string column - paid once per probe call, against a gather
+// over millions of rows. Anything else falls back to its offsets, which is an
+// underestimate but never zero.
+uint64_t approximateBytesPerRow(
+    cudf::table_view table,
+    cuda::stream_ref stream) {
+  const auto rows = table.num_rows();
+  if (rows <= 0) {
+    return 0;
+  }
+  uint64_t bytes = 0;
+  for (auto column : table) {
+    if (cudf::is_fixed_width(column.type())) {
+      bytes += static_cast<uint64_t>(cudf::size_of(column.type())) *
+          static_cast<uint64_t>(rows);
+    } else if (column.type().id() == cudf::type_id::STRING) {
+      const cudf::strings_column_view strings(column);
+      bytes += static_cast<uint64_t>(strings.chars_size(stream)) +
+          sizeof(cudf::size_type) * static_cast<uint64_t>(rows);
+    } else {
+      bytes += sizeof(cudf::size_type) * static_cast<uint64_t>(rows);
+    }
+    if (column.nullable()) {
+      bytes += (static_cast<uint64_t>(rows) + 7) / 8;
+    }
+  }
+  return std::max<uint64_t>(bytes / static_cast<uint64_t>(rows), 1);
+}
+
+} // namespace
+
 void CudfHashJoinProbe::appendUnfilteredOutputs(
     std::vector<JoinOutput>& outputs,
     cudf::table_view leftTableView,
@@ -778,9 +823,7 @@ void CudfHashJoinProbe::appendUnfilteredOutputs(
   // Splitting is only meaningful when both index columns describe the same
   // output rows. Join shapes that leave one side empty (semi, anti) already
   // emit at most one row per probe row, so they take the single-shot path.
-  const bool splittable = maxThreshold.has_value() && numLeft == numRight &&
-      numLeft > maxThreshold.value();
-  if (!splittable) {
+  if (numLeft != numRight) {
     outputs.push_back(unfilteredOutput(
         leftTableView,
         leftIndicesCol,
@@ -790,14 +833,81 @@ void CudfHashJoinProbe::appendUnfilteredOutputs(
     return;
   }
 
-  const auto batchRows = maxThreshold.value();
-  for (cudf::size_type offset = 0; offset < numLeft; offset += batchRows) {
+  // Below this, splitting further stops buying anything worth the kernel
+  // launches, and an allocation that still fails at this size is telling us
+  // about the device rather than about the batch.
+  static constexpr cudf::size_type kMinOutputBatchRows = 1 << 20;
+
+  // How many successes earn the bound back. Large enough that recovery does not
+  // race the next squeeze and start oscillating, small enough that a query is
+  // not still paying for a moment of pressure long after it passed.
+  static constexpr int32_t kOutputBatchesBeforeRecovery = 8;
+
+  // Convert the byte budget the bound really expresses into rows for this
+  // join's own output width. The configured value was derived as a row count
+  // at an assumed row size, so scale it by how far this output differs: a join
+  // emitting narrow rows gets more of them per batch, one dragging a comment
+  // string through gets fewer, and both land on the same number of bytes.
+  auto configuredRows = maxThreshold.value_or(numLeft);
+  if (maxThreshold.has_value()) {
+    const auto outputBytesPerRow =
+        approximateBytesPerRow(
+            leftTableView.select(outputLayout_.probeColumnIndices), stream) +
+        approximateBytesPerRow(
+            rightTableView.select(outputLayout_.buildColumnIndices), stream);
+    if (outputBytesPerRow > 0) {
+      const auto byteBudget = static_cast<uint64_t>(configuredRows) *
+          gpu_defaults::kAssumedBytesPerOutputRow;
+      const auto scaled = byteBudget / outputBytesPerRow;
+      configuredRows = static_cast<cudf::size_type>(std::clamp<uint64_t>(
+          scaled,
+          1,
+          static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max())));
+    }
+  }
+  auto batchRows = std::min(configuredRows, degradedOutputBatchRows_);
+  batchRows = std::max(cudf::size_type{1}, std::min(batchRows, numLeft));
+
+  cudf::size_type offset = 0;
+  while (offset < numLeft) {
     const auto length = std::min(batchRows, numLeft - offset);
     const std::vector<cudf::size_type> bounds{offset, offset + length};
-    auto leftSlice = cudf::slice(leftIndicesCol, bounds, stream).front();
-    auto rightSlice = cudf::slice(rightIndicesCol, bounds, stream).front();
-    outputs.push_back(unfilteredOutput(
-        leftTableView, leftSlice, rightTableView, rightSlice, stream));
+    try {
+      auto leftSlice = cudf::slice(leftIndicesCol, bounds, stream).front();
+      auto rightSlice = cudf::slice(rightIndicesCol, bounds, stream).front();
+      outputs.push_back(unfilteredOutput(
+          leftTableView, leftSlice, rightTableView, rightSlice, stream));
+    } catch (const rmm::out_of_memory&) {
+      // The gather is the largest allocation the probe makes, and how large it
+      // may be depends on what the rest of the plan is holding right now. No
+      // value configured before the query ran can know that, so learn it here:
+      // halve and retry the same rows. Nothing was appended, the slices are
+      // views, and the gather either produced a table or unwound, so retrying
+      // repeats work rather than duplicating or dropping output.
+      if (batchRows <= kMinOutputBatchRows) {
+        throw;
+      }
+      batchRows /= 2;
+      degradedOutputBatchRows_ = batchRows;
+      outputBatchesSinceFailure_ = 0;
+      LOG(WARNING) << "CudfHashJoinProbe: output gather of " << length
+                   << " rows did not fit; retrying at " << batchRows
+                   << " rows per batch";
+      continue;
+    }
+    offset += length;
+
+    // The pressure that forced the last reduction was usually another operator
+    // or another query, and it passes. Give the bound back after a run of
+    // batches that fit, so a moment of scarcity does not cost the rest of the
+    // query the launches it takes to emit everything in small pieces.
+    if (batchRows < configuredRows &&
+        ++outputBatchesSinceFailure_ >= kOutputBatchesBeforeRecovery) {
+      outputBatchesSinceFailure_ = 0;
+      batchRows =
+          (batchRows > configuredRows / 2) ? configuredRows : batchRows * 2;
+      degradedOutputBatchRows_ = batchRows;
+    }
   }
 }
 

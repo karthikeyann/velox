@@ -35,6 +35,8 @@
 
 #include <cuda.h>
 
+#include <limits>
+
 static const std::string kCudfAdapterName = "cuDF";
 
 namespace facebook::velox::cudf_velox {
@@ -339,6 +341,7 @@ void registerCudf() {
     constexpr uint64_t kFixedBatchSizeMinBytes = 256ULL << 20;
     constexpr uint64_t kFixedHashJoinDenseMinRows = 100'000'000;
     constexpr uint64_t kFixedPartitionedGroupbyMinGroups = 50'000'000;
+    constexpr uint64_t kFixedJoinOutputBatchRows = 32'000'000;
     if (!cudfConfig.batchSizeMinBytes.has_value()) {
       cudfConfig.batchSizeMinBytes = gpu_defaults::batchSizeMinBytes(
           kFixedBatchSizeMinBytes, cudfConfig.maxDriversPerTaskHint);
@@ -353,12 +356,19 @@ void registerCudf() {
           gpu_defaults::partitionedGroupbyMinGroups(
               kFixedPartitionedGroupbyMinGroups);
     }
+    if (!cudfConfig.joinOutputBatchRows.has_value()) {
+      cudfConfig.joinOutputBatchRows = static_cast<int32_t>(std::min<uint64_t>(
+          gpu_defaults::joinOutputBatchRows(kFixedJoinOutputBatchRows),
+          static_cast<uint64_t>(std::numeric_limits<int32_t>::max())));
+    }
     LOG(INFO) << "cuDF memory defaults: batch_size_min_bytes="
               << cudfConfig.batchSizeMinBytes.value_or(0)
               << " hash_join_dense_load_factor_min_rows="
               << cudfConfig.hashJoinDenseLoadFactorMinRows
               << " partitioned_groupby_min_groups="
-              << cudfConfig.partitionedGroupbyMinGroups;
+              << cudfConfig.partitionedGroupbyMinGroups
+              << " join_output_batch_rows="
+              << cudfConfig.joinOutputBatchRows.value_or(0);
   }
 
   const std::string mrMode = CudfConfig::getInstance().memoryResource;

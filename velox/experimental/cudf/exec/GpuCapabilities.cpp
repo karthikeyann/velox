@@ -245,5 +245,28 @@ uint64_t hashJoinDenseLoadFactorMinRows(uint64_t fallback) {
   return budget / kApproxBytesPerBuildRow;
 }
 
+uint64_t joinOutputBatchRows(uint64_t fallback) {
+  // One batch is a single pass over the output, so it wants to be large enough
+  // to amortise the launch and small enough that several concurrent probes,
+  // plus the build tables they read from, still fit beside it. A thirtieth of
+  // the device is that: about 1.5 GiB on a 48 GiB card, which at an output row
+  // of a few dozen bytes is around thirty million rows.
+  //
+  // Deliberately not tighter. A bound a third this size was measured to cost a
+  // join with a narrow output 74% in extra launches while buying nothing, and
+  // the queries that genuinely need less do not need a smaller starting point -
+  // a batch that turns out not to fit is halved and retried by the probe
+  // itself, which finds the right value for the query actually running rather
+  // than making every query pay the worst case.
+  //
+  // The row width is assumed rather than known, because the bound has to be
+  // fixed before the probe knows its output schema.
+  const auto budget = fractionOfDevice(0.0333);
+  if (budget == 0) {
+    return fallback;
+  }
+  return budget / kAssumedBytesPerOutputRow;
+}
+
 } // namespace gpu_defaults
 } // namespace facebook::velox::cudf_velox
