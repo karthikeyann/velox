@@ -59,6 +59,9 @@ struct CudfConfig {
       "cudf.hash_join_dense_load_factor_min_rows"};
   /// Hint for how many drivers share the device, used to size per-driver
   /// device-derived budgets.
+  /// Row bound for a single join probe output batch.
+  static constexpr const char* kCudfJoinOutputBatchRows{
+      "cudf.join_output_batch_rows"};
   static constexpr const char* kCudfMaxDriversPerTaskHint{
       "cudf.max_drivers_per_task_hint"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
@@ -236,6 +239,18 @@ struct CudfConfig {
   /// enough to be a problem. Zero means "derive from the device" (see
   /// gpu_defaults); a non-zero value is taken as configured and used as-is.
   uint64_t partitionedGroupbyMinGroups{0};
+
+  /// Maximum rows in one join probe output batch. A probe that matches many
+  /// build rows produces an output far larger than either input, and that
+  /// gather is the largest allocation the probe makes.
+  ///
+  /// Deliberately separate from batchSizeMaxThreshold, which is its fallback:
+  /// that value also bounds the concatenated build table, and the two want
+  /// opposite things. Splitting probe output finely is cheap, while splitting
+  /// the build into many tables makes the probe loop over every one of them, so
+  /// a single knob cannot serve both. Unset falls back to
+  /// batchSizeMaxThreshold.
+  std::optional<int32_t> joinOutputBatchRows;
 
   /// Drivers expected to share the device per task, used only to divide a
   /// device-derived per-driver budget. This is a hint: the real count is a

@@ -454,6 +454,12 @@ void CudfConfig::initialize(
         kCudfHashJoinLoadFactor,
         hashJoinLoadFactor);
   }
+  if (config.find(kCudfJoinOutputBatchRows) != config.end()) {
+    const auto rows = folly::to<int32_t>(config[kCudfJoinOutputBatchRows]);
+    VELOX_USER_CHECK_GT(
+        rows, 0, "cuDF join output batch rows must be positive");
+    joinOutputBatchRows = rows;
+  }
   if (config.find(kCudfMaxDriversPerTaskHint) != config.end()) {
     maxDriversPerTaskHint =
         folly::to<int32_t>(config[kCudfMaxDriversPerTaskHint]);

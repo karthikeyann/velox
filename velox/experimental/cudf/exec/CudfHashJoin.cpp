@@ -767,7 +767,12 @@ void CudfHashJoinProbe::appendUnfilteredOutputs(
     cudf::table_view rightTableView,
     cudf::column_view rightIndicesCol,
     cuda::stream_ref stream) {
-  const auto& maxThreshold = CudfConfig::getInstance().batchSizeMaxThreshold;
+  // Probe output is bounded independently of the build-side concat; see the
+  // comment on joinOutputBatchRows for why one value cannot serve both.
+  const auto& cudfConfig = CudfConfig::getInstance();
+  const auto& maxThreshold = cudfConfig.joinOutputBatchRows.has_value()
+      ? cudfConfig.joinOutputBatchRows
+      : cudfConfig.batchSizeMaxThreshold;
   const auto numLeft = leftIndicesCol.size();
   const auto numRight = rightIndicesCol.size();
   // Splitting is only meaningful when both index columns describe the same
