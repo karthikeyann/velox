@@ -213,6 +213,21 @@ uint64_t batchSizeMinBytes(uint64_t fallback, int32_t numDriversPerTask) {
   return std::max<uint64_t>(share / drivers, 32ULL << 20);
 }
 
+uint64_t parquetPassReadBytes(uint64_t fallback, int32_t numDriversPerTask) {
+  // Every scan driver decodes a pass at the same time and the rest of the plan
+  // has to fit beside all of them, so the share that matters is per driver. A
+  // sixth of the device split across the drivers sharing it is about 4 GiB
+  // each on a 48 GiB card with two drivers: comfortably more than a narrow
+  // projection decodes in one pass, and well under what a wide one would take
+  // if left alone.
+  const auto budget = fractionOfDevice(0.167);
+  if (budget == 0) {
+    return fallback;
+  }
+  const auto drivers = static_cast<uint64_t>(std::max(numDriversPerTask, 1));
+  return std::max<uint64_t>(budget / drivers, 1ULL << 30);
+}
+
 uint64_t partitionedGroupbyMinGroups(uint64_t fallback) {
   // Partitioning has to start while there is still room to hold the partitions
   // next to the state they came from, so this sits below the point where one

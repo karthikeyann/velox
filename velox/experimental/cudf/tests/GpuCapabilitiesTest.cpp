@@ -80,6 +80,7 @@ TEST_F(GpuCapabilitiesTest, derivedDefaultsScaleWithTheDevice) {
   // A build only earns a denser hash table once it is a real share of the
   // device, so the threshold must be a substantial number of rows.
   EXPECT_GT(gpu_defaults::hashJoinDenseLoadFactorMinRows(0), 1'000'000UL);
+  EXPECT_GT(gpu_defaults::parquetPassReadBytes(0, 2), 0UL);
   EXPECT_GT(gpu_defaults::partitionedGroupbyMinGroups(0), 0UL);
 }
 

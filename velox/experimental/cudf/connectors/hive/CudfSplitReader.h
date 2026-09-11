@@ -167,6 +167,16 @@ class CudfSplitReader : public NvtxHelper {
   // already hit memory pressure, otherwise the configured one.
   std::size_t currentChunkReadLimit() const;
 
+  /// Bytes one reader pass may decode. Returns the configured value when there
+  /// is one, and otherwise a share of device memory - see the definition for
+  /// why unbounded is not a safe default on a GPU.
+  std::size_t currentPassReadLimit() const;
+
+  /// Uncompressed bytes this split would decode: the columns actually read,
+  /// summed over its row groups. Available from the footer before any data is
+  /// touched, which is what lets the pass bound be decided per split.
+  uint64_t projectedDecodeBytes() const;
+
   // Create the experimental hybrid scan reader.
   void createExperimentalReader();
 

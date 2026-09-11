@@ -140,6 +140,13 @@ namespace gpu_defaults {
 /// and scales up on a larger one.
 uint64_t batchSizeMinBytes(uint64_t fallback, int32_t numDriversPerTask);
 
+/// Bytes a parquet split may decode in one pass.
+///
+/// Distinct from what the reader returns: a pass decodes whole row groups for
+/// every projected column and only then trims to the requested chunk size, so
+/// the decode is the larger number and the one that has to fit.
+uint64_t parquetPassReadBytes(uint64_t fallback, int32_t numDriversPerTask);
+
 /// Group count at which a final aggregation splits its state into device
 /// partitions instead of merging it as one table.
 ///
