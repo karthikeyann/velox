@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfDefaultStreamOverload.h"
+#include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include <cudf/detail/utilities/stream_pool.hpp>
@@ -33,6 +34,7 @@
 #include <cuda_runtime.h>
 
 #include <common/base/Exceptions.h>
+#include <glog/logging.h>
 
 #include <cstdlib>
 #include <string_view>
@@ -49,6 +51,10 @@ cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
         rmm::mr::cuda_memory_resource{},
         rmm::percent_of_free_device_memory(percent));
   } else if (mode == "async") {
+    // Left with RMM's unbounded release threshold on purpose: capping it makes
+    // the pool hand memory back continuously and re-acquire it, which was
+    // measured to cost the TPC-H SF1000 suite 52%. What the pool retains is
+    // instead released between queries - see releaseCachedDeviceMemory().
     return rmm::mr::cuda_async_memory_resource{};
   } else if (mode == "arena") {
     return rmm::mr::arena_memory_resource(
@@ -81,6 +87,31 @@ cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
       "Unknown memory resource mode: " + std::string(mode) +
       "\nExpecting: cuda, pool, async, arena, managed, prefetch_managed, " +
       "managed_pool, prefetch_managed_pool, managed_async, prefetch_managed_async");
+}
+
+void releaseCachedDeviceMemory() {
+  // A stream-ordered pool keeps everything it has ever allocated, so a query
+  // starts against whatever its predecessor peaked at rather than against the
+  // device. At TPC-H SF1000 that decided which query ran out of memory: the
+  // same suite failed on different queries depending on the order they ran in.
+  //
+  // Returning it continuously is worse than keeping it - the pool then spends
+  // its time re-acquiring what it just gave back. So it is returned here
+  // instead, once, when a task has finished and there is nothing left that
+  // wants it.
+  cudaMemPool_t pool{};
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetDefaultMemPool(&pool, device) != cudaSuccess) {
+    return;
+  }
+  // Zero means keep nothing. Anything still in use is unaffected; this only
+  // releases what the pool is holding on no one's behalf.
+  const auto status = cudaMemPoolTrimTo(pool, 0);
+  if (status != cudaSuccess) {
+    VLOG(1) << "Could not return cached device memory: "
+            << cudaGetErrorString(status);
+  }
 }
 
 cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {

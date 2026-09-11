@@ -34,6 +34,11 @@ extern std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
 /// Returns the memory resource designated for output vector allocations.
 rmm::device_async_resource_ref get_output_mr();
 
+/// Returns to the driver whatever the device allocator is holding but not
+/// using. Intended for the gap between queries: during one, the cache is what
+/// makes the allocator fast.
+void releaseCachedDeviceMemory();
+
 /// Creates a memory resource based on the given mode.
 ///
 /// @param mode rmm::mr::pool_memory_resource mode.

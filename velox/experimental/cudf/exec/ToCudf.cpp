@@ -29,6 +29,7 @@
 #include "velox/experimental/cudf/expression/JitExpression.h"
 
 #include "folly/Conv.h"
+#include "velox/exec/Task.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -304,6 +305,33 @@ bool cudfIsRegistered() {
   return isCudfRegistered;
 }
 
+namespace {
+/// Returns the device allocator's cache to the driver when a task finishes.
+///
+/// A stream-ordered pool keeps everything it has ever allocated, so without
+/// this a query starts against whatever its predecessor peaked at rather than
+/// against the device. At TPC-H SF1000 that is what decided which query ran out
+/// of memory: the same suite failed on different queries depending on the order
+/// they ran in. The task boundary is the right place because it is the one
+/// moment when nothing is meant to be holding device memory at all.
+class CudfMemoryReleaseListener : public exec::TaskListener {
+ public:
+  void onTaskCompletion(
+      const std::string& /*taskUuid*/,
+      const std::string& /*taskId*/,
+      exec::TaskState /*state*/,
+      std::exception_ptr /*error*/,
+      exec::TaskStats /*stats*/) override {
+    releaseCachedDeviceMemory();
+  }
+};
+
+std::shared_ptr<CudfMemoryReleaseListener>& memoryReleaseListener() {
+  static std::shared_ptr<CudfMemoryReleaseListener> listener;
+  return listener;
+}
+} // namespace
+
 void registerCudf() {
   if (cudfIsRegistered()) {
     return;
@@ -401,10 +429,19 @@ void registerCudf() {
     registerJitEvaluator(CudfConfig::getInstance().jitExpressionPriority);
   }
 
+  if (memoryReleaseListener() == nullptr) {
+    memoryReleaseListener() = std::make_shared<CudfMemoryReleaseListener>();
+    exec::registerTaskListener(memoryReleaseListener());
+  }
+
   isCudfRegistered = true;
 }
 
 void unregisterCudf() {
+  if (memoryReleaseListener() != nullptr) {
+    exec::unregisterTaskListener(memoryReleaseListener());
+    memoryReleaseListener().reset();
+  }
   output_mr_.reset();
   mr_.reset();
   // Undo registerCudf()'s operator adapter registration.
