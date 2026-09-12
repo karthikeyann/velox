@@ -265,6 +265,9 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::next(
 }
 
 std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
+  if (splitExhausted_) {
+    return std::nullopt;
+  }
   auto output_mr = determineCudfMemoryResource();
 
   if (!useExperimentalCudfReader_) {
@@ -272,6 +275,7 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
     VELOX_CHECK_NOT_NULL(splitReader_, "cudf parquet reader not present");
 
     if (!splitReader_->has_next()) {
+      releaseExhaustedSplitResources();
       return std::nullopt;
     }
 
@@ -348,6 +352,7 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
   });
 
   if (!exptSplitReader_->has_next_table_chunk()) {
+    releaseExhaustedSplitResources();
     return std::nullopt;
   }
 
@@ -356,7 +361,21 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
       std::move(tableWithMetadata.tbl), outputType_, stream_, output_mr);
 }
 
+void CudfSplitReader::releaseExhaustedSplitResources() {
+  // A reader keeps device buffers for as long as it lives, and resetSplit()
+  // only runs when the next split is prepared - so for the last split of a
+  // driver, nothing ever frees them. The scan then holds device memory for the
+  // remainder of the query, which is exactly when the operators downstream of
+  // it are at their peak. Free them the moment the split has no more to give.
+  splitExhausted_ = true;
+  splitReader_.reset();
+  exptSplitReader_.reset();
+  hybridScanState_.reset();
+  fileMetaData_.clear();
+}
+
 void CudfSplitReader::resetSplit() {
+  splitExhausted_ = false;
   splitReader_.reset();
   exptSplitReader_.reset();
   hybridScanState_.reset();

@@ -152,6 +152,11 @@ class CudfSplitReader : public NvtxHelper {
   // Clear splitReaders and datasources after split has been fully processed.
   void resetSplit();
 
+  /// Frees the device memory this split's reader is holding, once it has no
+  /// more chunks to give. Distinct from resetSplit(), which runs when the
+  /// *next* split arrives and so never runs for the last one.
+  void releaseExhaustedSplitResources();
+
   // Setup the cuDF reader options
   void setupReaderOptions();
 
@@ -198,6 +203,9 @@ class CudfSplitReader : public NvtxHelper {
   // rediscovering the failure on every split, and a scan that never hits
   // pressure never pays anything. Zero means the configured limit applies.
   std::shared_ptr<std::atomic<std::size_t>> degradedChunkReadLimit_;
+  /// Set once this split has produced its last chunk, so a repeat call returns
+  /// nothing rather than reaching for a reader that has been released.
+  bool splitExhausted_{false};
   const cudf::ast::expression* subfieldFilterAst_;
   cudf::ast::expression const* pushdownFilterExpr_;
   PushdownFilterBuilder pushdownFilterBuilder_;
