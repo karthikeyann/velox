@@ -23,7 +23,6 @@ add_library(
   CudfEnforceSingleRow.cpp
   CudfFilterProject.cpp
   CudfGroupId.cpp
-  GpuCapabilities.cpp
   CudfGroupby.cpp
   CudfHashJoin.cpp
   CudfJoin.cpp
@@ -41,6 +40,8 @@ add_library(
   DecimalAggregationDevice.cu
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp
+  GpuAdmission.cpp
+  GpuCapabilities.cpp
   GpuResources.cpp
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp

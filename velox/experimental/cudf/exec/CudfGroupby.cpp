@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
+#include "velox/experimental/cudf/exec/GpuAdmission.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -1851,6 +1852,16 @@ void CudfGroupby::computeFinalGroupbyIncrementally(CudfVectorPtr tbl) {
     bufferedResult_ = groupbyOnInput;
     return;
   }
+
+  // Merging concatenates the accumulated state with this batch and
+  // re-aggregates, so at the peak the old state, the copy, the hash table and
+  // the result are all resident. Two drivers doing that at once is what fills
+  // the device; one after the other is the same work. The projection is the
+  // state plus the batch, which is what the concatenate alone will take.
+  const auto projected =
+      static_cast<uint64_t>(bufferedResult_->estimateFlatSize()) +
+      static_cast<uint64_t>(tbl->estimateFlatSize());
+  auto admission = GpuAdmission::acquire(projected);
 
   std::vector<cudf::table_view> tablesToConcat;
   tablesToConcat.push_back(bufferedResult_->getTableView());

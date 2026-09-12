@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
+#include "velox/experimental/cudf/exec/GpuAdmission.h"
 #include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -849,6 +850,8 @@ void CudfHashJoinProbe::appendUnfilteredOutputs(
   // emitting narrow rows gets more of them per batch, one dragging a comment
   // string through gets fewer, and both land on the same number of bytes.
   auto configuredRows = maxThreshold.value_or(numLeft);
+  uint64_t outputBytesPerRowForAdmission =
+      gpu_defaults::kAssumedBytesPerOutputRow;
   if (maxThreshold.has_value()) {
     const auto outputBytesPerRow =
         approximateBytesPerRow(
@@ -856,6 +859,7 @@ void CudfHashJoinProbe::appendUnfilteredOutputs(
         approximateBytesPerRow(
             rightTableView.select(outputLayout_.buildColumnIndices), stream);
     if (outputBytesPerRow > 0) {
+      outputBytesPerRowForAdmission = outputBytesPerRow;
       const auto byteBudget = static_cast<uint64_t>(configuredRows) *
           gpu_defaults::kAssumedBytesPerOutputRow;
       const auto scaled = byteBudget / outputBytesPerRow;
@@ -873,6 +877,12 @@ void CudfHashJoinProbe::appendUnfilteredOutputs(
     const auto length = std::min(batchRows, numLeft - offset);
     const std::vector<cudf::size_type> bounds{offset, offset + length};
     try {
+      // The gather is the largest allocation a probe makes, and two drivers
+      // reaching it together is what fills the device on a wide join. The
+      // output width was already measured above, so the size of what this
+      // batch is about to allocate is known rather than guessed.
+      auto admission = GpuAdmission::acquire(
+          static_cast<uint64_t>(length) * outputBytesPerRowForAdmission);
       auto leftSlice = cudf::slice(leftIndicesCol, bounds, stream).front();
       auto rightSlice = cudf::slice(rightIndicesCol, bounds, stream).front();
       outputs.push_back(unfilteredOutput(

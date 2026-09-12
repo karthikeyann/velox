@@ -108,6 +108,12 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_gpu_admission_test
+  SOURCES Main.cpp GpuAdmissionTest.cpp
+  LIBS velox_cudf_exec Folly::folly
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_gpu_capabilities_test
   SOURCES Main.cpp GpuCapabilitiesTest.cpp
   LIBS velox_cudf_exec Folly::folly

@@ -57,6 +57,9 @@ struct CudfConfig {
   /// Build row count at or above which hashJoinLoadFactor is applied.
   static constexpr const char* kCudfHashJoinDenseLoadFactorMinRows{
       "cudf.hash_join_dense_load_factor_min_rows"};
+  /// Live device bytes above which large operations are admitted one at a time.
+  static constexpr const char* kCudfAdmissionThresholdBytes{
+      "cudf.admission_threshold_bytes"};
   /// Hint for how many drivers share the device, used to size per-driver
   /// device-derived budgets.
   /// Row bound for a single join probe output batch.
@@ -192,6 +195,19 @@ struct CudfConfig {
   /// Multiplier used to derive streaming_groupby's initial logical capacity
   /// from the first batch and to grow capacity when it is exhausted.
   double streamingGroupbyCapacityMultiplier{2.0};
+
+  /// Live device bytes above which the few operations large enough to fill the
+  /// device on their own are admitted one at a time rather than run
+  /// concurrently.
+  ///
+  /// Drivers do not coordinate with each other; they consult one counter
+  /// before their single dominant allocation. Below the threshold nothing is
+  /// serialised and the counter is not even read, so a query that is not under
+  /// pressure is untouched.
+  ///
+  /// Zero disables it, which is the default: this changes when work runs, and
+  /// that is worth opting into rather than inheriting.
+  uint64_t admissionThresholdBytes{0};
 
   /// Minimum rows to accumulate before GPU-side concatenation when
   /// batchSizeMinBytes is not configured. This is also the fallback target for

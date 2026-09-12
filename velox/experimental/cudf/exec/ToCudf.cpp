@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/GpuAdmission.h"
 #include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
@@ -389,6 +390,7 @@ void registerCudf() {
           gpu_defaults::joinOutputBatchRows(kFixedJoinOutputBatchRows),
           static_cast<uint64_t>(std::numeric_limits<int32_t>::max())));
     }
+    GpuAdmission::setThresholdBytes(cudfConfig.admissionThresholdBytes);
     LOG(INFO) << "cuDF memory defaults: batch_size_min_bytes="
               << cudfConfig.batchSizeMinBytes.value_or(0)
               << " hash_join_dense_load_factor_min_rows="
@@ -396,7 +398,9 @@ void registerCudf() {
               << " partitioned_groupby_min_groups="
               << cudfConfig.partitionedGroupbyMinGroups
               << " join_output_batch_rows="
-              << cudfConfig.joinOutputBatchRows.value_or(0);
+              << cudfConfig.joinOutputBatchRows.value_or(0)
+              << " admission_threshold_bytes="
+              << cudfConfig.admissionThresholdBytes;
   }
 
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
@@ -523,6 +527,10 @@ void CudfConfig::initialize(
   if (config.find(kCudfHashJoinDenseLoadFactorMinRows) != config.end()) {
     hashJoinDenseLoadFactorMinRows =
         folly::to<uint64_t>(config[kCudfHashJoinDenseLoadFactorMinRows]);
+  }
+  if (config.find(kCudfAdmissionThresholdBytes) != config.end()) {
+    admissionThresholdBytes =
+        folly::to<uint64_t>(config[kCudfAdmissionThresholdBytes]);
   }
   if (config.find(kCudfPartitionedGroupbyMinGroups) != config.end()) {
     partitionedGroupbyMinGroups =
