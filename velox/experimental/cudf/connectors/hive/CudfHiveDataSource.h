@@ -33,6 +33,7 @@
 
 #include <cudf/ast/expressions.hpp>
 
+#include <atomic>
 #include <mutex>
 #include <unordered_set>
 
@@ -125,6 +126,10 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   dwio::common::RuntimeStats runtimeStats_;
 
   std::unique_ptr<CudfSplitReader> cudfSplitReader_;
+  // Reduced chunk read limit learned from an allocation failure, shared across
+  // every split this data source reads so the lesson outlives one split.
+  std::shared_ptr<std::atomic<std::size_t>> degradedChunkReadLimit_{
+      std::make_shared<std::atomic<std::size_t>>(0)};
 
   // Optimized remaining-filter expression, or null when there is no remaining
   // filter. Gates remaining-filter evaluation in next().

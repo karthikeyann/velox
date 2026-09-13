@@ -17,6 +17,8 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
+#include "velox/experimental/cudf/exec/GpuAdmission.h"
+#include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -47,6 +49,7 @@
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/search.hpp>
 #include <cudf/stream_compaction.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
 
 #include <rmm/device_uvector.hpp>
@@ -60,6 +63,12 @@
 #include <optional>
 
 namespace facebook::velox::cudf_velox {
+namespace {
+// libcudf's own default occupancy (CUCO_DESIRED_LOAD_FACTOR); used for builds
+// small enough that shrinking the hash table would not change whether the
+// query fits.
+constexpr double kCudfDefaultHashJoinLoadFactor = 0.5;
+} // namespace
 
 namespace {
 
@@ -370,12 +379,25 @@ void CudfHashJoinBuild::doNoMoreInput() {
        joinNode_->isRightJoin() || joinNode_->isFullJoin() ||
        joinNode_->isLeftSemiProjectJoin());
 
+  // A denser hash table costs probe time, so only spend that where it buys
+  // something: the table's size is what threatens the device, and it is
+  // proportional to the build row count. Small builds keep libcudf's default
+  // occupancy and run at full speed; only a build large enough to matter pays
+  // for the extra density.
+  const auto& cudfConfig = CudfConfig::getInstance();
   std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
   for (auto i = 0; i < tbls.size(); i++) {
+    const auto buildRows = static_cast<uint64_t>(tbls[i]->num_rows());
+    const auto loadFactor =
+        buildRows >= cudfConfig.hashJoinDenseLoadFactorMinRows
+        ? cudfConfig.hashJoinLoadFactor
+        : kCudfDefaultHashJoinLoadFactor;
     hashObjects.push_back(
         (buildHashJoin) ? std::make_shared<cudf::hash_join>(
                               tbls[i]->view().select(buildKeyIndices),
+                              cudf::nullable_join::YES,
                               cudf::null_equality::UNEQUAL,
+                              loadFactor,
                               stream,
                               get_temp_mr())
                         : nullptr);
@@ -741,6 +763,164 @@ void CudfHashJoinProbe::doNoMoreInput() {
       stream);
 }
 
+namespace {
+
+// Bytes one row of `table` occupies, averaged over the rows it has.
+//
+// The join output bound has to be a row count, because that is what slicing the
+// index columns takes, but what actually has to fit is bytes. A row count that
+// suits an output of two integers is wrong by an order of magnitude for one
+// carrying a comment string, and TPC-H has both. Converting a byte budget
+// through the width measured here gives each join a bound in the units that
+// matter.
+//
+// Fixed-width columns are exact. Strings are measured, which costs one small
+// device read per string column - paid once per probe call, against a gather
+// over millions of rows. Anything else falls back to its offsets, which is an
+// underestimate but never zero.
+uint64_t approximateBytesPerRow(
+    cudf::table_view table,
+    cuda::stream_ref stream) {
+  const auto rows = table.num_rows();
+  if (rows <= 0) {
+    return 0;
+  }
+  uint64_t bytes = 0;
+  for (auto column : table) {
+    if (cudf::is_fixed_width(column.type())) {
+      bytes += static_cast<uint64_t>(cudf::size_of(column.type())) *
+          static_cast<uint64_t>(rows);
+    } else if (column.type().id() == cudf::type_id::STRING) {
+      const cudf::strings_column_view strings(column);
+      bytes += static_cast<uint64_t>(strings.chars_size(stream)) +
+          sizeof(cudf::size_type) * static_cast<uint64_t>(rows);
+    } else {
+      bytes += sizeof(cudf::size_type) * static_cast<uint64_t>(rows);
+    }
+    if (column.nullable()) {
+      bytes += (static_cast<uint64_t>(rows) + 7) / 8;
+    }
+  }
+  return std::max<uint64_t>(bytes / static_cast<uint64_t>(rows), 1);
+}
+
+} // namespace
+
+void CudfHashJoinProbe::appendUnfilteredOutputs(
+    std::vector<JoinOutput>& outputs,
+    cudf::table_view leftTableView,
+    cudf::column_view leftIndicesCol,
+    cudf::table_view rightTableView,
+    cudf::column_view rightIndicesCol,
+    cuda::stream_ref stream) {
+  // Probe output is bounded independently of the build-side concat; see the
+  // comment on joinOutputBatchRows for why one value cannot serve both.
+  const auto& cudfConfig = CudfConfig::getInstance();
+  const auto& maxThreshold = cudfConfig.joinOutputBatchRows.has_value()
+      ? cudfConfig.joinOutputBatchRows
+      : cudfConfig.batchSizeMaxThreshold;
+  const auto numLeft = leftIndicesCol.size();
+  const auto numRight = rightIndicesCol.size();
+  // Splitting is only meaningful when both index columns describe the same
+  // output rows. Join shapes that leave one side empty (semi, anti) already
+  // emit at most one row per probe row, so they take the single-shot path.
+  if (numLeft != numRight) {
+    outputs.push_back(unfilteredOutput(
+        leftTableView,
+        leftIndicesCol,
+        rightTableView,
+        rightIndicesCol,
+        stream));
+    return;
+  }
+
+  // Below this, splitting further stops buying anything worth the kernel
+  // launches, and an allocation that still fails at this size is telling us
+  // about the device rather than about the batch.
+  static constexpr cudf::size_type kMinOutputBatchRows = 1 << 20;
+
+  // How many successes earn the bound back. Large enough that recovery does not
+  // race the next squeeze and start oscillating, small enough that a query is
+  // not still paying for a moment of pressure long after it passed.
+  static constexpr int32_t kOutputBatchesBeforeRecovery = 8;
+
+  // Convert the byte budget the bound really expresses into rows for this
+  // join's own output width. The configured value was derived as a row count
+  // at an assumed row size, so scale it by how far this output differs: a join
+  // emitting narrow rows gets more of them per batch, one dragging a comment
+  // string through gets fewer, and both land on the same number of bytes.
+  auto configuredRows = maxThreshold.value_or(numLeft);
+  uint64_t outputBytesPerRowForAdmission =
+      gpu_defaults::kAssumedBytesPerOutputRow;
+  if (maxThreshold.has_value()) {
+    const auto outputBytesPerRow =
+        approximateBytesPerRow(
+            leftTableView.select(outputLayout_.probeColumnIndices), stream) +
+        approximateBytesPerRow(
+            rightTableView.select(outputLayout_.buildColumnIndices), stream);
+    if (outputBytesPerRow > 0) {
+      outputBytesPerRowForAdmission = outputBytesPerRow;
+      const auto byteBudget = static_cast<uint64_t>(configuredRows) *
+          gpu_defaults::kAssumedBytesPerOutputRow;
+      const auto scaled = byteBudget / outputBytesPerRow;
+      configuredRows = static_cast<cudf::size_type>(std::clamp<uint64_t>(
+          scaled,
+          1,
+          static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max())));
+    }
+  }
+  auto batchRows = std::min(configuredRows, degradedOutputBatchRows_);
+  batchRows = std::max(cudf::size_type{1}, std::min(batchRows, numLeft));
+
+  cudf::size_type offset = 0;
+  while (offset < numLeft) {
+    const auto length = std::min(batchRows, numLeft - offset);
+    const std::vector<cudf::size_type> bounds{offset, offset + length};
+    try {
+      // The gather is the largest allocation a probe makes, and two drivers
+      // reaching it together is what fills the device on a wide join. The
+      // output width was already measured above, so the size of what this
+      // batch is about to allocate is known rather than guessed.
+      auto admission = GpuAdmission::acquire(
+          static_cast<uint64_t>(length) * outputBytesPerRowForAdmission);
+      auto leftSlice = cudf::slice(leftIndicesCol, bounds, stream).front();
+      auto rightSlice = cudf::slice(rightIndicesCol, bounds, stream).front();
+      outputs.push_back(unfilteredOutput(
+          leftTableView, leftSlice, rightTableView, rightSlice, stream));
+    } catch (const rmm::out_of_memory&) {
+      // The gather is the largest allocation the probe makes, and how large it
+      // may be depends on what the rest of the plan is holding right now. No
+      // value configured before the query ran can know that, so learn it here:
+      // halve and retry the same rows. Nothing was appended, the slices are
+      // views, and the gather either produced a table or unwound, so retrying
+      // repeats work rather than duplicating or dropping output.
+      if (batchRows <= kMinOutputBatchRows) {
+        throw;
+      }
+      batchRows /= 2;
+      degradedOutputBatchRows_ = batchRows;
+      outputBatchesSinceFailure_ = 0;
+      LOG(WARNING) << "CudfHashJoinProbe: output gather of " << length
+                   << " rows did not fit; retrying at " << batchRows
+                   << " rows per batch";
+      continue;
+    }
+    offset += length;
+
+    // The pressure that forced the last reduction was usually another operator
+    // or another query, and it passes. Give the bound back after a run of
+    // batches that fit, so a moment of scarcity does not cost the rest of the
+    // query the launches it takes to emit everything in small pieces.
+    if (batchRows < configuredRows &&
+        ++outputBatchesSinceFailure_ >= kOutputBatchesBeforeRecovery) {
+      outputBatchesSinceFailure_ = 0;
+      batchRows =
+          (batchRows > configuredRows / 2) ? configuredRows : batchRows * 2;
+      degradedOutputBatchRows_ = batchRows;
+    }
+  }
+}
+
 CudfHashJoinProbe::JoinOutput CudfHashJoinProbe::unfilteredOutput(
     cudf::table_view leftTableView,
     cudf::column_view leftIndicesCol,
@@ -966,12 +1146,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
             stream));
       }
     } else {
-      cudfOutputs.push_back(unfilteredOutput(
+      appendUnfilteredOutputs(
+          cudfOutputs,
           leftTableView,
           leftIndicesCol,
           rightTableView,
           rightIndicesCol,
-          stream));
+          stream);
     }
   }
   return cudfOutputs;
@@ -1041,12 +1222,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::leftJoin(
 
           probeTracker.update(filteredLeftCol, stream, get_temp_mr());
 
-          cudfOutputs.push_back(unfilteredOutput(
+          appendUnfilteredOutputs(
+              cudfOutputs,
               leftTableView,
               filteredLeftCol,
               rightTableView,
               filteredRightCol,
-              stream));
+              stream);
         }
       } else {
         auto leftIndicesSpanCopy =
@@ -1086,12 +1268,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::leftJoin(
       }
     } else {
       probeTracker.update(leftIndicesCol, stream, get_temp_mr());
-      cudfOutputs.push_back(unfilteredOutput(
+      appendUnfilteredOutputs(
+          cudfOutputs,
           leftTableView,
           leftIndicesCol,
           rightTableView,
           rightIndicesCol,
-          stream));
+          stream);
     }
   };
 
@@ -1145,12 +1328,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::leftJoin(
     //     JoinNoMatch. Per filter_join_indices semantics, input pairs with
     //     JoinNoMatch in either position pass through unchanged (the predicate
     //     cannot be evaluated), so filtering would be a no-op anyway.
-    cudfOutputs.push_back(unfilteredOutput(
+    appendUnfilteredOutputs(
+        cudfOutputs,
         leftTableView,
         unmatchedLeftCol,
         rightTables[0]->view(),
         unmatchedRightCol,
-        stream));
+        stream);
   }
 
   return cudfOutputs;
@@ -1281,12 +1465,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::rightJoin(
           filterFunc,
           stream));
     } else {
-      cudfOutputs.push_back(unfilteredOutput(
+      appendUnfilteredOutputs(
+          cudfOutputs,
           leftTableView,
           leftIndicesCol,
           rightTableView,
           rightIndicesCol,
-          stream));
+          stream);
     }
   }
   return cudfOutputs;
@@ -1383,23 +1568,25 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::fullJoin(
         probeTracker.update(filteredLeftCol, stream, get_temp_mr());
         updateRightMatchedFlags(i, filteredRightCol, rightTableView.num_rows());
 
-        cudfOutputs.push_back(unfilteredOutput(
+        appendUnfilteredOutputs(
+            cudfOutputs,
             leftTableView,
             filteredLeftCol,
             rightTableView,
             filteredRightCol,
-            stream));
+            stream);
       }
     } else {
       probeTracker.update(leftIndicesCol, stream, get_temp_mr());
       updateRightMatchedFlags(i, rightIndicesCol, rightTableView.num_rows());
 
-      cudfOutputs.push_back(unfilteredOutput(
+      appendUnfilteredOutputs(
+          cudfOutputs,
           leftTableView,
           leftIndicesCol,
           rightTableView,
           rightIndicesCol,
-          stream));
+          stream);
     }
   }
 
@@ -1418,12 +1605,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::fullJoin(
 
     // Use unfilteredOutput directly — see the matching comment in leftJoin()
     // for why filteredOutputIndices cannot be used here.
-    cudfOutputs.push_back(unfilteredOutput(
+    appendUnfilteredOutputs(
+        cudfOutputs,
         leftTableView,
         unmatchedLeftCol,
         rightTables[0]->view(),
         unmatchedRightCol,
-        stream));
+        stream);
   }
 
   return cudfOutputs;
@@ -1484,12 +1672,13 @@ CudfHashJoinProbe::leftSemiFilterJoin(
     auto matchedRightIndices = cudf::make_column_from_scalar(
         sentinelScalar, matchedIndices->size(), stream, get_temp_mr());
 
-    cudfOutputs.push_back(unfilteredOutput(
+    appendUnfilteredOutputs(
+        cudfOutputs,
         leftTableView,
         matchedLeftCol,
         rightTables[0]->view(),
         matchedRightIndices->view(),
-        stream));
+        stream);
   }
 
   return cudfOutputs;
@@ -2040,12 +2229,13 @@ CudfHashJoinProbe::rightSemiFilterJoin(
       cudf::device_span<cudf::size_type const>{*rightJoinIndices};
   auto rightIndicesCol = cudf::column_view{rightIndicesSpan};
   auto leftIndicesCol = cudf::empty_like(rightIndicesCol);
-  cudfOutputs.push_back(unfilteredOutput(
+  appendUnfilteredOutputs(
+      cudfOutputs,
       leftTableView,
       leftIndicesCol->view(),
       rightTableView,
       rightIndicesCol,
-      stream));
+      stream);
 
   return cudfOutputs;
 }
@@ -2117,12 +2307,13 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::antiJoin(
       cudf::device_span<cudf::size_type const>{*leftJoinIndices};
   auto leftIndicesCol = cudf::column_view{leftIndicesSpan};
   auto rightIndicesCol = cudf::empty_like(leftIndicesCol);
-  cudfOutputs.push_back(unfilteredOutput(
+  appendUnfilteredOutputs(
+      cudfOutputs,
       leftTableView,
       leftIndicesCol,
       rightTableView,
       rightIndicesCol->view(),
-      stream));
+      stream);
 
   return cudfOutputs;
 }

@@ -14,9 +14,11 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
+#include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
@@ -27,6 +29,10 @@
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/connectors/hive/HiveDataSource.h"
 #include "velox/connectors/hive/TableHandle.h"
+
+#include <rmm/error.hpp>
+
+#include <atomic>
 #ifdef VELOX_ENABLE_ABFS
 #include "velox/connectors/hive/storage_adapters/abfs/AbfsUtil.h"
 #endif
@@ -171,7 +177,8 @@ CudfSplitReader::CudfSplitReader(
     const std::shared_ptr<io::IoStatistics>& ioStatistics,
     const std::shared_ptr<IoStats>& ioStats,
     bool useExperimentalCudfReader,
-    const cudf::ast::expression* subfieldFilterAst)
+    const cudf::ast::expression* subfieldFilterAst,
+    std::shared_ptr<std::atomic<std::size_t>> degradedChunkReadLimit)
     : NvtxHelper(
           nvtx3::rgb{80, 171, 241},
           std::nullopt,
@@ -189,6 +196,10 @@ CudfSplitReader::CudfSplitReader(
       pool_(connectorQueryCtx->memoryPool()),
       useExperimentalCudfReader_(useExperimentalCudfReader),
       baseReaderOpts_(pool_),
+      degradedChunkReadLimit_(
+          degradedChunkReadLimit != nullptr
+              ? std::move(degradedChunkReadLimit)
+              : std::make_shared<std::atomic<std::size_t>>(0)),
       subfieldFilterAst_(subfieldFilterAst),
       pushdownFilterExpr_(subfieldFilterAst) {
   baseReaderOpts_.setDataIoStats(ioStatistics_);
@@ -254,6 +265,9 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::next(
 }
 
 std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
+  if (splitExhausted_) {
+    return std::nullopt;
+  }
   auto output_mr = determineCudfMemoryResource();
 
   if (!useExperimentalCudfReader_) {
@@ -261,12 +275,26 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
     VELOX_CHECK_NOT_NULL(splitReader_, "cudf parquet reader not present");
 
     if (!splitReader_->has_next()) {
+      releaseExhaustedSplitResources();
       return std::nullopt;
     }
 
-    auto tableWithMetadata = splitReader_->read_chunk();
-    return castDecimalColumnsToVeloxTypes(
-        std::move(tableWithMetadata.tbl), outputType_, stream_, output_mr);
+    // Reading a chunk is the largest transient allocation a scan makes, and on
+    // a GPU that also holds operator state it is the allocation most likely to
+    // fail. Rather than bounding every scan up front - which costs scan-heavy
+    // queries that are never under pressure - degrade only the scans that
+    // actually fail: halve this split's chunk read limit and read it again.
+    while (true) {
+      try {
+        auto tableWithMetadata = splitReader_->read_chunk();
+        return castDecimalColumnsToVeloxTypes(
+            std::move(tableWithMetadata.tbl), outputType_, stream_, output_mr);
+      } catch (const rmm::out_of_memory&) {
+        if (!halveChunkReadLimitAndRebuild()) {
+          throw;
+        }
+      }
+    }
   }
 
   // Read table using the experimental parquet reader
@@ -324,6 +352,7 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
   });
 
   if (!exptSplitReader_->has_next_table_chunk()) {
+    releaseExhaustedSplitResources();
     return std::nullopt;
   }
 
@@ -332,7 +361,21 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
       std::move(tableWithMetadata.tbl), outputType_, stream_, output_mr);
 }
 
+void CudfSplitReader::releaseExhaustedSplitResources() {
+  // A reader keeps device buffers for as long as it lives, and resetSplit()
+  // only runs when the next split is prepared - so for the last split of a
+  // driver, nothing ever frees them. The scan then holds device memory for the
+  // remainder of the query, which is exactly when the operators downstream of
+  // it are at their peak. Free them the moment the split has no more to give.
+  splitExhausted_ = true;
+  splitReader_.reset();
+  exptSplitReader_.reset();
+  hybridScanState_.reset();
+  fileMetaData_.clear();
+}
+
 void CudfSplitReader::resetSplit() {
+  splitExhausted_ = false;
   splitReader_.reset();
   exptSplitReader_.reset();
   hybridScanState_.reset();
@@ -542,10 +585,8 @@ void CudfSplitReader::createCudfReader() {
 
   // Create a parquet reader
   splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
-      cudfHiveConfig_->maxChunkReadLimitSession(
-          connectorQueryCtx_->sessionProperties()),
-      cudfHiveConfig_->maxPassReadLimitSession(
-          connectorQueryCtx_->sessionProperties()),
+      currentChunkReadLimit(),
+      currentPassReadLimit(),
       std::move(sources),
       std::move(fileMetaData_),
       readerOptions_,
@@ -554,6 +595,97 @@ void CudfSplitReader::createCudfReader() {
 
   // Metadata ingested
   fileMetaData_.clear();
+}
+
+uint64_t CudfSplitReader::projectedDecodeBytes() const {
+  if (fileMetaData_.empty()) {
+    return 0;
+  }
+  // total_uncompressed_size per column chunk, summed over the row groups of
+  // this split and over only the columns actually read. That last part is what
+  // makes this worth computing: two splits of the same file size decode wildly
+  // different amounts depending on the projection, and it is the decoded size
+  // that has to fit.
+  const std::unordered_set<std::string> wanted(
+      readColumnNames_.begin(), readColumnNames_.end());
+  uint64_t bytes = 0;
+  for (const auto& metadata : fileMetaData_) {
+    for (const auto& rowGroup : metadata.row_groups) {
+      for (const auto& column : rowGroup.columns) {
+        // A leaf's path is its ancestry; the first element is the top-level
+        // column, which is what the scan names.
+        if (column.meta_data.path_in_schema.empty() ||
+            wanted.count(column.meta_data.path_in_schema.front()) == 0) {
+          continue;
+        }
+        bytes += static_cast<uint64_t>(
+            std::max<int64_t>(column.meta_data.total_uncompressed_size, 0));
+      }
+    }
+  }
+  return bytes;
+}
+
+std::size_t CudfSplitReader::currentPassReadLimit() const {
+  const auto configured = cudfHiveConfig_->maxPassReadLimitSession(
+      connectorQueryCtx_->sessionProperties());
+  if (configured != 0) {
+    return configured;
+  }
+
+  // A pass is the set of row groups the reader decodes together, and it is a
+  // different quantity from the chunk it hands back. Bounding the chunk alone
+  // was measured to leave the decode footprint untouched: a wide projection
+  // still materialised most of a file, which at TPC-H SF1000 is 12 GB of
+  // customer per scan driver and is why Q10 could not run. Bounding the pass
+  // everywhere is not the answer either - it was measured to cost other
+  // queries their own headroom and lose them instead.
+  //
+  // So bound it exactly where it is needed, which the split can work out for
+  // itself: sum the uncompressed size of the columns this scan actually reads.
+  // A split that would decode more than its share of the device gets a bound;
+  // one that would not is left alone and pays nothing. The same file gives
+  // different answers for different queries, which is the point - Q9 reads two
+  // narrow columns of orders and needs no bound, Q10 reads nearly all of
+  // customer and does.
+  const auto budget = gpu_defaults::parquetPassReadBytes(
+      0, CudfConfig::getInstance().maxDriversPerTaskHint);
+  if (budget == 0 || projectedDecodeBytes() <= budget) {
+    return 0;
+  }
+  return static_cast<std::size_t>(budget);
+}
+
+std::size_t CudfSplitReader::currentChunkReadLimit() const {
+  const auto learned = degradedChunkReadLimit_->load(std::memory_order_relaxed);
+  if (learned != 0) {
+    return learned;
+  }
+  return cudfHiveConfig_->maxChunkReadLimitSession(
+      connectorQueryCtx_->sessionProperties());
+}
+
+bool CudfSplitReader::halveChunkReadLimitAndRebuild() {
+  // Floor chosen so a split still makes forward progress; below this the chunk
+  // is small enough that the failure is not the scan's to solve.
+  constexpr std::size_t kMinChunkReadLimit = 32UL << 20;
+  const auto current = currentChunkReadLimit();
+  // An unlimited chunk has no size to halve, so start from a bound that is
+  // large enough to stay efficient but small enough to relieve the pressure.
+  const auto next = current == 0 ? (1UL << 30) : current / 2;
+  if (next < kMinChunkReadLimit) {
+    return false;
+  }
+  degradedChunkReadLimit_->store(next, std::memory_order_relaxed);
+
+  LOG(WARNING) << "cuDF scan hit an allocation failure; retrying this split "
+               << "with a " << next << " byte chunk read limit and a "
+               << currentPassReadLimit() << " byte pass read limit";
+  // read_chunk() has no partial-consumption contract, so the split is restarted
+  // from the beginning with the reduced limit.
+  splitReader_.reset();
+  createCudfReader();
+  return splitReader_ != nullptr;
 }
 
 void CudfSplitReader::createExperimentalReader() {

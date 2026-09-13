@@ -34,6 +34,7 @@
 
 #include <cuda/stream>
 
+#include <limits>
 #include <memory>
 
 namespace facebook::velox::cudf_velox {
@@ -360,6 +361,50 @@ class CudfHashJoinProbe : public CudfOperatorBase {
       cudf::table_view rightTableView,
       cudf::column_view rightIndicesCol,
       cuda::stream_ref stream);
+
+  /**
+   * @brief Appends the unfiltered join output, split into batches whose row
+   * count is bounded by cudf.batch_size_max_threshold.
+   *
+   * A join whose probe batch matches many build rows gathers an output far
+   * larger than either input, and gathering it in one piece is the largest
+   * allocation the probe makes. Emitting it as several bounded batches keeps
+   * that allocation proportional to the configured batch size instead of to
+   * the match multiplicity, without changing the rows produced.
+   */
+  void appendUnfilteredOutputs(
+      std::vector<JoinOutput>& outputs,
+      cudf::table_view leftTableView,
+      cudf::column_view leftIndicesCol,
+      cudf::table_view rightTableView,
+      cudf::column_view rightIndicesCol,
+      cuda::stream_ref stream);
+
+  /** @brief Rows per output batch this operator has learned it can afford.
+   *
+   * A configured bound is a guess made before the query ran, and the right
+   * value depends on how much of the device the rest of the plan is using at
+   * the moment the gather happens - which no static value can know. Starts
+   * unbounded and only ever falls, when a gather has actually run out of
+   * memory; the reduced value is then kept for the rest of the query so the
+   * lesson is learned once rather than per batch.
+   *
+   * Per operator rather than shared between probe drivers: they meet the same
+   * pressure within a batch or two of each other, and a shared counter would
+   * need an owner outliving them all for no useful gain.
+   */
+  cudf::size_type degradedOutputBatchRows_{
+      std::numeric_limits<cudf::size_type>::max()};
+
+  /** @brief Batches emitted since the last one that did not fit.
+   *
+   * Pressure on the device is usually someone else's, and it passes. Without a
+   * way back, one squeeze early in a query would tax every batch after it, so
+   * a run of successes earns the bound back - halve on failure, double after a
+   * run of successes, never above what was configured.
+   */
+  int32_t outputBatchesSinceFailure_{0};
+
   /**
    * @brief Constructs join output table with filter condition applied.
    * @param leftTableView Input probe table view

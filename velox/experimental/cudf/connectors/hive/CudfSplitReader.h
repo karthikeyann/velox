@@ -35,7 +35,9 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/types.hpp>
 
+#include <atomic>
 #include <functional>
+#include <memory>
 #include <utility>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -64,7 +66,9 @@ class CudfSplitReader : public NvtxHelper {
       const std::shared_ptr<io::IoStatistics>& ioStatistics,
       const std::shared_ptr<IoStats>& ioStats,
       bool useExperimentalCudfReader,
-      const cudf::ast::expression* subfieldFilterAst);
+      const cudf::ast::expression* subfieldFilterAst,
+      std::shared_ptr<std::atomic<std::size_t>> degradedChunkReadLimit =
+          nullptr);
 
   virtual ~CudfSplitReader() = default;
 
@@ -148,11 +152,35 @@ class CudfSplitReader : public NvtxHelper {
   // Clear splitReaders and datasources after split has been fully processed.
   void resetSplit();
 
+  /// Frees the device memory this split's reader is holding, once it has no
+  /// more chunks to give. Distinct from resetSplit(), which runs when the
+  /// *next* split arrives and so never runs for the last one.
+  void releaseExhaustedSplitResources();
+
   // Setup the cuDF reader options
   void setupReaderOptions();
 
   // Create the chunked parquet reader.
   void createCudfReader();
+
+  // Rebuild the chunked parquet reader with a smaller chunk read limit after an
+  // allocation failure, restarting the split. Returns false once the limit has
+  // reached the floor and retrying can no longer help.
+  bool halveChunkReadLimitAndRebuild();
+
+  // Chunk read limit to use now: the learned reduced limit if this query has
+  // already hit memory pressure, otherwise the configured one.
+  std::size_t currentChunkReadLimit() const;
+
+  /// Bytes one reader pass may decode. Returns the configured value when there
+  /// is one, and otherwise a share of device memory - see the definition for
+  /// why unbounded is not a safe default on a GPU.
+  std::size_t currentPassReadLimit() const;
+
+  /// Uncompressed bytes this split would decode: the columns actually read,
+  /// summed over its row groups. Available from the footer before any data is
+  /// touched, which is what lets the pass bound be decided per split.
+  uint64_t projectedDecodeBytes() const;
 
   // Create the experimental hybrid scan reader.
   void createExperimentalReader();
@@ -169,6 +197,15 @@ class CudfSplitReader : public NvtxHelper {
   bool useExperimentalCudfReader_;
 
   dwio::common::ReaderOptions baseReaderOpts_;
+  // Reduced chunk read limit learned from an allocation failure, shared with
+  // the owning data source so it survives this split. A scan that hits memory
+  // pressure once keeps the smaller chunk for the rest of the query instead of
+  // rediscovering the failure on every split, and a scan that never hits
+  // pressure never pays anything. Zero means the configured limit applies.
+  std::shared_ptr<std::atomic<std::size_t>> degradedChunkReadLimit_;
+  /// Set once this split has produced its last chunk, so a repeat call returns
+  /// nothing rather than reaching for a reader that has been released.
+  bool splitExhausted_{false};
   const cudf::ast::expression* subfieldFilterAst_;
   cudf::ast::expression const* pushdownFilterExpr_;
   PushdownFilterBuilder pushdownFilterBuilder_;

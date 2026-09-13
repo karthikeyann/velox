@@ -19,6 +19,8 @@
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/GpuAdmission.h"
+#include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
@@ -28,11 +30,14 @@
 #include "velox/experimental/cudf/expression/JitExpression.h"
 
 #include "folly/Conv.h"
+#include "velox/exec/Task.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda.h>
+
+#include <limits>
 
 static const std::string kCudfAdapterName = "cuDF";
 
@@ -301,6 +306,33 @@ bool cudfIsRegistered() {
   return isCudfRegistered;
 }
 
+namespace {
+/// Returns the device allocator's cache to the driver when a task finishes.
+///
+/// A stream-ordered pool keeps everything it has ever allocated, so without
+/// this a query starts against whatever its predecessor peaked at rather than
+/// against the device. At TPC-H SF1000 that is what decided which query ran out
+/// of memory: the same suite failed on different queries depending on the order
+/// they ran in. The task boundary is the right place because it is the one
+/// moment when nothing is meant to be holding device memory at all.
+class CudfMemoryReleaseListener : public exec::TaskListener {
+ public:
+  void onTaskCompletion(
+      const std::string& /*taskUuid*/,
+      const std::string& /*taskId*/,
+      exec::TaskState /*state*/,
+      std::exception_ptr /*error*/,
+      exec::TaskStats /*stats*/) override {
+    releaseCachedDeviceMemory();
+  }
+};
+
+std::shared_ptr<CudfMemoryReleaseListener>& memoryReleaseListener() {
+  static std::shared_ptr<CudfMemoryReleaseListener> listener;
+  return listener;
+}
+} // namespace
+
 void registerCudf() {
   if (cudfIsRegistered()) {
     return;
@@ -323,16 +355,69 @@ void registerCudf() {
   VELOX_CHECK_GE(contextDevice, 0, "Failed to get current CUDA device ordinal");
   setCudfContextDevice(contextDevice);
 
+  // Read the device before anything derives a default from it. The context
+  // exists by this point, and every memory-related default below is a size that
+  // only means something relative to the device it will live on.
+  initializeGpuCapabilities();
+
+  // Fill in any memory default the deployment did not set from what the device
+  // actually is. A byte count that suits a 48 GiB board is wrong on a 16 GiB
+  // one and leaves most of a 180 GiB one unused, so the fixed values are only
+  // a fallback for a device that could not be queried. An explicitly
+  // configured value always wins.
+  {
+    auto& cudfConfig = CudfConfig::getInstance();
+    constexpr uint64_t kFixedBatchSizeMinBytes = 256ULL << 20;
+    constexpr uint64_t kFixedHashJoinDenseMinRows = 100'000'000;
+    constexpr uint64_t kFixedPartitionedGroupbyMinGroups = 50'000'000;
+    constexpr uint64_t kFixedJoinOutputBatchRows = 32'000'000;
+    if (!cudfConfig.batchSizeMinBytes.has_value()) {
+      cudfConfig.batchSizeMinBytes = gpu_defaults::batchSizeMinBytes(
+          kFixedBatchSizeMinBytes, cudfConfig.maxDriversPerTaskHint);
+    }
+    if (cudfConfig.hashJoinDenseLoadFactorMinRows == 0) {
+      cudfConfig.hashJoinDenseLoadFactorMinRows =
+          gpu_defaults::hashJoinDenseLoadFactorMinRows(
+              kFixedHashJoinDenseMinRows);
+    }
+    if (cudfConfig.partitionedGroupbyMinGroups == 0) {
+      cudfConfig.partitionedGroupbyMinGroups =
+          gpu_defaults::partitionedGroupbyMinGroups(
+              kFixedPartitionedGroupbyMinGroups);
+    }
+    if (!cudfConfig.joinOutputBatchRows.has_value()) {
+      cudfConfig.joinOutputBatchRows = static_cast<int32_t>(std::min<uint64_t>(
+          gpu_defaults::joinOutputBatchRows(kFixedJoinOutputBatchRows),
+          static_cast<uint64_t>(std::numeric_limits<int32_t>::max())));
+    }
+    GpuAdmission::setThresholdBytes(cudfConfig.admissionThresholdBytes);
+    LOG(INFO) << "cuDF memory defaults: batch_size_min_bytes="
+              << cudfConfig.batchSizeMinBytes.value_or(0)
+              << " hash_join_dense_load_factor_min_rows="
+              << cudfConfig.hashJoinDenseLoadFactorMinRows
+              << " partitioned_groupby_min_groups="
+              << cudfConfig.partitionedGroupbyMinGroups
+              << " join_output_batch_rows="
+              << cudfConfig.joinOutputBatchRows.value_or(0)
+              << " admission_threshold_bytes="
+              << cudfConfig.admissionThresholdBytes;
+  }
+
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
-  auto mr = cudf_velox::createMemoryResource(
+  auto base = cudf_velox::createMemoryResource(
       mrMode, CudfConfig::getInstance().memoryPercent);
-  cudf::set_current_device_resource(mr);
-  mr_ = std::move(mr);
+  // Wrap the device resource in a statistics adaptor so that
+  // cudfAllocatedBytes() can report live device memory.
+  statsMr_.emplace(std::move(base));
+  mr_ = statsMr_.value();
+  cudf::set_current_device_resource(mr_.value());
 
   const auto& outputMrMode = CudfConfig::getInstance().outputMemoryResource;
   if (!outputMrMode.empty() && outputMrMode != mrMode) {
-    output_mr_ = cudf_velox::createMemoryResource(
-        outputMrMode, CudfConfig::getInstance().memoryPercent);
+    outputStatsMr_.emplace(
+        cudf_velox::createMemoryResource(
+            outputMrMode, CudfConfig::getInstance().memoryPercent));
+    output_mr_ = outputStatsMr_.value();
   } else {
     output_mr_ = mr_;
   }
@@ -353,12 +438,25 @@ void registerCudf() {
     registerJitEvaluator(CudfConfig::getInstance().jitExpressionPriority);
   }
 
+  if (memoryReleaseListener() == nullptr) {
+    memoryReleaseListener() = std::make_shared<CudfMemoryReleaseListener>();
+    exec::registerTaskListener(memoryReleaseListener());
+  }
+
   isCudfRegistered = true;
 }
 
 void unregisterCudf() {
+  if (memoryReleaseListener() != nullptr) {
+    exec::unregisterTaskListener(memoryReleaseListener());
+    memoryReleaseListener().reset();
+  }
+  // Reset the any_resource copies before the adaptors they were copied from,
+  // so that the wrapped upstream resources are released here.
   output_mr_.reset();
   mr_.reset();
+  outputStatsMr_.reset();
+  statsMr_.reset();
   // Undo registerCudf()'s operator adapter registration.
   OperatorAdapterRegistry::getInstance().clear();
   exec::DriverFactory::adapters.erase(
@@ -398,6 +496,45 @@ void CudfConfig::initialize(
   if (config.find(kCudfBatchSizeMinThreshold) != config.end()) {
     batchSizeMinThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMinThreshold]);
+  }
+  if (config.find(kCudfBatchSizeMinBytes) != config.end()) {
+    const auto targetBytes =
+        folly::to<uint64_t>(config[kCudfBatchSizeMinBytes]);
+    VELOX_USER_CHECK_GT(
+        targetBytes,
+        0,
+        "cuDF BatchConcat minimum byte target must be positive");
+    batchSizeMinBytes = targetBytes;
+  }
+  if (config.find(kCudfHashJoinLoadFactor) != config.end()) {
+    hashJoinLoadFactor = folly::to<double>(config[kCudfHashJoinLoadFactor]);
+    VELOX_USER_CHECK(
+        hashJoinLoadFactor > 0.0 && hashJoinLoadFactor <= 1.0,
+        "{} must be in (0, 1], got {}",
+        kCudfHashJoinLoadFactor,
+        hashJoinLoadFactor);
+  }
+  if (config.find(kCudfJoinOutputBatchRows) != config.end()) {
+    const auto rows = folly::to<int32_t>(config[kCudfJoinOutputBatchRows]);
+    VELOX_USER_CHECK_GT(
+        rows, 0, "cuDF join output batch rows must be positive");
+    joinOutputBatchRows = rows;
+  }
+  if (config.find(kCudfMaxDriversPerTaskHint) != config.end()) {
+    maxDriversPerTaskHint =
+        folly::to<int32_t>(config[kCudfMaxDriversPerTaskHint]);
+  }
+  if (config.find(kCudfHashJoinDenseLoadFactorMinRows) != config.end()) {
+    hashJoinDenseLoadFactorMinRows =
+        folly::to<uint64_t>(config[kCudfHashJoinDenseLoadFactorMinRows]);
+  }
+  if (config.find(kCudfAdmissionThresholdBytes) != config.end()) {
+    admissionThresholdBytes =
+        folly::to<uint64_t>(config[kCudfAdmissionThresholdBytes]);
+  }
+  if (config.find(kCudfPartitionedGroupbyMinGroups) != config.end()) {
+    partitionedGroupbyMinGroups =
+        folly::to<uint64_t>(config[kCudfPartitionedGroupbyMinGroups]);
   }
   if (config.find(kCudfBatchSizeMaxThreshold) != config.end()) {
     batchSizeMaxThreshold =

@@ -16,9 +16,21 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 
+#include "velox/common/base/Exceptions.h"
+#include "velox/common/base/tests/GTestUtils.h"
+
+#include <folly/Conv.h>
 #include <gtest/gtest.h>
 
+#include <limits>
+
 namespace facebook::velox::cudf_velox::test {
+
+TEST(ConfigTest, BatchConcatThresholdDefaults) {
+  CudfConfig config;
+  EXPECT_EQ(config.batchSizeMinThreshold, 100'000);
+  EXPECT_FALSE(config.batchSizeMinBytes);
+}
 
 TEST(ConfigTest, cudfConfig) {
   std::unordered_map<std::string, std::string> options = {
@@ -29,7 +41,10 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
       {CudfConfig::kCudfStreamingGroupbyEnabled, "true"},
       {CudfConfig::kCudfStreamingGroupbyCapacityMultiplier, "3.5"},
-      {CudfConfig::kCudfAllowCpuFallback, "false"}};
+      {CudfConfig::kCudfAllowCpuFallback, "false"},
+      {CudfConfig::kCudfBatchSizeMinThreshold, "123456"},
+      {CudfConfig::kCudfBatchSizeMinBytes, "2147483648"},
+      {CudfConfig::kCudfHashJoinLoadFactor, "0.8"}};
 
   CudfConfig config;
   ASSERT_FALSE(config.streamingGroupbyEnabled);
@@ -43,5 +58,37 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.streamingGroupbyEnabled, true);
   ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 3.5);
   ASSERT_EQ(config.allowCpuFallback, false);
+  ASSERT_EQ(config.batchSizeMinThreshold, 123'456);
+  ASSERT_EQ(config.batchSizeMinBytes.value(), 2'147'483'648);
+  ASSERT_DOUBLE_EQ(config.hashJoinLoadFactor, 0.8);
+}
+
+TEST(ConfigTest, RejectsZeroBatchSizeMinBytes) {
+  CudfConfig config;
+  std::unordered_map<std::string, std::string> options = {
+      {CudfConfig::kCudfBatchSizeMinBytes, "0"}};
+
+  VELOX_ASSERT_USER_THROW(
+      config.initialize(std::move(options)),
+      "cuDF BatchConcat minimum byte target must be positive");
+}
+
+TEST(ConfigTest, ParsesMaximumBatchSizeMinBytes) {
+  CudfConfig config;
+  std::unordered_map<std::string, std::string> options = {
+      {CudfConfig::kCudfBatchSizeMinBytes, "18446744073709551615"}};
+
+  config.initialize(std::move(options));
+
+  EXPECT_EQ(
+      config.batchSizeMinBytes.value(), std::numeric_limits<uint64_t>::max());
+}
+
+TEST(ConfigTest, RejectsBatchSizeMinBytesOverflow) {
+  CudfConfig config;
+  std::unordered_map<std::string, std::string> options = {
+      {CudfConfig::kCudfBatchSizeMinBytes, "18446744073709551616"}};
+
+  EXPECT_THROW(config.initialize(std::move(options)), folly::ConversionError);
 }
 } // namespace facebook::velox::cudf_velox::test

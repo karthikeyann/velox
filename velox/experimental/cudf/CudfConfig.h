@@ -18,6 +18,7 @@
 
 #include <cudf/types.hpp>
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -45,10 +46,33 @@ struct CudfConfig {
   static constexpr const char* kCudfLogFallback{"cudf.log_fallback"};
   static constexpr const char* kCudfBatchSizeMinThreshold{
       "cudf.batch_size_min_threshold"};
+  /// Minimum buffered GPU byte target for CudfBatchConcat.
+  static constexpr const char* kCudfBatchSizeMinBytes{
+      "cudf.batch_size_min_bytes"};
   static constexpr const char* kCudfBatchSizeMaxThreshold{
       "cudf.batch_size_max_threshold"};
+  /// Hash table occupancy for cudf::hash_join build tables.
+  static constexpr const char* kCudfHashJoinLoadFactor{
+      "cudf.hash_join_load_factor"};
+  /// Build row count at or above which hashJoinLoadFactor is applied.
+  static constexpr const char* kCudfHashJoinDenseLoadFactorMinRows{
+      "cudf.hash_join_dense_load_factor_min_rows"};
+  /// Live device bytes above which large operations are admitted one at a time.
+  static constexpr const char* kCudfAdmissionThresholdBytes{
+      "cudf.admission_threshold_bytes"};
+  /// Hint for how many drivers share the device, used to size per-driver
+  /// device-derived budgets.
+  /// Row bound for a single join probe output batch.
+  static constexpr const char* kCudfJoinOutputBatchRows{
+      "cudf.join_output_batch_rows"};
+  static constexpr const char* kCudfMaxDriversPerTaskHint{
+      "cudf.max_drivers_per_task_hint"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
+  /// Group count at or above which a final aggregation holds its state as
+  /// device partitions. Zero disables partitioning entirely.
+  static constexpr const char* kCudfPartitionedGroupbyMinGroups{
+      "cudf.partitioned_groupby_min_groups"};
   static constexpr const char* kCudfStreamingGroupbyEnabled{
       "cudf.streaming_groupby_enabled"};
   static constexpr const char* kCudfStreamingGroupbyCapacityMultiplier{
@@ -158,10 +182,9 @@ struct CudfConfig {
   /// Whether to insert CudfBatchConcat operators before supported Cudf
   /// operators.
   /// This can improve performance by reducing the number of cuda kernel
-  /// launches on addInput of certain operators by collecting a minimum number
-  /// of rows before concatenating and passing on to the next operator.
-  /// This batch size is determined by batchSizeMinThreshold and
-  /// batchSizeMaxThreshold
+  /// launches on addInput of certain operators. Inputs are collected until
+  /// batchSizeMinBytes is reached, or batchSizeMinThreshold otherwise.
+  /// batchSizeMaxThreshold limits the rows in a concatenated batch.
   bool concatOptimizationEnabled{false};
 
   /// Use libcudf's persistent streaming_groupby for eligible final grouped
@@ -173,13 +196,87 @@ struct CudfConfig {
   /// from the first batch and to grow capacity when it is exhausted.
   double streamingGroupbyCapacityMultiplier{2.0};
 
-  /// Minimum rows to accumulate before GPU-side concatenation in
-  /// `CudfBatchConcat` (default 100k).
+  /// Live device bytes above which the few operations large enough to fill the
+  /// device on their own are admitted one at a time rather than run
+  /// concurrently.
+  ///
+  /// Drivers do not coordinate with each other; they consult one counter
+  /// before their single dominant allocation. Below the threshold nothing is
+  /// serialised and the counter is not even read, so a query that is not under
+  /// pressure is untouched.
+  ///
+  /// Zero disables it, which is the default: this changes when work runs, and
+  /// that is worth opting into rather than inheriting.
+  uint64_t admissionThresholdBytes{0};
+
+  /// Minimum rows to accumulate before GPU-side concatenation when
+  /// batchSizeMinBytes is not configured. This is also the fallback target for
+  /// zero-column vectors, which have no GPU buffers to count (default 100k).
   int32_t batchSizeMinThreshold{100000};
+
+  /// Optional minimum GPU byte target for concatenation, measured by
+  /// CudfVector::estimateFlatSize(). When unset, batchSizeMinThreshold applies.
+  std::optional<uint64_t> batchSizeMinBytes;
 
   /// Maximum rows allowed in a concatenated batch (user configurable).
   /// When not set, cuDF's own `size_type::max()` is used.
   std::optional<int32_t> batchSizeMaxThreshold;
+
+  /// Desired occupancy of the cudf::hash_join hash table in (0, 1]. The table
+  /// stores one 8-byte (hash, row index) slot per capacity entry, so the build
+  /// side of a join with N rows costs N / loadFactor * 8 bytes on top of the
+  /// build table itself. libcudf's default is 0.5 (fastest probes); 0.8 halves
+  /// the table for large builds at a small probe cost, which is what lets a
+  /// 1.5 B-row build fit next to its own data on a 48 GiB GPU.
+  double hashJoinLoadFactor{0.5};
+
+  /// Builds with fewer rows than this keep libcudf's default occupancy, so a
+  /// query whose joins comfortably fit is never slowed down by a denser table.
+  /// The default is high enough that only multi-hundred-million-row builds -
+  /// the ones whose hash table is a material fraction of the device - opt in.
+  /// Zero means "derive from the device" (see gpu_defaults); a non-zero value
+  /// is taken as configured and used as-is.
+  uint64_t hashJoinDenseLoadFactorMinRows{0};
+
+  /// Group count above which the incremental final aggregation splits its
+  /// accumulated state into hash partitions that stay on the device, and from
+  /// then on merges each input batch one partition at a time.
+  ///
+  /// The merge that grows the state concatenates it with the new batch and
+  /// re-aggregates, so the old state, the concatenated copy, the hash table and
+  /// the result are all resident at the peak - roughly twice the state.
+  /// Partitioning does not make the state smaller; it makes that peak a
+  /// function of one partition, which is sound because equal keys hash equally
+  /// and a partition can be merged without consulting any other. Nothing leaves
+  /// the device.
+  ///
+  /// Aggregations below the threshold keep exactly the path they used before,
+  /// so the extra partitioning work only applies where the state was large
+  /// enough to be a problem. Zero means "derive from the device" (see
+  /// gpu_defaults); a non-zero value is taken as configured and used as-is.
+  uint64_t partitionedGroupbyMinGroups{0};
+
+  /// Maximum rows in one join probe output batch. A probe that matches many
+  /// build rows produces an output far larger than either input, and that
+  /// gather is the largest allocation the probe makes.
+  ///
+  /// Deliberately separate from batchSizeMaxThreshold, which is its fallback:
+  /// that value also bounds the concatenated build table, and the two want
+  /// opposite things. Splitting probe output finely is cheap, while splitting
+  /// the build into many tables makes the probe loop over every one of them, so
+  /// a single knob cannot serve both. Unset falls back to
+  /// batchSizeMaxThreshold. Unset derives a value from the device (see
+  /// gpu_defaults), which is what makes a large join fit without hand-tuning:
+  /// inheriting the build cap gave batches sized for a table rather than for a
+  /// gather, and a single one of those could be most of the device.
+  std::optional<int32_t> joinOutputBatchRows;
+
+  /// Drivers expected to share the device per task, used only to divide a
+  /// device-derived per-driver budget. This is a hint: the real count is a
+  /// query property (task.max-drivers-per-task) not known when the process
+  /// starts, and getting it wrong only makes a budget slightly generous or
+  /// slightly tight, never incorrect.
+  int32_t maxDriversPerTaskHint{2};
   // Query config key for the TopN batch size in the cuDF TopN operator.
   int32_t topNBatchSize{5};
 

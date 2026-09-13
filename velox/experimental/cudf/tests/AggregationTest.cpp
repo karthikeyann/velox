@@ -29,6 +29,7 @@
 #include "velox/type/Timestamp.h"
 
 #include <cmath>
+#include <limits>
 
 namespace facebook::velox::exec::test {
 
@@ -292,6 +293,83 @@ int64_t streamingGroupbyStatSum(
   }
   const auto statIt = planIt->second.customStats.find(std::string{name});
   return statIt == planIt->second.customStats.end() ? 0 : statIt->second.sum;
+}
+
+// The final aggregation splits its accumulated state into device hash
+// partitions once it holds more groups than a threshold, so that each later
+// merge touches one partition rather than the whole state. These force that
+// split with a threshold no state can stay under, and check that the answer
+// does not change.
+TEST_F(AggregationTest, devicePartitionedFinalAggregation) {
+  // Enough distinct keys, spread over enough batches, that the final
+  // aggregation merges repeatedly rather than seeing everything at once.
+  std::vector<RowVectorPtr> data;
+  constexpr int32_t kBatches = 8;
+  constexpr int32_t kRowsPerBatch = 2'000;
+  for (int32_t b = 0; b < kBatches; ++b) {
+    data.push_back(makeRowVector({
+        makeFlatVector<int64_t>(
+            kRowsPerBatch,
+            // Keys repeat across batches, so partitions really do have to
+            // merge rather than just accumulate disjoint rows.
+            [b](auto row) { return (row * 7 + b) % 997; }),
+        makeFlatVector<int64_t>(
+            kRowsPerBatch, [](auto row) { return row % 13; }),
+    }));
+  }
+  createDuckDbTable(data);
+
+  auto plan = PlanBuilder()
+                  .values(data)
+                  .partialAggregation({"c0"}, {"sum(c1)", "count(c1)"})
+                  .finalAggregation()
+                  .planNode();
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto savedThreshold = config.partitionedGroupbyMinGroups;
+  SCOPE_EXIT {
+    config.partitionedGroupbyMinGroups = savedThreshold;
+  };
+
+  // A threshold no state can stay under, so the split happens on the first
+  // merge.
+  config.partitionedGroupbyMinGroups = 1;
+  assertQuery(plan, "SELECT c0, sum(c1), count(c1) FROM tmp GROUP BY c0");
+
+  // And a threshold nothing reaches, so the same query runs the unpartitioned
+  // path. Both must agree with the reference, which is what makes the split
+  // safe to take on nothing more than a size threshold.
+  config.partitionedGroupbyMinGroups = std::numeric_limits<uint64_t>::max();
+  assertQuery(plan, "SELECT c0, sum(c1), count(c1) FROM tmp GROUP BY c0");
+}
+
+// A grouping key every row shares still has to survive partitioning: fifteen
+// of the sixteen partitions receive nothing, and an empty partition must be
+// skipped rather than end the output or produce a row.
+TEST_F(AggregationTest, devicePartitionedSingleGroup) {
+  std::vector<RowVectorPtr> data;
+  for (int32_t b = 0; b < 4; ++b) {
+    data.push_back(makeRowVector({
+        makeFlatVector<int64_t>(500, [](auto /*row*/) { return int64_t{42}; }),
+        makeFlatVector<int64_t>(500, [](auto row) { return row; }),
+    }));
+  }
+  createDuckDbTable(data);
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto savedThreshold = config.partitionedGroupbyMinGroups;
+  SCOPE_EXIT {
+    config.partitionedGroupbyMinGroups = savedThreshold;
+  };
+  config.partitionedGroupbyMinGroups = 1;
+
+  auto plan = PlanBuilder()
+                  .values(data)
+                  .partialAggregation({"c0"}, {"sum(c1)", "min(c1)", "max(c1)"})
+                  .finalAggregation()
+                  .planNode();
+  assertQuery(
+      plan, "SELECT c0, sum(c1), min(c1), max(c1) FROM tmp GROUP BY c0");
 }
 
 TEST_F(AggregationTest, global) {
