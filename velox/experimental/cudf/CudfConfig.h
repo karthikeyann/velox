@@ -63,6 +63,10 @@ struct CudfConfig {
       "cudf.max_drivers_per_task_hint"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
+  /// Group count at or above which a final aggregation holds its state as
+  /// device partitions. Zero disables partitioning entirely.
+  static constexpr const char* kCudfPartitionedGroupbyMinGroups{
+      "cudf.partitioned_groupby_min_groups"};
   static constexpr const char* kCudfStreamingGroupbyEnabled{
       "cudf.streaming_groupby_enabled"};
   static constexpr const char* kCudfStreamingGroupbyCapacityMultiplier{
@@ -214,6 +218,24 @@ struct CudfConfig {
   /// Zero means "derive from the device" (see gpu_defaults); a non-zero value
   /// is taken as configured and used as-is.
   uint64_t hashJoinDenseLoadFactorMinRows{0};
+
+  /// Group count above which the incremental final aggregation splits its
+  /// accumulated state into hash partitions that stay on the device, and from
+  /// then on merges each input batch one partition at a time.
+  ///
+  /// The merge that grows the state concatenates it with the new batch and
+  /// re-aggregates, so the old state, the concatenated copy, the hash table and
+  /// the result are all resident at the peak - roughly twice the state.
+  /// Partitioning does not make the state smaller; it makes that peak a
+  /// function of one partition, which is sound because equal keys hash equally
+  /// and a partition can be merged without consulting any other. Nothing leaves
+  /// the device.
+  ///
+  /// Aggregations below the threshold keep exactly the path they used before,
+  /// so the extra partitioning work only applies where the state was large
+  /// enough to be a problem. Zero means "derive from the device" (see
+  /// gpu_defaults); a non-zero value is taken as configured and used as-is.
+  uint64_t partitionedGroupbyMinGroups{0};
 
   /// Drivers expected to share the device per task, used only to divide a
   /// device-derived per-driver budget. This is a hint: the real count is a

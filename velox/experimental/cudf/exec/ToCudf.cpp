@@ -338,6 +338,7 @@ void registerCudf() {
     auto& cudfConfig = CudfConfig::getInstance();
     constexpr uint64_t kFixedBatchSizeMinBytes = 256ULL << 20;
     constexpr uint64_t kFixedHashJoinDenseMinRows = 100'000'000;
+    constexpr uint64_t kFixedPartitionedGroupbyMinGroups = 50'000'000;
     if (!cudfConfig.batchSizeMinBytes.has_value()) {
       cudfConfig.batchSizeMinBytes = gpu_defaults::batchSizeMinBytes(
           kFixedBatchSizeMinBytes, cudfConfig.maxDriversPerTaskHint);
@@ -347,10 +348,17 @@ void registerCudf() {
           gpu_defaults::hashJoinDenseLoadFactorMinRows(
               kFixedHashJoinDenseMinRows);
     }
+    if (cudfConfig.partitionedGroupbyMinGroups == 0) {
+      cudfConfig.partitionedGroupbyMinGroups =
+          gpu_defaults::partitionedGroupbyMinGroups(
+              kFixedPartitionedGroupbyMinGroups);
+    }
     LOG(INFO) << "cuDF memory defaults: batch_size_min_bytes="
               << cudfConfig.batchSizeMinBytes.value_or(0)
               << " hash_join_dense_load_factor_min_rows="
-              << cudfConfig.hashJoinDenseLoadFactorMinRows;
+              << cudfConfig.hashJoinDenseLoadFactorMinRows
+              << " partitioned_groupby_min_groups="
+              << cudfConfig.partitionedGroupbyMinGroups;
   }
 
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
@@ -453,6 +461,10 @@ void CudfConfig::initialize(
   if (config.find(kCudfHashJoinDenseLoadFactorMinRows) != config.end()) {
     hashJoinDenseLoadFactorMinRows =
         folly::to<uint64_t>(config[kCudfHashJoinDenseLoadFactorMinRows]);
+  }
+  if (config.find(kCudfPartitionedGroupbyMinGroups) != config.end()) {
+    partitionedGroupbyMinGroups =
+        folly::to<uint64_t>(config[kCudfPartitionedGroupbyMinGroups]);
   }
   if (config.find(kCudfBatchSizeMaxThreshold) != config.end()) {
     batchSizeMaxThreshold =

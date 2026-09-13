@@ -35,6 +35,7 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/partitioning.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
@@ -47,6 +48,61 @@
 
 namespace {
 
+// Partitions the final-aggregation state is split into when it is kept on the
+// device. Sixteen divides the merge peak enough to matter on a build whose
+// state runs to tens of gigabytes, while leaving each partition large enough
+// that aggregating it still saturates the GPU.
+constexpr int32_t kFinalGroupbyDevicePartitions = 16;
+
+// Hash-partitions `table` on `keyIndices` and returns the partitions as owned
+// tables. Equal keys hash equally, so every row of a group lands in the same
+// partition on every call - which is what makes it correct to aggregate one
+// partition without consulting the others.
+std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::size_type>>
+hashPartitionTable(
+    cudf::table_view table,
+    const std::vector<cudf::size_type>& keyIndices,
+    int32_t numPartitions,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  auto [partitioned, offsets] = cudf::hash_partition(
+      table,
+      keyIndices,
+      numPartitions,
+      cudf::hash_id::HASH_MURMUR3,
+      cudf::DEFAULT_HASH_SEED,
+      stream,
+      mr);
+  VELOX_CHECK_EQ(offsets.size(), static_cast<size_t>(numPartitions) + 1);
+  return {std::move(partitioned), std::move(offsets)};
+}
+
+/// Splits `partitioned` at the boundaries `hash_partition` reported and copies
+/// each piece into a table of its own.
+///
+/// Kept separate from the partitioning above so that a caller can release
+/// whatever the partitioning read from before this allocates. The two copies
+/// are then never both outstanding alongside the source, which on a state of
+/// any size is the difference between two copies resident and three.
+std::vector<std::unique_ptr<cudf::table>> ownPartitions(
+    const cudf::table& partitioned,
+    const std::vector<cudf::size_type>& offsets,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  // cudf::split takes interior boundaries only, so drop offsets.front()
+  // (always zero) and offsets.back() (the total row count).
+  const std::vector<cudf::size_type> splitPoints(
+      offsets.begin() + 1, offsets.end() - 1);
+  const auto views = cudf::split(partitioned.view(), splitPoints, stream);
+
+  std::vector<std::unique_ptr<cudf::table>> parts;
+  parts.reserve(views.size());
+  for (const auto& view : views) {
+    parts.push_back(std::make_unique<cudf::table>(view, stream, mr));
+  }
+  return parts;
+}
+
 using namespace facebook::velox;
 using cudf_velox::castDecimal64InputToDecimal128;
 using cudf_velox::CountInputKind;
@@ -58,6 +114,19 @@ using cudf_velox::ResolvedAggregateInfo;
 using cudf_velox::serializeDecimalPartialOrIntermediateState;
 using cudf_velox::StreamingGroupbyAggregator;
 using cudf_velox::validateIntermediateColumnType;
+
+// The buffered state is laid out as [grouping keys..., aggregates...], so the
+// grouping key output channels index the key columns of the state as well as
+// of the input.
+std::vector<cudf::size_type> keyIndicesOf(
+    const std::vector<column_index_t>& groupingKeyOutputChannels) {
+  std::vector<cudf::size_type> keyIndices;
+  keyIndices.reserve(groupingKeyOutputChannels.size());
+  for (const auto channel : groupingKeyOutputChannels) {
+    keyIndices.push_back(static_cast<cudf::size_type>(channel));
+  }
+  return keyIndices;
+}
 
 size_t streamingGroupbySafeCapacity() {
   // libcudf encodes an in-flight row as max_distinct_keys + row_index in a
@@ -1532,6 +1601,17 @@ void CudfGroupby::initialize() {
       aggregationInput.constants,
       aggregationInput.maskChannels);
 
+  // Only the incremental kFinal merge accumulates state whose size the plan
+  // does not bound, so that is the only path worth partitioning. Streaming
+  // groupby keeps its own fixed-capacity table and never grows one, so the two
+  // are mutually exclusive by construction.
+  if (incrementalAggregationEnabled_ && !streamingGroupbyEnabled_ &&
+      aggregationNode_->step() == core::AggregationNode::Step::kFinal &&
+      !aggregationNode_->groupingKeys().empty()) {
+    partitionedGroupbyMinGroups_ =
+        CudfConfig::getInstance().partitionedGroupbyMinGroups;
+  }
+
   // Check that aggregate result type match the output type.
   // TODO: This is output schema validation. In velox CPU, it's done using
   // output types reported by aggregation functions. We can't do that in cudf
@@ -1596,7 +1676,163 @@ void CudfGroupby::computePartialGroupbyIncrementally(CudfVectorPtr tbl) {
   }
 }
 
+void CudfGroupby::partitionBufferedResult() {
+  VELOX_CHECK_NOT_NULL(bufferedResult_);
+  VELOX_CHECK(devicePartitions_.empty());
+  const auto stream = bufferedResult_->stream();
+
+  auto [partitioned, offsets] = hashPartitionTable(
+      bufferedResult_->getTableView(),
+      keyIndicesOf(groupingKeyOutputChannels_),
+      kFinalGroupbyDevicePartitions,
+      stream,
+      get_output_mr());
+  // The partitioning has copied everything it needs, so drop the single-table
+  // state before the per-partition copies below allocate. Doing it here rather
+  // than after is what keeps the peak at two copies of the state instead of
+  // three. The free is stream-ordered on the stream the partitioning ran on,
+  // so it cannot race the copy.
+  bufferedResult_.reset();
+  devicePartitions_ =
+      ownPartitions(*partitioned, offsets, stream, get_output_mr());
+  partitioned.reset();
+  stream.sync();
+  // Everything touching these partitions from here on runs on this stream.
+  devicePartitionStream_ = stream;
+
+  VLOG(1) << "CudfGroupbyFINAL: state split into "
+          << kFinalGroupbyDevicePartitions
+          << " device partitions; further merges touch one at a time";
+}
+
+void CudfGroupby::mergeIntoDevicePartitions(CudfVectorPtr tbl) {
+  VELOX_CHECK(!devicePartitions_.empty());
+  VELOX_CHECK(devicePartitionStream_.has_value());
+  // Work on the partitions' own stream, and make it wait for the batch. The
+  // batch may have been produced on another stream, and a partition freed here
+  // is ordered on this stream only.
+  const auto stream = *devicePartitionStream_;
+  const auto inputStream = tbl->stream();
+  if (inputStream.get() != stream.get()) {
+    cudf::detail::join_streams(
+        std::vector<cuda::stream_ref>{inputStream}, stream);
+  }
+  auto permutedInputView = tbl->getTableView().select(
+      aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+
+  // Split the batch the same way the state is split. Equal keys hash equally,
+  // so batch partition p contains exactly the rows whose groups live in state
+  // partition p and nothing else.
+  auto [partitionedInput, inputOffsets] = hashPartitionTable(
+      permutedInputView,
+      keyIndicesOf(groupingKeyOutputChannels_),
+      kFinalGroupbyDevicePartitions,
+      stream,
+      get_temp_mr());
+  // The batch has been copied into the partitioning; release it before the
+  // merges below allocate. Synchronise first: the batch belongs to the stream
+  // it arrived on, so its free is not ordered against work queued here.
+  stream.sync();
+  tbl.reset();
+  auto inputParts =
+      ownPartitions(*partitionedInput, inputOffsets, stream, get_temp_mr());
+  partitionedInput.reset();
+
+  for (size_t i = 0; i < devicePartitions_.size(); ++i) {
+    if (inputParts[i]->num_rows() == 0) {
+      continue;
+    }
+    if (devicePartitions_[i] == nullptr ||
+        devicePartitions_[i]->num_rows() == 0) {
+      // Nothing to merge with, but the rows still have to be folded into
+      // intermediate state so that every partition holds the same shape.
+      auto aggregated = doGroupByAggregation(
+          inputParts[i]->view(),
+          groupingKeyOutputChannels_,
+          intermediateAggregators_,
+          bufferedResultType_,
+          stream,
+          get_output_mr());
+      stream.sync();
+      inputParts[i].reset();
+      if (aggregated != nullptr) {
+        devicePartitions_[i] = std::make_unique<cudf::table>(
+            aggregated->getTableView(), stream, get_output_mr());
+        stream.sync();
+      }
+      continue;
+    }
+
+    // This is the peak the whole arrangement exists to bound: one partition's
+    // state, one partition's batch, and the hash table and result the
+    // re-aggregation builds over them. Without the split it would be the same
+    // four quantities over the entire state.
+    const std::vector<cudf::table_view> toConcat{
+        devicePartitions_[i]->view(), inputParts[i]->view()};
+    auto concatenated = cudf::concatenate(toConcat, stream, get_temp_mr());
+    // The concatenate has copied both inputs, but it is asynchronous and these
+    // frees are not ordered against it on every path, so wait before dropping
+    // what it read.
+    stream.sync();
+    devicePartitions_[i].reset();
+    inputParts[i].reset();
+
+    auto merged = doGroupByAggregation(
+        concatenated->view(),
+        groupingKeyOutputChannels_,
+        intermediateAggregators_,
+        bufferedResultType_,
+        stream,
+        get_output_mr());
+    concatenated.reset();
+    VELOX_CHECK_NOT_NULL(merged);
+    devicePartitions_[i] = std::make_unique<cudf::table>(
+        merged->getTableView(), stream, get_output_mr());
+    stream.sync();
+  }
+}
+
+CudfVectorPtr CudfGroupby::finalizeDevicePartition(int32_t partition) {
+  auto& part = devicePartitions_[partition];
+  if (part == nullptr || part->num_rows() == 0) {
+    part.reset();
+    return nullptr;
+  }
+  const auto stream =
+      devicePartitionStream_.value_or(cudfGlobalStreamPool().get_stream());
+
+  // The partition holds intermediate state for a disjoint set of keys, so a
+  // single final-step aggregation over it produces the operator's output rows
+  // for those keys - the same aggregators and output type the unpartitioned
+  // path finishes with.
+  auto result = doGroupByAggregation(
+      part->view(),
+      groupingKeyOutputChannels_,
+      aggregators_,
+      outputType_,
+      stream,
+      get_output_mr());
+  stream.sync();
+  part.reset();
+  return result;
+}
+
 void CudfGroupby::computeFinalGroupbyIncrementally(CudfVectorPtr tbl) {
+  if (!devicePartitions_.empty()) {
+    mergeIntoDevicePartitions(std::move(tbl));
+    return;
+  }
+  // Split once the state is large enough that merging it whole is what puts
+  // the device at risk, and merge this batch into the partitions rather than
+  // into a table that is about to be discarded.
+  if (partitionedGroupbyMinGroups_ != 0 && bufferedResult_ != nullptr &&
+      static_cast<uint64_t>(bufferedResult_->size()) >
+          partitionedGroupbyMinGroups_) {
+    partitionBufferedResult();
+    mergeIntoDevicePartitions(std::move(tbl));
+    return;
+  }
+
   auto inputTableStream = tbl->stream();
   auto permutedInputView = tbl->getTableView().select(
       aggregationInputChannels_.begin(), aggregationInputChannels_.end());
@@ -1825,6 +2061,24 @@ RowVectorPtr CudfGroupby::doGetOutput() {
     return finalizeStreamingGroupby();
   }
 
+  // A partitioned final aggregation finishes one partition per call. Each
+  // holds a disjoint set of keys, so its rows are complete on their own and go
+  // downstream without waiting for the rest - and only one partition's worth
+  // of final-step state is resident at a time, which is the same bound the
+  // partitioning gave the merge.
+  if (!devicePartitions_.empty()) {
+    while (nextDevicePartition_ <
+           static_cast<int32_t>(devicePartitions_.size())) {
+      if (auto result = finalizeDevicePartition(nextDevicePartition_++)) {
+        return result;
+      }
+    }
+    devicePartitions_.clear();
+    devicePartitionStream_.reset();
+    finished_ = true;
+    return nullptr;
+  }
+
   // Streaming finalization: single step uses finalAggregators_ to convert
   // intermediate results to final output; final step uses aggregators_.
   // At this point isPartialOutput_ is false (handled above) and noMoreInput_
@@ -1896,6 +2150,13 @@ void CudfGroupby::doClose() {
   streamingGroupbyStream_.reset();
   streamingGroupbyCapacity_ = 0;
   streamingGroupbyAggregators_.clear();
+  if (devicePartitionStream_.has_value()) {
+    // The partitions are freed on the stream that owns them, so wait for the
+    // work queued there before dropping them.
+    devicePartitionStream_->sync();
+  }
+  devicePartitions_.clear();
+  devicePartitionStream_.reset();
   inputs_.clear();
   bufferedResult_.reset();
   aggregators_.clear();

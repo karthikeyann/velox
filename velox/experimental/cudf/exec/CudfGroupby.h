@@ -208,6 +208,22 @@ class CudfGroupby : public CudfOperatorBase {
 
   void computePartialGroupbyIncrementally(CudfVectorPtr tbl);
   void computeFinalGroupbyIncrementally(CudfVectorPtr tbl);
+
+  /// Splits the buffered state into hash partitions that stay on the device,
+  /// leaving 'bufferedResult_' null. After this the state is the same rows in
+  /// the same number of bytes, just held as several tables instead of one,
+  /// which is what lets a later merge touch one of them at a time.
+  void partitionBufferedResult();
+
+  /// Merges one input batch into the partitioned state, one partition at a
+  /// time. Equal keys hash equally, so the batch's partition p only ever meets
+  /// the state's partition p and no group is split.
+  void mergeIntoDevicePartitions(CudfVectorPtr tbl);
+
+  /// Applies the final aggregation step to one device partition, producing the
+  /// operator's output rows for the keys that hash into it, and releases the
+  /// partition. Returns nullptr when the partition is empty.
+  CudfVectorPtr finalizeDevicePartition(int32_t partition);
   void computeSingleGroupbyIncrementally(CudfVectorPtr tbl);
 
   std::vector<column_index_t> groupingKeyInputChannels_;
@@ -238,6 +254,33 @@ class CudfGroupby : public CudfOperatorBase {
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
   CudfVectorPtr bufferedResult_;
+
+  // Group count for 'bufferedResult_' past which the state is split into
+  // device partitions. Only set for the incremental kFinal merge, the one path
+  // whose accumulated state is unbounded.
+  //
+  // The merge that grows the state concatenates it with the new batch and
+  // re-aggregates, so the old state, the concatenated copy, the hash table and
+  // the result are all resident at the peak - roughly twice the state.
+  // Splitting does not make the state smaller; it makes that peak a function
+  // of one partition, which is sound because equal keys hash equally and a
+  // partition can be merged without consulting any other. Nothing leaves the
+  // device.
+  uint64_t partitionedGroupbyMinGroups_{0};
+
+  // Final-aggregation state held as hash partitions on the device. Empty until
+  // the state first exceeds the threshold, which is what keeps a small
+  // aggregation on exactly the code it used before.
+  std::vector<std::unique_ptr<cudf::table>> devicePartitions_;
+
+  // Partition that the next doGetOutput() call emits.
+  int32_t nextDevicePartition_{0};
+
+  // The stream the partitions were allocated on, and the only stream they are
+  // read or freed on afterwards. A free is ordered on the stream that owns the
+  // buffer, so releasing a partition from another stream while work here still
+  // reads it is a use-after-free the device reports as an illegal address.
+  std::optional<cuda::stream_ref> devicePartitionStream_;
 
   std::vector<std::unique_ptr<StreamingGroupbyAggregator>>
       streamingGroupbyAggregators_;
