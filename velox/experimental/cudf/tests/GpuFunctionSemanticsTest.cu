@@ -30,6 +30,11 @@
 #include "velox/experimental/cudf/functions/GpuDateTimeFunctions.cuh"
 #include "velox/experimental/cudf/functions/GpuLogicalFunctions.cuh"
 
+// For FOLLY_ALWAYS_INLINE, which the checked-arithmetic structs carry and
+// which arrives through the shadow rather than from real folly.
+#include "folly/CPortability.h"
+
+#include "velox/functions/lib/CheckedArithmetic.h"
 #include "velox/functions/prestosql/Arithmetic.h"
 
 #include <gtest/gtest.h>
@@ -37,6 +42,7 @@
 #include <cmath>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include <vector>
 
 namespace facebook::velox::cudf_velox::gpu_sfi {
@@ -337,6 +343,76 @@ TEST(GpuFunctionSemanticsTest, roundAndTruncateAgreeWithHostBitForBit) {
 
     EXPECT_EQ(bits(got[i].rounded), bits(expectedRound));
     EXPECT_EQ(bits(got[i].truncated), bits(expectedTruncate));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A check that fails
+// ---------------------------------------------------------------------------
+
+struct CheckedAddCase {
+  int64_t a;
+  int64_t b;
+};
+
+struct CheckedAddResult {
+  int64_t value;
+  uint8_t raised;
+};
+
+/// Stands in for what the adapter's kernel does around a function body: give
+/// this thread its error byte, run the body, read the byte back. Written out
+/// here rather than going through GpuSimpleFunctionAdapter so that the
+/// mechanism is tested on its own, without a registry, a column or a stream.
+__global__ void checkedAddRecordingErrors(
+    const CheckedAddCase* cases,
+    CheckedAddResult* out,
+    int count) {
+  gpuErrorBytes[threadIdx.x] = static_cast<uint8_t>(GpuErrorKind::kNone);
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) {
+    return;
+  }
+  int64_t value{-1};
+  facebook::velox::functions::CheckedPlusFunction<GpuExec>{}.call(
+      value, cases[i].a, cases[i].b);
+  out[i].value = value;
+  out[i].raised = gpuErrorBytes[threadIdx.x];
+}
+
+// The whole point of the error mechanism, at its smallest: an overflow inside
+// checkedPlus reaches VELOX_ARITHMETIC_ERROR, which on the CPU throws and on
+// the device has to leave a trace instead. Before this existed the row below
+// returned a wrapped value indistinguishable from an answer.
+TEST(GpuFunctionSemanticsTest, aFailedCheckIsRecordedPerRow) {
+  constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+  constexpr int64_t kMin = std::numeric_limits<int64_t>::min();
+  const std::vector<CheckedAddCase> cases{
+      {1, 2},
+      {kMax, 1},
+      {3, 4},
+      {kMin, -1},
+      {kMax, 0},
+      {-1, -1},
+  };
+  const std::vector<bool> shouldRaise{false, true, false, true, false, false};
+
+  auto got = mapOnDevice<CheckedAddCase, CheckedAddResult>(
+      cases, [&](const CheckedAddCase* in, CheckedAddResult* out, int count) {
+        checkedAddRecordingErrors<<<1, count, count * sizeof(uint8_t)>>>(
+            in, out, count);
+      });
+
+  for (size_t i = 0; i < cases.size(); ++i) {
+    SCOPED_TRACE(fmt::format("case {}: {} + {}", i, cases[i].a, cases[i].b));
+    if (shouldRaise[i]) {
+      EXPECT_EQ(got[i].raised, static_cast<uint8_t>(GpuErrorKind::kFailed));
+    } else {
+      // A clean row must not be declined by its neighbour's failure: the byte
+      // belongs to one thread, which is what makes the mechanism per row.
+      EXPECT_EQ(got[i].raised, static_cast<uint8_t>(GpuErrorKind::kNone));
+      EXPECT_EQ(got[i].value, cases[i].a + cases[i].b);
+    }
   }
 }
 
