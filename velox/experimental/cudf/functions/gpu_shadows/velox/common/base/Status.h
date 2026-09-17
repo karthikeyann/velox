@@ -32,9 +32,17 @@
 // rather than an error -- a different answer, not a suppressed diagnostic. That
 // distinction is why Status-returning functions wait for per-row error
 // reporting rather than being mapped onto the bool convention.
+//
+// The macros below do raise into the error sink, even though nothing is
+// registered that can reach them. A macro whose polarity is wrong is a trap
+// that springs on whoever first lifts the static_assert, and this one was
+// wrong: it returned OK() on the failure condition.
 #pragma once
 
+#include "velox/experimental/cudf/functions/GpuErrorSink.cuh"
 #include "velox/experimental/cudf/types/GpuProxyTypes.cuh"
+
+#include "velox/common/base/Exceptions.h"
 
 namespace facebook::velox {
 
@@ -44,6 +52,13 @@ class Status {
 
   GPU_HOST_DEVICE static Status OK() {
     return Status{};
+  }
+
+  /// The real one carries a message built with fmt. Here the message is what
+  /// the host recovers by re-evaluating the row, so a failed Status is just
+  /// the bit that says so.
+  GPU_HOST_DEVICE static Status UserError() {
+    return Status{false};
   }
 
   GPU_HOST_DEVICE bool ok() const {
@@ -58,13 +73,38 @@ class Status {
 
 } // namespace facebook::velox
 
-// Reports the failure by returning a non-OK Status on the real path. Here the
-// condition is evaluated -- it may have side effects, and discarding it would
-// change behaviour -- and the arguments are referenced so they do not read as
-// unused, matching what the Exceptions.h shadow does for the check macros.
-#define VELOX_USER_RETURN(expr, ...)          \
-  do {                                        \
-    if (static_cast<bool>(expr)) {            \
-      return ::facebook::velox::Status::OK(); \
-    }                                         \
+// Returns a user error when the condition holds -- the same polarity as the
+// real macro, which is worth stating because this shadow had it backwards and
+// returned OK() on exactly the failures it exists to report.
+//
+// The raise is what lets the host find out: a Status travelling up through
+// GpuUDFHolder would only say "this row has no value", which is what a null
+// says too. See GpuErrorSink.cuh.
+#define VELOX_USER_RETURN(expr, ...)                                      \
+  do {                                                                    \
+    if (static_cast<bool>(expr)) {                                        \
+      ::facebook::velox::gpu_shadow_detail::useArgs(__VA_ARGS__);         \
+      ::facebook::velox::cudf_velox::gpu_sfi::gpuRaise(                   \
+          ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kFailed); \
+      return ::facebook::velox::Status::UserError();                      \
+    }                                                                     \
   } while (0)
+
+// The comparison forms. Spark's decimal and arithmetic headers use these, and
+// the shadow had none of them -- latent only because those headers are not yet
+// compiled for the device.
+#define VELOX_GPU_SHADOW_USER_RETURN_OP(e1, e2, op, ...) \
+  VELOX_USER_RETURN(!((e1)op(e2))__VA_OPT__(, ) __VA_ARGS__)
+
+#define VELOX_USER_RETURN_EQ(e1, e2, ...) \
+  VELOX_GPU_SHADOW_USER_RETURN_OP(e1, e2, == __VA_OPT__(, ) __VA_ARGS__)
+#define VELOX_USER_RETURN_NE(e1, e2, ...) \
+  VELOX_GPU_SHADOW_USER_RETURN_OP(e1, e2, != __VA_OPT__(, ) __VA_ARGS__)
+#define VELOX_USER_RETURN_LT(e1, e2, ...) \
+  VELOX_GPU_SHADOW_USER_RETURN_OP(e1, e2, < __VA_OPT__(, ) __VA_ARGS__)
+#define VELOX_USER_RETURN_LE(e1, e2, ...) \
+  VELOX_GPU_SHADOW_USER_RETURN_OP(e1, e2, <= __VA_OPT__(, ) __VA_ARGS__)
+#define VELOX_USER_RETURN_GT(e1, e2, ...) \
+  VELOX_GPU_SHADOW_USER_RETURN_OP(e1, e2, > __VA_OPT__(, ) __VA_ARGS__)
+#define VELOX_USER_RETURN_GE(e1, e2, ...) \
+  VELOX_GPU_SHADOW_USER_RETURN_OP(e1, e2, >= __VA_OPT__(, ) __VA_ARGS__)

@@ -36,6 +36,7 @@
 #include "velox/experimental/cudf/functions/GpuExec.h"
 
 #include "velox/common/base/BitUtil.h"
+#include "velox/common/base/Status.h"
 #include "velox/functions/prestosql/Arithmetic.h"
 #include "velox/functions/prestosql/Bitwise.h"
 #include "velox/functions/prestosql/Comparisons.h"
@@ -196,6 +197,19 @@ verifyCountBits(const uint64_t* bits, int32_t begin, int32_t end) {
   return facebook::velox::bits::countBits(bits, begin, end);
 }
 
+/// The Status shadow, which nothing else compiles for the device yet.
+///
+/// Not a registered convention -- GpuUDFHolder still refuses a Status-returning
+/// call() -- but the shadow has to parse and its macros have to mean what the
+/// real ones mean. This is here because the shadow's VELOX_USER_RETURN was
+/// inverted, returning OK() on exactly the condition it exists to report, and
+/// nothing compiled it.
+__device__ facebook::velox::Status verify_user_return(bool shouldFail) {
+  VELOX_USER_RETURN(shouldFail, "device status");
+  VELOX_USER_RETURN_NE(shouldFail, true, "device status ne");
+  return facebook::velox::Status::OK();
+}
+
 } // namespace
 
 // Forces device codegen for every verifier above. Sinks results through a
@@ -247,6 +261,8 @@ __global__ void probeKernel(double* sink, const uint64_t* bits) {
   verify_gte();
   verify_between();
   verify_clamp();
+
+  *sink += verify_user_return(bits[0] != 0).ok() ? 1.0 : 2.0;
 
   verify_bitwise_and();
   verify_bitwise_or();
