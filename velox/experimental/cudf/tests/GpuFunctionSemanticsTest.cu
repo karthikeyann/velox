@@ -33,7 +33,6 @@
 // For FOLLY_ALWAYS_INLINE, which the checked-arithmetic structs carry and
 // which arrives through the shadow rather than from real folly.
 #include "folly/CPortability.h"
-
 #include "velox/functions/lib/CheckedArithmetic.h"
 #include "velox/functions/prestosql/Arithmetic.h"
 
@@ -406,7 +405,10 @@ TEST(GpuFunctionSemanticsTest, aFailedCheckIsRecordedPerRow) {
   for (size_t i = 0; i < cases.size(); ++i) {
     SCOPED_TRACE(fmt::format("case {}: {} + {}", i, cases[i].a, cases[i].b));
     if (shouldRaise[i]) {
-      EXPECT_EQ(got[i].raised, static_cast<uint8_t>(GpuErrorKind::kFailed));
+      // VELOX_ARITHMETIC_ERROR is a VeloxUserError on the real path, which is
+      // the class a TRY is allowed to swallow -- so it has to arrive as one
+      // here, not as the runtime error a VELOX_CHECK would raise.
+      EXPECT_EQ(got[i].raised, static_cast<uint8_t>(GpuErrorKind::kUserError));
     } else {
       // A clean row must not be declined by its neighbour's failure: the byte
       // belongs to one thread, which is what makes the mechanism per row.

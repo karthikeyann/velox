@@ -45,20 +45,31 @@
 /// per launch and per block by construction -- and it is faster to reach.
 namespace facebook::velox::cudf_velox::gpu_sfi {
 
-/// Reasons a row was declined. The host does not render these as messages: it
-/// re-evaluates the declined row through Velox's own CPU evaluator, which
-/// produces the real message, the real error code and the real TRY behaviour.
-/// This exists to make a failure legible in a log or a test, not to be a
-/// second source of truth for error text.
+/// What class of error a declined row hit.
+///
+/// Deliberately not a catalogue of which macro fired. The host recovers the
+/// message, the error code and the TRY behaviour by re-evaluating the row
+/// through Velox's own evaluator, so the only thing this has to carry is what
+/// *policy* needs, and policy needs exactly one distinction:
+///
+///     EvalCtx::setStatus records a user error against the row, where a TRY
+///     may turn it into a null, and VELOX_FAILs anything else on the spot
+///     (EvalCtx.cpp:206-217).
+///
+/// So a user error is suppressible and a runtime error is not, and that is the
+/// whole enum. Splitting it by macro shape instead -- check versus fail versus
+/// unsupported -- looks more informative and has no consumer.
 enum class GpuErrorKind : uint8_t {
   kNone = 0,
-  /// A VELOX_CHECK / VELOX_USER_CHECK whose condition was false.
-  kCheckFailed = 1,
-  /// A VELOX_FAIL / VELOX_USER_FAIL / VELOX_ARITHMETIC_ERROR, unconditional
-  /// where it appears.
-  kFailed = 2,
-  /// A VELOX_NYI or VELOX_UNSUPPORTED.
-  kUnsupported = 3,
+  /// VELOX_USER_CHECK*, VELOX_USER_FAIL, VELOX_ARITHMETIC_ERROR,
+  /// VELOX_SCHEMA_MISMATCH_ERROR: VeloxUserError on the real path, which a
+  /// TRY above this expression is allowed to swallow.
+  kUserError = 1,
+  /// VELOX_CHECK*, VELOX_FAIL, VELOX_UNREACHABLE, VELOX_NYI,
+  /// VELOX_UNSUPPORTED and the uncatchable pair: VeloxRuntimeError, which a
+  /// TRY must not swallow. A row carrying this has to fail the query however
+  /// it is wrapped.
+  kRuntimeError = 2,
 };
 
 /// One byte per thread of the block, carved out of the launch's dynamic shared
@@ -83,8 +94,7 @@ extern __shared__ uint8_t gpuErrorBytes[];
 /// - First failure wins, so the kind describes the earliest rejected
 ///   precondition rather than whatever the damaged arithmetic hit afterwards.
 /// - No atomics and no global memory: a byte belongs to exactly one thread.
-__host__ __device__ inline void gpuRaise(
-    GpuErrorKind kind = GpuErrorKind::kCheckFailed) {
+__host__ __device__ inline void gpuRaise(GpuErrorKind kind) {
 #ifdef __CUDA_ARCH__
   if (gpuErrorBytes[threadIdx.x] == static_cast<uint8_t>(GpuErrorKind::kNone)) {
     gpuErrorBytes[threadIdx.x] = static_cast<uint8_t>(kind);

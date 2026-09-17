@@ -55,10 +55,22 @@ class Status {
   }
 
   /// The real one carries a message built with fmt. Here the message is what
-  /// the host recovers by re-evaluating the row, so a failed Status is just
-  /// the bit that says so.
+  /// the host recovers by re-evaluating the row, so a failed Status carries
+  /// only what the host cannot recover afterwards: whether a TRY above the
+  /// expression is allowed to swallow the row.
   GPU_HOST_DEVICE static Status UserError() {
-    return Status{false};
+    return Status{
+        ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kUserError};
+  }
+
+  GPU_HOST_DEVICE static Status RuntimeError() {
+    return Status{
+        ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kRuntimeError};
+  }
+
+  GPU_HOST_DEVICE ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind
+  errorKind() const {
+    return kind_;
   }
 
   GPU_HOST_DEVICE bool ok() const {
@@ -66,9 +78,13 @@ class Status {
   }
 
  private:
-  GPU_HOST_DEVICE explicit Status(bool ok) : ok_(ok) {}
+  GPU_HOST_DEVICE explicit Status(
+      ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind kind)
+      : ok_(false), kind_(kind) {}
 
   bool ok_{true};
+  ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind kind_{
+      ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kNone};
 };
 
 } // namespace facebook::velox
@@ -80,14 +96,14 @@ class Status {
 // The raise is what lets the host find out: a Status travelling up through
 // GpuUDFHolder would only say "this row has no value", which is what a null
 // says too. See GpuErrorSink.cuh.
-#define VELOX_USER_RETURN(expr, ...)                                      \
-  do {                                                                    \
-    if (static_cast<bool>(expr)) {                                        \
-      ::facebook::velox::gpu_shadow_detail::useArgs(__VA_ARGS__);         \
-      ::facebook::velox::cudf_velox::gpu_sfi::gpuRaise(                   \
-          ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kFailed); \
-      return ::facebook::velox::Status::UserError();                      \
-    }                                                                     \
+#define VELOX_USER_RETURN(expr, ...)                                         \
+  do {                                                                       \
+    if (static_cast<bool>(expr)) {                                           \
+      ::facebook::velox::gpu_shadow_detail::useArgs(__VA_ARGS__);            \
+      ::facebook::velox::cudf_velox::gpu_sfi::gpuRaise(                      \
+          ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kUserError); \
+      return ::facebook::velox::Status::UserError();                         \
+    }                                                                        \
   } while (0)
 
 // The comparison forms. Spark's decimal and arithmetic headers use these, and
@@ -108,3 +124,72 @@ class Status {
   VELOX_GPU_SHADOW_USER_RETURN_OP(e1, e2, > __VA_OPT__(, ) __VA_ARGS__)
 #define VELOX_USER_RETURN_GE(e1, e2, ...) \
   VELOX_GPU_SHADOW_USER_RETURN_OP(e1, e2, >= __VA_OPT__(, ) __VA_ARGS__)
+
+// Returns the caller's status when the condition holds. The class comes from
+// the status itself rather than being assumed, which is why the shadow Status
+// carries one.
+#ifndef VELOX_RETURN_IF
+#define VELOX_RETURN_IF(condition, status)                                    \
+  do {                                                                        \
+    if (static_cast<bool>(condition)) {                                       \
+      ::facebook::velox::cudf_velox::gpu_sfi::gpuRaise((status).errorKind()); \
+      return (status);                                                        \
+    }                                                                         \
+  } while (0)
+#endif
+
+// The real one accepts a Status or a Result<T> through genericToStatus. There
+// is no Result on the device, so this is the Status form only; a body using
+// the other shape cannot be compiled for the device at all.
+#ifndef VELOX_RETURN_NOT_OK
+#define VELOX_RETURN_NOT_OK(status)                  \
+  do {                                               \
+    ::facebook::velox::Status _gpuStatus = (status); \
+    VELOX_RETURN_IF(!_gpuStatus.ok(), _gpuStatus);   \
+  } while (0)
+#endif
+
+// folly::Expected has no device form, so the early return these three perform
+// cannot be spelled here -- there is no value of the caller's return type to
+// construct. They raise and fall through, which leaves the row declined and
+// the body computing a value nobody keeps: the same bargain every check on
+// this path makes, since a raise cannot unwind either. A body that genuinely
+// returns Expected<T> will not compile for the device regardless; these exist
+// so that a header containing one still parses.
+#ifndef VELOX_RETURN_UNEXPECTED_IF
+#define VELOX_RETURN_UNEXPECTED_IF(condition, status)                        \
+  do {                                                                       \
+    if (static_cast<bool>(condition)) {                                      \
+      ::facebook::velox::cudf_velox::gpu_sfi::gpuRaise(                      \
+          ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kUserError); \
+    }                                                                        \
+  } while (0)
+#endif
+
+#ifndef VELOX_RETURN_UNEXPECTED_NOT_OK
+#define VELOX_RETURN_UNEXPECTED_NOT_OK(status)          \
+  do {                                                  \
+    ::facebook::velox::Status _gpuStatus = (status);    \
+    if (!_gpuStatus.ok()) {                             \
+      ::facebook::velox::cudf_velox::gpu_sfi::gpuRaise( \
+          _gpuStatus.errorKind());                      \
+    }                                                   \
+  } while (0)
+#endif
+
+#ifndef VELOX_RETURN_UNEXPECTED
+#define VELOX_RETURN_UNEXPECTED(expected)                                      \
+  do {                                                                         \
+    auto _gpuExpected = (expected);                                            \
+    VELOX_RETURN_UNEXPECTED_IF(_gpuExpected.hasError(), _gpuExpected.error()); \
+  } while (0)
+#endif
+
+#ifndef VELOX_USER_RETURN_NULL
+#define VELOX_USER_RETURN_NULL(e, ...) \
+  VELOX_USER_RETURN((e) == nullptr __VA_OPT__(, ) __VA_ARGS__)
+#endif
+#ifndef VELOX_USER_RETURN_NOT_NULL
+#define VELOX_USER_RETURN_NOT_NULL(e, ...) \
+  VELOX_USER_RETURN((e) != nullptr __VA_OPT__(, ) __VA_ARGS__)
+#endif
