@@ -37,6 +37,7 @@ std::unique_ptr<cudf::column> launcherA(
     const GpuFunctionInstance&,
     cudf::size_type,
     cudf::data_type,
+    uint8_t*,
     cuda::stream_ref,
     rmm::device_async_resource_ref) {
   return nullptr;
@@ -47,6 +48,7 @@ std::unique_ptr<cudf::column> launcherB(
     const GpuFunctionInstance&,
     cudf::size_type,
     cudf::data_type,
+    uint8_t*,
     cuda::stream_ref,
     rmm::device_async_resource_ref) {
   return nullptr;

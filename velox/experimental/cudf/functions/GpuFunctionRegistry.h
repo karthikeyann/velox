@@ -83,11 +83,20 @@ struct GpuFunctionInstance {
 /// Evaluates one registered function over a row range. Instantiated behind the
 /// shadow boundary, one per (function, argument types) combination, the way
 /// SimpleFunctionAdapterFactoryImpl is instantiated per UDFHolder.
+///
+/// `declinedRows` is one byte per row, zeroed by the caller, in which the
+/// launch records the rows whose checks failed as a gpu_sfi::GpuErrorKind. A
+/// null pointer turns error collection off, which is what the check sites test
+/// before doing any work. The row's output value is meaningless when its byte
+/// is non-zero, and its validity bit is cleared, so a caller that ignores this
+/// buffer sees a null rather than the garbage a rejected precondition
+/// produced.
 using GpuLaunchFn = std::unique_ptr<cudf::column> (*)(
     const std::vector<GpuArgView>& arguments,
     const GpuFunctionInstance& instance,
     cudf::size_type numRows,
     cudf::data_type outputType,
+    uint8_t* declinedRows,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 

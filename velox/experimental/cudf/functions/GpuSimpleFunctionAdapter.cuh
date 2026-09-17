@@ -28,6 +28,7 @@
 // Only includable from a translation unit compiled with the gpu_shadows/
 // include path.
 
+#include "velox/experimental/cudf/functions/GpuErrorSink.cuh"
 #include "velox/experimental/cudf/functions/GpuExec.h"
 #include "velox/experimental/cudf/functions/GpuFunctionRegistry.h"
 #include "velox/experimental/cudf/functions/GpuVariadicView.h"
@@ -408,17 +409,32 @@ __device__ inline auto slotNullableArg(
 /// pointers and passes them through, a null pointer meaning a null input. A
 /// view is passed by value in either case -- there is no "absent pack" for a
 /// pointer to express.
+/// Clears this thread's error byte. Shared memory is not zeroed for you, and a
+/// byte left over from a previous block scheduled on the same shared memory
+/// would decline a row that did nothing wrong.
+__device__ inline void clearRaisedError() {
+  gpuErrorBytes[threadIdx.x] = static_cast<uint8_t>(GpuErrorKind::kNone);
+}
+
+/// Reads what the body recorded, if anything. The check sites write here
+/// because it is the only state they can reach (GpuErrorSink.cuh).
+__device__ inline GpuErrorKind raisedError() {
+  return static_cast<GpuErrorKind>(gpuErrorBytes[threadIdx.x]);
+}
+
 template <typename Holder, typename TOut, typename... TIn, std::size_t... I>
 __device__ void evaluateRow(
     typename Holder::udf_struct_t fn,
     TOut* out,
     bool* valid,
+    uint8_t* declinedRows,
     const GpuArgView* arguments,
     int32_t numArgs,
     cudf::size_type row,
     std::index_sequence<I...>) {
   TOut result{};
 
+  bool ok;
   if constexpr (Holder::isDefaultNullBehavior) {
     // call() and callNullFree() are never shown a null.
     if ((slotIsNull<TIn>(arguments, I, row) || ...)) {
@@ -427,24 +443,35 @@ __device__ void evaluateRow(
       }
       return;
     }
-    bool const ok =
+    ok =
         Holder::invoke(fn, result, slotArg<TIn>(arguments, numArgs, I, row)...);
-    if (ok) {
-      out[row] = result;
-    }
-    if (valid != nullptr) {
-      valid[row] = ok;
-    }
   } else {
     // callNullable() asked to see nulls, which arrive as null pointers.
-    bool const ok = Holder::invokeNullable(
+    ok = Holder::invokeNullable(
         fn, result, slotNullableArg<TIn>(arguments, numArgs, I, row)...);
-    if (ok) {
-      out[row] = result;
+  }
+
+  // A declined row's result was computed from data a check rejected, so it is
+  // not written even though the body produced one. Declining and returning
+  // false are different things that both end in a null here: false is the
+  // function saying "no value for this row", declined is "this row has an
+  // error the host still has to raise".
+  //
+  // Only when the caller is collecting. Without a buffer to record it in,
+  // nulling the row would turn an error the CPU raises into a null nobody
+  // asked for, so the launch keeps the behaviour it has today.
+  if (declinedRows != nullptr) {
+    auto const raised = raisedError();
+    if (raised != GpuErrorKind::kNone) {
+      declinedRows[row] = static_cast<uint8_t>(raised);
+      ok = false;
     }
-    if (valid != nullptr) {
-      valid[row] = ok;
-    }
+  }
+  if (ok) {
+    out[row] = result;
+  }
+  if (valid != nullptr) {
+    valid[row] = ok;
   }
 }
 
@@ -453,9 +480,14 @@ __global__ void simpleFunctionKernel(
     typename Holder::udf_struct_t fn,
     TOut* out,
     bool* valid,
+    uint8_t* declinedRows,
     const GpuArgView* arguments,
     int32_t numArgs,
     cudf::size_type numRows) {
+  // Before the bounds check: every thread of the block owns a byte whether or
+  // not it has a row, and leaving one uninitialized would be read by nobody
+  // today and by the wrong person tomorrow.
+  clearRaisedError();
   auto const row = static_cast<cudf::size_type>(
       blockIdx.x * static_cast<unsigned>(blockDim.x) + threadIdx.x);
   if (row >= numRows) {
@@ -465,6 +497,7 @@ __global__ void simpleFunctionKernel(
       fn,
       out,
       valid,
+      declinedRows,
       arguments,
       numArgs,
       row,
@@ -485,6 +518,7 @@ struct GpuSimpleFunctionAdapter {
       const GpuFunctionInstance& instance,
       cudf::size_type numRows,
       cudf::data_type outputType,
+      uint8_t* declinedRows,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) {
     // The instance is typed again here, in the only translation unit that can
@@ -512,7 +546,10 @@ struct GpuSimpleFunctionAdapter {
         arguments.begin(), arguments.end(), [](const GpuArgView& argument) {
           return argument.nullMask != nullptr;
         });
-    auto const needsValidity = anyNullable || !Holder::alwaysSucceeds;
+    // A declined row is nulled, so collecting errors makes validity necessary
+    // even for a function that can otherwise never produce one.
+    auto const needsValidity =
+        anyNullable || !Holder::alwaysSucceeds || declinedRows != nullptr;
 
     rmm::device_uvector<bool> valid(
         needsValidity ? numRows : 0,
@@ -523,10 +560,19 @@ struct GpuSimpleFunctionAdapter {
         Holder,
         TOut,
         typename gpu::GpuExec::resolver<TArgs>::in_type...>
-        <<<detail::gridSize(numRows), detail::kBlockSize, 0, stream.get()>>>(
+        // One byte of dynamic shared memory per thread, which is where a check
+        // site several frames down records a failure. Requested
+        // unconditionally: the check sites cannot see whether this launch is
+        // collecting, so the region has to exist for them either way. At one
+        // byte per thread it costs nothing an occupancy calculator notices.
+        <<<detail::gridSize(numRows),
+           detail::kBlockSize,
+           detail::kBlockSize * sizeof(uint8_t),
+           stream.get()>>>(
             fn,
             out->mutable_view().template data<TOut>(),
             needsValidity ? valid.data() : nullptr,
+            declinedRows,
             deviceArguments.data(),
             static_cast<int32_t>(arguments.size()),
             numRows);

@@ -285,7 +285,17 @@ ColumnOrView GpuSfiExpression::eval(
   const GpuFunctionInstance instance{
       instance_.empty() ? nullptr : instance_.data(),
       static_cast<int32_t>(instance_.size())};
-  return launch_(argViews, instance, numRows, outputType_, stream, mr);
+  // Not collecting: the policy that decides what to do with a declined row
+  // lives above this node, and until it exists a launch behaves as it did
+  // before -- see GPU_SFI_ERROR_DESIGN.md.
+  return launch_(
+      argViews,
+      instance,
+      numRows,
+      outputType_,
+      /*declinedRows=*/nullptr,
+      stream,
+      mr);
 }
 
 void GpuSfiExpression::close() {

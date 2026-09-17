@@ -16,139 +16,169 @@
 
 // GPU shadow for velox/common/base/Exceptions.h
 //
-// =========================================================================
-// KNOWN LIMITATION: VELOX_CHECK* macros are currently silent no-ops on GPU.
-// =========================================================================
+// Real Velox throws VeloxException on a failed check. A kernel cannot throw
+// and cannot unwind, so the device form of a check is: evaluate the condition,
+// and on failure record that this row was declined and keep going.
 //
-// Real Velox throws `VeloxException` on a failed check. C++ exceptions are
-// not supported on CUDA device code (you cannot `throw` from inside a
-// kernel and unwind across thread blocks), so a direct port of the
-// throwing semantics is impossible.
+// What that means for a function body, and why:
 //
-// In this MVP foundation PR the macros expand to a no-op variadic
-// helper `useArgs(args...)`. The helper:
+//   * The condition is evaluated. It used to be discarded, which is what made
+//     every check on this path silent. This is the cost of error reporting and
+//     it is paid on the happy path, by every row.
 //
-//   * uses each argument (via pass-by-const-ref) so locals computed
-//     solely to feed a check (e.g. `upperBound` in
-//     `BitCountFunction::call`) don't trigger unused-variable warnings,
-//     and parameters in `FOLLY_ALWAYS_INLINE` helpers like `checkRadix`
-//     are not flagged as "set but never used" by nvcc warning #550-D;
-//   * is `constexpr` and inline-empty, so under optimization the call
-//     itself disappears -- only the argument evaluation (reading a
-//     register or literal) remains, which is essentially free for the
-//     simple expressions that Velox check sites use.
+//   * A failed check does not return. There is no way to leave a nested device
+//     frame early, so the body runs on with data a check has just rejected and
+//     produces a value from it. That value is garbage and the host discards
+//     the row -- see GpuErrorSink.cuh. It is the same garbage the body
+//     produced before this mechanism existed; the difference is that it is no
+//     longer silent.
 //
-// We deliberately do NOT wrap this in `sizeof(...)` (an unevaluated
-// context). That would suppress the runtime evaluation but causes nvcc
-// to emit "parameter set but never used" warnings on host helpers
-// whose entire body is a check.
+//   * The message is dropped. The host does not render the recorded kind as
+//     user-visible text: it re-evaluates the declined row through Velox's own
+//     CPU evaluator, which produces the real message, the real error code, and
+//     the real TRY behaviour with nothing duplicated here. Formatting on the
+//     device would mean a second copy of every format string, kept in step by
+//     hand.
 //
-// Any Velox SFI `call()` body that relies on VELOX_USER_CHECK for input
-// validation (e.g. `BitCountFunction` requires `2 <= bits <= 64`,
-// `DivideFunction` checks for divide-by-zero) will SILENTLY produce a
-// wrong result on GPU when the precondition fails.
+//   * VELOX_DCHECK* stay no-ops, matching a release CPU build.
 //
-// PLANNED RESOLUTION (PR 3+ / GpuSimpleFunctionAdapter):
-// The adapter that wraps `Fn::call()` into a CUDA kernel will introduce
-// a per-row error-propagation mechanism. Concretely, one of:
-//   - A per-row `gpu_error_t` argument threaded into the macro body,
-//     so a failed check flips the output row's null bit and records an
-//     error code that the host inspects post-kernel.
-//   - A device-side error flag with a status word, returned to the
-//     host through a stream-scoped status buffer.
-//
-// Until that lands, treat these macros as advisory documentation of
-// preconditions that GPU callers must enforce upstream (input filtering,
-// null mask combining, etc.) before invoking a `Fn<GpuExec>::call()`.
-//
-// Grep `TODO(gpu-sfi-checks)` to find every site that needs an update
-// when the error-propagation design lands.
+// See GPU_SFI_ERROR_DESIGN.md for the design and the options rejected.
 #pragma once
+
+#include "velox/experimental/cudf/functions/GpuErrorSink.cuh"
 
 namespace facebook::velox::gpu_shadow_detail {
 
-// Variadic no-op consumer used by the VELOX_CHECK* shadow macros. The
-// function body is empty; under optimization the call is elided and
-// only the (cheap) argument evaluation remains. Pass-by-const-ref
-// ensures both unused-variable warnings AND "parameter set but never
-// used" warnings on host helpers are suppressed.
+// Variadic no-op consumer for the message arguments of a check. They are not
+// formatted on the device, but they have to be *used*, or a local computed
+// only to feed a check draws an unused-variable warning, and a parameter used
+// only by a check in a FOLLY_ALWAYS_INLINE helper draws nvcc warning #550-D.
+//
+// Pass-by-const-ref, and called only on the failure path: the condition itself
+// already uses the operands, so nothing needs to be evaluated twice.
 template <typename... Ts>
-constexpr void useArgs(const Ts&...) {}
+__host__ __device__ constexpr void useArgs(const Ts&...) {}
 
 } // namespace facebook::velox::gpu_shadow_detail
 
-// Shared expansion for all no-op check macros. We evaluate each
-// argument (essentially free for the simple expressions Velox uses)
-// and discard the result. See file-level header for the trade-off
-// rationale (`sizeof` unevaluated context would be cheaper but causes
-// nvcc warning #550-D on host helpers whose body is purely checks).
+// A check whose condition failed.
+#define VELOX_GPU_SHADOW_CHECK(cond, ...)                                      \
+  do {                                                                         \
+    if (!(cond)) {                                                             \
+      ::facebook::velox::gpu_shadow_detail::useArgs(__VA_ARGS__);              \
+      ::facebook::velox::cudf_velox::gpu_sfi::gpuRaise(                        \
+          ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kCheckFailed); \
+    }                                                                          \
+  } while (0)
+
+// The binary-comparison forms. The operands are used by the condition, so only
+// the message arguments go to useArgs.
+#define VELOX_GPU_SHADOW_CHECK_OP(a, b, op, ...) \
+  VELOX_GPU_SHADOW_CHECK((a)op(b) __VA_OPT__(, ) __VA_ARGS__)
+
+// An unconditional failure: VELOX_FAIL and friends.
+#define VELOX_GPU_SHADOW_FAIL(kind, ...)                        \
+  do {                                                          \
+    ::facebook::velox::gpu_shadow_detail::useArgs(__VA_ARGS__); \
+    ::facebook::velox::cudf_velox::gpu_sfi::gpuRaise(kind);     \
+  } while (0)
+
+// Retained for the debug-only macros below, which stay silent.
 #define VELOX_GPU_SHADOW_NOOP_CHECK(...) \
   ::facebook::velox::gpu_shadow_detail::useArgs(__VA_ARGS__)
 
-// TODO(gpu-sfi-checks): wire into per-row error-propagation in adapter.
 #ifndef VELOX_CHECK
-#define VELOX_CHECK(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_CHECK(...) VELOX_GPU_SHADOW_CHECK(__VA_ARGS__)
 #endif
 #ifndef VELOX_CHECK_EQ
-#define VELOX_CHECK_EQ(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_CHECK_EQ(a, b, ...) \
+  VELOX_GPU_SHADOW_CHECK_OP(a, b, == __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_CHECK_NE
-#define VELOX_CHECK_NE(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_CHECK_NE(a, b, ...) \
+  VELOX_GPU_SHADOW_CHECK_OP(a, b, != __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_CHECK_LT
-#define VELOX_CHECK_LT(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_CHECK_LT(a, b, ...) \
+  VELOX_GPU_SHADOW_CHECK_OP(a, b, < __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_CHECK_LE
-#define VELOX_CHECK_LE(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_CHECK_LE(a, b, ...) \
+  VELOX_GPU_SHADOW_CHECK_OP(a, b, <= __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_CHECK_GT
-#define VELOX_CHECK_GT(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_CHECK_GT(a, b, ...) \
+  VELOX_GPU_SHADOW_CHECK_OP(a, b, > __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_CHECK_GE
-#define VELOX_CHECK_GE(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_CHECK_GE(a, b, ...) \
+  VELOX_GPU_SHADOW_CHECK_OP(a, b, >= __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_CHECK_NOT_NULL
-#define VELOX_CHECK_NOT_NULL(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_CHECK_NOT_NULL(p, ...) \
+  VELOX_GPU_SHADOW_CHECK((p) != nullptr __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_CHECK_NULL
-#define VELOX_CHECK_NULL(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_CHECK_NULL(p, ...) \
+  VELOX_GPU_SHADOW_CHECK((p) == nullptr __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_FAIL
-#define VELOX_FAIL(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_FAIL(...)                                             \
+  VELOX_GPU_SHADOW_FAIL(                                            \
+      ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kFailed \
+          __VA_OPT__(, ) __VA_ARGS__)
 #endif
 
+// Deliberately not __builtin_unreachable(). A body that reaches this has been
+// wrong about something, and telling the optimizer it cannot happen turns that
+// into undefined behaviour for the whole launch rather than one declined row.
 #ifndef VELOX_UNREACHABLE
-#define VELOX_UNREACHABLE(...) __builtin_unreachable()
+#define VELOX_UNREACHABLE(...)                                      \
+  VELOX_GPU_SHADOW_FAIL(                                            \
+      ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kFailed \
+          __VA_OPT__(, ) __VA_ARGS__)
 #endif
 
 #ifndef VELOX_USER_CHECK
-#define VELOX_USER_CHECK(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_USER_CHECK(...) VELOX_GPU_SHADOW_CHECK(__VA_ARGS__)
 #endif
 #ifndef VELOX_USER_CHECK_EQ
-#define VELOX_USER_CHECK_EQ(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_USER_CHECK_EQ(a, b, ...) \
+  VELOX_GPU_SHADOW_CHECK_OP(a, b, == __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_USER_CHECK_NE
-#define VELOX_USER_CHECK_NE(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_USER_CHECK_NE(a, b, ...) \
+  VELOX_GPU_SHADOW_CHECK_OP(a, b, != __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_USER_CHECK_LT
-#define VELOX_USER_CHECK_LT(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_USER_CHECK_LT(a, b, ...) \
+  VELOX_GPU_SHADOW_CHECK_OP(a, b, < __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_USER_CHECK_LE
-#define VELOX_USER_CHECK_LE(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_USER_CHECK_LE(a, b, ...) \
+  VELOX_GPU_SHADOW_CHECK_OP(a, b, <= __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_USER_CHECK_GT
-#define VELOX_USER_CHECK_GT(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_USER_CHECK_GT(a, b, ...) \
+  VELOX_GPU_SHADOW_CHECK_OP(a, b, > __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_USER_CHECK_GE
-#define VELOX_USER_CHECK_GE(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_USER_CHECK_GE(a, b, ...) \
+  VELOX_GPU_SHADOW_CHECK_OP(a, b, >= __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_USER_CHECK_NOT_NULL
-#define VELOX_USER_CHECK_NOT_NULL(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_USER_CHECK_NOT_NULL(p, ...) \
+  VELOX_GPU_SHADOW_CHECK((p) != nullptr __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_USER_FAIL
-#define VELOX_USER_FAIL(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_USER_FAIL(...)                                        \
+  VELOX_GPU_SHADOW_FAIL(                                            \
+      ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kFailed \
+          __VA_OPT__(, ) __VA_ARGS__)
 #endif
 
+// Debug-only on the CPU, and compiled out of a release build there. Left
+// silent here for the same reason.
 #ifndef VELOX_DCHECK
 #define VELOX_DCHECK(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
 #endif
@@ -174,13 +204,21 @@ constexpr void useArgs(const Ts&...) {}
 #define VELOX_DCHECK_NOT_NULL(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
 #endif
 
-// TODO(gpu-sfi-checks): wire into per-row error-propagation in adapter.
 #ifndef VELOX_NYI
-#define VELOX_NYI(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_NYI(...)                                                   \
+  VELOX_GPU_SHADOW_FAIL(                                                 \
+      ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kUnsupported \
+          __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_UNSUPPORTED
-#define VELOX_UNSUPPORTED(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_UNSUPPORTED(...)                                           \
+  VELOX_GPU_SHADOW_FAIL(                                                 \
+      ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kUnsupported \
+          __VA_OPT__(, ) __VA_ARGS__)
 #endif
 #ifndef VELOX_ARITHMETIC_ERROR
-#define VELOX_ARITHMETIC_ERROR(...) VELOX_GPU_SHADOW_NOOP_CHECK(__VA_ARGS__)
+#define VELOX_ARITHMETIC_ERROR(...)                                 \
+  VELOX_GPU_SHADOW_FAIL(                                            \
+      ::facebook::velox::cudf_velox::gpu_sfi::GpuErrorKind::kFailed \
+          __VA_OPT__(, ) __VA_ARGS__)
 #endif
