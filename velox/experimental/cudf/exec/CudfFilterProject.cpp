@@ -187,13 +187,15 @@ void CudfFilterProject::initialize() {
   // lifetime.
   auto* const queryCtx = operatorCtx_->execCtx()->queryCtx();
   auto* const pool = operatorCtx_->pool();
+  inputRowType_ = inputType;
   const auto optimizeAndCompile =
-      [inputType, queryCtx, pool](const core::TypedExprPtr& expr) {
+      [this, inputType, queryCtx, pool](const core::TypedExprPtr& expr) {
+        auto optimized = expression::optimize(expr, queryCtx, pool);
+        // Kept for the CPU re-run, so that path evaluates the same tree the
+        // GPU compiled rather than one folded a second time.
+        cpuExprSource_.push_back(optimized);
         return createCudfExpression(
-            expression::optimize(expr, queryCtx, pool),
-            inputType,
-            pool,
-            queryCtx->queryConfig());
+            optimized, inputType, pool, queryCtx->queryConfig());
       };
   if (hasFilter_) {
     // First expr is Filter, rest are Project.
@@ -215,6 +217,132 @@ void CudfFilterProject::initialize() {
   project_.reset();
 }
 
+/// Builds the operator's output from CPU results, mirroring what project()
+/// does on the device: computed expressions land on their result channels,
+/// pass-through columns are copied from the input, and `selected` is the
+/// filter's verdict.
+///
+/// Assembled by hand rather than through Operator::fillOutput because
+/// CudfFilterProject declares its own resultProjections_ and
+/// identityProjections_, shadowing the base class's, so the base sees empty
+/// ones.
+RowVectorPtr CudfFilterProject::assembleCpuOutput(
+    const RowVectorPtr& hostInput,
+    std::vector<VectorPtr>& results,
+    const SelectivityVector& selected,
+    cuda::stream_ref stream) {
+  auto* const pool = operatorCtx_->pool();
+  const auto numSelected = selected.countSelected();
+
+  // Row numbers the filter kept, so every column can be gathered the same way.
+  BufferPtr indices = allocateIndices(numSelected, pool);
+  auto* rawIndices = indices->asMutable<vector_size_t>();
+  vector_size_t next = 0;
+  selected.applyToSelected(
+      [&](vector_size_t row) { rawIndices[next++] = row; });
+
+  // Whatever encoding Velox produced is left alone: toCudfTable exports
+  // through Arrow with flattenDictionary and flattenConstant set, which is how
+  // every other conversion in this operator handles encodings.
+  const auto wrap = [&](const VectorPtr& source) -> VectorPtr {
+    if (numSelected == source->size()) {
+      return source;
+    }
+    return BaseVector::wrapInDictionary(
+        /*nulls=*/nullptr, indices, numSelected, source);
+  };
+
+  std::vector<VectorPtr> children(outputType_->size());
+  for (const auto& projection : resultProjections_) {
+    // inputChannel is the index initialize() gave this projection in the
+    // expression list, which is the order cpuExprs_ evaluates and therefore
+    // the order of `results`. It already accounts for the filter sitting at
+    // index 0 when there is one.
+    children[projection.outputChannel] = wrap(results[projection.inputChannel]);
+  }
+  for (const auto& identity : identityProjections_) {
+    children[identity.outputChannel] =
+        wrap(hostInput->childAt(identity.inputChannel));
+  }
+
+  auto output = std::make_shared<RowVector>(
+      pool, outputType_, nullptr, numSelected, std::move(children));
+
+  // The operator's contract is a CudfVector: everything downstream casts to
+  // one. So the CPU answer goes back to the device.
+  auto table = with_arrow::toCudfTable(output, pool, stream, get_output_mr());
+  return std::make_shared<CudfVector>(
+      pool, outputType_, numSelected, std::move(table), stream);
+}
+
+RowVectorPtr CudfFilterProject::evaluateOnCpu(
+    std::vector<std::unique_ptr<cudf::column>> columns,
+    bool applyFilter,
+    cuda::stream_ref stream) {
+  // Velox's own evaluator is the point of this path. It produces the message,
+  // the error code and the user-versus-runtime distinction, and it narrows
+  // rows through any conditional in the tree -- so a row the GPU declined
+  // eagerly, that a conditional above it would have discarded, raises nothing
+  // here. Nothing about Velox's error behaviour is reimplemented.
+  std::vector<cudf::column_view> views;
+  views.reserve(columns.size());
+  for (const auto& column : columns) {
+    views.push_back(column->view());
+  }
+
+  // The whole input schema, not the fields the expression reads: FieldReference
+  // resolves by index into the row, so a narrowed vector would misbind.
+  // The overload that takes the type rather than a name prefix: field names
+  // have to be the input's, because a FieldReference in the expression
+  // resolves by name and would otherwise not find its column.
+  auto hostInput = with_arrow::toVeloxColumn(
+      cudf::table_view{views},
+      operatorCtx_->pool(),
+      std::static_pointer_cast<const Type>(inputRowType_),
+      stream,
+      get_temp_mr());
+  stream.sync();
+
+  auto* const execCtx = operatorCtx_->execCtx();
+  if (cpuExprs_ == nullptr) {
+    // Built on first use: most queries never reach this path, and building an
+    // ExprSet does constant folding.
+    auto source = cpuExprSource_;
+    cpuExprs_ = velox::exec::makeExprSetFromFlag(std::move(source), execCtx);
+  }
+
+  velox::exec::LocalSelectivityVector rowsHolder(*execCtx, hostInput->size());
+  auto* const rows = rowsHolder.get();
+  rows->setAll();
+  velox::exec::EvalCtx evalCtx(execCtx, cpuExprs_.get(), hostInput.get());
+
+  std::vector<VectorPtr> results;
+  cpuExprs_->eval(*rows, evalCtx, results);
+
+  // Reaching here means the row the GPU declined does not raise on the CPU,
+  // which is the conditional-masking case: the answer is the CPU's, and the
+  // GPU result for this batch is discarded.
+  auto selected = rowsHolder.get();
+  if (applyFilter) {
+    const auto& filterResult = results.front();
+    velox::exec::LocalSelectivityVector filteredHolder(
+        *execCtx, hostInput->size());
+    auto* const filtered = filteredHolder.get();
+    filtered->clearAll();
+    auto* const decoded = filterResult->as<SimpleVector<bool>>();
+    VELOX_CHECK_NOT_NULL(
+        decoded, "A filter must evaluate to a flat boolean on the CPU path");
+    for (vector_size_t row = 0; row < hostInput->size(); ++row) {
+      if (!decoded->isNullAt(row) && decoded->valueAt(row)) {
+        filtered->setValid(row, true);
+      }
+    }
+    filtered->updateBounds();
+    return assembleCpuOutput(hostInput, results, *filtered, stream);
+  }
+  return assembleCpuOutput(hostInput, results, *selected, stream);
+}
+
 void CudfFilterProject::doAddInput(RowVectorPtr input) {
   input_ = std::move(input);
 }
@@ -234,13 +362,31 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
   auto inputTableColumns = cudfInput->release()->release();
   auto outputSize = input_->size();
 
-  if (hasFilter_) {
-    filter(inputTableColumns, stream);
+  if (hasFilter_ && !filter(inputTableColumns, stream)) {
+    // The filter declined a row, and its own error is the one to raise, so
+    // the CPU redoes the filter as well as the projections.
+    auto output = evaluateOnCpu(
+        std::move(inputTableColumns), /*applyFilter=*/true, stream);
+    // Retired here as on every other path out of this function. The columns
+    // were released from the CudfVector above, so a second visit to the same
+    // input would dereference the null table it now holds.
+    input_.reset();
+    return output;
   }
   if (!inputTableColumns.empty()) {
     outputSize = inputTableColumns.front()->size();
   }
-  auto outputColumns = project(inputTableColumns, stream);
+  auto projected = project(inputTableColumns, stream);
+  if (!projected.has_value()) {
+    // A projection declined. The filter has already run, so the rows in hand
+    // are the survivors -- which is what the projections were evaluated over,
+    // and re-projecting the survivors is what the CPU operator does too.
+    auto output = evaluateOnCpu(
+        std::move(inputTableColumns), /*applyFilter=*/false, stream);
+    input_.reset();
+    return output;
+  }
+  auto outputColumns = std::move(projected).value();
 
   auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
   auto const numColumns = outputTable->num_columns();
@@ -259,7 +405,7 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
   return cudfOutput;
 }
 
-void CudfFilterProject::filter(
+bool CudfFilterProject::filter(
     std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
     cuda::stream_ref stream) {
   // Evaluate the Filter
@@ -268,8 +414,15 @@ void CudfFilterProject::filter(
   for (auto& col : inputTableColumns) {
     inputViews.push_back(col->view());
   }
+  gpu_sfi::GpuSfiErrors errors(stream, get_temp_mr());
   auto filterColumn =
-      filterEvaluator_->eval(inputViews, stream, get_temp_mr(), true);
+      filterEvaluator_->eval(inputViews, stream, get_temp_mr(), true, &errors);
+  // Before the retention mask: a declined row is nulled, and a null row is
+  // dropped, so this is the last point at which the row still exists and the
+  // input is still whole.
+  if (errors.resolve() != gpu_sfi::ErrorClass::kNone) {
+    return false;
+  }
   auto filterColumnView = asView(filterColumn);
   bool shouldApplyFilter = [&]() {
     if (filterColumnView.has_nulls()) {
@@ -294,9 +447,11 @@ void CudfFilterProject::filter(
         *filterTable, filterColumnView, stream, get_output_mr());
     inputTableColumns = filteredTable->release();
   }
+  return true;
 }
 
-std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
+std::optional<std::vector<std::unique_ptr<cudf::column>>>
+CudfFilterProject::project(
     std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
     cuda::stream_ref stream) {
   std::vector<cudf::column_view> inputViews;
@@ -306,8 +461,14 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
   }
   std::vector<ColumnOrView> columns;
   for (auto& projectEvaluator : projectEvaluators_) {
-    columns.push_back(
-        projectEvaluator->eval(inputViews, stream, get_output_mr(), true));
+    gpu_sfi::GpuSfiErrors errors(stream, get_temp_mr());
+    columns.push_back(projectEvaluator->eval(
+        inputViews, stream, get_output_mr(), true, &errors));
+    // Checked per projection so the later ones are never launched, and so the
+    // input columns are still whole -- the identity moves below have not run.
+    if (errors.resolve() != gpu_sfi::ErrorClass::kNone) {
+      return std::nullopt;
+    }
   }
 
   // Rearrange columns to match outputType_

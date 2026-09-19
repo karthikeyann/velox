@@ -27,7 +27,12 @@
 #include "velox/expression/SignatureBinder.h"
 #include "velox/type/TypeCoercer.h"
 
+#include <cudf/aggregation.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
+
+#include <rmm/device_uvector.hpp>
 
 #include <algorithm>
 
@@ -50,6 +55,38 @@ bool hasNullLiteralArgument(const core::TypedExprPtr& expr) {
     }
   }
   return false;
+}
+
+/// True when `entry` was compiled for exactly these physical types.
+///
+/// A variadic tail repeats its element kind, matching how the signature
+/// spells one type for any number of trailing arguments.
+bool physicalTypesMatch(
+    const gpu_sfi::GpuFunctionEntry& entry,
+    const std::vector<TypePtr>& argumentTypes,
+    const TypePtr& returnType) {
+  if (entry.returnKind != returnType->kind()) {
+    return false;
+  }
+  if (entry.argumentKinds.empty()) {
+    // Registered before kinds were recorded, or a function with no arguments.
+    return argumentTypes.empty();
+  }
+  const auto fixed = entry.signature->variableArity()
+      ? entry.argumentKinds.size() - 1
+      : entry.argumentKinds.size();
+  if (entry.signature->variableArity() ? argumentTypes.size() < fixed
+                                       : argumentTypes.size() != fixed) {
+    return false;
+  }
+  for (std::size_t i = 0; i < argumentTypes.size(); ++i) {
+    const auto expected =
+        i < fixed ? entry.argumentKinds[i] : entry.argumentKinds.back();
+    if (argumentTypes[i]->kind() != expected) {
+      return false;
+    }
+  }
+  return true;
 }
 
 const gpu_sfi::GpuFunctionEntry* resolve(const core::TypedExprPtr& expr) {
@@ -90,9 +127,18 @@ const gpu_sfi::GpuFunctionEntry* resolve(const core::TypedExprPtr& expr) {
     // Binding proves the arguments fit; the return type still has to be the one
     // the plan expects, since a bound generic could resolve to something else.
     const auto returnType = binder.tryResolveReturnType();
-    if (returnType != nullptr && returnType->equivalent(*expr->type())) {
-      return &entry;
+    if (returnType == nullptr || !returnType->equivalent(*expr->type())) {
+      continue;
     }
+    // And the kernel has to have been compiled for these physical types. A
+    // decimal signature says decimal(i1,i5) whether the storage is int64 or
+    // int128, so binding cannot tell a short-decimal kernel from a long one;
+    // picking the wrong one reads the wrong width and returns arithmetic on
+    // fragments of its operands.
+    if (!physicalTypesMatch(entry, argumentTypes, returnType)) {
+      continue;
+    }
+    return &entry;
   }
   return nullptr;
 }
@@ -243,13 +289,14 @@ ColumnOrView GpuSfiExpression::eval(
     std::vector<cudf::column_view> inputColumnViews,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
-    bool /*finalize*/) {
+    bool /*finalize*/,
+    gpu_sfi::GpuSfiErrors* errors) {
   // Results of delegated children have to outlive the launch.
   std::vector<ColumnOrView> subexpressionResults;
   subexpressionResults.reserve(subexpressions_.size());
   for (const auto& subexpression : subexpressions_) {
-    subexpressionResults.push_back(
-        subexpression->eval(inputColumnViews, stream, mr));
+    subexpressionResults.push_back(subexpression->eval(
+        inputColumnViews, stream, mr, /*finalize=*/false, errors));
   }
 
   std::vector<GpuArgView> argViews;
@@ -285,17 +332,28 @@ ColumnOrView GpuSfiExpression::eval(
   const GpuFunctionInstance instance{
       instance_.empty() ? nullptr : instance_.data(),
       static_cast<int32_t>(instance_.size())};
-  // Not collecting: the policy that decides what to do with a declined row
-  // lives above this node, and until it exists a launch behaves as it did
-  // before -- see GPU_SFI_ERROR_DESIGN.md.
+  if (errors == nullptr) {
+    // Nobody above can act on a declined row, so the launch behaves as it
+    // always has rather than nulling a row whose error would go unreported.
+    // Passing a buffer here and dropping it would turn an error into a
+    // different answer, which is worse. See GPU_SFI_ERROR_DESIGN.md.
+    return launch_(
+        argViews,
+        instance,
+        numRows,
+        outputType_,
+        /*declinedRows=*/nullptr,
+        stream,
+        mr);
+  }
+
+  // The buffer belongs to the scope, not to this launch: every launch under
+  // one evaluation records into the same one, so what the owner reads is the
+  // union over the whole tree. No reduction and no read here -- reading a
+  // device scalar synchronises the stream, and the owner does it once.
+  auto* const declinedRows = errors->declinedRows(numRows);
   return launch_(
-      argViews,
-      instance,
-      numRows,
-      outputType_,
-      /*declinedRows=*/nullptr,
-      stream,
-      mr);
+      argViews, instance, numRows, outputType_, declinedRows, stream, mr);
 }
 
 void GpuSfiExpression::close() {

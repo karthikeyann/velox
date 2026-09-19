@@ -15,7 +15,9 @@
  */
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluatorRegistry.h"
+#include "velox/experimental/cudf/expression/JitExpression.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 #include "velox/experimental/cudf/tests/CudfFunctionBaseTest.h"
 
@@ -28,6 +30,7 @@
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/parse/TypeResolver.h"
+#include "velox/type/DecimalUtil.h"
 #include "velox/type/Time.h"
 
 #include <folly/ScopeGuard.h>
@@ -1578,8 +1581,9 @@ TEST_F(CudfFilterProjectTest, betweenLiteralAndColumnBounds) {
   functionEntry.create = [create = previousEntry.create, &betweenCreations](
                              const core::TypedExprPtr& expr,
                              const RowTypePtr& rowType,
-                             memory::MemoryPool* pool) {
-    auto evaluator = create(expr, rowType, pool);
+                             memory::MemoryPool* pool,
+                             const core::QueryConfig& config) {
+    auto evaluator = create(expr, rowType, pool, config);
     if (expr->isCallKind() &&
         expr->asUnchecked<core::CallTypedExpr>()->name() == "between") {
       ++betweenCreations;
@@ -1684,13 +1688,23 @@ TEST_F(CudfFilterProjectTest, round) {
              .planNode();
   AssertQueryBuilder(plan).assertResults(data);
 
+  // Negative digits on an integral argument change nothing, because that is
+  // what Velox does: round() returns `number` unchanged for an integral type
+  // unless instantiated with alwaysRoundNegDec, and nothing in the tree
+  // instantiates it that way. Verified directly --
+  // functions::round<int64_t, int32_t>(4123, -3) is 4123.
+  //
+  // This expected 4000 while the cuDF function tier served round, because
+  // cudf::round does round negative digits. GPU SFI compiles Velox's own body,
+  // so the GPU now agrees with the CPU and the old expectation was pinning the
+  // divergence. Whether Velox itself should match Presto here is a separate
+  // question, and not one the GPU path gets to answer differently.
   plan = PlanBuilder()
              .setParseOptions(options)
              .values({data})
              .project({"round(c0, -3) as c1"})
              .planNode();
-  auto expected = makeRowVector({makeFlatVector<int64_t>({4000, 456789000})});
-  AssertQueryBuilder(plan).assertResults(expected);
+  AssertQueryBuilder(plan).assertResults(data);
 }
 
 TEST_F(CudfFilterProjectTest, roundDecimal) {
@@ -2820,6 +2834,312 @@ TEST_F(CudfSimpleFilterProjectTest, roundDouble) {
       999999999999999.5,
   })});
   AssertQueryBuilder(plan).assertResults(expected);
+}
+
+// The point of the whole error mechanism, end to end: a row whose check fails
+// inside a GPU-compiled Velox function body has to produce the error the CPU
+// produces, not a wrapped value.
+//
+// decimal(38,0) is the widest Presto decimal, so adding the maximum to itself
+// overflows. DecimalPlusFunction::call reaches VELOX_ARITHMETIC_ERROR, which is
+// a no-op on the device; the launch records the row instead, and the operator
+// re-evaluates the batch through Velox, which raises.
+TEST_F(CudfFilterProjectTest, declinedRowRaisesTheErrorTheCpuWouldRaise) {
+  auto data = makeRowVector({makeFlatVector<int128_t>(
+      {DecimalUtil::kLongDecimalMax, 1}, DECIMAL(38, 0))});
+
+  auto plan =
+      PlanBuilder().values({data}).project({"c0 + c0 AS c1"}).planNode();
+
+  // The message is not asserted from a guess: it is whatever Velox produces,
+  // because Velox is what produced it. At scale 0 the rescale is a no-op, so
+  // the overflow surfaces from checkedPlus, whose typeName defaults to
+  // "integer" -- not from the "Decimal overflow" branch above it.
+  VELOX_ASSERT_USER_THROW(
+      AssertQueryBuilder(plan).copyResults(pool()),
+      "integer overflow: 99999999999999999999999999999999999999 + "
+      "99999999999999999999999999999999999999");
+}
+
+// The other half of the contract: a row that does not violate anything must be
+// unaffected by the machinery that watches for one.
+TEST_F(CudfFilterProjectTest, cleanRowsAreUntouchedByErrorCollection) {
+  auto data =
+      makeRowVector({makeFlatVector<int128_t>({1, 2, 3}, DECIMAL(38, 0))});
+  auto expected =
+      makeRowVector({makeFlatVector<int128_t>({2, 4, 6}, DECIMAL(38, 0))});
+
+  auto plan =
+      PlanBuilder().values({data}).project({"c0 + c0 AS c1"}).planNode();
+
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
+// Division by zero is a different check from overflow -- VELOX_USER_CHECK_NE
+// inside divideWithRoundUp rather than VELOX_ARITHMETIC_ERROR -- and it has to
+// arrive with the same fidelity.
+TEST_F(CudfFilterProjectTest, declinedDivisionByZeroRaisesTheCpuError) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({100, 200}, DECIMAL(10, 2)),
+      makeFlatVector<int64_t>({5, 0}, DECIMAL(10, 2)),
+  });
+
+  auto plan =
+      PlanBuilder().values({data}).project({"c0 / c1 AS c2"}).planNode();
+
+  VELOX_ASSERT_USER_THROW(
+      AssertQueryBuilder(plan).copyResults(pool()), "Division by zero");
+}
+
+// Modulus reaches its own check, and the message differs from divide's, so a
+// mechanism that reported a generic error would pass the test above and fail
+// this one.
+TEST_F(CudfFilterProjectTest, declinedModulusByZeroRaisesTheCpuError) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({100, 200}, DECIMAL(10, 2)),
+      makeFlatVector<int64_t>({5, 0}, DECIMAL(10, 2)),
+  });
+
+  auto plan =
+      PlanBuilder().values({data}).project({"mod(c0, c1) AS c2"}).planNode();
+
+  VELOX_ASSERT_USER_THROW(
+      AssertQueryBuilder(plan).copyResults(pool()), "Modulus by zero");
+}
+
+// The other family with live checks: integral arithmetic bound to the Checked*
+// structs, where the check is in velox::checkedPlus rather than in the function
+// body itself -- one frame further down than the decimal cases.
+TEST_F(CudfFilterProjectTest, declinedIntegralOverflowRaisesTheCpuError) {
+  // Integral arithmetic goes to the AST evaluator by default, which outranks
+  // GPU SFI and carries none of Velox's checks, so cuDF's wrapping semantics
+  // answer and nothing is declined. The claim under test is parity when GPU SFI
+  // is the evaluator, so make it one by dropping the tiers above it for the
+  // duration of this test. Priority is a config, so this is a configuration
+  // Velox can be run in, not a contrivance.
+  cudf_velox::ensureBuiltinExpressionEvaluatorsRegistered();
+  auto& registry = cudf_velox::getCudfExpressionEvaluatorRegistry();
+  const auto previousAst = registry.at(cudf_velox::kAstEvaluatorName);
+  const auto previousJit = registry.at(cudf_velox::kJitEvaluatorName);
+  SCOPE_EXIT {
+    registry.at(cudf_velox::kAstEvaluatorName) = previousAst;
+    registry.at(cudf_velox::kJitEvaluatorName) = previousJit;
+  };
+  registry.at(cudf_velox::kAstEvaluatorName).priority = 0;
+  registry.at(cudf_velox::kJitEvaluatorName).priority = 0;
+
+  auto data = makeRowVector(
+      {makeFlatVector<int64_t>({1, std::numeric_limits<int64_t>::max()})});
+
+  auto plan =
+      PlanBuilder().values({data}).project({"c0 + c0 AS c1"}).planNode();
+
+  // Presto binds integral plus to CheckedPlusFunction, after the unchecked
+  // registration and therefore over it, so the CPU raises rather than wrapping.
+  VELOX_ASSERT_USER_THROW(
+      AssertQueryBuilder(plan).copyResults(pool()), "integer overflow");
+}
+
+// A filter is the case where detection has to happen before the rows are
+// compacted away: a declined row is nulled, a null row is dropped, so a check
+// that noticed one batch later would have nothing left to report.
+TEST_F(CudfFilterProjectTest, declinedRowInAFilterRaisesTheCpuError) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({100, 200}, DECIMAL(10, 2)),
+      makeFlatVector<int64_t>({5, 0}, DECIMAL(10, 2)),
+  });
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .filter("cast(c0 / c1 as double) > 1.0")
+                  .planNode();
+
+  VELOX_ASSERT_USER_THROW(
+      AssertQueryBuilder(plan).copyResults(pool()), "Division by zero");
+}
+
+// Parity cuts both ways: the GPU must not raise where the CPU would not.
+//
+// A GPU conditional computes both branches for every row and selects
+// afterwards, because that is the only shape a data-parallel select has. So
+// `c0 + c0` overflows here on the device even though Velox's SwitchExpr
+// evaluates that branch only on the rows the condition picked, and never on the
+// row that overflows. A mechanism that reported the decline as an error would
+// invent a failure the CPU does not have.
+//
+// This is the reason recovery re-runs the whole expression rather than the
+// subtree that declined: re-running the subtree would throw, and only the full
+// tree carries the conditional that masks it.
+TEST_F(CudfFilterProjectTest, aMaskedOverflowIsNotAnError) {
+  cudf_velox::ensureBuiltinExpressionEvaluatorsRegistered();
+  auto& registry = cudf_velox::getCudfExpressionEvaluatorRegistry();
+  const auto previousAst = registry.at(cudf_velox::kAstEvaluatorName);
+  const auto previousJit = registry.at(cudf_velox::kJitEvaluatorName);
+  SCOPE_EXIT {
+    registry.at(cudf_velox::kAstEvaluatorName) = previousAst;
+    registry.at(cudf_velox::kJitEvaluatorName) = previousJit;
+  };
+  registry.at(cudf_velox::kAstEvaluatorName).priority = 0;
+  registry.at(cudf_velox::kJitEvaluatorName).priority = 0;
+
+  auto data = makeRowVector(
+      {makeFlatVector<int64_t>({1, std::numeric_limits<int64_t>::max()})});
+
+  // The doubling branch is selected only for the row where it is safe.
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .project({"if(c0 = 1, c0 + c0, c0) AS c1"})
+                  .planNode();
+
+  auto expected = makeRowVector(
+      {makeFlatVector<int64_t>({2, std::numeric_limits<int64_t>::max()})});
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
+// TRY needs no device counterpart, and this is why: no cuDF evaluator claims
+// "try", so canBeEvaluatedByCudf rejects any tree containing it and the
+// operator is never replaced. The rows never reach a kernel, so there is
+// nothing to decline and nothing to suppress.
+//
+// Both halves are asserted, because the property stops being true the moment
+// some evaluator claims "try": a declined row would then have to be suppressed
+// into a null rather than raised, and this test is what fails first.
+TEST_F(CudfFilterProjectTest, tryIsNotGpuEligible) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({100, 200}, DECIMAL(10, 2)),
+      makeFlatVector<int64_t>({5, 0}, DECIMAL(10, 2)),
+  });
+
+  auto plan =
+      PlanBuilder().values({data}).project({"try(c0 / c1) AS c2"}).planNode();
+
+  // The fixture forbids CPU fallback, so an ineligible plan is a hard error.
+  // That error is the evidence: this plan cannot be given to the GPU.
+  VELOX_ASSERT_THROW(
+      AssertQueryBuilder(plan).copyResults(pool()),
+      "Replacement with cuDF operator failed");
+
+  // With fallback permitted, Velox runs the whole thing and TRY behaves as
+  // Velox's TRY: 1.00 / 0.05 = 20.00, and the division by zero is suppressed
+  // to a null rather than raised. Re-registered rather than just reassigned
+  // because the driver adapter captures the flag when it is registered.
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto previousFallback = config.allowCpuFallback;
+  SCOPE_EXIT {
+    cudf_velox::unregisterCudf();
+    config.allowCpuFallback = previousFallback;
+    cudf_velox::registerCudf();
+  };
+  cudf_velox::unregisterCudf();
+  config.allowCpuFallback = true;
+  cudf_velox::registerCudf();
+
+  auto expected = makeRowVector(
+      {makeNullableFlatVector<int64_t>({2000, std::nullopt}, DECIMAL(12, 2))});
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
+// Every check the registered function set can actually fail.
+//
+// Of the 69 functions GPU SFI registers, 12 contain a reachable precondition
+// check: the six Checked* integral operators, which raise through
+// velox::checked* helpers, and the six decimal operators, which raise in their
+// own bodies or through divideWithRoundUp and valueInRange. The other 57 have
+// no check to fail. Every one of those checks is a VELOX_USER_CHECK or a
+// VELOX_ARITHMETIC_ERROR -- there is no VELOX_CHECK, VELOX_FAIL, VELOX_NYI or
+// VELOX_UNREACHABLE anywhere in the set -- which is why every case here is a
+// user error, and why no runtime-class case appears: today none is reachable.
+//
+// The messages are not chosen, they are Velox's. Each is the string Velox's own
+// code formats, so a divergence in either direction fails this test.
+TEST_F(CudfFilterProjectTest, everyReachableCheckRaisesTheCpuError) {
+  // Integral arithmetic would go to the AST evaluator, which carries no checks.
+  cudf_velox::ensureBuiltinExpressionEvaluatorsRegistered();
+  auto& registry = cudf_velox::getCudfExpressionEvaluatorRegistry();
+  const auto previousAst = registry.at(cudf_velox::kAstEvaluatorName);
+  const auto previousJit = registry.at(cudf_velox::kJitEvaluatorName);
+  SCOPE_EXIT {
+    registry.at(cudf_velox::kAstEvaluatorName) = previousAst;
+    registry.at(cudf_velox::kJitEvaluatorName) = previousJit;
+  };
+  registry.at(cudf_velox::kAstEvaluatorName).priority = 0;
+  registry.at(cudf_velox::kJitEvaluatorName).priority = 0;
+
+  constexpr auto kMax = std::numeric_limits<int64_t>::max();
+  constexpr auto kMin = std::numeric_limits<int64_t>::min();
+
+  // The second row of each pair is the one that fails, so every case also
+  // proves a clean row survives alongside a failing one.
+  auto integral = makeRowVector({
+      makeFlatVector<int64_t>({1, kMax}),
+      makeFlatVector<int64_t>({1, 0}),
+  });
+  auto extremes = makeRowVector({
+      makeFlatVector<int64_t>({1, kMin}),
+      makeFlatVector<int64_t>({1, 1}),
+  });
+  auto decimals = makeRowVector({
+      makeFlatVector<int64_t>({100, 200}, DECIMAL(10, 2)),
+      makeFlatVector<int64_t>({5, 0}, DECIMAL(10, 2)),
+  });
+  auto wideDecimals = makeRowVector({
+      makeFlatVector<int128_t>(
+          {1, DecimalUtil::kLongDecimalMax}, DECIMAL(38, 0)),
+      // Negated, so that subtracting it overflows the same way adding the
+      // positive one does.
+      makeFlatVector<int128_t>(
+          {1, -DecimalUtil::kLongDecimalMax}, DECIMAL(38, 0)),
+  });
+
+  auto nearLimit = makeRowVector({
+      makeFlatVector<int128_t>(
+          {1, static_cast<int128_t>(6) * DecimalUtil::kPowersOfTen[37]},
+          DECIMAL(38, 0)),
+      makeFlatVector<int128_t>({1, 2}, DECIMAL(38, 0)),
+  });
+
+  struct Case {
+    const char* what;
+    RowVectorPtr data;
+    const char* projection;
+    const char* message;
+  };
+
+  const std::vector<Case> cases{
+      // checkedPlus, checkedMinus, checkedMultiply: "{} overflow: {} op {}",
+      // where the type name for int64 is Velox's default, "integer".
+      {"checkedPlus", integral, "c0 + c0", "integer overflow: "},
+      {"checkedMinus", extremes, "c0 - c1", "integer overflow: "},
+      {"checkedMultiply", integral, "c0 * c0", "integer overflow: "},
+      // checkedDivide and checkedModulus word their zero divisors
+      // differently from each other, which is Velox's inconsistency to keep.
+      {"checkedDivide", integral, "c0 / c1", "division by zero"},
+      {"checkedModulus", integral, "c0 % c1", "Cannot divide by 0"},
+      {"checkedNegate", extremes, "negate(c0)", "Cannot negate minimum value"},
+      // The decimal operators. Plus and minus at scale 0 rescale by a factor
+      // of one, so the overflow surfaces from checkedPlus rather than from
+      // their own "Decimal overflow" branch.
+      {"decimalPlus", wideDecimals, "c0 + c0", "integer overflow: "},
+      {"decimalMinus", wideDecimals, "c0 - c1", "integer overflow: "},
+      // checkedMultiply fires first here: the product leaves int128 entirely.
+      {"decimalMultiply", wideDecimals, "c0 * c0", "integer overflow: "},
+      // And here it does not, so the range check below it is what fails:
+      // 6e37 * 2 fits int128 but is larger than a decimal(38,0) can hold.
+      // That is the only way to reach valueInRange's own message.
+      {"decimalMultiplyRange", nearLimit, "c0 * c1", "Decimal overflow"},
+      {"decimalDivide", decimals, "c0 / c1", "Division by zero"},
+      {"decimalModulus", decimals, "mod(c0, c1)", "Modulus by zero"},
+  };
+
+  for (const auto& testCase : cases) {
+    SCOPED_TRACE(testCase.what);
+    auto plan = PlanBuilder()
+                    .values({testCase.data})
+                    .project({fmt::format("{} AS out", testCase.projection)})
+                    .planNode();
+    VELOX_ASSERT_USER_THROW(
+        AssertQueryBuilder(plan).copyResults(pool()), testCase.message);
+  }
 }
 
 } // namespace

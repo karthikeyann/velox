@@ -330,11 +330,11 @@ void CudfNestedLoopJoinProbe::initialize() {
   if (hasNonAstSubexprSpanningBothSides(
           optimizedCondition, probeType_, buildType_)) {
     useAstFilter_ = false;
-    filterEvaluator_ = createCudfExpression(
-        optimizedCondition,
-        facebook::velox::type::concatRowTypes({probeType_, buildType_}),
-        pool,
-        config);
+    filterRowType_ =
+        facebook::velox::type::concatRowTypes({probeType_, buildType_});
+    cpuFilterSource_ = optimizedCondition;
+    filterEvaluator_ =
+        createCudfExpression(optimizedCondition, filterRowType_, pool, config);
     hasFilter_ = true;
     return;
   }
@@ -674,8 +674,23 @@ CudfNestedLoopJoinProbe::crossJoinConditionalIndices(
       filterEvaluator_,
       "Join filter evaluator must be initialized before "
       "crossJoinConditionalIndices");
-  auto filterColumn = filterEvaluator_->eval(combinedViews, stream, mr);
-  auto mask = asView(filterColumn);
+  gpu_sfi::GpuSfiErrors errors(stream, get_temp_mr());
+  auto filterColumn = filterEvaluator_->eval(
+      combinedViews, stream, mr, /*finalize=*/true, &errors);
+  // Checked before the mask is applied, while the combined rows are still
+  // whole: the declined row is one of them, and applying the mask drops it.
+  std::unique_ptr<cudf::column> recovered;
+  if (errors.resolve() != gpu_sfi::ErrorClass::kNone) {
+    recovered = reevaluateFilterOnCpu(
+        cpuFilterSource_,
+        filterRowType_,
+        combinedViews,
+        cpuFilter_,
+        operatorCtx_->execCtx(),
+        operatorCtx_->pool(),
+        stream);
+  }
+  auto mask = recovered != nullptr ? recovered->view() : asView(filterColumn);
 
   auto filteredProbeIndices = cudf::apply_retention_mask(
       cudf::table_view{{probeIndices->view()}}, mask, stream, mr);

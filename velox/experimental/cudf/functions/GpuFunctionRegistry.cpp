@@ -103,9 +103,15 @@ bool registerGpuKernel(
     // FunctionSignature::operator== compares argument types, return type and
     // variable arity together, so an overload differing only in arity is
     // correctly a different entry rather than a replacement.
+    // Physical kinds are part of the identity, not just the signature: the
+    // five decimal registrations of one function share a signature string and
+    // differ only here, so comparing signatures alone made them overwrite one
+    // another and left whichever registered last to serve every decimal call.
     auto existing = std::find_if(
         entries.begin(), entries.end(), [&](const GpuFunctionEntry& entry) {
-          return *entry.signature == *veloxSignature;
+          return *entry.signature == *veloxSignature &&
+              entry.argumentKinds == signature.argumentKinds &&
+              entry.returnKind == signature.returnKind;
         });
 
     if (existing != entries.end()) {
@@ -118,7 +124,13 @@ bool registerGpuKernel(
       continue;
     }
 
-    entries.push_back(GpuFunctionEntry{veloxSignature, launch, instanceSpec});
+    entries.push_back(
+        GpuFunctionEntry{
+            veloxSignature,
+            launch,
+            instanceSpec,
+            signature.argumentKinds,
+            signature.returnKind});
   }
   return registeredAll;
 }

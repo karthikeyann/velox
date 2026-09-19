@@ -41,11 +41,11 @@ class CudfFilterProject : public CudfOperatorBase {
     return !input_;
   }
 
-  void filter(
+  bool filter(
       std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
       cuda::stream_ref stream);
 
-  std::vector<std::unique_ptr<cudf::column>> project(
+  std::optional<std::vector<std::unique_ptr<cudf::column>>> project(
       std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
       cuda::stream_ref stream);
 
@@ -78,6 +78,29 @@ class CudfFilterProject : public CudfOperatorBase {
 
   std::vector<CudfExpressionPtr> projectEvaluators_;
   CudfExpressionPtr filterEvaluator_;
+
+  // What the CPU needs to re-evaluate a batch a GPU launch declined. The
+  // expressions are the optimized ones the GPU compiled, so the two paths
+  // evaluate the same tree rather than two differently folded ones; the filter
+  // is first when there is one, matching the evaluator order above.
+  RowTypePtr inputRowType_;
+  std::vector<core::TypedExprPtr> cpuExprSource_;
+  std::unique_ptr<velox::exec::ExprSet> cpuExprs_;
+
+  // Evaluates everything on the CPU and returns the operator's output, which
+  // is how a declined row gets the error Velox would have raised. `columns`
+  // holds the rows to evaluate: the whole input when the filter declined, the
+  // post-filter survivors when a projection did.
+  RowVectorPtr evaluateOnCpu(
+      std::vector<std::unique_ptr<cudf::column>> columns,
+      bool applyFilter,
+      cuda::stream_ref stream);
+
+  RowVectorPtr assembleCpuOutput(
+      const RowVectorPtr& hostInput,
+      std::vector<VectorPtr>& results,
+      const SelectivityVector& selected,
+      cuda::stream_ref stream);
 
   std::vector<velox::exec::IdentityProjection> resultProjections_;
   std::vector<velox::exec::IdentityProjection> identityProjections_;

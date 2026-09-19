@@ -929,3 +929,43 @@ TEST_F(TableScanTest, multiLevelNestedDecimalScan) {
                 makeArrayVector({0, 2, 4}, listElements)})})});
   assertDecimalScanRoundTrip(vector, rowType);
 }
+
+// The fourth and last place a GPU SFI kernel runs: a scan's remaining filter.
+// Its obligation is the same as a projection's or a join filter's, and the
+// check has to be noticed before the retention mask drops the row.
+//
+// Decimal division puts the filter on GPU SFI without touching priorities,
+// since the AST evaluator does not take decimals.
+TEST_F(TableScanTest, declinedRowInARemainingFilterRaisesTheCpuError) {
+  auto rowType = ROW({"c0", "c1"}, {DECIMAL(10, 2), DECIMAL(10, 2)});
+  auto vector = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({100, 200}, DECIMAL(10, 2)),
+       makeFlatVector<int64_t>({5, 0}, DECIMAL(10, 2))});
+
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), std::vector<RowVectorPtr>{vector});
+
+  auto assignments =
+      facebook::velox::exec::test::HiveConnectorTestBase::allRegularColumns(
+          rowType);
+
+  auto plan = PlanBuilder(pool_.get())
+                  .startTableScan()
+                  .connectorId(kCudfHiveConnectorId)
+                  .outputType(rowType)
+                  .dataColumns(rowType)
+                  .assignments(assignments)
+                  .remainingFilter("cast(c0 / c1 as double) > 1.0")
+                  .endTableScan()
+                  .planNode();
+
+  // The second row divides by zero. Velox raises it, as a user error, with its
+  // own message -- the data source re-runs the whole remaining filter through
+  // Velox rather than reporting the decline itself.
+  VELOX_ASSERT_USER_THROW(
+      AssertQueryBuilder(plan)
+          .splits(makeCudfHiveConnectorSplits({filePath}))
+          .copyResults(pool()),
+      "Division by zero");
+}

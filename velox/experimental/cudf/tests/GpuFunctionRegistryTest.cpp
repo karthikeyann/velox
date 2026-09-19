@@ -29,6 +29,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 namespace facebook::velox::cudf_velox::gpu_sfi {
 namespace {
 
@@ -60,7 +62,9 @@ GpuFunctionSignature doubleBinary() {
       {"double", "double"},
       /*variadicTail=*/false,
       /*integerVariables=*/{},
-      /*variableConstraints=*/{}};
+      /*variableConstraints=*/{},
+      /*argumentKinds=*/{TypeKind::DOUBLE, TypeKind::DOUBLE},
+      /*returnKind=*/TypeKind::DOUBLE};
 }
 
 GpuFunctionSignature bigintBinary() {
@@ -69,7 +73,9 @@ GpuFunctionSignature bigintBinary() {
       {"bigint", "bigint"},
       /*variadicTail=*/false,
       /*integerVariables=*/{},
-      /*variableConstraints=*/{}};
+      /*variableConstraints=*/{},
+      /*argumentKinds=*/{TypeKind::BIGINT, TypeKind::BIGINT},
+      /*returnKind=*/TypeKind::BIGINT};
 }
 
 // Stand-in for a function with no initialize(): the instance is an empty
@@ -213,6 +219,12 @@ TEST_F(GpuFunctionRegistryTest, prestoRegistrationsCarryVeloxSignatures) {
     plusSignatures.push_back(entry.signature->toString());
   }
   std::sort(plusSignatures.begin(), plusSignatures.end());
+  // Distinct shapes: the five decimal kernels share one signature string and
+  // are told apart by physical type, which
+  // decimalOverloadsAreKeyedByPhysicalType covers.
+  plusSignatures.erase(
+      std::unique(plusSignatures.begin(), plusSignatures.end()),
+      plusSignatures.end());
   // Two floating-point overloads from the plain struct, four integral ones from
   // CheckedPlusFunction, and one decimal, under one name. Overloads of the same
   // name coexist rather than replacing each other, and which struct backs which
@@ -247,12 +259,17 @@ TEST_F(GpuFunctionRegistryTest, prestoRegistrationsCarryVeloxSignatures) {
 TEST_F(GpuFunctionRegistryTest, numericBreadthMatchesVeloxTypeSets) {
   registerPrestoGpuFunctions("");
 
+  // Distinct signatures, not kernels. One signature can be backed by several
+  // kernels that differ only in physical type -- every decimal function is
+  // five of them -- and what this test is about is which shapes a function
+  // accepts, which is the question Velox's own type sets answer.
   auto signaturesOf = [](const std::vector<GpuFunctionEntry>* entries) {
     std::vector<std::string> out;
     for (const auto& entry : *entries) {
       out.push_back(entry.signature->toString());
     }
     std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
   };
 
@@ -306,7 +323,12 @@ TEST_F(GpuFunctionRegistryTest, decimalSignaturesCarryPrecisionAndScale) {
       /*integerVariables=*/{"i1", "i5", "i1", "i5", "i1", "i5"},
       // Free here: the result precision and scale come from the argument
       // ones only because this signature repeats i1 and i5 in the return.
-      /*variableConstraints=*/{}};
+      /*variableConstraints=*/{},
+      // A long decimal on both sides: int128 storage, which is what
+      // distinguishes this registration from the short-decimal one that
+      // renders the same signature string.
+      /*argumentKinds=*/{TypeKind::HUGEINT, TypeKind::HUGEINT},
+      /*returnKind=*/TypeKind::HUGEINT};
   ASSERT_TRUE(
       registerGpuKernel({"decimal_add"}, signature, launcherA, noInitialize()));
 
@@ -489,22 +511,51 @@ TEST_F(GpuFunctionRegistryTest, decimalFunctionsCarryAnInitializedInstance) {
 // TODO(gpu-sfi-decimal): key entries on the physical argument types as well as
 // the signature, so resolution can pick the kernel compiled for the resolved
 // precision rather than the one that registered last.
-TEST_F(GpuFunctionRegistryTest, decimalOverloadsCollapseBySignature) {
+// A decimal signature says decimal(i1,i5) whether the storage is int64 or
+// int128, so Velox's five argument-type combinations per decimal function all
+// render the same string. Keying the registry on the string alone made them
+// overwrite one another, leaving one kernel to serve every decimal call: a
+// long-decimal call then ran a kernel compiled for a short operand, read eight
+// bytes where sixteen live, and returned arithmetic on fragments of its
+// inputs. Reproduced as {1,2,3} + itself giving {2,2,5}.
+//
+// So the five have to be distinguishable, and what distinguishes them is the
+// physical type each kernel was compiled for.
+TEST_F(GpuFunctionRegistryTest, decimalOverloadsAreKeyedByPhysicalType) {
   registerPrestoGpuFunctions("");
 
   const auto* entries = lookup("plus");
   ASSERT_NE(entries, nullptr);
 
-  const auto decimals = std::count_if(
-      entries->begin(), entries->end(), [](const GpuFunctionEntry& entry) {
-        return entry.signature->returnType().baseName() == "decimal";
-      });
+  std::vector<std::pair<std::vector<TypeKind>, TypeKind>> decimalKinds;
+  for (const auto& entry : *entries) {
+    if (entry.signature->returnType().baseName() == "decimal") {
+      decimalKinds.emplace_back(entry.argumentKinds, entry.returnKind);
+    }
+  }
 
-  // One, where Velox's five combinations would want five distinguishable
-  // kernels. Raise this the moment physical-type keying lands.
-  EXPECT_EQ(decimals, 1)
-      << "if this is no longer 1, decimal dispatch has been made "
-         "physical-type aware and the TODO above can go";
+  // The five registerDecimalBinary combinations: (long,long)->long,
+  // (short,short)->short, (short,short)->long, (short,long)->long and
+  // (long,short)->long.
+  EXPECT_EQ(decimalKinds.size(), 5);
+
+  // Every one of them distinct, which is the property that was missing: a
+  // duplicate here means two kernels the registry cannot tell apart, and the
+  // later registration would silently serve calls meant for the earlier.
+  std::sort(decimalKinds.begin(), decimalKinds.end());
+  EXPECT_EQ(
+      std::adjacent_find(decimalKinds.begin(), decimalKinds.end()),
+      decimalKinds.end())
+      << "two decimal kernels share a signature and a physical shape";
+
+  // And each is one of the two decimal storage widths, never anything else.
+  for (const auto& [arguments, returnKind] : decimalKinds) {
+    for (const auto kind : arguments) {
+      EXPECT_TRUE(kind == TypeKind::BIGINT || kind == TypeKind::HUGEINT);
+    }
+    EXPECT_TRUE(
+        returnKind == TypeKind::BIGINT || returnKind == TypeKind::HUGEINT);
+  }
 }
 
 } // namespace

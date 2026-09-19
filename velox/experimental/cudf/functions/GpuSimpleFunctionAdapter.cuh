@@ -90,6 +90,15 @@ struct isVariadicArg<Variadic<T>> : std::true_type {};
 /// a bigint and never match a decimal call.
 template <typename T>
 struct SignatureType {
+  /// The physical type the kernel was compiled for, which the signature
+  /// string cannot express: ShortDecimal<P,S> and LongDecimal<P,S> render
+  /// identically as decimal(i1,i5) while being int64 and int128. Without this
+  /// the registry cannot tell the five decimal registrations apart, and a
+  /// long-decimal call runs whichever kernel registered last.
+  static constexpr TypeKind kind() {
+    return SimpleTypeTrait<T>::typeKind;
+  }
+
   static std::string name() {
     return lowercase(SimpleTypeTrait<T>::name);
   }
@@ -98,6 +107,10 @@ struct SignatureType {
 
 template <typename P, typename S>
 struct SignatureType<ShortDecimal<P, S>> {
+  static constexpr TypeKind kind() {
+    return TypeKind::BIGINT;
+  }
+
   static std::string name() {
     return "decimal(" + P::name() + "," + S::name() + ")";
   }
@@ -109,6 +122,10 @@ struct SignatureType<ShortDecimal<P, S>> {
 
 template <typename P, typename S>
 struct SignatureType<LongDecimal<P, S>> {
+  static constexpr TypeKind kind() {
+    return TypeKind::HUGEINT;
+  }
+
   static std::string name() {
     return "decimal(" + P::name() + "," + S::name() + ")";
   }
@@ -123,6 +140,12 @@ struct SignatureType<LongDecimal<P, S>> {
 /// compares the element type against however many arguments arrive.
 template <typename T>
 struct SignatureType<Variadic<T>> {
+  /// The element's kind: a pack of one type, so every trailing argument has
+  /// to be that type physically as well as by name.
+  static constexpr TypeKind kind() {
+    return SignatureType<T>::kind();
+  }
+
   static std::string name() {
     return SignatureType<T>::name();
   }
@@ -339,7 +362,10 @@ struct GpuUDFHolder {
         detail::SignatureType<TReturn>::name(),
         {detail::SignatureType<TArgs>::name()...},
         (detail::isVariadicArg<TArgs>::value || ...),
-        detail::signatureVariables<TReturn, TArgs...>()};
+        detail::signatureVariables<TReturn, TArgs...>(),
+        /*variableConstraints=*/{},
+        {detail::SignatureType<TArgs>::kind()...},
+        detail::SignatureType<TReturn>::kind()};
   }
 };
 

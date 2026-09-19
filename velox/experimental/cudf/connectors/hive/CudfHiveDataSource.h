@@ -22,6 +22,8 @@
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
+#include "velox/expression/Expr.h"
+
 #include "velox/common/base/RandomUtil.h"
 #include "velox/common/io/IoStatistics.h"
 #include "velox/common/io/Options.h"
@@ -134,6 +136,10 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   // next(). Null when there is no remaining filter.
   std::shared_ptr<velox::cudf_velox::CudfExpression>
       cudfRemainingFilterExpression_;
+
+  // The same filter compiled for Velox, built on the first batch in which a
+  // GPU SFI kernel declines a row; see reevaluateFilterOnCpu.
+  std::unique_ptr<velox::exec::ExprSet> cpuRemainingFilter_;
 
   std::atomic<uint64_t> totalRemainingFilterTime_{0};
 

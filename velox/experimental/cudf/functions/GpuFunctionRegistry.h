@@ -138,6 +138,18 @@ struct GpuFunctionSignature {
   /// scale as unconstrained, and binding either fails or resolves them to
   /// something the kernel was not compiled for.
   std::vector<std::pair<std::string, std::string>> variableConstraints;
+
+  /// The physical types this kernel was compiled for.
+  ///
+  /// The signature strings above cannot express them: ShortDecimal<P,S> and
+  /// LongDecimal<P,S> both render as decimal(i1,i5) while being int64 and
+  /// int128 respectively, so Velox's five decimal registrations per function
+  /// collapse to one signature. Matching on these as well is what keeps a
+  /// long-decimal call off a kernel compiled for a short one -- which reads
+  /// eight bytes where sixteen live, and silently returns arithmetic on the
+  /// wrong halves of its operands.
+  std::vector<TypeKind> argumentKinds;
+  TypeKind returnKind{TypeKind::UNKNOWN};
 };
 
 /// Registers `launch` under each alias.

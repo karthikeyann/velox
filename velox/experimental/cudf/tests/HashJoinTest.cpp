@@ -9716,4 +9716,39 @@ TEST_F(HashJoinTest, mixedGroupedExecution) {
       0);
 }
 
+// A GPU SFI kernel can decline a row inside a join filter as easily as inside a
+// projection, and the joined rows are gone once the mask has been applied -- so
+// the check has to happen while they are still whole.
+//
+// Decimal division puts the filter on GPU SFI without touching priorities: the
+// AST evaluator does not take decimals.
+TEST_F(HashJoinTest, declinedRowInAJoinFilterRaisesTheCpuError) {
+  auto probe = makeRowVector(
+      {"k", "t_val"},
+      {makeFlatVector<int32_t>({1, 2}),
+       makeFlatVector<int64_t>({100, 200}, DECIMAL(10, 2))});
+  auto build = makeRowVector(
+      {"u_k", "u_val"},
+      {makeFlatVector<int32_t>({1, 2}),
+       makeFlatVector<int64_t>({5, 0}, DECIMAL(10, 2))});
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan =
+      PlanBuilder(planNodeIdGenerator)
+          .values({probe})
+          .hashJoin(
+              {"k"},
+              {"u_k"},
+              PlanBuilder(planNodeIdGenerator).values({build}).planNode(),
+              "cast(t_val / u_val as double) > 1.0",
+              {"k"},
+              core::JoinType::kInner)
+          .planNode();
+
+  // The row that pairs 200 with 0. Velox raises it, the device cannot, and the
+  // message is Velox's own.
+  VELOX_ASSERT_USER_THROW(
+      AssertQueryBuilder(plan).copyResults(pool()), "Division by zero");
+}
+
 } // namespace

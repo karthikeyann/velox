@@ -44,6 +44,11 @@ struct GpuFunctionEntry {
   GpuLaunchFn launch;
   /// How to build this function's instance before the first launch.
   GpuFunctionInstanceSpec instanceSpec;
+  /// The physical types this kernel was compiled for. Two entries can share a
+  /// signature and differ here -- every decimal function does -- so binding
+  /// alone does not identify the right kernel. See GpuFunctionSignature.
+  std::vector<TypeKind> argumentKinds;
+  TypeKind returnKind{TypeKind::UNKNOWN};
 };
 
 /// Every registration made so far, keyed by lowercased function name.

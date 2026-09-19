@@ -1068,21 +1068,18 @@ TEST_F(CudfDecimalTest, decimalDivideByZero) {
                   .project({"a / b AS div"})
                   .planNode();
 
-  auto result =
-      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
-
-  // Expect null for rows where b = 0, and the division result otherwise.
-  // Input values are stored as fixed-point: 100 = 1.00, 200 = 2.00, etc.
-  // Row 0: 1.00 / 0 = null
-  // Row 1: 2.00 / 0.50 = 4.00 (stored as 400 in DECIMAL(12,2))
-  // Row 2: 3.00 / 0 = null
-  auto expectedType = DECIMAL(12, 2);
-  auto expected = makeRowVector({
-      makeNullableFlatVector<int64_t>(
-          {std::nullopt, 400, std::nullopt}, expectedType),
-  });
-
-  facebook::velox::test::assertEqualVectors(expected, result);
+  // Velox raises here, it does not return null: divideWithRoundUp opens with
+  // VELOX_USER_CHECK_NE(b, 0, "Division by zero"), and Velox's own
+  // DecimalArithmeticTest asserts exactly that for "c0 / 0.0".
+  //
+  // This test previously expected nulls for the zero divisors, which was
+  // cudf::binary_operation's answer rather than Velox's. GPU SFI compiles
+  // Velox's own body, so the check now fires on the device, the row is
+  // declined, and Velox raises it -- as a user error, which is what
+  // VELOX_ASSERT_USER_THROW pins.
+  VELOX_ASSERT_USER_THROW(
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool()),
+      "Division by zero");
 }
 
 TEST_F(CudfDecimalTest, decimalModulo) {
