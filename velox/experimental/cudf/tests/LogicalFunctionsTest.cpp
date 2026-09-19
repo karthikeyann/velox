@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/JitExpression.h"
+#include "velox/experimental/cudf/functions/GpuSfiExpression.h"
 #include "velox/experimental/cudf/tests/utils/ExpressionTestUtil.h"
 
 #include "velox/common/file/FileSystems.h"
@@ -77,12 +78,24 @@ class CudfLogicalFunctionsTest : public OperatorTestBase {
            const RowTypePtr& row,
            memory::MemoryPool* pool,
            const core::QueryConfig& config) {
-          return std::make_shared<cudf_velox::JitExpression>(expr, row, pool);
+          return std::make_shared<cudf_velox::JitExpression>(
+              expr, row, pool, config);
         },
         /*overwrite=*/true);
+
+    // GPU SFI outranks the function tier too, and it registers not and
+    // is_null, so without this the expressions below route to a compiled
+    // kernel and never reach the implementations this suite is about.
+    auto& registry = cudf_velox::getCudfExpressionEvaluatorRegistry();
+    auto& gpuSfi = registry.at(cudf_velox::kGpuSfiEvaluatorName);
+    previousGpuSfiPriority_ = gpuSfi.priority;
+    gpuSfi.priority = 0;
   }
 
   void TearDown() override {
+    cudf_velox::getCudfExpressionEvaluatorRegistry()
+        .at(cudf_velox::kGpuSfiEvaluatorName)
+        .priority = previousGpuSfiPriority_;
     cudf_velox::unregisterCudf();
     execCtx_.reset();
     queryCtx_.reset();
@@ -116,6 +129,9 @@ class CudfLogicalFunctionsTest : public OperatorTestBase {
 
   std::shared_ptr<core::QueryCtx> queryCtx_;
   std::unique_ptr<core::ExecCtx> execCtx_;
+  /// Restored in TearDown: the evaluator registry is global, so a demotion
+  /// left behind would silently change what later suites exercise.
+  int previousGpuSfiPriority_{0};
 };
 
 // UnaryFunction: negation of a boolean column. Base column-only path.
