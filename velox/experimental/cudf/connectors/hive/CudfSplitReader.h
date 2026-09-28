@@ -28,8 +28,10 @@
 #include "velox/connectors/hive/FileHandle.h"
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/dwio/common/Statistics.h"
+#include "velox/type/Filter.h"
 #include "velox/type/Type.h"
 
+#include <cudf/ast/expressions.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>
 #include <cudf/io/parquet.hpp>
@@ -39,6 +41,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -74,6 +77,8 @@ class CudfSplitReader : public NvtxHelper {
   /// row group pass to be on the device, one sample per pass.
   static constexpr const char* kFetchWaitWallNanos = "cudfFetchWaitWallNanos";
 
+  /// Snapshots dynamicFilters for reader pruning. Later filters remain in the
+  /// data source for post-read filtering.
   CudfSplitReader(
       std::shared_ptr<CudfHiveConnectorSplit> split,
       std::shared_ptr<const ::facebook::velox::connector::hive::HiveTableHandle>
@@ -87,7 +92,8 @@ class CudfSplitReader : public NvtxHelper {
       const std::shared_ptr<FetchAheadContext>& fetchAheadContext,
       const std::shared_ptr<io::IoStatistics>& ioStatistics,
       const std::shared_ptr<IoStats>& ioStats,
-      const cudf::ast::expression* subfieldFilterAst);
+      const cudf::ast::expression* subfieldFilterAst,
+      const common::SubfieldFilters* dynamicFilters);
 
   virtual ~CudfSplitReader();
 
@@ -143,6 +149,12 @@ class CudfSplitReader : public NvtxHelper {
   /// Get the stream.
   cuda::stream_ref stream() const {
     return stream_;
+  }
+
+  /// Whether footer statistics prove all retained rows satisfy the dynamic
+  /// snapshot.
+  bool dynamicFiltersSatisfied() const {
+    return dynamicFiltersSatisfied_;
   }
 
   /// Releases the reader, data source, parquet metadata and any pending
@@ -294,6 +306,10 @@ class CudfSplitReader : public NvtxHelper {
   // Setup the cuDF reader options
   void setupReaderOptions();
 
+  // Use the parsed integer statistics to prune groups and prove redundant
+  // ranges.
+  void filterDynamicRowGroups();
+
   // Setup Parquet column and offset indexes for the cudf split reader.
   void setupPageIndexes();
 
@@ -344,6 +360,16 @@ class CudfSplitReader : public NvtxHelper {
 
   std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
   memory::MemoryPool* pool_;
+  // The immutable integer bounds supplied when this reader was created.
+  std::vector<std::tuple<
+      std::string,
+      cudf::data_type,
+      std::shared_ptr<const common::Filter>>>
+      readerDynamicFilters_;
+  // One entry per row group; empty if dynamic statistics cannot be used.
+  std::vector<bool> dynamicRowGroups_;
+  // Every row in a retained group satisfies the captured dynamic bounds.
+  bool dynamicFiltersSatisfied_{false};
 
   // The connector's fetch-ahead state. Null when the connector has no
   // fetch-ahead budget. Declared before the pass state, whose buffers can be

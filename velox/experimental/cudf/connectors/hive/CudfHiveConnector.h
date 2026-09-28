@@ -45,7 +45,7 @@ class CudfHiveConnector final
       ConnectorQueryCtx* connectorQueryCtx) override final;
 
   bool canAddDynamicFilter() const override {
-    return false;
+    return true;
   }
 
   bool supportsSplitPreload() const override {
