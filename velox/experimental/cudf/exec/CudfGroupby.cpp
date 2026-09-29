@@ -44,6 +44,8 @@
 
 #include <cuda/std/numeric>
 
+#include <folly/ScopeGuard.h>
+
 #include <cmath>
 #include <limits>
 
@@ -150,8 +152,7 @@ struct StreamingGroupbyDecimalSumAggregator final
       cudf::table_view input,
       std::vector<cudf::column_view>& preparedColumns,
       cuda::stream_ref stream) override {
-    decodedState_ = {};
-    castedState_.reset();
+    releaseInput();
     auto column = input.column(inputIndex);
     const auto scale = getDecimalPrecisionScale(*resultType).second;
     const cudf::data_type stateType{cudf::type_id::DECIMAL128, -scale};
@@ -186,6 +187,11 @@ struct StreamingGroupbyDecimalSumAggregator final
     auto output = std::move(results[resultIndex_].results[0]);
     validateDecimalSumResult(output->view(), stream);
     return castStreamingOutput(std::move(output), resultType, stream, mr);
+  }
+
+  void releaseInput() override {
+    decodedState_ = {};
+    castedState_.reset();
   }
 
  private:
@@ -502,6 +508,13 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
     return col;
   }
 
+  void releaseInput() override {
+    GroupbyAggregator::releaseInput();
+    castedInput_.reset();
+    decodedSum_.reset();
+    decodedCount_.reset();
+  }
+
   bool supportsDirectFinalization() const override {
     return step == core::AggregationNode::Step::kFinal;
   }
@@ -611,6 +624,13 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
     }
     // All four aggregation steps are handled above.
     VELOX_UNREACHABLE();
+  }
+
+  void releaseInput() override {
+    GroupbyAggregator::releaseInput();
+    castedInput_.reset();
+    decodedSum_.reset();
+    decodedCount_.reset();
   }
 
   bool supportsDirectFinalization() const override {
@@ -1555,11 +1575,14 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr input) {
     if (needsStreamJoin) {
       streamingGroupbyEvent_->recordFrom(stateStream).waitOn(inputStream);
     }
+    for (auto& aggregator : streamingGroupbyAggregators_) {
+      aggregator->releaseInput();
+    }
   };
 
-  auto preparedInput =
-      makeStreamingGroupbyInputView(input->getTableView(), stateStream);
   try {
+    auto preparedInput =
+        makeStreamingGroupbyInputView(input->getTableView(), stateStream);
     if (!streamingGroupby_) {
       // max_distinct_keys is a logical capacity. libcudf's 0.5 cuco load
       // factor allocates roughly two physical hash slots per logical key. The
@@ -1945,6 +1968,12 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
       ignoreNullKeys_ ? cudf::null_policy::EXCLUDE
                       : cudf::null_policy::INCLUDE);
 
+  auto releaseInputs = [&]() {
+    for (auto& aggregator : aggregators) {
+      aggregator->releaseInput();
+    }
+  };
+  auto releaseInputsGuard = folly::makeGuard(releaseInputs);
   std::vector<cudf::groupby::aggregation_request> requests;
   {
     nvtx3::scoped_range_in<VeloxDomain> range{
@@ -1962,6 +1991,9 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
     std::tie(groupKeys, results) =
         groupByOwner.aggregate(requests, stream, mr);
   }
+  requests.clear();
+  releaseInputs();
+  releaseInputsGuard.dismiss();
 
   std::unique_ptr<cudf::table> resultTable;
   {
