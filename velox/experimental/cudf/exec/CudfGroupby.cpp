@@ -524,16 +524,11 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
     VELOX_CHECK(supportsDirectFinalization());
-    std::unique_ptr<cudf::column> sum;
-    if (nativeState.encoding ==
-        CudfPhysicalEncoding::kNativeDecimal64SumState) {
-      sum = std::move(state);
-    } else {
-      const auto scale = getDecimalPrecisionScale(*resultType).second;
-      auto decoded = cudf_velox::deserializeDecimalSumState(
-          state->view(), scale, stream);
-      sum = std::make_unique<cudf::column>(decoded.sum->view(), stream, mr);
-    }
+    const auto scale = getDecimalPrecisionScale(*resultType).second;
+    auto decoded = cudf_velox::deserializeDecimalSumState(
+        state->view(), scale, stream);
+    auto sum =
+        std::make_unique<cudf::column>(decoded.sum->view(), stream, mr);
     validateDecimalSumResult(sum->view(), stream);
     const auto outputType = cudf_velox::veloxToCudfDataType(resultType);
     if (sum->type() != outputType) {
