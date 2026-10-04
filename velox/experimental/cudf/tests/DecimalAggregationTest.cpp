@@ -15,7 +15,9 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
+#include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -47,9 +49,14 @@
 
 #include <cuda_runtime_api.h>
 
+#include <folly/String.h>
+
 #include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <map>
 #include <optional>
+#include <set>
 #include <type_traits>
 
 namespace facebook::velox::cudf_velox {
@@ -262,8 +269,60 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
     const auto planStats = exec::toPlanStats(task->taskStats());
     const auto it = planStats.find(planNodeId);
     return it != planStats.end() &&
-        it->second.customStats.count(
-            std::string{kStreamingGroupbyUsedStat}) > 0;
+        it->second.customStats.count(std::string{kStreamingGroupbyUsedStat}) >
+        0;
+  }
+
+  // Grouped decimal input covering positive, negative, cancelling, partially
+  // null and all-null groups plus DECIMAL64 extremes (for scale-0 DECIMAL(18)
+  // the extremes are +/-(10^18 - 1)). Returned as several small batches.
+  std::vector<RowVectorPtr> makeGroupedDecimalBatches(const TypePtr& type) {
+    const auto [precision, scale] = getDecimalPrecisionScale(*type);
+    const int64_t extreme = type->isShortDecimal()
+        ? static_cast<int64_t>(DecimalUtil::kPowersOfTen[18] - 1)
+        : 999'999'999'999'999'999;
+    const std::vector<int32_t> keys{1, 1, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 6, 6};
+    const std::vector<std::optional<int64_t>> values{
+        12345,
+        250,
+        -12345,
+        -250,
+        700,
+        -700,
+        0,
+        100,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        extreme,
+        extreme,
+        -extreme};
+    std::vector<RowVectorPtr> batches;
+    for (int32_t batch = 0; batch < 3; ++batch) {
+      // Rotate so each batch has a different group mix.
+      std::vector<int32_t> batchKeys;
+      std::vector<std::optional<int64_t>> batchValues;
+      for (size_t i = 0; i < keys.size(); ++i) {
+        const auto index = (i + batch * 5) % keys.size();
+        batchKeys.push_back(keys[index]);
+        batchValues.push_back(values[index]);
+      }
+      VectorPtr valueVector;
+      if (type->isShortDecimal()) {
+        valueVector = makeNullableFlatVector<int64_t>(batchValues, type);
+      } else {
+        std::vector<std::optional<int128_t>> wide;
+        for (const auto& value : batchValues) {
+          wide.push_back(
+              value.has_value() ? std::make_optional<int128_t>(*value)
+                                : std::nullopt);
+        }
+        valueVector = makeNullableFlatVector<int128_t>(wide, type);
+      }
+      batches.push_back(makeRowVector(
+          {"k", "d"}, {makeFlatVector<int32_t>(batchKeys), valueVector}));
+    }
+    return batches;
   }
 };
 
@@ -920,23 +979,35 @@ TEST_F(CudfDecimalTest, decimalGroupbyReleasesRequestTemporaries) {
         EXPECT_EQ(tracking.get_outstanding_allocations().count(castData), 0);
         auto state = partial[0]->makeOutputColumn(partialResults, stream, mr);
 
+        // The partial state is a self-describing struct; the final step's
+        // request views alias its children, so no decode temporary exists and
+        // nothing may be left behind after releaseInput().
+        ASSERT_EQ(state->type().id(), cudf::type_id::STRUCT);
+        std::set<const void*> stateChildData;
+        for (cudf::size_type child = 0; child < state->num_children();
+             ++child) {
+          stateChildData.insert(state->view().child(child).head());
+        }
         const cudf::table_view stateInput{
             {partialKeys->view().column(0), state->view()}};
         cudf::groupby::groupby finalGroupby(partialKeys->view());
         final[0]->addGroupbyRequest(stateInput, requests, stream, mr);
-        std::vector<void*> decodedData;
+        std::vector<void*> requestData;
         for (const auto& request : requests) {
-          decodedData.push_back(const_cast<void*>(request.values.head()));
+          requestData.push_back(const_cast<void*>(request.values.head()));
           ASSERT_EQ(
-              tracking.get_outstanding_allocations().count(decodedData.back()),
+              tracking.get_outstanding_allocations().count(requestData.back()),
               1);
+          EXPECT_EQ(stateChildData.count(requestData.back()), 1);
         }
         auto [finalKeys, finalResults] =
             finalGroupby.aggregate(requests, stream, mr);
         requests.clear();
         final[0]->releaseInput();
-        for (auto* data : decodedData) {
-          EXPECT_EQ(tracking.get_outstanding_allocations().count(data), 0);
+        for (auto* data : requestData) {
+          if (stateChildData.count(data) == 0) {
+            EXPECT_EQ(tracking.get_outstanding_allocations().count(data), 0);
+          }
         }
         auto result = final[0]->makeOutputColumn(finalResults, stream, mr);
         ASSERT_EQ(result->size(), 1);
@@ -2354,5 +2425,683 @@ TEST_F(CudfDecimalTest, cudfVarbinaryRowTypeMismatch) {
       roundTrip->setType(expectedType), "Cannot change vector type");
 }
 
+// ---------------------------------------------------------------------------
+// Self-describing decimal aggregate state (struct transport form).
+// ---------------------------------------------------------------------------
+
+// Builds the 32-byte-per-row CPU blob (count int64, overflow int64, sum low
+// uint64, sum high int64) as a cuDF STRING column, i.e. what CudfFromVelox
+// produces from a CPU partial's VARBINARY output.
+std::unique_ptr<cudf::column> makeBlobStateColumn(
+    const std::vector<int64_t>& counts,
+    const std::vector<int64_t>& overflows,
+    const std::vector<int128_t>& sums,
+    const std::vector<bool>* valid,
+    cuda::stream_ref stream) {
+  constexpr size_t kRowBytes = 32;
+  const auto numRows = static_cast<cudf::size_type>(sums.size());
+  VELOX_CHECK_EQ(counts.size(), sums.size());
+  VELOX_CHECK_EQ(overflows.size(), sums.size());
+  std::vector<int32_t> offsets(numRows + 1);
+  std::vector<uint8_t> chars(static_cast<size_t>(numRows) * kRowBytes);
+  for (cudf::size_type i = 0; i < numRows; ++i) {
+    offsets[i] = static_cast<int32_t>(i * kRowBytes);
+    auto* row = chars.data() + static_cast<size_t>(i) * kRowBytes;
+    const uint64_t low = static_cast<uint64_t>(sums[i]);
+    const int64_t high = static_cast<int64_t>(sums[i] >> 64);
+    std::memcpy(row, &counts[i], sizeof(int64_t));
+    std::memcpy(row + 8, &overflows[i], sizeof(int64_t));
+    std::memcpy(row + 16, &low, sizeof(uint64_t));
+    std::memcpy(row + 24, &high, sizeof(int64_t));
+  }
+  offsets[numRows] = static_cast<int32_t>(numRows * kRowBytes);
+  auto offsetsCol = makeFixedWidthColumn<int32_t>(
+      cudf::data_type{cudf::type_id::INT32}, offsets, nullptr, stream);
+  rmm::device_buffer charsBuf(chars.size(), stream);
+  if (!chars.empty()) {
+    auto status = cudaMemcpyAsync(
+        charsBuf.data(),
+        chars.data(),
+        chars.size(),
+        cudaMemcpyHostToDevice,
+        stream.get());
+    VELOX_CHECK_EQ(0, static_cast<int>(status));
+    stream.sync();
+  }
+  cuda::device_buffer<std::byte> mask{
+      stream, cudf::get_current_device_resource_ref()};
+  cudf::size_type nullCount = 0;
+  if (valid) {
+    std::tie(mask, nullCount) = makeNullMask(*valid, stream);
+  }
+  return cudf::make_strings_column(
+      numRows,
+      std::move(offsetsCol),
+      std::move(charsBuf),
+      nullCount,
+      std::move(mask));
+}
+
+// Builds the aggregation node for 'aggregate' over ROW(k BIGINT, d 'type') at
+// the given step (grouped by k, or global when 'grouped' is false).
+std::shared_ptr<const core::AggregationNode> makeDecimalAggregationNode(
+    const std::string& aggregate,
+    const TypePtr& type,
+    core::AggregationNode::Step step,
+    bool grouped,
+    memory::MemoryPool* pool) {
+  auto keys = BaseVector::create<FlatVector<int64_t>>(BIGINT(), 1, pool);
+  auto values = BaseVector::create(type, 1, pool);
+  auto input = std::make_shared<RowVector>(
+      pool,
+      ROW({"k", "d"}, {BIGINT(), type}),
+      nullptr,
+      1,
+      std::vector<VectorPtr>{keys, values});
+  const std::vector<std::string> groupingKeys =
+      grouped ? std::vector<std::string>{"k"} : std::vector<std::string>{};
+  auto builder = exec::test::PlanBuilder().values({input}).partialAggregation(
+      groupingKeys, {aggregate});
+  if (step == core::AggregationNode::Step::kIntermediate) {
+    builder.intermediateAggregation();
+  } else if (step == core::AggregationNode::Step::kFinal) {
+    builder.finalAggregation();
+  } else {
+    VELOX_CHECK(step == core::AggregationNode::Step::kPartial);
+  }
+  auto node = std::dynamic_pointer_cast<const core::AggregationNode>(
+      builder.planNode());
+  VELOX_CHECK_NOT_NULL(node);
+  VELOX_CHECK(node->step() == step);
+  return node;
+}
+
+std::unique_ptr<GroupbyAggregator> makeDecimalGroupbyAggregator(
+    const std::string& aggregate,
+    const TypePtr& type,
+    core::AggregationNode::Step step,
+    memory::MemoryPool* pool) {
+  auto node = makeDecimalAggregationNode(aggregate, type, step, true, pool);
+  auto aggregators = toGroupbyAggregators(
+      *node, node->step(), node->outputType(), {nullptr}, {});
+  VELOX_CHECK_EQ(aggregators.size(), 1);
+  return std::move(aggregators[0]);
+}
+
+struct ReduceAggregatorWithType {
+  std::unique_ptr<ReduceAggregator> aggregator;
+  TypePtr outputType;
+};
+
+ReduceAggregatorWithType makeDecimalReduceAggregator(
+    const std::string& aggregate,
+    const TypePtr& type,
+    core::AggregationNode::Step step,
+    memory::MemoryPool* pool) {
+  auto node = makeDecimalAggregationNode(aggregate, type, step, false, pool);
+  auto aggregators = toReduceAggregators(
+      *node, node->step(), node->outputType(), {nullptr}, {});
+  VELOX_CHECK_EQ(aggregators.size(), 1);
+  return {std::move(aggregators[0]), node->outputType()->childAt(0)};
+}
+
+// Runs one group-by aggregator over a [keys, values] table and returns the
+// group keys (INT64) with the aggregate output column.
+struct GroupbyRun {
+  std::unique_ptr<cudf::table> keys;
+  std::unique_ptr<cudf::column> output;
+};
+
+GroupbyRun runGroupbyAggregator(
+    GroupbyAggregator& aggregator,
+    cudf::column_view keys,
+    cudf::column_view values,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  const cudf::table_view input{{keys, values}};
+  cudf::groupby::groupby groupby(
+      cudf::table_view{{keys}}, cudf::null_policy::INCLUDE);
+  std::vector<cudf::groupby::aggregation_request> requests;
+  aggregator.addGroupbyRequest(input, requests, stream, mr);
+  auto [groupKeys, results] = groupby.aggregate(requests, stream, mr);
+  requests.clear();
+  aggregator.releaseInput();
+  return {
+      std::move(groupKeys), aggregator.makeOutputColumn(results, stream, mr)};
+}
+
+// Copies a group-by result to the host as key -> optional value.
+template <typename T>
+std::map<int64_t, std::optional<T>> hostGroups(
+    const cudf::table_view& keys,
+    const cudf::column_view& values,
+    cuda::stream_ref stream) {
+  auto hostKeys = copyColumnData<int64_t>(keys.column(0), stream);
+  auto hostValues = copyColumnData<T>(values, stream);
+  // copyNullMask yields a zero-filled vector for a non-nullable column, which
+  // isValidAt would read as all-null; treat such columns as fully valid.
+  const auto mask = values.nullable() ? copyNullMask(values, stream)
+                                      : std::vector<cudf::bitmask_type>{};
+  std::map<int64_t, std::optional<T>> result;
+  for (size_t i = 0; i < hostKeys.size(); ++i) {
+    result[hostKeys[i]] =
+        isValidAt(mask, i) ? std::make_optional(hostValues[i]) : std::nullopt;
+  }
+  return result;
+}
+
+struct ShapeCase {
+  std::string aggregate;
+  TypePtr type;
+  DecimalStateShape shape;
+  std::vector<cudf::type_id> childTypes;
+};
+
+std::vector<ShapeCase> decimalShapeCases() {
+  return {
+      {"sum(d)",
+       DECIMAL(18, 2),
+       DecimalStateShape::kSum64,
+       {cudf::type_id::DECIMAL128}},
+      {"avg(d)",
+       DECIMAL(18, 2),
+       DecimalStateShape::kAvg64,
+       {cudf::type_id::DECIMAL128, cudf::type_id::INT64}},
+      {"sum(d)",
+       DECIMAL(38, 2),
+       DecimalStateShape::kSum128,
+       {cudf::type_id::INT64, cudf::type_id::DECIMAL128}},
+      {"avg(d)",
+       DECIMAL(38, 2),
+       DecimalStateShape::kAvg128,
+       {cudf::type_id::DECIMAL128, cudf::type_id::INT64, cudf::type_id::INT64}},
+  };
+}
+
+void expectDecimalStateStruct(
+    const cudf::column_view& column,
+    const ShapeCase& shapeCase,
+    int32_t scale) {
+  ASSERT_EQ(column.type().id(), cudf::type_id::STRUCT);
+  ASSERT_TRUE(isDecimalStateStruct(column));
+  EXPECT_EQ(decimalStateShapeOf(column), shapeCase.shape);
+  // Validity lives on the sum child only; the parent has no null mask.
+  EXPECT_FALSE(column.nullable());
+  ASSERT_EQ(
+      static_cast<size_t>(column.num_children()), shapeCase.childTypes.size());
+  for (size_t i = 0; i < shapeCase.childTypes.size(); ++i) {
+    const auto child = column.child(static_cast<cudf::size_type>(i));
+    EXPECT_EQ(child.type().id(), shapeCase.childTypes[i]) << "child " << i;
+    EXPECT_EQ(child.size(), column.size());
+    if (shapeCase.childTypes[i] == cudf::type_id::DECIMAL128) {
+      EXPECT_EQ(child.type().scale(), -scale);
+    }
+  }
+}
+
+// Raw input column of 'type' for keys {0, 0, 1, 1}: group 0 holds {100, null},
+// group 1 is all null.
+std::unique_ptr<cudf::column> makeRawDecimalInput(
+    const TypePtr& type,
+    cuda::stream_ref stream) {
+  const std::vector<bool> valid{true, false, false, false};
+  if (type->isShortDecimal()) {
+    return makeDecimalColumn<int64_t>({100, 0, 0, 0}, 2, &valid, stream);
+  }
+  return makeDecimalColumn<int128_t>({100, 0, 0, 0}, 2, &valid, stream);
+}
+
 } // namespace
+
+TEST_F(CudfDecimalTest, decimalPartialGroupbyEmitsStateStruct) {
+  const auto stream = cudf::get_default_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+  for (const auto& shapeCase : decimalShapeCases()) {
+    SCOPED_TRACE(shapeCase.aggregate + " " + shapeCase.type->toString());
+    auto partial = makeDecimalGroupbyAggregator(
+        shapeCase.aggregate,
+        shapeCase.type,
+        core::AggregationNode::Step::kPartial,
+        pool());
+    auto keys = makeInt64Column({0, 0, 1, 1}, nullptr, stream);
+    auto values = makeRawDecimalInput(shapeCase.type, stream);
+    auto run = runGroupbyAggregator(
+        *partial, keys->view(), values->view(), stream, mr);
+    ASSERT_EQ(run.output->size(), 2);
+    expectDecimalStateStruct(run.output->view(), shapeCase, 2);
+
+    const auto shape = shapeCase.shape;
+    const auto sumIndex = shape == DecimalStateShape::kSum128 ? 1 : 0;
+    auto sums = hostGroups<int128_t>(
+        run.keys->view(), run.output->view().child(sumIndex), stream);
+    EXPECT_EQ(sums.at(0), std::make_optional<int128_t>(100));
+    EXPECT_FALSE(sums.at(1).has_value());
+    if (decimalStateHasCount(shape)) {
+      auto counts = hostGroups<int64_t>(
+          run.keys->view(), run.output->view().child(1), stream);
+      EXPECT_EQ(counts.at(0), std::make_optional<int64_t>(1));
+      EXPECT_EQ(counts.at(1), std::make_optional<int64_t>(0));
+    }
+    if (decimalStateHasOverflow(shape)) {
+      const auto overflowIndex = shape == DecimalStateShape::kSum128 ? 0 : 2;
+      auto overflows = hostGroups<int64_t>(
+          run.keys->view(), run.output->view().child(overflowIndex), stream);
+      EXPECT_EQ(overflows.at(0), std::make_optional<int64_t>(0));
+      EXPECT_EQ(overflows.at(1), std::make_optional<int64_t>(0));
+    }
+
+    // The struct feeds a FINAL step directly.
+    auto final = makeDecimalGroupbyAggregator(
+        shapeCase.aggregate,
+        shapeCase.type,
+        core::AggregationNode::Step::kFinal,
+        pool());
+    auto finalRun = runGroupbyAggregator(
+        *final, run.keys->view().column(0), run.output->view(), stream, mr);
+    ASSERT_EQ(finalRun.output->size(), 2);
+    if (shapeCase.aggregate == "sum(d)") {
+      auto result = hostGroups<int128_t>(
+          finalRun.keys->view(), finalRun.output->view(), stream);
+      EXPECT_EQ(result.at(0), std::make_optional<int128_t>(100));
+      EXPECT_FALSE(result.at(1).has_value());
+    } else if (shapeCase.type->isShortDecimal()) {
+      auto result = hostGroups<int64_t>(
+          finalRun.keys->view(), finalRun.output->view(), stream);
+      EXPECT_EQ(result.at(0), std::make_optional<int64_t>(100));
+      EXPECT_FALSE(result.at(1).has_value());
+    } else {
+      auto result = hostGroups<int128_t>(
+          finalRun.keys->view(), finalRun.output->view(), stream);
+      EXPECT_EQ(result.at(0), std::make_optional<int128_t>(100));
+      EXPECT_FALSE(result.at(1).has_value());
+    }
+
+    // The struct also feeds an INTERMEDIATE step, which re-emits the shape.
+    auto intermediate = makeDecimalGroupbyAggregator(
+        shapeCase.aggregate,
+        shapeCase.type,
+        core::AggregationNode::Step::kIntermediate,
+        pool());
+    auto intermediateRun = runGroupbyAggregator(
+        *intermediate,
+        run.keys->view().column(0),
+        run.output->view(),
+        stream,
+        mr);
+    ASSERT_EQ(intermediateRun.output->size(), 2);
+    expectDecimalStateStruct(intermediateRun.output->view(), shapeCase, 2);
+    auto mergedSums = hostGroups<int128_t>(
+        intermediateRun.keys->view(),
+        intermediateRun.output->view().child(sumIndex),
+        stream);
+    EXPECT_EQ(mergedSums.at(0), std::make_optional<int128_t>(100));
+    EXPECT_FALSE(mergedSums.at(1).has_value());
+  }
+}
+
+TEST_F(CudfDecimalTest, decimalPartialReduceEmitsStateStruct) {
+  const auto stream = cudf::get_default_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+  for (const auto& shapeCase : decimalShapeCases()) {
+    SCOPED_TRACE(shapeCase.aggregate + " " + shapeCase.type->toString());
+    auto partial = makeDecimalReduceAggregator(
+        shapeCase.aggregate,
+        shapeCase.type,
+        core::AggregationNode::Step::kPartial,
+        pool());
+    auto values = makeRawDecimalInput(shapeCase.type, stream);
+    auto state = partial.aggregator->doReduce(
+        cudf::table_view{{values->view()}},
+        partial.outputType,
+        values->size(),
+        stream,
+        mr);
+    ASSERT_EQ(state->size(), 1);
+    expectDecimalStateStruct(state->view(), shapeCase, 2);
+    const auto sumIndex = shapeCase.shape == DecimalStateShape::kSum128 ? 1 : 0;
+    EXPECT_EQ(
+        copyColumnData<int128_t>(state->view().child(sumIndex), stream),
+        std::vector<int128_t>{100});
+    EXPECT_EQ(state->view().child(sumIndex).null_count(), 0);
+
+    auto intermediate = makeDecimalReduceAggregator(
+        shapeCase.aggregate,
+        shapeCase.type,
+        core::AggregationNode::Step::kIntermediate,
+        pool());
+    auto merged = intermediate.aggregator->doReduce(
+        cudf::table_view{{state->view()}},
+        intermediate.outputType,
+        1,
+        stream,
+        mr);
+    expectDecimalStateStruct(merged->view(), shapeCase, 2);
+
+    auto final = makeDecimalReduceAggregator(
+        shapeCase.aggregate,
+        shapeCase.type,
+        core::AggregationNode::Step::kFinal,
+        pool());
+    auto result = final.aggregator->doReduce(
+        cudf::table_view{{merged->view()}}, final.outputType, 1, stream, mr);
+    ASSERT_EQ(result->size(), 1);
+    EXPECT_EQ(result->null_count(), 0);
+    if (result->type().id() == cudf::type_id::DECIMAL64) {
+      EXPECT_EQ(
+          copyColumnData<int64_t>(result->view(), stream),
+          std::vector<int64_t>{100});
+    } else {
+      EXPECT_EQ(
+          copyColumnData<int128_t>(result->view(), stream),
+          std::vector<int128_t>{100});
+    }
+
+    // An all-null input yields a null state row and a null final result.
+    const std::vector<bool> allNull{false, false};
+    auto nullValues = shapeCase.type->isShortDecimal()
+        ? makeDecimalColumn<int64_t>({0, 0}, 2, &allNull, stream)
+        : makeDecimalColumn<int128_t>({0, 0}, 2, &allNull, stream);
+    auto nullState = partial.aggregator->doReduce(
+        cudf::table_view{{nullValues->view()}},
+        partial.outputType,
+        2,
+        stream,
+        mr);
+    expectDecimalStateStruct(nullState->view(), shapeCase, 2);
+    EXPECT_EQ(nullState->view().child(sumIndex).null_count(), 1);
+    auto nullResult = final.aggregator->doReduce(
+        cudf::table_view{{nullState->view()}}, final.outputType, 1, stream, mr);
+    ASSERT_EQ(nullResult->size(), 1);
+    EXPECT_EQ(nullResult->null_count(), 1);
+  }
+}
+
+TEST_F(CudfDecimalTest, decimalFinalAcceptsCpuBlobState) {
+  const auto stream = cudf::get_default_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+  // Three state rows from a CPU partial: group 0 has two rows (counts 2 and
+  // 1), group 1 one row, group 2 an all-null row.
+  const std::vector<bool> valid{true, true, true, false};
+  auto keys = makeInt64Column({0, 0, 1, 2}, nullptr, stream);
+  auto blob = makeBlobStateColumn(
+      {2, 1, 1, 0}, {0, 0, 0, 0}, {100, 50, -30, 0}, &valid, stream);
+
+  for (const auto& shapeCase : decimalShapeCases()) {
+    SCOPED_TRACE(shapeCase.aggregate + " " + shapeCase.type->toString());
+    auto final = makeDecimalGroupbyAggregator(
+        shapeCase.aggregate,
+        shapeCase.type,
+        core::AggregationNode::Step::kFinal,
+        pool());
+    auto run =
+        runGroupbyAggregator(*final, keys->view(), blob->view(), stream, mr);
+    ASSERT_EQ(run.output->size(), 3);
+    if (shapeCase.aggregate == "sum(d)") {
+      auto result =
+          hostGroups<int128_t>(run.keys->view(), run.output->view(), stream);
+      EXPECT_EQ(result.at(0), std::make_optional<int128_t>(150));
+      EXPECT_EQ(result.at(1), std::make_optional<int128_t>(-30));
+      EXPECT_FALSE(result.at(2).has_value());
+    } else if (shapeCase.type->isShortDecimal()) {
+      auto result =
+          hostGroups<int64_t>(run.keys->view(), run.output->view(), stream);
+      EXPECT_EQ(result.at(0), std::make_optional<int64_t>(50));
+      EXPECT_EQ(result.at(1), std::make_optional<int64_t>(-30));
+      EXPECT_FALSE(result.at(2).has_value());
+    } else {
+      auto result =
+          hostGroups<int128_t>(run.keys->view(), run.output->view(), stream);
+      EXPECT_EQ(result.at(0), std::make_optional<int128_t>(50));
+      EXPECT_EQ(result.at(1), std::make_optional<int128_t>(-30));
+      EXPECT_FALSE(result.at(2).has_value());
+    }
+
+    // The same blob through an INTERMEDIATE step re-emits the plan shape with
+    // the real scale on the sum child, and a FINAL over it agrees.
+    auto intermediate = makeDecimalGroupbyAggregator(
+        shapeCase.aggregate,
+        shapeCase.type,
+        core::AggregationNode::Step::kIntermediate,
+        pool());
+    auto intermediateRun = runGroupbyAggregator(
+        *intermediate, keys->view(), blob->view(), stream, mr);
+    expectDecimalStateStruct(intermediateRun.output->view(), shapeCase, 2);
+    auto finalAgain = makeDecimalGroupbyAggregator(
+        shapeCase.aggregate,
+        shapeCase.type,
+        core::AggregationNode::Step::kFinal,
+        pool());
+    auto rerun = runGroupbyAggregator(
+        *finalAgain,
+        intermediateRun.keys->view().column(0),
+        intermediateRun.output->view(),
+        stream,
+        mr);
+    if (rerun.output->type().id() == cudf::type_id::DECIMAL64) {
+      EXPECT_EQ(
+          hostGroups<int64_t>(rerun.keys->view(), rerun.output->view(), stream),
+          hostGroups<int64_t>(run.keys->view(), run.output->view(), stream));
+    } else {
+      EXPECT_EQ(
+          hostGroups<int128_t>(
+              rerun.keys->view(), rerun.output->view(), stream),
+          hostGroups<int128_t>(run.keys->view(), run.output->view(), stream));
+    }
+
+    // Direct finalization (used by the incremental final path) accepts both
+    // the struct and the blob.
+    ASSERT_TRUE(final->supportsDirectFinalization());
+    auto fromStruct = final->finalize(
+        std::make_unique<cudf::column>(
+            intermediateRun.output->view(), stream, mr),
+        stream,
+        mr);
+    auto fromBlob = final->finalize(
+        std::make_unique<cudf::column>(blob->view(), stream, mr), stream, mr);
+    ASSERT_EQ(fromStruct->size(), 3);
+    ASSERT_EQ(fromBlob->size(), 4);
+    EXPECT_EQ(fromBlob->null_count(), 1);
+  }
+
+  // Global (CudfReduce) FINAL over the blob.
+  for (const auto& shapeCase : decimalShapeCases()) {
+    SCOPED_TRACE(
+        "reduce " + shapeCase.aggregate + " " + shapeCase.type->toString());
+    auto final = makeDecimalReduceAggregator(
+        shapeCase.aggregate,
+        shapeCase.type,
+        core::AggregationNode::Step::kFinal,
+        pool());
+    auto result = final.aggregator->doReduce(
+        cudf::table_view{{blob->view()}}, final.outputType, 4, stream, mr);
+    ASSERT_EQ(result->size(), 1);
+    EXPECT_EQ(result->null_count(), 0);
+    if (shapeCase.aggregate == "sum(d)") {
+      EXPECT_EQ(
+          copyColumnData<int128_t>(result->view(), stream),
+          std::vector<int128_t>{120});
+    } else if (result->type().id() == cudf::type_id::DECIMAL64) {
+      EXPECT_EQ(
+          copyColumnData<int64_t>(result->view(), stream),
+          std::vector<int64_t>{30});
+    } else {
+      EXPECT_EQ(
+          copyColumnData<int128_t>(result->view(), stream),
+          std::vector<int128_t>{30});
+    }
+  }
+}
+
+TEST_F(CudfDecimalTest, decimalFinalRejectsBlobWithOverflow) {
+  const auto stream = cudf::get_default_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+  auto keys = makeInt64Column({0, 0, 1}, nullptr, stream);
+  auto blob =
+      makeBlobStateColumn({1, 1, 1}, {1, 0, -2}, {5, 7, 9}, nullptr, stream);
+  // Overflow is only representable for DECIMAL128 raw inputs (the DECIMAL64
+  // shapes drop it because it is provably zero there).
+  for (const auto& aggregate : {"sum(d)", "avg(d)"}) {
+    SCOPED_TRACE(aggregate);
+    auto final = makeDecimalGroupbyAggregator(
+        aggregate, DECIMAL(38, 2), core::AggregationNode::Step::kFinal, pool());
+    VELOX_ASSERT_USER_THROW(
+        runGroupbyAggregator(*final, keys->view(), blob->view(), stream, mr),
+        "Decimal overflow");
+    VELOX_ASSERT_USER_THROW(
+        final->finalize(
+            std::make_unique<cudf::column>(blob->view(), stream, mr),
+            stream,
+            mr),
+        "Decimal overflow");
+    auto reduce = makeDecimalReduceAggregator(
+        aggregate, DECIMAL(38, 2), core::AggregationNode::Step::kFinal, pool());
+    VELOX_ASSERT_USER_THROW(
+        reduce.aggregator->doReduce(
+            cudf::table_view{{blob->view()}}, reduce.outputType, 3, stream, mr),
+        "Decimal overflow");
+  }
+
+  // The existing DECIMAL(38) range check still fires on the merged sum.
+  const int128_t limit = DecimalUtil::kPowersOfTen[38];
+  auto bigBlob =
+      makeBlobStateColumn({1, 1}, {0, 0}, {limit - 1, 1}, nullptr, stream);
+  auto oneKey = makeInt64Column({0, 0}, nullptr, stream);
+  for (const auto& type : {DECIMAL(18, 2), DECIMAL(38, 2)}) {
+    SCOPED_TRACE(type->toString());
+    auto final = makeDecimalGroupbyAggregator(
+        "sum(d)", type, core::AggregationNode::Step::kFinal, pool());
+    VELOX_ASSERT_USER_THROW(
+        runGroupbyAggregator(
+            *final, oneKey->view(), bigBlob->view(), stream, mr),
+        "Decimal overflow");
+    auto reduce = makeDecimalReduceAggregator(
+        "sum(d)", type, core::AggregationNode::Step::kFinal, pool());
+    VELOX_ASSERT_USER_THROW(
+        reduce.aggregator->doReduce(
+            cudf::table_view{{bigBlob->view()}},
+            reduce.outputType,
+            2,
+            stream,
+            mr),
+        "Decimal overflow");
+  }
+}
+
+TEST_F(CudfDecimalTest, decimalPartialFinalLocalExchangeMatchesCpu) {
+  auto& config = CudfConfig::getInstance();
+  const auto savedStreamingGroupbyEnabled = config.streamingGroupbyEnabled;
+  SCOPE_EXIT {
+    config.streamingGroupbyEnabled = savedStreamingGroupbyEnabled;
+  };
+  for (const auto& type : {DECIMAL(18, 0), DECIMAL(18, 2), DECIMAL(38, 2)}) {
+    const auto batches = makeGroupedDecimalBatches(type);
+    for (const auto& aggregates : std::vector<std::vector<std::string>>{
+             {"sum(d) AS s"},
+             {"avg(d) AS a"},
+             {"sum(d) AS s", "avg(d) AS a"}}) {
+      for (const bool streaming : {false, true}) {
+        SCOPED_TRACE(
+            fmt::format(
+                "{} {} streaming={}",
+                type->toString(),
+                folly::join(",", aggregates),
+                streaming));
+        config.streamingGroupbyEnabled = streaming;
+        const auto plan = exec::test::PlanBuilder()
+                              .values(batches, true)
+                              .partialAggregation({"k"}, aggregates)
+                              .localPartition({"k"})
+                              .finalAggregation()
+                              .orderBy({"k"}, false)
+                              .planNode();
+        unregisterCudf();
+        auto expected =
+            exec::test::AssertQueryBuilder(plan).maxDrivers(2).copyResults(
+                pool());
+        registerCudf();
+        exec::test::AssertQueryBuilder(plan)
+            .maxDrivers(2)
+            .config(CudfFromVelox::kGpuBatchSizeRows, "3")
+            .config(core::QueryConfig::kMaxPartialAggregationMemory, "1")
+            .assertResults(expected);
+      }
+    }
+  }
+}
+
+TEST_F(CudfDecimalTest, decimalPartialIntermediateFinalMatchesCpu) {
+  for (const auto& type : {DECIMAL(18, 2), DECIMAL(38, 2)}) {
+    const auto batches = makeGroupedDecimalBatches(type);
+    for (const auto& aggregates : std::vector<std::vector<std::string>>{
+             {"sum(d) AS s"},
+             {"avg(d) AS a"},
+             {"sum(d) AS s", "avg(d) AS a"}}) {
+      SCOPED_TRACE(type->toString() + " " + folly::join(",", aggregates));
+      const auto plan = exec::test::PlanBuilder()
+                            .values(batches, true)
+                            .partialAggregation({"k"}, aggregates)
+                            .localPartition({"k"})
+                            .intermediateAggregation()
+                            .localPartition({"k"})
+                            .finalAggregation()
+                            .orderBy({"k"}, false)
+                            .planNode();
+      unregisterCudf();
+      auto expected =
+          exec::test::AssertQueryBuilder(plan).maxDrivers(2).copyResults(
+              pool());
+      registerCudf();
+      exec::test::AssertQueryBuilder(plan)
+          .maxDrivers(2)
+          .config(CudfFromVelox::kGpuBatchSizeRows, "3")
+          .config(core::QueryConfig::kMaxPartialAggregationMemory, "1")
+          .assertResults(expected);
+    }
+  }
+}
+
+TEST_F(CudfDecimalTest, decimalGlobalSumAvgMatchesCpu) {
+  for (const auto& type : {DECIMAL(18, 2), DECIMAL(38, 2)}) {
+    auto grouped = makeGroupedDecimalBatches(type);
+    std::vector<RowVectorPtr> batches;
+    for (const auto& batch : grouped) {
+      batches.push_back(makeRowVector({"d"}, {batch->childAt(1)}));
+    }
+    // An all-null batch set exercises the null state row.
+    std::vector<RowVectorPtr> allNull{makeRowVector(
+        {"d"},
+        {type->isShortDecimal()
+             ? VectorPtr(
+                   makeNullableFlatVector<int64_t>(
+                       {std::nullopt, std::nullopt}, type))
+             : VectorPtr(
+                   makeNullableFlatVector<int128_t>(
+                       {std::nullopt, std::nullopt}, type))})};
+    for (const auto& input : {batches, allNull}) {
+      for (const bool withIntermediate : {false, true}) {
+        SCOPED_TRACE(
+            fmt::format(
+                "{} rows={} intermediate={}",
+                type->toString(),
+                input.size(),
+                withIntermediate));
+        auto builder =
+            exec::test::PlanBuilder().values(input).partialAggregation(
+                {}, {"sum(d) AS s", "avg(d) AS a"});
+        if (withIntermediate) {
+          builder.intermediateAggregation();
+        }
+        const auto plan = builder.finalAggregation().planNode();
+        unregisterCudf();
+        auto expected =
+            exec::test::AssertQueryBuilder(plan).copyResults(pool());
+        registerCudf();
+        exec::test::AssertQueryBuilder(plan)
+            .config(CudfFromVelox::kGpuBatchSizeRows, "3")
+            .assertResults(expected);
+      }
+    }
+  }
+}
+
 } // namespace facebook::velox::cudf_velox

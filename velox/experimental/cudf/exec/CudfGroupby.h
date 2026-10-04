@@ -17,6 +17,7 @@
 
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 
 #include <cudf/groupby.hpp>
 
@@ -79,6 +80,27 @@ struct StreamingGroupbyAggregator {
       std::optional<column_index_t> childIndex = std::nullopt) const;
 };
 
+// Describes a decimal SUM/AVG aggregate whose intermediate column (logical
+// VARBINARY) is carried on the GPU as a self-describing state struct. 'shape'
+// is the plan-determined struct shape this aggregate emits; 'scale' is the
+// decimal scale of the state's sum (the raw input scale), used to decode a
+// scale-less STRING blob.
+struct DecimalStateInfo {
+  DecimalStateShape shape;
+  int32_t scale;
+};
+
+/// Raises a "Decimal overflow" user error if any valid row of the DECIMAL128
+/// 'sum' column lies outside the DECIMAL(38) range.
+void validateDecimalSumResult(cudf::column_view sum, cuda::stream_ref stream);
+
+/// Raises a "Decimal overflow" user error if any valid row of the INT64
+/// 'overflow' state field is nonzero. A default-constructed (size 0) view is
+/// accepted and means the field was not tracked.
+void validateDecimalOverflowIsZero(
+    cudf::column_view overflow,
+    cuda::stream_ref stream);
+
 struct GroupbyAggregator {
   core::AggregationNode::Step step;
   uint32_t inputIndex;
@@ -112,6 +134,13 @@ struct GroupbyAggregator {
       cuda::stream_ref /*stream*/,
       rmm::device_async_resource_ref /*mr*/) {
     VELOX_UNSUPPORTED("Aggregate does not support direct finalization");
+  }
+
+  // Non-empty for decimal SUM/AVG aggregates whose intermediate column is a
+  // self-describing decimal state (STRING blob or state struct). The operator
+  // uses it to buffer and concatenate such columns field by field.
+  virtual std::optional<DecimalStateInfo> decimalStateInfo() const {
+    return std::nullopt;
   }
 
   virtual ~GroupbyAggregator() = default;
