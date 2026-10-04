@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationDevice.h"
 
 #include <cudf/column/column_device_view.cuh>
@@ -22,6 +23,7 @@
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <rmm/device_scalar.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
@@ -41,14 +43,23 @@ namespace {
 
 // Mirrors the CPU LongDecimalWithOverflowState layout so serialized SUM state
 // is interchangeable between CPU and GPU aggregation.
-// TODO: Track int128 overflow as the CPU does (DecimalUtil::addWithOverflow);
-// the `overflow` field is reserved for that and is always 0 until then.
+// TODO: Track int128 carries as the CPU does (DecimalUtil::addWithOverflow).
+// cuDF's DECIMAL128 SUM wraps modulo 2^128 without counting carries, so every
+// GPU producer writes overflow = 0 and the field is meaningful only when it
+// came from a CPU-produced state, which FINAL rejects when it is nonzero; see
+// DecimalAggregationState.h.
 struct DecimalSumState {
   int64_t count; // count of non-null input rows aggregated
-  int64_t overflow; // net int128 carries (CPU parity); always 0 on GPU for now
+  int64_t overflow; // net int128 carries; always 0 when produced on the GPU
   uint64_t lower; // lower 64 bits of the decimal sum
   int64_t upper; // upper 64 bits of the decimal sum (signed)
 };
+
+// 10^38: DECIMAL(38) values lie strictly within (-kDecimal38Limit,
+// kDecimal38Limit).
+constexpr __int128_t kDecimal38Limit =
+    static_cast<__int128_t>(10'000'000'000'000'000'000ULL) *
+    static_cast<__int128_t>(10'000'000'000'000'000'000ULL);
 
 struct DecimalSumCount {
   __int128_t sum;
@@ -67,9 +78,8 @@ struct Decimal64ToSumCount {
 };
 
 struct AddDecimalSumCount {
-  __device__ DecimalSumCount operator()(
-      DecimalSumCount lhs,
-      DecimalSumCount rhs) const {
+  __device__ DecimalSumCount
+  operator()(DecimalSumCount lhs, DecimalSumCount rhs) const {
     return {lhs.sum + rhs.sum, lhs.count + rhs.count};
   }
 };
@@ -109,10 +119,14 @@ struct FillOffsetsFunctor {
   }
 };
 
+// `counts` and `overflows` may be nullptr, in which case the blob fields are
+// filled with 1 and 0 respectively (the values a state that does not carry
+// them is defined to have).
 template <typename SumT, typename OffsetT>
 struct PackStateFunctor {
   cuda::std::span<const SumT> sums;
-  cuda::std::span<const int64_t> counts;
+  const int64_t* counts;
+  const int64_t* overflows;
   cuda::std::span<const OffsetT> offsets;
   uint8_t* chars;
 
@@ -122,8 +136,8 @@ struct PackStateFunctor {
     int64_t upper;
     uint64_t lower;
     splitToWords(sums[idx], upper, lower);
-    state->count = counts[idx];
-    state->overflow = 0;
+    state->count = counts ? counts[idx] : int64_t{1};
+    state->overflow = overflows ? overflows[idx] : int64_t{0};
     state->lower = lower;
     state->upper = upper;
   }
@@ -135,6 +149,7 @@ struct UnpackStateFunctor {
   const uint8_t* chars;
   cuda::std::span<__int128_t> sums;
   cuda::std::span<int64_t> counts;
+  int64_t* overflows; // may be nullptr
   cudf::bitmask_type const* nullMask;
 
   __device__ void operator()(cudf::size_type idx) const {
@@ -147,11 +162,27 @@ struct UnpackStateFunctor {
     int64_t offset = static_cast<int64_t>(offsets[idx]);
     auto* state = reinterpret_cast<const DecimalSumState*>(chars + offset);
     counts[idx] = state->count;
+    if (overflows) {
+      overflows[idx] = state->overflow;
+    }
     sums[idx] = (static_cast<__int128_t>(state->upper) << 64) | state->lower;
   }
 };
 
-// Half-up sum/count divide for AVG.
+// Half-up `value / count` for count > 0: rounds the magnitude up when the
+// remainder is at least half the divisor, as DecimalUtil::divideWithRoundUp
+// does with noRoundUp == false.
+template <typename T>
+__device__ __forceinline__ T divideHalfUp(T value, int64_t count) {
+  using U = cuda::std::make_unsigned_t<T>;
+  U magnitude = value < 0 ? -static_cast<U>(value) : static_cast<U>(value);
+  U half = static_cast<U>(count / 2);
+  U rounded = (magnitude + half) / static_cast<U>(count);
+  // `U{0} - rounded` avoids signed overflow for the most negative value.
+  return static_cast<T>(value < 0 ? U{0} - rounded : rounded);
+}
+
+// Per-row half-up AVG.
 template <typename SumT>
 struct AvgRoundFunctor {
   cuda::std::span<const SumT> sums;
@@ -160,17 +191,27 @@ struct AvgRoundFunctor {
 
   __device__ void operator()(cudf::size_type idx) const {
     auto count = counts[idx];
-    if (count == 0) {
-      out[idx] = SumT{0};
+    out[idx] = count == 0 ? SumT{0} : divideHalfUp(sums[idx], count);
+  }
+};
+
+// Per-row FINAL range check of a merged DECIMAL128 sum against DECIMAL(38).
+// The worst outcome over all rows is accumulated in `*result`.
+struct CheckDecimalSumFunctor {
+  const __int128_t* sums; // already advanced by the sum view's offset
+  cudf::bitmask_type const* sumMask; // may be nullptr
+  cudf::size_type sumOffset;
+  int32_t* result;
+
+  __device__ void operator()(cudf::size_type idx) const {
+    if (sumMask && !cudf::bit_is_set(sumMask, idx + sumOffset)) {
       return;
     }
-    auto sum = sums[idx];
-    using U = cuda::std::make_unsigned_t<SumT>;
-    U absSum = sum < 0 ? -static_cast<U>(sum) : static_cast<U>(sum);
-    U half = static_cast<U>(count / 2);
-    U rounded = (absSum + half) / static_cast<U>(count);
-    // Use `U{0} - rounded` below to avoid signed overflow
-    out[idx] = static_cast<SumT>(sum < 0 ? U{0} - rounded : rounded);
+    __int128_t const sum = sums[idx];
+    if (sum <= -kDecimal38Limit || sum >= kDecimal38Limit) {
+      atomicMax(
+          result, static_cast<int32_t>(detail::DecimalSumCheck::kOutOfRange));
+    }
   }
 };
 
@@ -212,8 +253,12 @@ buildStateValidityMaskImpl(
         cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
         0};
   }
-  auto sumDeviceView = cudf::column_device_view::create(sumCol, stream);
-  auto countDeviceView = cudf::column_device_view::create(countCol, stream);
+  // The device views are scratch for the kernel below and never leave this
+  // call.
+  auto sumDeviceView =
+      cudf::column_device_view::create(sumCol, stream, get_temp_mr());
+  auto countDeviceView =
+      cudf::column_device_view::create(countCol, stream, get_temp_mr());
   StateValidPredicate pred{*sumDeviceView, *countDeviceView};
   // Build a BOOL8 column of per-row validity, then convert via the public API.
   auto bools = cudf::make_fixed_width_column(
@@ -258,27 +303,29 @@ void reduceDecimal64SumCount(
       input.data<int64_t>(), input.nullable() ? input.null_mask() : nullptr};
   auto result = rmm::device_uvector<DecimalSumCount>(1, stream, mr);
   size_t tempStorageBytes = 0;
-  CUDF_CUDA_TRY(cub::DeviceReduce::TransformReduce(
-      nullptr,
-      tempStorageBytes,
-      indices,
-      result.data(),
-      input.size(),
-      AddDecimalSumCount{},
-      transform,
-      DecimalSumCount{0, 0},
-      stream.get()));
+  CUDF_CUDA_TRY(
+      cub::DeviceReduce::TransformReduce(
+          nullptr,
+          tempStorageBytes,
+          indices,
+          result.data(),
+          input.size(),
+          AddDecimalSumCount{},
+          transform,
+          DecimalSumCount{0, 0},
+          stream.get()));
   auto tempStorage = rmm::device_buffer(tempStorageBytes, stream, mr);
-  CUDF_CUDA_TRY(cub::DeviceReduce::TransformReduce(
-      tempStorage.data(),
-      tempStorageBytes,
-      indices,
-      result.data(),
-      input.size(),
-      AddDecimalSumCount{},
-      transform,
-      DecimalSumCount{0, 0},
-      stream.get()));
+  CUDF_CUDA_TRY(
+      cub::DeviceReduce::TransformReduce(
+          tempStorage.data(),
+          tempStorageBytes,
+          indices,
+          result.data(),
+          input.size(),
+          AddDecimalSumCount{},
+          transform,
+          DecimalSumCount{0, 0},
+          stream.get()));
   cub::DeviceFor::ForEachN(
       cuda::counting_iterator<cudf::size_type>{0},
       1,
@@ -329,6 +376,7 @@ struct unpackDecimalSumStateKernel {
   const uint8_t* chars;
   cudf::mutable_column_view sumView;
   cudf::mutable_column_view countView;
+  int64_t* overflows;
   cudf::size_type numRows;
   cudf::bitmask_type const* nullMask;
   cuda::stream_ref stream;
@@ -346,6 +394,7 @@ struct unpackDecimalSumStateKernel {
               chars,
               cuda::std::span<__int128_t>{sumView.data<__int128_t>(), n},
               cuda::std::span<int64_t>{countView.data<int64_t>(), n},
+              overflows,
               nullMask};
         },
         stream);
@@ -390,6 +439,7 @@ struct averageRoundDecimalSumKernel {
 struct packDecimalSumStateKernel {
   cudf::column_view sumCol;
   const int64_t* counts;
+  const int64_t* overflows;
   cudf::column_view offsetsView;
   uint8_t* chars;
   cudf::size_type numRows;
@@ -405,7 +455,8 @@ struct packDecimalSumStateKernel {
         [&] {
           return PackStateFunctor<SumT, OffsetT>{
               cuda::std::span<const SumT>{sums, n},
-              cuda::std::span<const int64_t>{counts, n},
+              counts,
+              overflows,
               cuda::std::span<const OffsetT>{offsetsView.data<OffsetT>(), n},
               chars};
         },
@@ -418,6 +469,23 @@ struct packDecimalSumStateKernel {
     CUDF_FAIL("Invalid types for decimal sum state pack");
   }
 };
+
+void packDecimalSumState(
+    cudf::type_id sumType,
+    cudf::type_id offsetType,
+    cudf::column_view sumCol,
+    const int64_t* counts,
+    const int64_t* overflows,
+    cudf::column_view offsetsView,
+    uint8_t* chars,
+    cudf::size_type numRows,
+    cuda::stream_ref stream) {
+  cudf::double_type_dispatcher<cudf::dispatch_storage_type>(
+      cudf::data_type{sumType},
+      cudf::data_type{offsetType},
+      packDecimalSumStateKernel{
+          sumCol, counts, overflows, offsetsView, chars, numRows, stream});
+}
 
 void fillOffsetsForDecimalSumState(
     cudf::type_id offsetType,
@@ -435,13 +503,21 @@ void unpackDecimalSumState(
     const uint8_t* chars,
     cudf::mutable_column_view sumView,
     cudf::mutable_column_view countView,
+    int64_t* overflows,
     cudf::size_type numRows,
     cudf::bitmask_type const* nullMask,
     cuda::stream_ref stream) {
   cudf::type_dispatcher(
       cudf::data_type{offsetType},
       unpackDecimalSumStateKernel{
-          offsetsView, chars, sumView, countView, numRows, nullMask, stream});
+          offsetsView,
+          chars,
+          sumView,
+          countView,
+          overflows,
+          numRows,
+          nullMask,
+          stream});
 }
 
 void averageRoundDecimalSum(
@@ -456,20 +532,29 @@ void averageRoundDecimalSum(
       averageRoundDecimalSumKernel{sumCol, counts, outView, numRows, stream});
 }
 
-void packDecimalSumState(
-    cudf::type_id sumType,
-    cudf::type_id offsetType,
-    cudf::column_view sumCol,
-    const int64_t* counts,
-    cudf::column_view offsetsView,
-    uint8_t* chars,
-    cudf::size_type numRows,
+DecimalSumCheck checkDecimalSumRange(
+    cudf::column_view sum,
     cuda::stream_ref stream) {
-  cudf::double_type_dispatcher<cudf::dispatch_storage_type>(
-      cudf::data_type{sumType},
-      cudf::data_type{offsetType},
-      packDecimalSumStateKernel{
-          sumCol, counts, offsetsView, chars, numRows, stream});
+  CUDF_EXPECTS(
+      sum.type().id() == cudf::type_id::DECIMAL128,
+      "Decimal sum range check requires a DECIMAL128 sum column");
+  auto const numRows = sum.size();
+  if (numRows == 0 || sum.null_count() == numRows) {
+    return DecimalSumCheck::kOk;
+  }
+  int32_t const ok = static_cast<int32_t>(DecimalSumCheck::kOk);
+  rmm::device_scalar<int32_t> result(ok, stream, get_temp_mr());
+  launchDeviceFor(
+      numRows,
+      [&] {
+        return CheckDecimalSumFunctor{
+            sum.data<__int128_t>(),
+            sum.nullable() ? sum.null_mask() : nullptr,
+            sum.offset(),
+            result.data()};
+      },
+      stream);
+  return static_cast<DecimalSumCheck>(result.value(stream));
 }
 
 std::pair<cuda::device_buffer<std::byte>, cudf::size_type>

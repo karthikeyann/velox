@@ -62,14 +62,16 @@ void fillOffsetsForDecimalSumState(
     cuda::stream_ref stream);
 
 /**
- * Encodes each row's partial sum and count into the fixed-width device layout
- * used for VARBINARY interchange.
+ * Encodes each row's partial sum, count and overflow into the fixed-width
+ * device layout used for VARBINARY interchange.
  *
  * @param sumType DECIMAL64 or DECIMAL128; selects sum storage width.
  * @param offsetType INT32 or INT64; selects offset storage width. sumType and
  *        offsetType are dispatched via cudf::double_type_dispatcher.
  * @param sumCol per-row sums.
- * @param counts per-row int64 counts.
+ * @param counts per-row int64 counts, or nullptr to write 1 for every row.
+ * @param overflows per-row int64 overflow carries, or nullptr to write 0 for
+ *        every row.
  * @param offsetsView per-row byte offsets into chars.
  * @param chars output payload buffer.
  * @param numRows number of rows.
@@ -80,6 +82,7 @@ void packDecimalSumState(
     cudf::type_id offsetType,
     cudf::column_view sumCol,
     const int64_t* counts,
+    const int64_t* overflows,
     cudf::column_view offsetsView,
     uint8_t* chars,
     cudf::size_type numRows,
@@ -94,6 +97,8 @@ void packDecimalSumState(
  * @param chars packed payload buffer.
  * @param sumView output per-row DECIMAL128 sums.
  * @param countView output per-row counts.
+ * @param overflows output per-row overflow carries, or nullptr to drop the
+ *        overflow field.
  * @param numRows number of rows.
  * @param nullMask device null-mask bitmap; null rows are skipped to avoid
  *        out-of-bounds reads when Arrow compacts null payloads.  Pass nullptr
@@ -106,12 +111,14 @@ void unpackDecimalSumState(
     const uint8_t* chars,
     cudf::mutable_column_view sumView,
     cudf::mutable_column_view countView,
+    int64_t* overflows,
     cudf::size_type numRows,
     cudf::bitmask_type const* nullMask,
     cuda::stream_ref stream);
 
 /**
- * Per-row half-up integer divide of sum by count; count == 0 writes zero
+ * Per-row half-up integer divide of sum by count, as DecimalUtil::
+ * divideWithRoundUp does with noRoundUp == false; count == 0 writes zero
  * (validity is applied separately).
  *
  * @param sumType DECIMAL64 or DECIMAL128; selects sum storage width via
@@ -128,6 +135,28 @@ void averageRoundDecimalSum(
     const int64_t* counts,
     cudf::mutable_column_view outView,
     cudf::size_type numRows,
+    cuda::stream_ref stream);
+
+/**
+ * Outcome of checkDecimalSumRange, encoded as the largest code hit by any row.
+ */
+enum class DecimalSumCheck : int32_t {
+  kOk = 0,
+  /** The sum lies outside the DECIMAL(38) range. */
+  kOutOfRange = 1,
+};
+
+/**
+ * Checks that every valid row of a DECIMAL128 column lies strictly within
+ * +-10^38, in one device pass and one host sync.
+ *
+ * @param sum DECIMAL128 column.
+ * @param stream CUDA stream for the launch; synchronized once to read back the
+ *        result.
+ * @return kOk or kOutOfRange.
+ */
+DecimalSumCheck checkDecimalSumRange(
+    cudf::column_view sum,
     cuda::stream_ref stream);
 
 /**

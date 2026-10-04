@@ -127,6 +127,19 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_decimal_state_shape_test
+  SOURCES Main.cpp DecimalStateShapeTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib
+  TIMEOUT 3000
+)
+
+foreach(target velox_cudf_decimal_aggregation_test
+                velox_cudf_decimal_state_shape_test
+)
+  velox_add_test_headers(${target} DecimalStateTestColumns.h)
+endforeach()
+
+velox_add_cudf_test(
   NAME velox_cudf_vector_test
   SOURCES Main.cpp CudfVectorTest.cpp
   LIBS velox_cudf_vector velox_vector_test_lib cudf::cudf

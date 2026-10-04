@@ -15,6 +15,9 @@
  */
 #pragma once
 
+#include "velox/experimental/cudf/exec/DecimalAggregationState.h"
+
+#include "velox/core/PlanNode.h"
 #include "velox/type/Type.h"
 
 #include <cudf/column/column.hpp>
@@ -26,81 +29,81 @@
 
 namespace facebook::velox::cudf_velox {
 
-/**
- * Asserts that a column holds serialized decimal aggregate state in the form
- * Velox uses for VARBINARY: a cuDF STRING column whose bytes are the packed
- * sum/count payloads (see serializeDecimalSumState). The payload does not carry
- * scale, so VARBINARY intermediate steps decode at scale 0; the real scale is
- * applied at final cast time.
- *
- * @param column column to validate.
- */
-void validateIntermediateColumnType(cudf::column_view const& column);
+/// Asserts that a column holds decimal aggregate state under a Velox VARBINARY
+/// logical type: either the cuDF STRING blob or a self-describing decimal
+/// state STRUCT (see DecimalAggregationState.h). The blob does not carry
+/// scale, so it is decoded at the scale the plan provides; a struct carries
+/// its scale on the sum child.
+void validateIntermediateColumnType(const cudf::column_view& column);
 
-/**
- * Casts a DECIMAL64 column up to DECIMAL128 (scale preserved) so a subsequent
- * SUM accumulates in 128 bits instead of wrapping. Allocates the casted column
- * from the temporary memory resource into holder and returns its view. Lifetime
- * stays valid only while holder is alive.
- *
- * @param inputCol DECIMAL64 input column.
- * @param holder receives ownership of the casted column when inputCol is
- *        DECIMAL64; unchanged otherwise.
- * @param stream CUDA stream for device work.
- * @return view of inputCol or of the column stored in holder.
- */
+/// True if a column whose Velox type is `type` is physically an unpacked
+/// decimal aggregate state struct, i.e. the logical type is VARBINARY and the
+/// cuDF column is a STRUCT. Operators that would read the bytes of such a
+/// column (as a key, in an expression, through Arrow) use this to guard or to
+/// pack first.
+bool isDecimalStateUnderVarbinary(
+    const TypePtr& type,
+    const cudf::column_view& column);
+
+/// Resolves the state shape and sum scale of a decimal SUM or AVG aggregate
+/// from `aggregate.rawInputTypes[0]`. Throws unless the plan carries exactly
+/// one raw input type and it is a DECIMAL. The operators only classify an
+/// aggregate as a decimal SUM/AVG when that holds (resolveAggregateInfos).
+DecimalStateInfo decimalStateInfoFor(
+    bool isAverage,
+    const core::AggregationNode::Aggregate& aggregate);
+
+/// Casts a DECIMAL64 column up to DECIMAL128 (scale preserved) so a subsequent
+/// SUM accumulates in 128 bits instead of wrapping. Allocates the casted
+/// column from the temporary memory resource into `holder` and returns its
+/// view, valid only while `holder` is alive. Returns `inputCol` unchanged
+/// when it is not DECIMAL64.
 cudf::column_view castDecimal64InputToDecimal128(
-    cudf::column_view inputCol,
+    const cudf::column_view& inputCol,
     std::unique_ptr<cudf::column>& holder,
     cuda::stream_ref stream);
 
-/**
- * Ensures the partial-row count column is INT64, casting with the temporary
- * memory resource (the result is consumed internally, not part of operator
- * output) when the incoming type differs.
- *
- * @param count partial-row count column.
- * @param stream CUDA stream for device work.
- * @return INT64 count column (moved through when already INT64).
- */
-std::unique_ptr<cudf::column> castCountColumnToInt64(
-    std::unique_ptr<cudf::column> count,
-    cuda::stream_ref stream);
-
-/**
- * Normalizes the count column to INT64, then encodes sum and count into a
- * single STRING column of fixed-width per-row payloads (delegates to
- * serializeDecimalSumState). Used when emitting or persisting partial /
- * intermediate decimal SUM state for the cuDF path.
- *
- * @param sum partial sum column (DECIMAL64 or DECIMAL128).
- * @param count partial-row count column.
- * @param stream CUDA stream for device work.
- * @param mr memory resource for allocated columns.
- * @return STRING column of serialized state.
- */
-std::unique_ptr<cudf::column> serializeDecimalPartialOrIntermediateState(
-    std::unique_ptr<cudf::column> sum,
-    std::unique_ptr<cudf::column> count,
+/// Casts `column` to the cuDF type of the Velox `type` when the two differ and
+/// moves it through unchanged otherwise.
+std::unique_ptr<cudf::column> castToVeloxType(
+    std::unique_ptr<cudf::column> column,
+    const TypePtr& type,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
-/**
- * Normalizes the count column to INT64, computes a per-row decimal average
- * from intermediate sum/count (delegates to computeDecimalAverage), then casts
- * the result to the Velox result type when its cuDF decimal encoding differs
- * from the average column's type.
- *
- * @param sum intermediate sum column (DECIMAL64 or DECIMAL128).
- * @param count intermediate count column.
- * @param resultType Velox type of the finalized average.
- * @param stream CUDA stream for device work.
- * @param mr memory resource for allocated columns.
- * @return finalized average column.
- */
+/// FINAL step for decimal SUM: raises the CPU's "Decimal overflow" user error
+/// where the merged sum leaves the DECIMAL(38) range and casts to
+/// `resultType`. A nullptr `overflow` means the field was not tracked and is
+/// zero. The GPU does not fold int128 carries, so a nonzero merged overflow
+/// (which only a CPU-produced blob can carry) also raises "Decimal overflow".
+std::unique_ptr<cudf::column> finalizeDecimalSum(
+    std::unique_ptr<cudf::column> sum,
+    std::unique_ptr<cudf::column> overflow,
+    const TypePtr& resultType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+/// FINAL step for decimal AVG: normalizes `count` to INT64, divides with the
+/// CPU's half-up rounding (computeDecimalAverage) and casts to `resultType`.
+/// Like the CPU, no range check is applied to the average. `overflow` is
+/// treated like finalizeDecimalSum does: nullptr means not tracked, and a
+/// nonzero merged overflow raises "Decimal overflow".
 std::unique_ptr<cudf::column> finalizeDecimalAverage(
     std::unique_ptr<cudf::column> sum,
     std::unique_ptr<cudf::column> count,
+    std::unique_ptr<cudf::column> overflow,
+    const TypePtr& resultType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+/// FINAL step over the merged flat fields of a decimal state of `shape`:
+/// finalizeDecimalSum for the SUM shapes (a count, if present, is ignored) and
+/// finalizeDecimalAverage for the AVG shapes. `count` and `overflow` may be
+/// null pointers when the state did not carry them. Shared by CudfGroupby
+/// (group-by FINAL and direct finalization) and CudfReduce.
+std::unique_ptr<cudf::column> finalizeDecimalState(
+    DecimalStateColumns state,
+    DecimalStateShape shape,
     const TypePtr& resultType,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
