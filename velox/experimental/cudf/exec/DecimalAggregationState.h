@@ -56,11 +56,16 @@ namespace facebook::velox::cudf_velox {
 ///
 /// Known limitation: GPU producers do not track int128 carries (cuDF's
 /// DECIMAL128 SUM wraps modulo 2^128), so the overflow child they emit is
-/// always 0. A nonzero overflow can only come from a CPU-produced blob. The
-/// overflow children are carried and merged (summed exactly) so that FINAL can
-/// see them; FINAL rejects a nonzero merged overflow with "Decimal overflow"
-/// (see finalizeDecimalSum and finalizeDecimalAverage in
-/// DecimalAggregationHostOps.h).
+/// always 0. A nonzero overflow can only come from a CPU-produced blob. On
+/// merge the overflow children are summed exactly while the sum children wrap
+/// modulo 2^128, so the merged pair is congruent to the true total modulo
+/// 2^128 but is not in the CPU's canonical form; FINAL therefore folds it as
+/// sum + overflow * 2^127 modulo 2^128 (see finalizeDecimalSum and
+/// finalizeDecimalAverage in DecimalAggregationHostOps.h). GPU SUM then equals
+/// CPU SUM for every total inside int128. GPU AVG equals CPU AVG except that
+/// when the merged pair is non-canonical the result may differ from the CPU's
+/// by one unit in the last place, because the CPU's own result depends on
+/// accumulation order in exact-half cases.
 enum class DecimalStateShape : uint8_t {
   kSum64,
   kSum128,
@@ -136,12 +141,15 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
     rmm::device_async_resource_ref mr);
 
 /// Finalizes AVG from flat state: divides each sum by its count with the
-/// CPU's half-up rounding (see detail::averageRoundDecimalSum) and produces a
-/// column of the sum's decimal type. Rows are null where the sum or count is
-/// null or the count is zero.
+/// CPU's rounding (DecimalUtil::computeAverage for a canonical nonzero
+/// `overflow`, the folded total otherwise; see detail::averageRoundDecimalSum)
+/// and produces a column of the sum's decimal type. Rows are null where the
+/// sum or count is null or the count is zero. `overflow` must be a
+/// default-constructed (size 0) view when the state does not carry the field.
 std::unique_ptr<cudf::column> computeDecimalAverage(
     const cudf::column_view& sumCol,
     const cudf::column_view& countCol,
+    const cudf::column_view& overflowCol,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 

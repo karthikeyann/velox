@@ -46,14 +46,17 @@ namespace {
 // TODO: Track int128 carries as the CPU does (DecimalUtil::addWithOverflow).
 // cuDF's DECIMAL128 SUM wraps modulo 2^128 without counting carries, so every
 // GPU producer writes overflow = 0 and the field is meaningful only when it
-// came from a CPU-produced state, which FINAL rejects when it is nonzero; see
-// DecimalAggregationState.h.
+// came from a CPU-produced state; see DecimalAggregationState.h.
 struct DecimalSumState {
   int64_t count; // count of non-null input rows aggregated
   int64_t overflow; // net int128 carries; always 0 when produced on the GPU
   uint64_t lower; // lower 64 bits of the decimal sum
   int64_t upper; // upper 64 bits of the decimal sum (signed)
 };
+
+// 2^127, the weight of one unit of the overflow field
+// (DecimalUtil::kOverflowMultiplier).
+constexpr __uint128_t kOverflowMultiplier = static_cast<__uint128_t>(1) << 127;
 
 // 10^38: DECIMAL(38) values lie strictly within (-kDecimal38Limit,
 // kDecimal38Limit).
@@ -182,32 +185,128 @@ __device__ __forceinline__ T divideHalfUp(T value, int64_t count) {
   return static_cast<T>(value < 0 ? U{0} - rounded : rounded);
 }
 
-// Per-row half-up AVG.
+// Exact total of a (sum, overflow) pair modulo 2^128, interpreted as int128.
+// On the CPU one unit of overflow is worth 2^127 (DecimalUtil::addWithOverflow
+// keeps the low 127 bits of each same-sign add and counts the carry), so the
+// true total is T = sum + overflow * 2^127 as an exact integer. A GPU merge
+// adds the sum children with cuDF's wrapping DECIMAL128 SUM and the overflow
+// children exactly, so the merged pair is congruent to T modulo 2^128 but is
+// not necessarily in the CPU's canonical form (|sum| < 2^127 after every add).
+// Folding modulo 2^128 recovers T exactly whenever |T| < 2^127, which covers
+// the whole DECIMAL(38) range; a total beyond int128 aliases and cannot be
+// detected from the pair (the wrap count is lost, see the TODO above).
+__device__ __forceinline__ __int128_t
+foldOverflow(__int128_t sum, int64_t overflow) {
+  return static_cast<__int128_t>(
+      static_cast<__uint128_t>(sum) +
+      static_cast<__uint128_t>(overflow) * kOverflowMultiplier);
+}
+
+// True when the pair is in the form DecimalUtil::adjustSumForOverflow
+// accepts: the CPU's canonical representation of a total that fits in int128
+// after exactly one carry.
+__device__ __forceinline__ bool isCanonicalOverflow(
+    __int128_t sum,
+    int64_t overflow) {
+  return (overflow == 1 && sum < 0) || (overflow == -1 && sum > 0);
+}
+
+// (sum + overflow * 2^127) / count without widening past 128 bits, mirroring
+// DecimalUtil::computeAverage: divide 2^127 and sum by count separately, scale
+// the first quotient and remainder by overflow, and round only the combined
+// remainder. Bit-identical to the CPU for the same (sum, count, overflow).
+__device__ __forceinline__ __int128_t
+averageWithSplitOverflow(__int128_t sum, int64_t count, int64_t overflow) {
+  auto const unsignedCount = static_cast<__uint128_t>(count);
+  auto const unsignedOverflow = static_cast<__uint128_t>(overflow);
+  __uint128_t quotientMultiplier = kOverflowMultiplier / unsignedCount;
+  __uint128_t remainderMultiplier = kOverflowMultiplier % unsignedCount;
+  quotientMultiplier *= unsignedOverflow;
+  remainderMultiplier *= unsignedOverflow;
+  // C++ truncating division matches divideWithRoundUp with noRoundUp == true:
+  // the remainder carries the dividend's sign.
+  __int128_t const quotientSum = sum / count;
+  __int128_t const remainderSum = sum % count;
+  auto const remainderTotal = divideHalfUp(
+      static_cast<__int128_t>(
+          remainderMultiplier + static_cast<__uint128_t>(remainderSum)),
+      count);
+  return static_cast<__int128_t>(
+      quotientMultiplier + static_cast<__uint128_t>(quotientSum) +
+      static_cast<__uint128_t>(remainderTotal));
+}
+
+// AVG of a (sum, count, overflow) triple with overflow != 0. A canonical pair
+// takes the CPU's split division, which is bit-exact with computeAverage. A
+// non-canonical pair (a GPU merge that crossed +-2^127) is folded first and
+// then divided half-up. The CPU itself is path dependent by one ulp here: the
+// same inputs accumulated in an order that carries give a different canonical
+// pair, and the split and folded divisions differ by one ulp in exact-half
+// cases where the quotient and remainder terms have opposite signs.
+__device__ __forceinline__ __int128_t
+averageWithOverflow(__int128_t sum, int64_t count, int64_t overflow) {
+  if (isCanonicalOverflow(sum, overflow)) {
+    return averageWithSplitOverflow(sum, count, overflow);
+  }
+  return divideHalfUp(foldOverflow(sum, overflow), count);
+}
+
+// Per-row AVG with the CPU's rounding; `overflows` may be nullptr.
 template <typename SumT>
 struct AvgRoundFunctor {
   cuda::std::span<const SumT> sums;
   cuda::std::span<const int64_t> counts;
+  const int64_t* overflows;
   cuda::std::span<SumT> out;
 
   __device__ void operator()(cudf::size_type idx) const {
     auto count = counts[idx];
-    out[idx] = count == 0 ? SumT{0} : divideHalfUp(sums[idx], count);
+    if (count == 0) {
+      out[idx] = SumT{0};
+      return;
+    }
+    int64_t const overflow = overflows ? overflows[idx] : int64_t{0};
+    if (overflow == 0) {
+      out[idx] = divideHalfUp(sums[idx], count);
+      return;
+    }
+    out[idx] = static_cast<SumT>(averageWithOverflow(
+        static_cast<__int128_t>(sums[idx]), count, overflow));
   }
 };
 
-// Per-row FINAL range check of a merged DECIMAL128 sum against DECIMAL(38).
-// The worst outcome over all rows is accumulated in `*result`.
+// Per-row FINAL check of a merged DECIMAL128 sum. When `kFold` is set the
+// overflow field is folded into the sum in place (foldOverflow); the sum is
+// then range-checked against DECIMAL(38). The worst outcome over all rows is
+// accumulated in `*result`.
+template <bool kFold>
 struct CheckDecimalSumFunctor {
-  const __int128_t* sums; // already advanced by the sum view's offset
+  using SumPointer =
+      cuda::std::conditional_t<kFold, __int128_t*, const __int128_t*>;
+  SumPointer sums; // already advanced by the sum view's offset
   cudf::bitmask_type const* sumMask; // may be nullptr
   cudf::size_type sumOffset;
+  const int64_t* overflows; // used only when kFold
+  cudf::bitmask_type const* overflowMask; // may be nullptr
+  cudf::size_type overflowOffset;
   int32_t* result;
 
   __device__ void operator()(cudf::size_type idx) const {
     if (sumMask && !cudf::bit_is_set(sumMask, idx + sumOffset)) {
       return;
     }
-    __int128_t const sum = sums[idx];
+    __int128_t sum = sums[idx];
+    if constexpr (kFold) {
+      auto const overflowIdx = idx + overflowOffset;
+      int64_t const overflow =
+          overflowMask && !cudf::bit_is_set(overflowMask, overflowIdx)
+          ? int64_t{0}
+          : overflows[overflowIdx];
+      if (overflow != 0) {
+        sum = foldOverflow(sum, overflow);
+        sums[idx] = sum;
+      }
+    }
     if (sum <= -kDecimal38Limit || sum >= kDecimal38Limit) {
       atomicMax(
           result, static_cast<int32_t>(detail::DecimalSumCheck::kOutOfRange));
@@ -410,6 +509,7 @@ struct unpackDecimalSumStateKernel {
 struct averageRoundDecimalSumKernel {
   cudf::column_view sumCol;
   const int64_t* counts;
+  const int64_t* overflows;
   cudf::mutable_column_view outView;
   cudf::size_type numRows;
   cuda::stream_ref stream;
@@ -424,6 +524,7 @@ struct averageRoundDecimalSumKernel {
           return AvgRoundFunctor<SumT>{
               cuda::std::span<const SumT>{sumCol.data<SumT>(), n},
               cuda::std::span<const int64_t>{counts, n},
+              overflows,
               cuda::std::span<SumT>{outView.data<SumT>(), n}};
         },
         stream);
@@ -524,12 +625,14 @@ void averageRoundDecimalSum(
     cudf::type_id sumType,
     cudf::column_view sumCol,
     const int64_t* counts,
+    const int64_t* overflows,
     cudf::mutable_column_view outView,
     cudf::size_type numRows,
     cuda::stream_ref stream) {
   cudf::type_dispatcher<cudf::dispatch_storage_type>(
       cudf::data_type{sumType},
-      averageRoundDecimalSumKernel{sumCol, counts, outView, numRows, stream});
+      averageRoundDecimalSumKernel{
+          sumCol, counts, overflows, outView, numRows, stream});
 }
 
 DecimalSumCheck checkDecimalSumRange(
@@ -547,10 +650,46 @@ DecimalSumCheck checkDecimalSumRange(
   launchDeviceFor(
       numRows,
       [&] {
-        return CheckDecimalSumFunctor{
+        return CheckDecimalSumFunctor<false>{
             sum.data<__int128_t>(),
             sum.nullable() ? sum.null_mask() : nullptr,
             sum.offset(),
+            nullptr,
+            nullptr,
+            0,
+            result.data()};
+      },
+      stream);
+  return static_cast<DecimalSumCheck>(result.value(stream));
+}
+
+DecimalSumCheck foldDecimalSumOverflow(
+    cudf::mutable_column_view sum,
+    cudf::column_view overflow,
+    cuda::stream_ref stream) {
+  CUDF_EXPECTS(
+      sum.type().id() == cudf::type_id::DECIMAL128 && sum.offset() == 0,
+      "Decimal overflow fold requires an unsliced DECIMAL128 sum column");
+  auto const numRows = sum.size();
+  CUDF_EXPECTS(
+      overflow.type().id() == cudf::type_id::INT64 &&
+          overflow.size() == numRows,
+      "Decimal overflow fold requires an INT64 overflow column of the sum's size");
+  if (numRows == 0 || sum.null_count() == numRows) {
+    return DecimalSumCheck::kOk;
+  }
+  int32_t const ok = static_cast<int32_t>(DecimalSumCheck::kOk);
+  rmm::device_scalar<int32_t> result(ok, stream, get_temp_mr());
+  launchDeviceFor(
+      numRows,
+      [&] {
+        return CheckDecimalSumFunctor<true>{
+            sum.data<__int128_t>(),
+            sum.nullable() ? sum.null_mask() : nullptr,
+            0,
+            overflow.head<int64_t>(),
+            overflow.nullable() ? overflow.null_mask() : nullptr,
+            overflow.offset(),
             result.data()};
       },
       stream);

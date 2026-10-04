@@ -22,9 +22,6 @@
 
 #include "velox/common/base/Exceptions.h"
 
-#include <cudf/aggregation.hpp>
-#include <cudf/reduction.hpp>
-#include <cudf/scalar/scalar.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
@@ -105,28 +102,6 @@ std::unique_ptr<cudf::column> castToInt64(
   return column;
 }
 
-// The GPU does not fold int128 carries (see DecimalAggregationState.h), so a
-// merged overflow field other than zero cannot be finalized. Null rows count
-// as zero.
-void checkDecimalOverflowIsZero(
-    const cudf::column_view& overflow,
-    cuda::stream_ref stream) {
-  if (overflow.size() == 0 || overflow.null_count() == overflow.size()) {
-    return;
-  }
-  auto extremum = [&](const cudf::reduce_aggregation& agg) {
-    auto scalar = cudf::reduce(
-        overflow, agg, cudf::data_type{cudf::type_id::INT64}, stream,
-        get_temp_mr());
-    return static_cast<cudf::numeric_scalar<int64_t>&>(*scalar).value(stream);
-  };
-  if (extremum(*cudf::make_min_aggregation<cudf::reduce_aggregation>()) != 0 ||
-      extremum(*cudf::make_max_aggregation<cudf::reduce_aggregation>()) != 0) {
-    VELOX_USER_FAIL(
-        "Decimal overflow. A nonzero carry in the merged decimal state is not supported on the GPU");
-  }
-}
-
 // Raises the CPU's "Decimal overflow" user error for a device check outcome.
 void raiseDecimalSumCheck(detail::DecimalSumCheck check) {
   switch (check) {
@@ -152,10 +127,12 @@ std::unique_ptr<cudf::column> finalizeDecimalSum(
       "Decimal sum result requires a DECIMAL128 column: {}",
       cudf::type_to_name(sum->type()));
   if (overflow) {
-    checkDecimalOverflowIsZero(
-        castToInt64(std::move(overflow), stream)->view(), stream);
+    overflow = castToInt64(std::move(overflow), stream);
   }
-  raiseDecimalSumCheck(detail::checkDecimalSumRange(sum->view(), stream));
+  raiseDecimalSumCheck(
+      overflow ? detail::foldDecimalSumOverflow(
+                     sum->mutable_view(), overflow->view(), stream)
+               : detail::checkDecimalSumRange(sum->view(), stream));
   return castToVeloxType(std::move(sum), resultType, stream, mr);
 }
 
@@ -168,10 +145,14 @@ std::unique_ptr<cudf::column> finalizeDecimalAverage(
     rmm::device_async_resource_ref mr) {
   count = castToInt64(std::move(count), stream);
   if (overflow) {
-    checkDecimalOverflowIsZero(
-        castToInt64(std::move(overflow), stream)->view(), stream);
+    overflow = castToInt64(std::move(overflow), stream);
   }
-  auto average = computeDecimalAverage(sum->view(), count->view(), stream, mr);
+  auto average = computeDecimalAverage(
+      sum->view(),
+      count->view(),
+      overflow ? overflow->view() : cudf::column_view{},
+      stream,
+      mr);
   return castToVeloxType(std::move(average), resultType, stream, mr);
 }
 

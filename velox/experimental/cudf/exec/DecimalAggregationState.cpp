@@ -449,6 +449,7 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
 std::unique_ptr<cudf::column> computeDecimalAverage(
     const cudf::column_view& sumCol,
     const cudf::column_view& countCol,
+    const cudf::column_view& overflowCol,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   VELOX_CHECK(
@@ -464,6 +465,17 @@ std::unique_ptr<cudf::column> computeDecimalAverage(
       sumCol.size(),
       countCol.size(),
       "Decimal average requires sum and count of the same size");
+  bool const withOverflow = overflowCol.size() > 0;
+  if (withOverflow) {
+    VELOX_CHECK(
+        overflowCol.type().id() == cudf::type_id::INT64,
+        "Decimal average requires an INT64 overflow column: {}",
+        cudf::type_to_name(overflowCol.type()));
+    VELOX_CHECK_EQ(
+        sumCol.size(),
+        overflowCol.size(),
+        "Decimal average requires sum and overflow of the same size");
+  }
 
   auto numRows = sumCol.size();
   auto average = cudf::make_fixed_width_column(
@@ -474,6 +486,7 @@ std::unique_ptr<cudf::column> computeDecimalAverage(
         sumCol.type().id(),
         sumCol,
         countCol.data<int64_t>(),
+        withOverflow ? overflowCol.data<int64_t>() : nullptr,
         average->mutable_view(),
         static_cast<int32_t>(numRows),
         stream);

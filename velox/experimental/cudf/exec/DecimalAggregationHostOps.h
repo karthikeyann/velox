@@ -71,11 +71,15 @@ std::unique_ptr<cudf::column> castToVeloxType(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
-/// FINAL step for decimal SUM: raises the CPU's "Decimal overflow" user error
-/// where the merged sum leaves the DECIMAL(38) range and casts to
-/// `resultType`. A nullptr `overflow` means the field was not tracked and is
-/// zero. The GPU does not fold int128 carries, so a nonzero merged overflow
-/// (which only a CPU-produced blob can carry) also raises "Decimal overflow".
+/// FINAL step for decimal SUM, matching the CPU DecimalSumAggregate: folds the
+/// merged `overflow` field into `sum` as sum + overflow * 2^127 modulo 2^128
+/// (the exact total of a state produced by DecimalUtil::addWithOverflow,
+/// applied without adjustSumForOverflow's sign predicate because a GPU merge
+/// wraps the sum children; see foldDecimalSumOverflow), raises the CPU's
+/// "Decimal overflow" user error where the folded sum leaves the DECIMAL(38)
+/// range, and casts to `resultType`. A nullptr `overflow` means the field was
+/// not tracked and is zero. One device pass and one host sync for the
+/// validation.
 std::unique_ptr<cudf::column> finalizeDecimalSum(
     std::unique_ptr<cudf::column> sum,
     std::unique_ptr<cudf::column> overflow,
@@ -83,11 +87,14 @@ std::unique_ptr<cudf::column> finalizeDecimalSum(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
-/// FINAL step for decimal AVG: normalizes `count` to INT64, divides with the
-/// CPU's half-up rounding (computeDecimalAverage) and casts to `resultType`.
-/// Like the CPU, no range check is applied to the average. `overflow` is
-/// treated like finalizeDecimalSum does: nullptr means not tracked, and a
-/// nonzero merged overflow raises "Decimal overflow".
+/// FINAL step for decimal AVG, following the CPU DecimalAverageAggregateBase:
+/// normalizes `count` and `overflow` to INT64, divides with the rounding of
+/// DecimalUtil::computeAverage for a canonical nonzero `overflow` and with the
+/// folded total otherwise (nullptr means the field was not tracked), then
+/// casts to `resultType`. Like the CPU, no range check is applied to the
+/// average. The result equals the CPU's except that when the merged pair is
+/// non-canonical it may differ by one unit in the last place, because the
+/// CPU's own result depends on accumulation order in exact-half cases.
 std::unique_ptr<cudf::column> finalizeDecimalAverage(
     std::unique_ptr<cudf::column> sum,
     std::unique_ptr<cudf::column> count,
