@@ -61,7 +61,11 @@ namespace facebook::velox::cudf_velox {
 /// modulo 2^128, so the merged pair is congruent to the true total modulo
 /// 2^128 but is not in the CPU's canonical form; FINAL therefore folds it as
 /// sum + overflow * 2^127 modulo 2^128 (see finalizeDecimalSum and
-/// finalizeDecimalAverage in DecimalAggregationHostOps.h).
+/// finalizeDecimalAverage in DecimalAggregationHostOps.h). GPU SUM then equals
+/// CPU SUM for every total inside int128. GPU AVG equals CPU AVG except that
+/// when the merged pair is non-canonical the result may differ from the CPU's
+/// by one unit in the last place, because the CPU's own result depends on
+/// accumulation order in exact-half cases.
 enum class DecimalStateShape : uint8_t {
   kSum64,
   kSum128,

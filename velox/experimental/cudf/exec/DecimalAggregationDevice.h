@@ -124,6 +124,11 @@ void unpackDecimalSumState(
  * exactly as DecimalUtil::computeAverage does; otherwise (a GPU merge that
  * crossed +-2^127) the overflow is folded modulo 2^128 first and the result
  * divided half-up. count == 0 writes zero (validity is applied separately).
+ * The result equals the CPU's whenever the merged pair is the CPU's pair. When
+ * it is not (the CPU's merge carried past 2^127 and the GPU's did not, or vice
+ * versa) the result may differ from the CPU's by one unit in the last place at
+ * an exact-half quotient; the CPU's own result depends on accumulation order
+ * in those cases.
  *
  * @param sumType DECIMAL64 or DECIMAL128; selects sum storage width via
  *        cudf::type_dispatcher<cudf::dispatch_storage_type>.

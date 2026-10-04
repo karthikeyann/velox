@@ -2732,14 +2732,19 @@ TEST_F(CudfDecimalTest, decimalFinalAcceptsCpuBlobState) {
 }
 
 // A CPU partial state carries the number of 2^127 carries in its overflow
-// field. The GPU FINAL must return what the CPU FINAL returns over the same
-// partial states: the expected values come from cpuDecimalFinal, which runs
-// the CPU accumulator's own merge and finalization. The GPU merges the sum
-// children with a wrapping cuDF SUM, so its merged (sum, overflow) pair can
-// differ from the CPU's while denoting the same total; the FINAL must still
-// agree with the CPU. Each case runs through the group-by FINAL, the global
-// (CudfReduce) FINAL, and direct finalization, which the incremental FINAL
-// applies to the state merged by the group-by INTERMEDIATE aggregators.
+// field. The expected values come from cpuDecimalFinal, which runs the CPU
+// accumulator's own merge and finalization in row order. The GPU merges the
+// sum children with a wrapping cuDF SUM, so its merged (sum, overflow) pair can
+// differ from the CPU's while denoting the same total. GPU SUM equals CPU SUM
+// for every total inside int128. GPU AVG equals CPU AVG except that when the
+// merged pairs differ (one side carried past 2^127 and the other did not), the
+// result may differ from the CPU's by one unit in the last place at an
+// exact-half quotient: the CPU's own result depends on accumulation order in
+// exact-half cases, and no carry-free merge can match every CPU order. Such a
+// case sets `gpuAvg` and is not compared against the CPU AVG. Each case runs
+// through the group-by FINAL, the global (CudfReduce) FINAL, and direct
+// finalization, which the incremental FINAL applies to the state merged by the
+// group-by INTERMEDIATE aggregators.
 //
 // Totals beyond int128_t are a documented limitation: the GPU cannot tell
 // them from their alias modulo 2^128 (see DecimalAggregationState.h). Those
@@ -2747,6 +2752,7 @@ TEST_F(CudfDecimalTest, decimalFinalAcceptsCpuBlobState) {
 TEST_F(CudfDecimalTest, decimalFinalFoldsBlobOverflowLikeCpu) {
   const auto stream = cudf::get_default_stream();
   const auto mr = cudf::get_current_device_resource_ref();
+  const int128_t tenPow35 = DecimalUtil::kPowersOfTen[35];
   const int128_t tenPow36 = DecimalUtil::kPowersOfTen[36];
   const int128_t tenPow37 = DecimalUtil::kPowersOfTen[37];
   const int128_t twoPow126 = static_cast<int128_t>(1) << 126;
@@ -2763,6 +2769,9 @@ TEST_F(CudfDecimalTest, decimalFinalFoldsBlobOverflowLikeCpu) {
     std::vector<HostDecimalState> rows;
     // Hand-derived CPU results, checked against cpuDecimalFinal.
     CpuDecimalFinal expected;
+    // Set where the GPU AVG is known to differ from the CPU AVG by one ulp;
+    // the GPU AVG is then checked against this value instead of expected.avg.
+    std::optional<int128_t> gpuAvg{};
   };
   const std::vector<OverflowCase> cases = {
       // overflow 1 with a negative sum is a valid state: the value is
@@ -2804,6 +2813,24 @@ TEST_F(CudfDecimalTest, decimalFinalFoldsBlobOverflowLikeCpu) {
       {"mergeCarriesPastTwoPow127",
        {{3, 1, wrappedSum(tenPow37, 1)}, {1, 0, -95 * tenPow36}},
        {true, -85 * tenPow36, -2125 * (tenPow36 / 100)}},
+      // Known one-ulp AVG divergence: `expected` pins the CPU AVG and the GPU
+      // AVG is checked against `gpuAvg`, not against the CPU AVG. Four
+      // overflow-free partials 9 * 10^37, 9 * 10^37, -9 * 10^37 and
+      // -8 * 10^37 + 6: T = 10^37 + 6, count 4, T / 4 = 2.5 * 10^36 + 1.5.
+      // The CPU merge carries on 9 * 10^37 + 9 * 10^37 and ends with the
+      // canonical pair (T - 2^127, 1); computeAverage splits the division
+      // (2^127 / 4 = 2^125 rem 0; (T + 2 - 2^127) / 4 rem -2, and -2 / 4
+      // rounds away to -1), giving CPU AVG 2.5 * 10^36 + 1. The GPU sum wraps
+      // and returns to (T, 0), and T / 4 rounds half up: GPU AVG
+      // 2.5 * 10^36 + 2. Merging in another order (e.g. 9, -9, 9, -8) the CPU
+      // never carries and also returns 2.5 * 10^36 + 2. SUM is T on both.
+      {"cpuCarryExactHalfAvg",
+       {{1, 0, 9 * tenPow37},
+        {1, 0, 9 * tenPow37},
+        {1, 0, -9 * tenPow37},
+        {1, 0, -8 * tenPow37 + 6}},
+       {true, tenPow37 + 6, 25 * tenPow35 + 1},
+       25 * tenPow35 + 2},
       // Folds to 15 * 10^37 > 10^38 - 1: out of the DECIMAL(38) range.
       {"foldedOutOfRange",
        {{1, 1, wrappedSum(15 * tenPow37, 1)}},
@@ -2834,7 +2861,9 @@ TEST_F(CudfDecimalTest, decimalFinalFoldsBlobOverflowLikeCpu) {
     auto keys = makeInt64Column(zeroKeys, nullptr, stream);
     auto blob = makeDecimalStateBlob(overflowCase.rows, nullptr, false, stream);
     for (const bool isSum : {true, false}) {
-      const auto& expected = isSum ? cpu.sum : cpu.avg;
+      const auto& expected = isSum
+          ? cpu.sum
+          : (overflowCase.gpuAvg.has_value() ? overflowCase.gpuAvg : cpu.avg);
       if (!isSum && !expected.has_value()) {
         continue;
       }

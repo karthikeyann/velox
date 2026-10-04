@@ -45,11 +45,10 @@ bool isDecimalStateUnderVarbinary(
     const TypePtr& type,
     const cudf::column_view& column);
 
-/// Resolves the state shape and sum scale of a decimal SUM or AVG aggregate.
-/// The raw input type is taken from `aggregate.rawInputTypes` when the plan
-/// carries it; otherwise the aggregate's call argument type is used when it
-/// is a decimal (which is the case at raw-input steps). Throws if neither
-/// yields a DECIMAL type.
+/// Resolves the state shape and sum scale of a decimal SUM or AVG aggregate
+/// from `aggregate.rawInputTypes[0]`. Throws unless the plan carries exactly
+/// one raw input type and it is a DECIMAL. The operators only classify an
+/// aggregate as a decimal SUM/AVG when that holds (resolveAggregateInfos).
 DecimalStateInfo decimalStateInfoFor(
     bool isAverage,
     const core::AggregationNode::Aggregate& aggregate);
@@ -80,12 +79,14 @@ std::unique_ptr<cudf::column> finalizeDecimalSum(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
-/// FINAL step for decimal AVG, matching the CPU DecimalAverageAggregateBase:
+/// FINAL step for decimal AVG, following the CPU DecimalAverageAggregateBase:
 /// normalizes `count` and `overflow` to INT64, divides with the rounding of
 /// DecimalUtil::computeAverage for a canonical nonzero `overflow` and with the
 /// folded total otherwise (nullptr means the field was not tracked), then
 /// casts to `resultType`. Like the CPU, no range check is applied to the
-/// average.
+/// average. The result equals the CPU's except that when the merged pair is
+/// non-canonical it may differ by one unit in the last place, because the
+/// CPU's own result depends on accumulation order in exact-half cases.
 std::unique_ptr<cudf::column> finalizeDecimalAverage(
     std::unique_ptr<cudf::column> sum,
     std::unique_ptr<cudf::column> count,

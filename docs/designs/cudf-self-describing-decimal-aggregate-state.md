@@ -172,8 +172,15 @@ pre-existing behaviour of the blob path and is unchanged by this design. The
 overflow field is meaningful only when it came from a CPU-produced state. On
 merge the overflow children are summed exactly but the sum children still
 wrap, so the merged pair is congruent to the true total modulo 2^128 without
-being canonical; FINAL folds it as described in section 4, which is exact for
-every total that fits in int128. Closing the gap needs a carry-tracking
+being canonical; FINAL folds it as described in section 4. The complete
+divergence set from the CPU is therefore: (1) a total beyond int128, as above;
+and (2) for AVG only, a total inside int128 whose merged pair is
+non-canonical, where the average may differ from the CPU's by one unit in the
+last place at an exact-half quotient. GPU SUM equals CPU SUM for every total
+inside int128. Case (2) is inherent to not tracking carries: the CPU's own
+result depends on its accumulation order in exact-half cases, so no carry-free
+merge can match every CPU order (pinned by `cpuCarryExactHalfAvg` in
+`DecimalAggregationTest.cpp`). Closing the gap needs a carry-tracking
 reduction for DECIMAL128 (a custom reduce over `(sum, overflow)` for the
 global path and a host UDF or two-pass approach for `cudf::groupby`).
 

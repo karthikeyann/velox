@@ -384,14 +384,10 @@ TEST_F(DecimalStateShapeTest, zeroRowBlob) {
   EXPECT_EQ(flat.overflow.type().id(), cudf::type_id::INT64);
 }
 
-// decimalStateInfoFor takes the raw input type from rawInputTypes and, for an
-// aggregate declared without them, from the call argument when that is a
-// decimal (a raw-input step). A VARBINARY argument (an intermediate state)
-// cannot stand in for it. Note that the group-by and reduce operators only
-// treat an aggregate as a decimal SUM/AVG when rawInputTypes is set
-// (resolveAggregateInfos), so the fallback is reached through this function
-// only.
-TEST_F(DecimalStateShapeTest, stateInfoFallsBackToDecimalArgument) {
+// decimalStateInfoFor derives the shape and scale from rawInputTypes[0],
+// whatever the call argument type (VARBINARY at intermediate steps), and
+// requires the plan to carry it.
+TEST_F(DecimalStateShapeTest, stateInfoFromRawInputType) {
   auto aggregateOver = [](const TypePtr& argumentType,
                           std::vector<TypePtr> rawInputTypes) {
     core::AggregationNode::Aggregate aggregate;
@@ -412,9 +408,8 @@ TEST_F(DecimalStateShapeTest, stateInfoFallsBackToDecimalArgument) {
   };
   for (const auto& [argument, rawInputTypes, isAverage, shape, scale] :
        std::vector<Case>{
-           {DECIMAL(12, 3), {}, false, Shape::kSum64, 3},
-           {DECIMAL(38, 2), {}, true, Shape::kAvg128, 2},
            {VARBINARY(), {DECIMAL(18, 4)}, false, Shape::kSum64, 4},
+           {VARBINARY(), {DECIMAL(12, 3)}, true, Shape::kAvg64, 3},
            {VARBINARY(), {DECIMAL(30, 1)}, true, Shape::kAvg128, 1},
            // rawInputTypes win over a decimal argument.
            {DECIMAL(12, 3), {DECIMAL(38, 5)}, false, Shape::kSum128, 5},
@@ -430,9 +425,16 @@ TEST_F(DecimalStateShapeTest, stateInfoFallsBackToDecimalArgument) {
     EXPECT_EQ(info.shape, shape);
     EXPECT_EQ(info.scale, scale);
   }
+  // A decimal argument without rawInputTypes is rejected too.
+  VELOX_ASSERT_THROW(
+      decimalStateInfoFor(false, aggregateOver(DECIMAL(12, 3), {})),
+      "Decimal aggregate requires exactly one raw input type");
   VELOX_ASSERT_THROW(
       decimalStateInfoFor(false, aggregateOver(VARBINARY(), {})),
-      "Decimal aggregate requires its raw input type");
+      "Decimal aggregate requires exactly one raw input type");
+  VELOX_ASSERT_THROW(
+      decimalStateInfoFor(false, aggregateOver(VARBINARY(), {VARBINARY()})),
+      "Decimal aggregate requires a DECIMAL raw input");
 }
 
 // A blob view with a nonzero offset (cudf::slice) flattens and unpacks to the

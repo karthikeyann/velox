@@ -45,20 +45,12 @@ bool isDecimalStateUnderVarbinary(
 DecimalStateInfo decimalStateInfoFor(
     bool isAverage,
     const core::AggregationNode::Aggregate& aggregate) {
-  TypePtr rawInputType;
-  if (aggregate.rawInputTypes.size() == 1) {
-    rawInputType = aggregate.rawInputTypes[0];
-  } else if (
-      aggregate.call->inputs().size() == 1 &&
-      aggregate.call->inputs()[0]->type()->isDecimal()) {
-    // Plans built without rawInputTypes: at raw-input steps the argument
-    // itself is the raw input.
-    rawInputType = aggregate.call->inputs()[0]->type();
-  }
-  VELOX_CHECK_NOT_NULL(
-      rawInputType,
-      "Decimal aggregate requires its raw input type in the plan: {}",
+  VELOX_CHECK_EQ(
+      aggregate.rawInputTypes.size(),
+      1,
+      "Decimal aggregate requires exactly one raw input type in the plan: {}",
       aggregate.call->toString());
+  const auto& rawInputType = aggregate.rawInputTypes[0];
   VELOX_CHECK(
       rawInputType->isDecimal(),
       "Decimal aggregate requires a DECIMAL raw input: {}",
