@@ -34,6 +34,32 @@ target_link_libraries(
   velox_tpcds_benchmark_lib
 )
 
+# --- expression benchmark: GPU SFI vs the other evaluators and the CPU ---
+
+add_executable(velox_cudf_expression_benchmark CudfExpressionBenchmark.cpp)
+
+# velox_cudf_exec links the expression and GPU SFI libraries privately, so a
+# consumer that compiles expressions itself names them directly.
+target_link_libraries(
+  velox_cudf_expression_benchmark
+  velox_cudf_exec
+  velox_cudf_expression
+  velox_cudf_expression_registry
+  velox_cudf_gpu_function_bridge
+  velox_cudf_gpu_sfi_host
+  velox_exec
+  velox_expression
+  velox_functions_prestosql
+  velox_parse_parser
+  velox_parse_utils
+  velox_presto_types
+  velox_type_tz
+  velox_vector
+  cudf::cudf
+  Folly::folly
+  gflags::gflags
+)
+
 # --- other benchmarks ---
 
 add_executable(velox_cudf_interop_benchmark CudfInteropBenchmark.cpp)
