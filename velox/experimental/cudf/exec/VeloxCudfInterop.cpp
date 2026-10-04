@@ -214,16 +214,24 @@ void setArrowFormatBackToVarbinary(ArrowSchema* schema, const TypePtr& type) {
       break;
     }
     case TypeKind::VARBINARY: {
-      // Replace any format string with "z" to indicate VARBINARY.
-      static constexpr const char* kVarbinaryArrowFormat = "z";
+      // Replace the string format with the binary format of the same offset
+      // width: utf8 "u" (INT32 offsets) becomes binary "z", and large_utf8
+      // "U" (INT64 offsets, which cuDF emits for a STRING column whose chars
+      // exceed the large-strings threshold) becomes large_binary "Z". The
+      // Arrow bridge selects the offset type from the format, so forcing "z"
+      // over an INT64 offsets buffer would read the offsets as int32 pairs
+      // and produce garbage (including negative) string lengths.
+      const bool largeOffsets =
+          schema->format != nullptr && schema->format[0] == 'U';
+      const char* varbinaryArrowFormat = largeOffsets ? "Z" : "z";
       if (schema->format != nullptr) {
         std::free(const_cast<char*>(schema->format));
         schema->format = nullptr;
       }
-      const size_t bufferLen = std::strlen(kVarbinaryArrowFormat) + 1;
+      const size_t bufferLen = std::strlen(varbinaryArrowFormat) + 1;
       auto* buffer = static_cast<char*>(std::malloc(bufferLen));
       VELOX_CHECK_NOT_NULL(buffer);
-      std::memcpy(buffer, kVarbinaryArrowFormat, bufferLen);
+      std::memcpy(buffer, varbinaryArrowFormat, bufferLen);
       schema->format = buffer;
       break;
     }

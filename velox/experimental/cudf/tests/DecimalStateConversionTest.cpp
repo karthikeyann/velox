@@ -216,6 +216,20 @@ TEST_P(DecimalStateConversionShapeTest, structStateToVelox) {
   }
 }
 
+// Same as structStateToVelox, with libcudf forced to give the packed blob
+// column INT64 (large string) offsets. cuDF then exports it to Arrow as
+// large_utf8 ("U") and the import side has to keep the 64-bit offset width
+// when it rewrites the format to VARBINARY. Reproduces, at a small size, what
+// TPC-H Q17 at SF1000 hits when the partial state column exceeds 2^31 bytes.
+TEST_P(DecimalStateConversionShapeTest, structStateToVeloxWithLargeOffsets) {
+  ScopedEnvVar enableLargeStrings("LIBCUDF_LARGE_STRINGS_ENABLED", "1");
+  ScopedEnvVar threshold("LIBCUDF_LARGE_STRINGS_THRESHOLD", "1");
+  const auto shape = GetParam();
+  auto result = run(statePartial(shape).planNode(), /*passthrough=*/false);
+  ASSERT_EQ(result->size(), inputGroups().size());
+  verifyStates(result, shape);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     DecimalStateShapes,
     DecimalStateConversionShapeTest,
