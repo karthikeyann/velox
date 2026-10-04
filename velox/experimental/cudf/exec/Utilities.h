@@ -27,7 +27,21 @@
 
 namespace facebook::velox::cudf_velox {
 
-// Concatenate a vector of cuDF tables into a single table
+/// Concatenates table views into one table. Every concatenation of operator
+/// batches goes through here rather than cudf::concatenate directly: libcudf
+/// concatenates many small string inputs with a fused kernel that takes the
+/// output character count as a 32-bit cudf::size_type, so when the inputs add
+/// up to 2 GB or more of characters the count is truncated and the characters
+/// are never written (the offsets are right and the data is whatever the
+/// allocation held). This helper bounds the number of inputs per libcudf call
+/// for columns that contain strings, which keeps the fused kernel below that
+/// limit; above the bound the inputs are concatenated in groups first.
+[[nodiscard]] std::unique_ptr<cudf::table> concatenateTableViews(
+    const std::vector<cudf::table_view>& tableViews,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+/// Concatenates owned tables into one table; see concatenateTableViews.
 [[nodiscard]] std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,
     cuda::stream_ref stream,

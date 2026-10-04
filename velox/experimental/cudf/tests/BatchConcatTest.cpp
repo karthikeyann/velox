@@ -18,7 +18,9 @@
 #include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/tests/GTestUtils.h"
@@ -28,6 +30,11 @@
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+
+#include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -732,4 +739,49 @@ TEST_F(CudfBatchConcatTest, singleZeroColumnBatchSplitsAtMaxThreshold) {
   EXPECT_EQ(concatIt->second->inputVectors, 1);
   EXPECT_EQ(concatIt->second->outputVectors, 2)
       << "A 30-row zero-column input should be split into 20 and 10 rows";
+}
+
+// Many small VARCHAR batches whose characters add up to more than 2 GB. libcudf
+// concatenates such inputs with a fused kernel whose output size is a 32-bit
+// cudf::size_type, so the total is truncated and the characters are never
+// written: the offsets are right and the data is whatever the allocation held.
+// A hash join build side at TPC-H SF1000 (Q5, Q8) hits this and loses the
+// nation names. The funnel must keep the characters.
+TEST_F(CudfBatchConcatTest, manySmallStringBatchesOverTwoGigabytes) {
+  constexpr int kNumBatches = 6'000;
+  constexpr cudf::size_type kRowsPerBatch = 40'000;
+  const std::string value{"INDONESIA"};
+  const auto type = ROW({"name"}, {VARCHAR()});
+  auto stream = cudfGlobalStreamPool().get_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  cudf::string_scalar scalar(value, true, stream, mr);
+
+  std::vector<CudfVectorPtr> inputs;
+  inputs.reserve(kNumBatches);
+  for (int i = 0; i < kNumBatches; ++i) {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(
+        cudf::make_column_from_scalar(scalar, kRowsPerBatch, stream, mr));
+    inputs.push_back(
+        std::make_shared<CudfVector>(
+            pool(),
+            type,
+            kRowsPerBatch,
+            std::make_unique<cudf::table>(std::move(columns)),
+            stream));
+  }
+
+  auto table = getConcatenatedTable(std::move(inputs), type, stream, mr);
+  const auto numRows = table->num_rows();
+  ASSERT_EQ(numRows, static_cast<cudf::size_type>(kNumBatches) * kRowsPerBatch);
+  for (const auto row : {0, numRows / 2, numRows - 1}) {
+    auto slice = cudf::slice(table->view(), {row, row + 1}, stream)[0];
+    auto result =
+        with_arrow::toVeloxColumn(slice, pool(), type, "", stream, mr);
+    stream.sync();
+    EXPECT_EQ(
+        result->childAt(0)->asFlatVector<StringView>()->valueAt(0),
+        StringView(value))
+        << "row " << row;
+  }
 }
