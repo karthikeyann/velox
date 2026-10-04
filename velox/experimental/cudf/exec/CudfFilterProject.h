@@ -81,6 +81,15 @@ class CudfFilterProject : public CudfOperatorBase {
 
   std::vector<velox::exec::IdentityProjection> resultProjections_;
   std::vector<velox::exec::IdentityProjection> identityProjections_;
+
+  // Input channels of VARBINARY type read by the filter or by a computed
+  // (non-identity) projection. Checked per batch so that an expression never
+  // computes over a self-describing decimal aggregate state STRUCT. Identity
+  // projections are excluded: they pass the state through untouched.
+  std::vector<column_index_t> computedVarbinaryChannels_;
+
+  // Names of the input channels, for error messages.
+  std::vector<std::string> inputNames_;
 };
 
 } // namespace facebook::velox::cudf_velox

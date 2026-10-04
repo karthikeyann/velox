@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <set>
 #include <unordered_map>
 
 namespace facebook::velox::cudf_velox {
@@ -70,6 +71,26 @@ bool checkAddIdentityProjection(
   }
 
   return false;
+}
+
+// Fails if an expression input that the plan types as VARBINARY is physically
+// a cuDF STRUCT, i.e. an unmaterialized self-describing decimal aggregate state
+// (see DecimalAggregationState.h). Presto plans never compute on aggregation
+// intermediates, so this is a guard rather than a supported path.
+void checkNoDecimalStateExpressionInputs(
+    const std::vector<column_index_t>& channels,
+    const std::vector<std::unique_ptr<cudf::column>>& inputColumns,
+    const std::vector<std::string>& inputNames) {
+  for (const auto channel : channels) {
+    VELOX_CHECK_LT(channel, inputColumns.size());
+    if (inputColumns[channel]->type().id() == cudf::type_id::STRUCT) {
+      VELOX_FAIL(
+          "expression over an unmaterialized decimal aggregate state column "
+          "is not supported: column '{}' is VARBINARY but physically a cuDF "
+          "STRUCT",
+          inputNames[channel]);
+    }
+  }
 }
 
 // Split stats to attrbitute cardinality reduction to the Filter node.
@@ -187,10 +208,22 @@ void CudfFilterProject::initialize() {
   // lifetime.
   auto* const queryCtx = operatorCtx_->execCtx()->queryCtx();
   auto* const pool = operatorCtx_->pool();
+  // Every expression compiled here is a filter or a computed projection;
+  // identity projections were split off above. Record the VARBINARY input
+  // channels they read so doGetOutput() can reject decimal state STRUCTs.
+  std::set<column_index_t> varbinaryChannels;
   const auto optimizeAndCompile =
-      [inputType, queryCtx, pool](const core::TypedExprPtr& expr) {
-        return createCudfExpression(
-            expression::optimize(expr, queryCtx, pool), inputType, pool);
+      [inputType, queryCtx, pool, &varbinaryChannels](
+          const core::TypedExprPtr& expr) {
+        auto optimized = expression::optimize(expr, queryCtx, pool);
+        for (const auto& name : referencedInputFields(optimized)) {
+          const auto channel = inputType->getChildIdxIfExists(name);
+          if (channel.has_value() &&
+              inputType->childAt(*channel)->kind() == TypeKind::VARBINARY) {
+            varbinaryChannels.insert(*channel);
+          }
+        }
+        return createCudfExpression(optimized, inputType, pool);
       };
   if (hasFilter_) {
     // First expr is Filter, rest are Project.
@@ -207,6 +240,10 @@ void CudfFilterProject::initialize() {
         std::back_inserter(projectEvaluators_),
         optimizeAndCompile);
   }
+
+  computedVarbinaryChannels_.assign(
+      varbinaryChannels.begin(), varbinaryChannels.end());
+  inputNames_ = inputType->names();
 
   filter_.reset();
   project_.reset();
@@ -230,6 +267,11 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
   auto stream = cudfInput->stream();
   auto inputTableColumns = cudfInput->release()->release();
   auto outputSize = input_->size();
+
+  if (!computedVarbinaryChannels_.empty()) {
+    checkNoDecimalStateExpressionInputs(
+        computedVarbinaryChannels_, inputTableColumns, inputNames_);
+  }
 
   if (hasFilter_) {
     filter(inputTableColumns, stream);
