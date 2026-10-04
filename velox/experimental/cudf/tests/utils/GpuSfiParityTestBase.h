@@ -49,6 +49,27 @@ inline uint64_t nextRandom(uint64_t& state) {
   return state >> 11;
 }
 
+/// `name(c0, <literal>)` or `name(<literal>, c0)` over a column c0 of `type`,
+/// with a literal of `intervalType` holding `value`, as a planner delivers
+/// `c0 + INTERVAL '1' MONTH`. The parser spells every interval literal as
+/// INTERVAL DAY TO SECOND, so a call with an INTERVAL YEAR TO MONTH literal is
+/// built by hand.
+inline core::TypedExprPtr intervalCall(
+    const std::string& name,
+    const TypePtr& type,
+    const TypePtr& intervalType,
+    const Variant& value,
+    bool intervalFirst) {
+  std::vector<core::TypedExprPtr> inputs{
+      std::make_shared<core::FieldAccessTypedExpr>(type, "c0"),
+      std::make_shared<core::ConstantTypedExpr>(intervalType, value),
+  };
+  if (intervalFirst) {
+    std::swap(inputs[0], inputs[1]);
+  }
+  return std::make_shared<core::CallTypedExpr>(type, std::move(inputs), name);
+}
+
 /// An offset change of a time zone: the instant the clocks moved and the
 /// offsets, in seconds east of UTC, before and after it.
 struct OffsetChange {
@@ -79,6 +100,57 @@ offsetChanges(const std::string& timeZone, int32_t fromYear, int32_t toYear) {
     info = next;
   }
   return changes;
+}
+
+/// A local midnight that a forward clock change skipped, so that the day it
+/// would begin has no first instant: Timestamp::toGMT() raises for it.
+struct SkippedMidnight {
+  /// The instant the clocks moved forward.
+  int64_t utcSeconds;
+  /// The skipped midnight, in local seconds.
+  int64_t localSeconds;
+};
+
+/// The first forward change in [fromYear, toYear) whose gap holds a local
+/// midnight, or nullopt when the zone has none there. Zones that moved their
+/// clocks at midnight, such as America/Sao_Paulo, have one.
+inline std::optional<SkippedMidnight>
+skippedMidnight(const std::string& timeZone, int32_t fromYear, int32_t toYear) {
+  constexpr int64_t kSecondsInDay = 86'400;
+  for (const auto& change : offsetChanges(timeZone, fromYear, toYear)) {
+    if (change.offsetAfter <= change.offsetBefore) {
+      continue;
+    }
+    // The gap in local time: from the old offset's reading of the instant up
+    // to the new offset's reading of it.
+    const int64_t gapStart = change.utcSeconds + change.offsetBefore;
+    const int64_t gapEnd = change.utcSeconds + change.offsetAfter;
+    // The first midnight at or after the gap's start, rounding toward
+    // negative infinity for instants before the epoch.
+    const int64_t day =
+        gapStart / kSecondsInDay - (gapStart % kSecondsInDay < 0 ? 1 : 0);
+    const int64_t midnight =
+        day * kSecondsInDay == gapStart ? gapStart : (day + 1) * kSecondsInDay;
+    if (midnight < gapEnd) {
+      return SkippedMidnight{change.utcSeconds, midnight};
+    }
+  }
+  return std::nullopt;
+}
+
+/// The instant of a local wall-clock time in the zone, as the CPU resolves
+/// it: the earlier instant of a repeated time, and none for a skipped one.
+inline std::optional<int64_t> instantOfLocalTime(
+    const std::string& timeZone,
+    int64_t localSeconds) {
+  const auto* zone = tz::locateZone(timeZone);
+  const std::chrono::seconds local{localSeconds};
+  if (zone->tz() != nullptr &&
+      zone->tz()->get_info(date::local_seconds{local}).result ==
+          tzdb::local_info::nonexistent) {
+    return std::nullopt;
+  }
+  return zone->to_sys(local, tz::TimeZone::TChoose::kEarliest).count();
 }
 
 /// Compares GPU SFI with the CPU over one SQL expression and one input, with
@@ -219,6 +291,24 @@ class GpuSfiParityTestBase : public CudfFunctionBaseTest {
     ASSERT_NE(dynamic_cast<GpuSfiExpression*>(evaluator.get()), nullptr)
         << sql << " is not evaluated by GPU SFI";
     assertExpressionMatchesCpu(sql, input, rowType);
+  }
+
+  /// The same over a typed expression, for a call the parser cannot spell,
+  /// such as one with an INTERVAL YEAR TO MONTH literal.
+  void assertGpuMatchesCpu(
+      const core::TypedExprPtr& expr,
+      const RowVectorPtr& input) {
+    const auto rowType = asRowType(input->type());
+    const auto optimized =
+        expression::optimize(expr, queryCtx_.get(), execCtx_.pool());
+    const auto evaluator = createCudfExpression(
+        optimized, rowType, pool_.get(), queryCtx_->queryConfig());
+    ASSERT_NE(dynamic_cast<GpuSfiExpression*>(evaluator.get()), nullptr)
+        << expr->toString() << " is not evaluated by GPU SFI";
+    exec::ExprSet exprSet({expr}, &execCtx_);
+    const auto expected =
+        functions::test::FunctionBaseTest::evaluate(exprSet, input);
+    facebook::velox::test::assertEqualVectors(expected, evaluate(expr, input));
   }
 
   /// The rows of `input` the CPU answers `sql` for: the ones a TRY around it
