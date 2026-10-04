@@ -34,6 +34,28 @@ target_link_libraries(
   velox_tpcds_benchmark_lib
 )
 
+# --- decimal expression benchmark: GPU SFI vs the hand-written kernels ---
+
+add_executable(velox_cudf_decimal_expression_benchmark CudfDecimalExpressionBenchmark.cpp)
+
+# velox_cudf_exec links the expression and GPU SFI libraries privately, so a
+# consumer that compiles expressions itself names them directly.
+target_link_libraries(
+  velox_cudf_decimal_expression_benchmark
+  velox_cudf_exec
+  velox_cudf_expression
+  velox_cudf_expression_registry
+  velox_cudf_gpu_function_bridge
+  velox_exec
+  velox_exec_test_lib
+  velox_functions_prestosql
+  velox_parse_parser
+  velox_parse_utils
+  cudf::cudf
+  Folly::folly
+  gflags::gflags
+)
+
 # --- other benchmarks ---
 
 add_executable(velox_cudf_interop_benchmark CudfInteropBenchmark.cpp)
