@@ -16,6 +16,8 @@
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
+#include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -27,6 +29,7 @@
 #include "velox/exec/Operator.h"
 #include "velox/vector/ComplexVector.h"
 
+#include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -67,6 +70,60 @@ cudf::size_type preferredGpuBatchSizeRows(
       std::numeric_limits<vector_size_t>::max(),
       "velox.cudf.gpu_batch_size_rows must be <= max(vector_size_t)");
   return batchSize;
+}
+
+// Prepares a GPU table for Arrow export. Any top-level column whose Velox type
+// is VARBINARY but whose cuDF column is a self-describing decimal aggregate
+// state STRUCT is packed into the 32-byte STRING blob that CPU Velox expects,
+// so Arrow export sees a STRING column. Aggregation intermediates are always
+// top-level columns, so nested VARBINARY fields are not inspected. Returns a
+// view over the original columns with the packed ones substituted; the packed
+// columns are appended to `packed`, which the caller must keep alive until the
+// export has completed. Returns `table` unchanged when nothing needs packing.
+cudf::table_view packDecimalStatesForExport(
+    const cudf::table_view& table,
+    const RowTypePtr& outputType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr,
+    std::vector<std::unique_ptr<cudf::column>>& packed) {
+  VELOX_CHECK_EQ(
+      table.num_columns(),
+      static_cast<cudf::size_type>(outputType->size()),
+      "GPU table column count does not match the output type: {}",
+      outputType->toString());
+  std::vector<cudf::column_view> columns;
+  bool replaced = false;
+  for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
+    auto column = table.column(i);
+    if (isDecimalStateUnderVarbinary(outputType->childAt(i), column)) {
+      packed.push_back(packDecimalState(column, stream, mr));
+      column = packed.back()->view();
+      replaced = true;
+    }
+    columns.push_back(column);
+  }
+  return replaced ? cudf::table_view(columns) : table;
+}
+
+// Exports a GPU table to a Velox RowVector of `outputType`, packing any
+// self-describing decimal aggregate state columns to their VARBINARY blob form
+// first. Every GPU -> CPU conversion in CudfToVelox goes through here.
+RowVectorPtr exportToVelox(
+    const cudf::table_view& table,
+    const RowTypePtr& outputType,
+    memory::MemoryPool* pool,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  std::vector<std::unique_ptr<cudf::column>> packed;
+  auto exportView =
+      packDecimalStatesForExport(table, outputType, stream, mr, packed);
+  auto output =
+      with_arrow::toVeloxColumn(exportView, pool, outputType, "", stream, mr);
+  // Synchronize before `packed` is released so the export's device reads of
+  // the packed columns have completed.
+  stream.sync();
+  output->setType(outputType);
+  return output;
 }
 } // namespace
 
@@ -255,11 +312,7 @@ RowVectorPtr CudfToVelox::convertFrontToVelox() {
   inputs_.pop_front();
   auto stream = cudfVector->stream();
   auto tableView = cudfVector->getTableView();
-  auto output = with_arrow::toVeloxColumn(
-      tableView, pool(), outputType_, "", stream, get_temp_mr());
-  stream.sync();
-  output->setType(outputType_);
-  return output;
+  return exportToVelox(tableView, outputType_, pool(), stream, get_temp_mr());
 }
 
 // Output batching strategy
@@ -352,11 +405,8 @@ RowVectorPtr CudfToVelox::doGetOutput() {
           "Accumulated row count exceeds cudf int32 limit");
       auto concatTable = getConcatenatedTable(
           std::move(toConcat), outputType_, stream, get_temp_mr());
-      auto tableView = concatTable->view();
-      veloxBuffer_ = with_arrow::toVeloxColumn(
-          tableView, pool(), outputType_, "", stream, get_temp_mr());
-      stream.sync();
-      veloxBuffer_->setType(outputType_);
+      veloxBuffer_ = exportToVelox(
+          concatTable->view(), outputType_, pool(), stream, get_temp_mr());
       veloxOffset_ = 0;
       averageRowSize_ = std::nullopt;
     }

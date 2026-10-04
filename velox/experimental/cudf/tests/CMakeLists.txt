@@ -133,8 +133,18 @@ velox_add_cudf_test(
   TIMEOUT 3000
 )
 
-foreach(target velox_cudf_decimal_aggregation_test
-                velox_cudf_decimal_state_shape_test
+velox_add_cudf_test(
+  NAME velox_cudf_decimal_state_conversion_test
+  SOURCES Main.cpp DecimalStateConversionTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib
+  TIMEOUT 3000
+)
+
+foreach(
+  target
+  velox_cudf_decimal_aggregation_test
+  velox_cudf_decimal_state_shape_test
+  velox_cudf_decimal_state_conversion_test
 )
   velox_add_test_headers(${target} DecimalStateTestColumns.h)
 endforeach()

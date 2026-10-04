@@ -64,6 +64,10 @@ class CudfFromVelox : public CudfOperatorBase {
   bool finished_ = false;
 };
 
+/// Converts GPU CudfVectors to CPU RowVectors. A VARBINARY column that is
+/// physically a self-describing decimal aggregate state STRUCT (see
+/// DecimalAggregationState.h) is packed into the 32-byte VARBINARY blob that
+/// CPU Velox expects before Arrow export, on every conversion path.
 class CudfToVelox : public CudfOperatorBase {
  public:
   static constexpr const char* kPassthroughMode =
