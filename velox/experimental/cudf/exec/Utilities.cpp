@@ -16,8 +16,8 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
-#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/common/testutil/TestValue.h"
@@ -27,6 +27,7 @@
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -83,7 +84,87 @@ vector_size_t checkedVectorSize(size_t rowCount) {
       "cuDF vector row count exceeds Velox vector size limit");
   return static_cast<vector_size_t>(rowCount);
 }
+
+// libcudf's string concatenation copies the characters with a fused kernel
+// when the inputs are many and small (fewer than about 393 KB of characters
+// per input, 1.5 MB when nullable) and with one memcpy per input otherwise.
+// The fused kernel takes the output character count as cudf::size_type, so a
+// total of 2^31 characters or more is truncated and nothing is copied. With at
+// most this many inputs per call the fused kernel is only chosen for totals
+// below 1.5 GB, which fit; larger totals take the memcpy path, which is
+// correct for any size.
+constexpr size_t kMaxStringConcatenateFanIn = 1'024;
+
+bool containsStrings(const cudf::column_view& column) {
+  if (column.type().id() == cudf::type_id::STRING) {
+    return true;
+  }
+  for (cudf::size_type i = 0; i < column.num_children(); ++i) {
+    if (containsStrings(column.child(i))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Concatenates one column's views with at most kMaxStringConcatenateFanIn
+// inputs per libcudf call: groups of that many views are concatenated into
+// temporaries first, then the temporaries are concatenated (recursively, so
+// any fan-in is handled). Costs one extra copy of the column only when the
+// bound is exceeded.
+std::unique_ptr<cudf::column> concatenateColumnViewsBoundedFanIn(
+    const std::vector<cudf::column_view>& columnViews,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  if (columnViews.size() <= kMaxStringConcatenateFanIn) {
+    return cudf::concatenate(columnViews, stream, mr);
+  }
+  std::vector<std::unique_ptr<cudf::column>> groups;
+  std::vector<cudf::column_view> groupViews;
+  for (size_t begin = 0; begin < columnViews.size();
+       begin += kMaxStringConcatenateFanIn) {
+    const auto count =
+        std::min(kMaxStringConcatenateFanIn, columnViews.size() - begin);
+    groups.push_back(
+        cudf::concatenate(
+            cudf::host_span<cudf::column_view const>(
+                columnViews.data() + begin, count),
+            stream,
+            get_temp_mr()));
+    groupViews.push_back(groups.back()->view());
+  }
+  return concatenateColumnViewsBoundedFanIn(groupViews, stream, mr);
+}
+
 } // namespace
+
+std::unique_ptr<cudf::table> concatenateTableViews(
+    const std::vector<cudf::table_view>& tableViews,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK_GT(tableViews.size(), 0);
+  const auto& first = tableViews.front();
+  const bool boundFanIn = tableViews.size() > kMaxStringConcatenateFanIn &&
+      std::any_of(first.begin(), first.end(), containsStrings);
+  if (!boundFanIn) {
+    return cudf::concatenate(tableViews, stream, mr);
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(first.num_columns());
+  std::vector<cudf::column_view> columnViews(tableViews.size());
+  for (cudf::size_type columnIndex = 0; columnIndex < first.num_columns();
+       ++columnIndex) {
+    for (size_t i = 0; i < tableViews.size(); ++i) {
+      columnViews[i] = tableViews[i].column(columnIndex);
+    }
+    columns.push_back(
+        containsStrings(first.column(columnIndex))
+            ? concatenateColumnViewsBoundedFanIn(columnViews, stream, mr)
+            : cudf::concatenate(columnViews, stream, mr));
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
 
 std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,
@@ -102,8 +183,10 @@ std::unique_ptr<cudf::table> concatenateTables(
       tables.end(),
       std::back_inserter(tableViews),
       [&](const auto& tbl) { return tbl->view(); });
-  return cudf::concatenate(tableViews, stream, mr);
+  return concatenateTableViews(tableViews, stream, mr);
 }
+
+namespace {
 
 std::unique_ptr<cudf::table> makeEmptyTable(
     TypePtr const& inputType,
@@ -130,6 +213,7 @@ std::unique_ptr<cudf::table> makeEmptyTable(
   }
   return std::make_unique<cudf::table>(std::move(emptyColumns));
 }
+} // namespace
 
 std::unique_ptr<cudf::table> getConcatenatedTable(
     std::vector<CudfVectorPtr>&& tables,
@@ -159,7 +243,7 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
   // release in-place: the output is owned by `stream` but the input buffer was
   // allocated on a different stream, so releasing it would bind deallocation to
   // the wrong stream.
-  auto output = cudf::concatenate(tableViews, stream, mr);
+  auto output = concatenateTableViews(tableViews, stream, mr);
 
   orderCudfVectorDeallocationsAfterStream(tables, inputStreams, stream);
   // Input tables are deallocated here when 'tables' goes out of scope.
@@ -208,7 +292,7 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     }
 
     cudf::detail::join_streams(inputStreams, stream);
-    outputTables.push_back(cudf::concatenate(tableViews, stream, mr));
+    outputTables.push_back(concatenateTableViews(tableViews, stream, mr));
 
     // Rebind deallocation to the output stream where possible, then release
     // this group's inputs. Each completed output replaces its source inputs,
