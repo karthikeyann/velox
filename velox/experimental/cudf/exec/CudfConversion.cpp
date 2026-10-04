@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
@@ -28,7 +29,6 @@
 #include "velox/exec/Operator.h"
 #include "velox/vector/ComplexVector.h"
 
-#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -71,92 +71,15 @@ cudf::size_type preferredGpuBatchSizeRows(
       "velox.cudf.gpu_batch_size_rows must be <= max(vector_size_t)");
   return batchSize;
 }
-// True if `type` is or contains a VARBINARY anywhere in its tree.
-bool containsVarbinary(const TypePtr& type) {
-  if (type->kind() == TypeKind::VARBINARY) {
-    return true;
-  }
-  for (uint32_t i = 0; i < type->size(); ++i) {
-    if (containsVarbinary(type->childAt(i))) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// Walks a nested (ROW/ARRAY/MAP) Velox type alongside its cuDF column and
-// fails if a VARBINARY below the top level is physically a cuDF STRUCT, i.e. a
-// self-describing decimal aggregate state. Aggregation intermediates are
-// always top-level columns, so nested states are never produced; this guards
-// against silently exporting a STRUCT where Arrow expects binary data.
-void checkNoNestedDecimalState(
-    const TypePtr& type,
-    const cudf::column_view& column,
-    const std::string& path) {
-  switch (type->kind()) {
-    case TypeKind::VARBINARY:
-      VELOX_CHECK(
-          column.type().id() != cudf::type_id::STRUCT,
-          "CudfToVelox: VARBINARY field '{}' nested inside a complex type is "
-          "physically a cuDF STRUCT (unmaterialized decimal aggregate state); "
-          "nested decimal aggregate states are not supported",
-          path);
-      return;
-    case TypeKind::ROW: {
-      if (column.type().id() != cudf::type_id::STRUCT ||
-          column.num_children() != static_cast<cudf::size_type>(type->size())) {
-        return;
-      }
-      const auto& rowType = type->asRow();
-      for (uint32_t i = 0; i < rowType.size(); ++i) {
-        if (containsVarbinary(rowType.childAt(i))) {
-          checkNoNestedDecimalState(
-              rowType.childAt(i),
-              column.child(i),
-              path + "." + rowType.nameOf(i));
-        }
-      }
-      return;
-    }
-    case TypeKind::ARRAY:
-      if (column.type().id() == cudf::type_id::LIST &&
-          column.num_children() > cudf::lists_column_view::child_column_index) {
-        checkNoNestedDecimalState(
-            type->childAt(0),
-            column.child(cudf::lists_column_view::child_column_index),
-            path + "[]");
-      }
-      return;
-    case TypeKind::MAP: {
-      // cuDF represents MAP as LIST<STRUCT<key, value>>.
-      if (column.type().id() != cudf::type_id::LIST ||
-          column.num_children() <=
-              cudf::lists_column_view::child_column_index) {
-        return;
-      }
-      auto entries = column.child(cudf::lists_column_view::child_column_index);
-      if (entries.type().id() != cudf::type_id::STRUCT ||
-          entries.num_children() != 2) {
-        return;
-      }
-      checkNoNestedDecimalState(
-          type->childAt(0), entries.child(0), path + ".key");
-      checkNoNestedDecimalState(
-          type->childAt(1), entries.child(1), path + ".value");
-      return;
-    }
-    default:
-      return;
-  }
-}
 
 // Prepares a GPU table for Arrow export. Any top-level column whose Velox type
 // is VARBINARY but whose cuDF column is a self-describing decimal aggregate
 // state STRUCT is packed into the 32-byte STRING blob that CPU Velox expects,
-// so Arrow export sees a STRING column. Returns a view over the original
-// columns with the packed ones substituted; the packed columns are appended to
-// `packed`, which the caller must keep alive until the export has completed.
-// Returns `table` unchanged when nothing needs packing.
+// so Arrow export sees a STRING column. Aggregation intermediates are always
+// top-level columns, so nested VARBINARY fields are not inspected. Returns a
+// view over the original columns with the packed ones substituted; the packed
+// columns are appended to `packed`, which the caller must keep alive until the
+// export has completed. Returns `table` unchanged when nothing needs packing.
 cudf::table_view packDecimalStatesForExport(
     const cudf::table_view& table,
     const RowTypePtr& outputType,
@@ -166,25 +89,16 @@ cudf::table_view packDecimalStatesForExport(
   VELOX_CHECK_EQ(
       table.num_columns(),
       static_cast<cudf::size_type>(outputType->size()),
-      "CudfToVelox: GPU table column count does not match output type {}",
+      "GPU table column count does not match the output type: {}",
       outputType->toString());
   std::vector<cudf::column_view> columns;
   bool replaced = false;
   for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
-    const auto& type = outputType->childAt(i);
     auto column = table.column(i);
-    if (type->kind() == TypeKind::VARBINARY &&
-        column.type().id() == cudf::type_id::STRUCT) {
-      VELOX_CHECK(
-          isDecimalStateStruct(column),
-          "CudfToVelox: VARBINARY column '{}' is a cuDF STRUCT that is not a "
-          "recognized decimal aggregate state shape",
-          outputType->nameOf(i));
+    if (isDecimalStateUnderVarbinary(outputType->childAt(i), column)) {
       packed.push_back(packDecimalState(column, stream, mr));
       column = packed.back()->view();
       replaced = true;
-    } else if (type->size() > 0 && containsVarbinary(type)) {
-      checkNoNestedDecimalState(type, column, outputType->nameOf(i));
     }
     columns.push_back(column);
   }

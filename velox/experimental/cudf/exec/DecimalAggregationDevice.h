@@ -117,13 +117,18 @@ void unpackDecimalSumState(
     cuda::stream_ref stream);
 
 /**
- * Per-row half-up integer divide of sum by count; count == 0 writes zero
+ * Per-row decimal average with the CPU's rounding: when the row's overflow is
+ * zero this is a half-up integer divide of sum by count; otherwise it is
+ * (sum + overflow * 2^127) / count computed without widening past 128 bits,
+ * exactly as DecimalUtil::computeAverage does. count == 0 writes zero
  * (validity is applied separately).
  *
  * @param sumType DECIMAL64 or DECIMAL128; selects sum storage width via
  *        cudf::type_dispatcher<cudf::dispatch_storage_type>.
  * @param sumCol per-row sums.
  * @param counts per-row counts.
+ * @param overflows per-row int64 overflow carries, or nullptr when the state
+ *        does not carry the field (treated as zero).
  * @param outView output per-row averages.
  * @param numRows number of rows.
  * @param stream CUDA stream for the launch.
@@ -132,8 +137,54 @@ void averageRoundDecimalSum(
     cudf::type_id sumType,
     cudf::column_view sumCol,
     const int64_t* counts,
+    const int64_t* overflows,
     cudf::mutable_column_view outView,
     cudf::size_type numRows,
+    cuda::stream_ref stream);
+
+/// Outcome of checkDecimalSumRange and foldDecimalSumOverflow, encoded as the
+/// largest code hit by any row.
+enum class DecimalSumCheck : int32_t {
+  kOk = 0,
+  /// The overflow field could not be folded into the sum
+  /// (DecimalUtil::adjustSumForOverflow would return nullopt).
+  kOverflow = 1,
+  /// The (folded) sum lies outside the DECIMAL(38) range.
+  kOutOfRange = 2,
+};
+
+/**
+ * Checks that every valid row of a DECIMAL128 column lies strictly within
+ * +-10^38, in one device pass and one host sync.
+ *
+ * @param sum DECIMAL128 column.
+ * @param stream CUDA stream for the launch; synchronized once to read back the
+ *        result.
+ * @return kOk or kOutOfRange.
+ */
+DecimalSumCheck checkDecimalSumRange(
+    cudf::column_view sum,
+    cuda::stream_ref stream);
+
+/**
+ * Finalizes merged DECIMAL128 sums the way the CPU FINAL step does, in one
+ * device pass and one host sync. For every valid row with a nonzero overflow,
+ * folds it into the sum in place following DecimalUtil::adjustSumForOverflow
+ * (overflow == 1 with a negative sum, or overflow == -1 with a positive sum,
+ * adds overflow * 2^127; anything else is kOverflow). Then checks that the
+ * sum lies strictly within +-10^38.
+ *
+ * @param sum DECIMAL128 column, offset 0, modified in place when a fold
+ *        applies.
+ * @param overflow INT64 column of the same size. Null overflow rows count as
+ *        zero.
+ * @param stream CUDA stream for the launch; synchronized once to read back the
+ *        result.
+ * @return the worst code hit by any row.
+ */
+DecimalSumCheck foldDecimalSumOverflow(
+    cudf::mutable_column_view sum,
+    cudf::column_view overflow,
     cuda::stream_ref stream);
 
 /**

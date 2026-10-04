@@ -17,7 +17,6 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
-#include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
@@ -52,15 +51,14 @@ using facebook::velox::cudf_velox::DecimalStateColumns;
 using facebook::velox::cudf_velox::decimalStateHasCount;
 using facebook::velox::cudf_velox::decimalStateHasOverflow;
 using facebook::velox::cudf_velox::DecimalStateInfo;
-using facebook::velox::cudf_velox::decimalStateShapeFor;
+using facebook::velox::cudf_velox::decimalStateInfoFor;
 using facebook::velox::cudf_velox::finalizeDecimalAverage;
+using facebook::velox::cudf_velox::finalizeDecimalSum;
 using facebook::velox::cudf_velox::flattenDecimalState;
 using facebook::velox::cudf_velox::get_output_mr;
 using facebook::velox::cudf_velox::get_temp_mr;
 using facebook::velox::cudf_velox::ReduceAggregator;
 using facebook::velox::cudf_velox::ResolvedAggregateInfo;
-using facebook::velox::cudf_velox::validateDecimalOverflowIsZero;
-using facebook::velox::cudf_velox::validateDecimalSumResult;
 using facebook::velox::cudf_velox::validateIntermediateColumnType;
 using facebook::velox::cudf_velox::wrapDecimalState;
 
@@ -294,22 +292,6 @@ struct ReduceMeanAggregator : ReduceAggregator {
   }
 };
 
-// Returns the DecimalStateInfo for a decimal SUM/AVG aggregate declared on
-// 'rawInputType' (a DECIMAL): the struct shape the producer emits and the scale
-// of the state's sum.
-DecimalStateInfo makeDecimalStateInfo(
-    bool isAverage,
-    const TypePtr& rawInputType) {
-  VELOX_CHECK_NOT_NULL(rawInputType);
-  VELOX_CHECK(
-      rawInputType->isDecimal(),
-      "Decimal aggregate requires a DECIMAL raw input, got {}",
-      rawInputType->toString());
-  const auto [precision, scale] = getDecimalPrecisionScale(*rawInputType);
-  return DecimalStateInfo{
-      decimalStateShapeFor(isAverage, rawInputType->isLongDecimal()), scale};
-}
-
 // Materializes reduced sum/count scalars into 1-row columns.
 cudf_velox::DecimalSumStateColumns makeSumCountColumns(
     cudf::scalar const& sumScalar,
@@ -346,7 +328,7 @@ cudf_velox::DecimalSumStateColumns reduceRawDecimalSumCount(
 // Sums one flat state field into a 1-row column of the field's type. Null rows
 // are skipped; an all-null field yields a null row.
 std::unique_ptr<cudf::column> reduceStateField(
-    cudf::column_view field,
+    const cudf::column_view& field,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   auto const sumAgg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
@@ -359,7 +341,7 @@ std::unique_ptr<cudf::column> reduceStateField(
 // and merges each requested field across all rows into 1-row columns.
 // Fields not requested are left null in the result.
 DecimalStateColumns mergeDecimalState(
-    cudf::column_view inputCol,
+    const cudf::column_view& inputCol,
     const DecimalStateInfo& info,
     bool needCount,
     bool needOverflow,
@@ -379,40 +361,24 @@ DecimalStateColumns mergeDecimalState(
   return merged;
 }
 
-// Wraps flat fields into the plan-determined struct shape, synthesizing the
-// zero overflow child when the shape requires it and the GPU produced the
-// state (the GPU accumulates in 128 bits and never sets overflow).
-std::unique_ptr<cudf::column> wrapDecimalStateForOutput(
-    DecimalStateColumns&& flat,
+// kPartial: reduce the raw column to sum/count and emit the plan shape. The
+// overflow child, when the shape has one, is synthesized as zero by
+// wrapDecimalState: the GPU does not track carries.
+std::unique_ptr<cudf::column> partialDecimalState(
+    const cudf::column_view& inputCol,
     const DecimalStateInfo& info,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  if (decimalStateHasOverflow(info.shape) && !flat.overflow) {
-    cudf::numeric_scalar<int64_t> zero(0, true, stream, get_temp_mr());
-    flat.overflow =
-        cudf::make_column_from_scalar(zero, flat.sum->size(), stream, mr);
+  auto flat = reduceRawDecimalSumCount(inputCol, stream, mr);
+  if (!decimalStateHasCount(info.shape)) {
+    flat.count.reset();
   }
   return wrapDecimalState(std::move(flat), info.shape, stream, mr);
 }
 
-// kPartial: reduce the raw column to sum/count and emit the plan shape.
-std::unique_ptr<cudf::column> partialDecimalState(
-    cudf::column_view inputCol,
-    const DecimalStateInfo& info,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
-  auto cols = reduceRawDecimalSumCount(inputCol, stream, mr);
-  DecimalStateColumns flat;
-  flat.sum = std::move(cols.sum);
-  if (decimalStateHasCount(info.shape)) {
-    flat.count = std::move(cols.count);
-  }
-  return wrapDecimalStateForOutput(std::move(flat), info, stream, mr);
-}
-
 // kIntermediate: merge incoming state and re-emit the plan shape.
 std::unique_ptr<cudf::column> intermediateDecimalState(
-    cudf::column_view inputCol,
+    const cudf::column_view& inputCol,
     const DecimalStateInfo& info,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
@@ -423,13 +389,14 @@ std::unique_ptr<cudf::column> intermediateDecimalState(
       decimalStateHasOverflow(info.shape),
       stream,
       mr);
-  return wrapDecimalStateForOutput(std::move(merged), info, stream, mr);
+  return wrapDecimalState(std::move(merged), info.shape, stream, mr);
 }
 
 // kFinal SUM: merge sum (and overflow when the plan shape carries it; it is
-// provably zero for DECIMAL64 raw inputs), check the DECIMAL(38) range.
+// provably zero for DECIMAL64 raw inputs), fold the overflow and check the
+// DECIMAL(38) range as the CPU does.
 std::unique_ptr<cudf::column> finalDecimalSum(
-    cudf::column_view inputCol,
+    const cudf::column_view& inputCol,
     const DecimalStateInfo& info,
     TypePtr const& outputType,
     cuda::stream_ref stream,
@@ -441,21 +408,18 @@ std::unique_ptr<cudf::column> finalDecimalSum(
       decimalStateHasOverflow(info.shape),
       stream,
       mr);
-  if (merged.overflow) {
-    validateDecimalOverflowIsZero(merged.overflow->view(), stream);
-  }
-  validateDecimalSumResult(merged.sum->view(), stream);
-  auto const cudfOutType = cudf_velox::veloxToCudfDataType(outputType);
-  if (merged.sum->type() != cudfOutType) {
-    return cudf::cast(*merged.sum, cudfOutType, stream, mr);
-  }
-  return std::move(merged.sum);
+  return finalizeDecimalSum(
+      std::move(merged.sum),
+      std::move(merged.overflow),
+      outputType,
+      stream,
+      mr);
 }
 
 // kFinal AVG: merge sum, count (and overflow when carried), then divide with
-// decimal half-up rounding.
+// the CPU's decimal rounding.
 std::unique_ptr<cudf::column> finalDecimalAvg(
-    cudf::column_view inputCol,
+    const cudf::column_view& inputCol,
     const DecimalStateInfo& info,
     TypePtr const& resultType,
     cuda::stream_ref stream,
@@ -467,11 +431,13 @@ std::unique_ptr<cudf::column> finalDecimalAvg(
       decimalStateHasOverflow(info.shape),
       stream,
       mr);
-  if (merged.overflow) {
-    validateDecimalOverflowIsZero(merged.overflow->view(), stream);
-  }
   return finalizeDecimalAverage(
-      std::move(merged.sum), std::move(merged.count), resultType, stream, mr);
+      std::move(merged.sum),
+      std::move(merged.count),
+      std::move(merged.overflow),
+      resultType,
+      stream,
+      mr);
 }
 
 std::unique_ptr<cudf::column> singleDecimalAvgFromRawColumn(
@@ -479,9 +445,14 @@ std::unique_ptr<cudf::column> singleDecimalAvgFromRawColumn(
     TypePtr const& resultType,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  auto cols = reduceRawDecimalSumCount(inputCol, stream, mr);
+  auto flat = reduceRawDecimalSumCount(inputCol, stream, mr);
   return finalizeDecimalAverage(
-      std::move(cols.sum), std::move(cols.count), resultType, stream, mr);
+      std::move(flat.sum),
+      std::move(flat.count),
+      /*overflow=*/nullptr,
+      resultType,
+      stream,
+      mr);
 }
 
 std::unique_ptr<cudf::column> singleDecimalSumFromRawColumn(
@@ -789,11 +760,11 @@ struct ApproxDistinctAggregator : ReduceAggregator {
   std::int32_t precision_;
 };
 
-// 'rawInputType' is the aggregate's single raw input type from the plan, or
-// nullptr when it has none; decimal SUM/AVG derive their state shape from it.
+// 'aggregate' is the plan's declaration of the aggregate described by 'p';
+// decimal SUM/AVG derive their state shape from its raw input type.
 std::unique_ptr<ReduceAggregator> createReduceAggregator(
     const ResolvedAggregateInfo& p,
-    const TypePtr& rawInputType) {
+    const core::AggregationNode::Aggregate& aggregate) {
   auto const& kind = p.kind;
   auto prefix = cudf_velox::CudfConfig::getInstance().functionNamePrefix;
   if (kind.rfind(prefix + "sum", 0) == 0) {
@@ -804,7 +775,7 @@ std::unique_ptr<ReduceAggregator> createReduceAggregator(
           p.constant,
           p.resultType,
           p.maskIndex,
-          makeDecimalStateInfo(/*isAverage=*/false, rawInputType));
+          decimalStateInfoFor(/*isAverage=*/false, aggregate));
     }
     return std::make_unique<ReduceSumAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
@@ -829,7 +800,7 @@ std::unique_ptr<ReduceAggregator> createReduceAggregator(
           p.inputIndex,
           p.constant,
           p.resultType,
-          makeDecimalStateInfo(/*isAverage=*/true, rawInputType));
+          decimalStateInfoFor(/*isAverage=*/true, aggregate));
     }
     return std::make_unique<ReduceMeanAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType, p.maskIndex);
@@ -859,9 +830,7 @@ std::vector<std::unique_ptr<ReduceAggregator>> toReduceAggregators(
   std::vector<std::unique_ptr<ReduceAggregator>> aggregators;
   aggregators.reserve(params.size());
   for (size_t i = 0; i < params.size(); ++i) {
-    const auto& rawInputTypes = aggregates[i].rawInputTypes;
-    aggregators.push_back(createReduceAggregator(
-        params[i], rawInputTypes.size() == 1 ? rawInputTypes[0] : nullptr));
+    aggregators.push_back(createReduceAggregator(params[i], aggregates[i]));
   }
   return aggregators;
 }

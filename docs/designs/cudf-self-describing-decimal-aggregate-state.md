@@ -99,6 +99,21 @@ Verified against the CPU consumer in `DecimalAggregate.h`:
   (`DecimalAggregate.h:176-199`), not from count.
 - `DecimalAverageAggregateBase::computeFinalValue`
   (`AverageAggregateBase.h:403-409`) reads sum, count, and overflow.
+- Nonzero overflow is not an error on the CPU. `addWithOverflow` keeps the
+  low 127 bits of the running sum and counts carries of 2^127 in `overflow`.
+  `DecimalSumAggregate::computeFinalValue` calls
+  `DecimalUtil::adjustSumForOverflow`, which accepts `overflow == 1` with a
+  negative sum and `overflow == -1` with a positive sum (adding
+  `overflow * 2^127`, which wraps back to the exact total), raises
+  "Decimal overflow" for any other nonzero value, and then range-checks
+  against DECIMAL(38). `DecimalUtil::computeAverage` accepts any overflow and
+  returns `(sum + overflow * 2^127) / count` with half-up rounding, computed
+  without widening past 128 bits; the average is not range-checked. The GPU
+  FINAL step reproduces both rules on device (`finalizeDecimalSum`,
+  `finalizeDecimalAverage` in `exec/DecimalAggregationHostOps.h`) in a single
+  pass with one host sync per output batch, and skips the overflow work
+  entirely for shapes without an overflow child (DECIMAL64 raw input, the
+  Q18 path).
 - Overflow is provably zero for DECIMAL64 raw inputs: a DECIMAL64 value fits
   in 63 bits and the row count fits in 63 bits, so the sum fits in 126 bits.
 - `mergeWith` (`DecimalAggregate.h:34-44`) only requires `count` to be
@@ -135,10 +150,28 @@ Properties:
   column on every worker emits the same shape. Struct-versus-struct mismatch
   can arise only from version skew between workers.
 - Validity lives on the `sum` child only. The struct parent carries no null
-  mask, which avoids a redundant mask and avoids `make_structs_column`
-  superimposing parent nulls onto children (which can copy child masks). A
-  state row is null exactly when `sum` is null; cuDF group-by SUM yields null
-  for an all-null group, which is the required SUM semantics.
+  mask when a producer emits it, which avoids a redundant mask and avoids
+  `make_structs_column` superimposing parent nulls onto children (which can
+  copy child masks). A state row is null exactly when `sum` is null; cuDF
+  group-by SUM yields null for an all-null group, which is the required SUM
+  semantics. Consumers nevertheless tolerate a parent mask (a nullifying
+  gather such as an outer-join probe adds one): `flattenDecimalState` and
+  `packDecimalState` treat a row as null when the parent or the `sum` child
+  is null, folding the parent mask into an owned copy of `sum` only in that
+  case, at zero cost when the parent has no nulls.
+
+Known limitation: GPU producers do not track int128 carries. cuDF's
+DECIMAL128 SUM wraps modulo 2^128, so the `overflow` child emitted by a GPU
+producer (kSum128 and kAvg128) is always 0 and `packDecimalState` writes that 0
+into the blob. A DECIMAL(38) total that wraps back into range is therefore
+reported silently wrong, and one that lands out of range is reported as
+"Decimal overflow" even when the true average would be in range. This is the
+pre-existing behaviour of the blob path and is unchanged by this design. The
+overflow field is meaningful only when it came from a CPU-produced state; it
+is honoured on merge (summed across partials) and at FINAL (folded per the CPU
+rules above). Closing the gap needs a carry-tracking reduction for DECIMAL128
+(a custom reduce over `(sum, overflow)` for the global path and a host UDF or
+two-pass approach for `cudf::groupby`).
 
 Q18 lands on the first row: 16 bytes plus one validity bit per group, the
 same as the branch.
@@ -152,15 +185,20 @@ same as the branch.
   resulting flat columns in a struct of the chosen shape by moving the
   children. No copy, no pack kernel.
 - FINAL and INTERMEDIATE: flatten each incoming state column to flat child
-  columns before any other work, accepting a STRING blob (existing
-  `deserializeDecimalSumState`) or any struct shape (child views plus
-  synthesized zero or one columns for missing fields). Buffer flat columns,
-  not a struct; the struct is a transport form only. This replaces the raw
-  `cudf::concatenate` at `exec/CudfGroupby.cpp:1951` operating on mixed
-  forms.
+  columns before any other work, accepting a STRING blob or any struct shape
+  (child views plus synthesized zero or one columns for missing fields; see
+  `flattenDecimalState`). The state buffered between incremental FINAL rounds
+  is a struct of the plan shape with no parent mask, which is byte-identical
+  to the flat children; the next round flattens it by view, so nothing is
+  copied. Before the buffered struct is concatenated with a new batch, the
+  concat funnel's `normalizeDecimalStateTableViews` brings both to one
+  physical form (a CPU-produced blob is unpacked toward the struct). This
+  replaces the raw `cudf::concatenate` at `exec/CudfGroupby.cpp:1951`
+  operating on mixed forms.
 - INTERMEDIATE output re-wraps in the plan-determined shape. FINAL output
-  runs the existing DECIMAL(38) range check (`validateDecimalSumResult`) and
-  average rounding.
+  folds the merged overflow into the sum and runs the DECIMAL(38) range check
+  (`finalizeDecimalSum`) or divides with the CPU's rounding
+  (`finalizeDecimalAverage`), as described in section 4.
 
 ### 6.2 `CudfToVelox` (`exec/CudfConversion.cpp`)
 

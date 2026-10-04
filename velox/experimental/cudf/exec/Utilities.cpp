@@ -90,51 +90,67 @@ vector_size_t checkedVectorSize(size_t rowCount) {
 // regardless of offset width (cudf::concatenate handles mixed INT32/INT64
 // offsets). STRUCT columns match when their direct children have identical
 // data types (which includes the decimal scale). Host-side metadata only.
-bool samePhysicalForm(const cudf::column_view& a, const cudf::column_view& b) {
-  if (a.type() != b.type()) {
+bool samePhysicalForm(
+    const cudf::column_view& left,
+    const cudf::column_view& right) {
+  if (left.type() != right.type()) {
     return false;
   }
-  if (a.type().id() != cudf::type_id::STRUCT) {
+  if (left.type().id() != cudf::type_id::STRUCT) {
     return true;
   }
-  if (a.num_children() != b.num_children()) {
+  if (left.num_children() != right.num_children()) {
     return false;
   }
-  for (cudf::size_type i = 0; i < a.num_children(); ++i) {
-    if (a.child(i).type() != b.child(i).type()) {
+  for (cudf::size_type i = 0; i < left.num_children(); ++i) {
+    if (left.child(i).type() != right.child(i).type()) {
       return false;
     }
   }
   return true;
 }
 
-// True if column `col` does not have one physical form across `views`.
+// True if column `columnIndex` does not have one physical form across
+// `views`.
 bool hasMixedPhysicalForm(
     const std::vector<cudf::table_view>& views,
-    cudf::size_type col) {
-  const auto first = views.front().column(col);
+    cudf::size_type columnIndex) {
+  const auto first = views.front().column(columnIndex);
   for (size_t i = 1; i < views.size(); ++i) {
-    if (!samePhysicalForm(first, views[i].column(col))) {
+    if (!samePhysicalForm(first, views[i].column(columnIndex))) {
       return true;
     }
   }
   return false;
 }
 
-// Velox scale of the sum carried by the first decimal state struct in
-// `columns`, or 0 if every column is a STRING blob. In the all-blob case
-// normalizeDecimalStateBatches is a no-op, so the scale is never consulted.
-int32_t decimalStateScale(const std::vector<cudf::column_view>& columns) {
-  for (const auto& column : columns) {
-    if (!isDecimalStateStruct(column)) {
-      continue;
+std::unique_ptr<cudf::table> makeEmptyTable(
+    TypePtr const& inputType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  std::vector<std::unique_ptr<cudf::column>> emptyColumns;
+  for (size_t i = 0; i < inputType->size(); ++i) {
+    if (auto const& childType = inputType->childAt(i);
+        childType->kind() == TypeKind::ROW) {
+      auto tbl = makeEmptyTable(childType, stream, mr);
+      auto structColumn = std::make_unique<cudf::column>(
+          cudf::data_type(cudf::type_id::STRUCT),
+          0,
+          rmm::device_buffer(),
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+          0,
+          tbl->release());
+      emptyColumns.push_back(std::move(structColumn));
+    } else {
+      // VARBINARY becomes STRING, so an empty table never carries a decimal
+      // state struct; the concat funnel drops or re-types it when it meets
+      // struct batches.
+      auto emptyColumn = cudf::make_empty_column(
+          cudf_velox::veloxToCudfDataType(inputType->childAt(i)));
+      emptyColumns.push_back(std::move(emptyColumn));
     }
-    const auto sumIndex =
-        decimalStateShapeOf(column) == DecimalStateShape::kSum128 ? 1 : 0;
-    // cuDF stores the negated Velox scale.
-    return -column.child(sumIndex).type().scale();
   }
-  return 0;
+  return std::make_unique<cudf::table>(std::move(emptyColumns));
 }
 } // namespace
 
@@ -159,10 +175,11 @@ std::vector<std::unique_ptr<cudf::column>> normalizeDecimalStateTableViews(
       std::min(numColumns, static_cast<cudf::size_type>(tableType->size()));
 
   std::vector<cudf::size_type> mixedColumns;
-  for (cudf::size_type col = 0; col < numColumns; ++col) {
-    if (tableType->childAt(col)->kind() == TypeKind::VARBINARY &&
-        hasMixedPhysicalForm(tableViews, col)) {
-      mixedColumns.push_back(col);
+  for (cudf::size_type columnIndex = 0; columnIndex < numColumns;
+       ++columnIndex) {
+    if (tableType->childAt(columnIndex)->kind() == TypeKind::VARBINARY &&
+        hasMixedPhysicalForm(tableViews, columnIndex)) {
+      mixedColumns.push_back(columnIndex);
     }
   }
   if (mixedColumns.empty()) {
@@ -183,8 +200,8 @@ std::vector<std::unique_ptr<cudf::column>> normalizeDecimalStateTableViews(
     if (tableViews.size() <= 1) {
       return replacements;
     }
-    std::erase_if(mixedColumns, [&](cudf::size_type col) {
-      return !hasMixedPhysicalForm(tableViews, col);
+    std::erase_if(mixedColumns, [&](cudf::size_type columnIndex) {
+      return !hasMixedPhysicalForm(tableViews, columnIndex);
     });
     if (mixedColumns.empty()) {
       return replacements;
@@ -199,22 +216,20 @@ std::vector<std::unique_ptr<cudf::column>> normalizeDecimalStateTableViews(
   }
 
   std::vector<cudf::column_view> columnViews(tableViews.size());
-  for (const auto col : mixedColumns) {
-    for (size_t b = 0; b < tableViews.size(); ++b) {
-      columnViews[b] = batchColumns[b][col];
+  for (const auto columnIndex : mixedColumns) {
+    for (size_t batch = 0; batch < tableViews.size(); ++batch) {
+      columnViews[batch] = batchColumns[batch][columnIndex];
       VELOX_CHECK(
-          isDecimalStateColumn(columnViews[b]),
-          "Cannot concatenate VARBINARY column {} whose physical cuDF type "
-          "differs across batches and is not a decimal aggregate state "
-          "(batch {} has cuDF type id {})",
-          col,
-          b,
-          static_cast<int32_t>(columnViews[b].type().id()));
+          isDecimalStateColumn(columnViews[batch]),
+          "Cannot concatenate a VARBINARY column whose physical cuDF type differs across batches and is not a decimal aggregate state: column {}, batch {}, type {}",
+          columnIndex,
+          batch,
+          cudf::type_to_name(columnViews[batch].type()));
     }
-    auto columnReplacements = normalizeDecimalStateBatches(
-        columnViews, decimalStateScale(columnViews), stream, mr);
-    for (size_t b = 0; b < tableViews.size(); ++b) {
-      batchColumns[b][col] = columnViews[b];
+    auto columnReplacements =
+        normalizeDecimalStateBatches(columnViews, stream, mr);
+    for (size_t batch = 0; batch < tableViews.size(); ++batch) {
+      batchColumns[batch][columnIndex] = columnViews[batch];
     }
     std::move(
         columnReplacements.begin(),
@@ -222,8 +237,8 @@ std::vector<std::unique_ptr<cudf::column>> normalizeDecimalStateTableViews(
         std::back_inserter(replacements));
   }
 
-  for (size_t b = 0; b < tableViews.size(); ++b) {
-    tableViews[b] = cudf::table_view(batchColumns[b]);
+  for (size_t batch = 0; batch < tableViews.size(); ++batch) {
+    tableViews[batch] = cudf::table_view(batchColumns[batch]);
   }
   return replacements;
 }
@@ -246,32 +261,6 @@ std::unique_ptr<cudf::table> concatenateTables(
       std::back_inserter(tableViews),
       [&](const auto& tbl) { return tbl->view(); });
   return cudf::concatenate(tableViews, stream, mr);
-}
-
-std::unique_ptr<cudf::table> makeEmptyTable(
-    TypePtr const& inputType,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
-  std::vector<std::unique_ptr<cudf::column>> emptyColumns;
-  for (size_t i = 0; i < inputType->size(); ++i) {
-    if (auto const& childType = inputType->childAt(i);
-        childType->kind() == TypeKind::ROW) {
-      auto tbl = makeEmptyTable(childType, stream, mr);
-      auto structColumn = std::make_unique<cudf::column>(
-          cudf::data_type(cudf::type_id::STRUCT),
-          0,
-          rmm::device_buffer(),
-          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
-          0,
-          tbl->release());
-      emptyColumns.push_back(std::move(structColumn));
-    } else {
-      auto emptyColumn = cudf::make_empty_column(
-          cudf_velox::veloxToCudfDataType(inputType->childAt(i)));
-      emptyColumns.push_back(std::move(emptyColumn));
-    }
-  }
-  return std::make_unique<cudf::table>(std::move(emptyColumns));
 }
 
 std::unique_ptr<cudf::table> getConcatenatedTable(

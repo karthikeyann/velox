@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfMarkDistinct.h"
+#include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
@@ -93,10 +94,9 @@ RowVectorPtr CudfMarkDistinct::doGetOutput() {
   const auto& inputRowType = cudfInput->type()->asRow();
   for (const auto keyIndex : distinctKeyIndices_) {
     VELOX_CHECK(
-        inputRowType.childAt(keyIndex)->kind() != TypeKind::VARBINARY ||
-            tableView.column(keyIndex).type().id() != cudf::type_id::STRUCT,
-        "CudfMarkDistinct does not support a decimal aggregate state as a "
-        "distinct key (input column {})",
+        !isDecimalStateUnderVarbinary(
+            inputRowType.childAt(keyIndex), tableView.column(keyIndex)),
+        "MarkDistinct does not support a decimal aggregate state as a key: input column {}",
         keyIndex);
   }
 

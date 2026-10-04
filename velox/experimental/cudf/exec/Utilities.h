@@ -34,50 +34,24 @@ namespace facebook::velox::cudf_velox {
     rmm::device_async_resource_ref mr);
 
 /**
- * @brief Builds a zero-row cuDF table whose columns follow @p inputType.
- *
- * VARBINARY columns are built as STRING (the CudfFromVelox form), so a
- * zero-row table never carries a decimal aggregate state struct. Within the
- * concat funnel such a table is dropped or re-typed when it meets struct
- * batches; see normalizeDecimalStateTableViews.
- */
-[[nodiscard]] std::unique_ptr<cudf::table> makeEmptyTable(
-    TypePtr const& inputType);
-
-/**
- * @brief Normalizes the physical form of decimal aggregate state columns
- * across table views that are about to be concatenated or merged.
+ * @brief Brings decimal aggregate state columns to one physical form across
+ * table views that are about to be concatenated or merged.
  *
  * A decimal SUM/AVG aggregate state whose logical Velox type is VARBINARY may
- * be physically either a cuDF STRING blob or a cuDF STRUCT (see
- * DecimalAggregationState.h). cudf::concatenate and cudf::merge require every
- * input to have identical column types, so a batch carrying the blob cannot be
- * combined with a batch carrying the struct as-is.
- *
- * For every top-level column whose Velox type in @p tableType is VARBINARY and
- * whose physical cuDF type differs across @p tableViews, this:
- *   - drops zero-row views when at least one non-empty view remains (a
- *     zero-row table contributes no rows; it is typically the STRING output of
- *     makeEmptyTable and would otherwise force a re-type);
- *   - calls normalizeDecimalStateBatches on that column's views and rebinds the
- *     corresponding columns of @p tableViews to the normalized columns.
- *
- * Columns of any other Velox type are never inspected or rebound, and when no
- * VARBINARY column differs (the common case: all blobs or all one struct
- * shape) nothing is done beyond a host-side comparison of column types; in
- * particular zero-row views are kept. Nested VARBINARY fields are not
- * considered; decimal states are always top-level columns.
- *
- * The decimal scale passed to normalizeDecimalStateBatches is taken from the
- * sum child of the first struct batch in the column. If every batch is a blob
- * there is nothing to normalize and the scale is irrelevant (0 is passed).
+ * be a cuDF STRING blob or a cuDF STRUCT (see DecimalAggregationState.h), and
+ * cudf::concatenate requires identical column types. For every top-level
+ * VARBINARY column of @p tableType whose physical form differs across
+ * @p tableViews, zero-row views are dropped while at least one non-empty view
+ * remains, and the remaining views of that column are normalized with
+ * normalizeDecimalStateBatches and rebound. Nothing is inspected or rebound
+ * otherwise.
  *
  * @param tableViews Views to normalize in place. May shrink when zero-row
  * views are dropped; never becomes empty if it was non-empty.
  * @param tableType Velox row type describing the logical column types.
  * @param stream CUDA stream for any unpack/widen work.
- * @param mr Memory resource for the replacement columns. They are temporaries
- * and should normally come from get_temp_mr().
+ * @param mr Memory resource for the replacement columns (normally
+ * get_temp_mr()).
  * @return Replacement columns referenced by the rebound views. The caller must
  * keep them alive until the concatenate/merge consuming @p tableViews has been
  * enqueued on @p stream.
@@ -100,8 +74,7 @@ normalizeDecimalStateTableViews(
  * The input tables are consumed and deallocated when the function returns.
  * If the input vector is empty, returns an empty table matching tableType.
  *
- * Decimal aggregate state columns (logical VARBINARY) whose physical form
- * differs across inputs are brought to one form first; see
+ * Decimal aggregate state columns are normalized first; see
  * normalizeDecimalStateTableViews.
  *
  * @param tables Input vector of CudfVectors to concatenate (consumed during
@@ -135,9 +108,8 @@ normalizeDecimalStateTableViews(
  * are also properly synchronized. The input tables are consumed and deallocated
  * after synchronization.
  *
- * Decimal aggregate state columns are normalized per output batch with
- * normalizeDecimalStateTableViews, so each output table is uniform, but two
- * output tables may carry such a column in different physical forms.
+ * Decimal aggregate state columns are normalized per output batch, so each
+ * output table is uniform but two output tables may differ in physical form.
  *
  * Input ownership is released one output batch at a time after stream-safe
  * deallocation ordering has been established. This avoids retaining the full

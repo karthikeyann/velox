@@ -15,131 +15,81 @@
  */
 #pragma once
 
+#include "velox/common/EnumDeclare.h"
+
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 
 #include <cuda/stream>
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
 
-struct DecimalSumStateColumns {
-  std::unique_ptr<cudf::column> sum;
-  std::unique_ptr<cudf::column> count;
-};
-
-/** Directly reduces DECIMAL64 input into one DECIMAL128 sum and INT64 count. */
-DecimalSumStateColumns reduceDecimal64SumCount(
-    const cudf::column_view& input,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr);
-
-/**
- * Decodes intermediate decimal SUM aggregate state stored as a cuDF STRING
- * column (fixed-size packed bytes per row, converted from Velox VARBINARY) into
- * two device columns: a DECIMAL128 sum with scale -scale (matching Velox
- * intermediate state) and an INT64 partial row count. Handles empty input,
- * all-null state without touching payload buffers, and propagates the source
- * null mask to both outputs when present.
- *
- * @param stateCol STRING column of packed sum/count payloads.
- * @param scale decimal scale used to set the output sum column's scale to
- *        -scale.
- * @param stream CUDA stream for device work.
- * @return decoded sum and count columns.
- */
-DecimalSumStateColumns deserializeDecimalSumState(
-    const cudf::column_view& stateCol,
-    int32_t scale,
-    cuda::stream_ref stream);
-
-/**
- * Encodes partial decimal SUM state (DECIMAL64 or DECIMAL128 sums plus INT64
- * counts) into a single STRING column (later converted to Velox VARBINARY):
- * per-row fixed-width payloads and string offsets (INT32 or INT64 depending on
- * total char size and cuDF large-strings settings). The output null mask
- * matches buildStateValidityMask: a row is invalid if the sum or count is null,
- * or the count is zero.
- *
- * @param sumCol per-row partial sums (DECIMAL64 or DECIMAL128).
- * @param countCol per-row INT64 partial row counts.
- * @param stream CUDA stream for device work.
- * @param mr memory resource for allocated columns.
- * @return STRING column of serialized state.
- */
-std::unique_ptr<cudf::column> serializeDecimalSumState(
-    const cudf::column_view& sumCol,
-    const cudf::column_view& countCol,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr);
-
-/**
- * Finalizes AVG from intermediate SUM state: divides each sum by its count on
- * device with decimal-specific rounding (see averageRoundDecimalSum),
- * producing a column of the same decimal type as the sum. Rows are null where
- * buildStateValidityMask marks them invalid (null sum/count or zero count),
- * matching serializeDecimalSumState.
- *
- * @param sumCol per-row partial sums (DECIMAL64 or DECIMAL128).
- * @param countCol per-row INT64 partial row counts.
- * @param stream CUDA stream for device work.
- * @param mr memory resource for allocated columns.
- * @return per-row decimal average column.
- */
-std::unique_ptr<cudf::column> computeDecimalAverage(
-    const cudf::column_view& sumCol,
-    const cudf::column_view& countCol,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr);
-
-
-// ---------------------------------------------------------------------------
-// Self-describing decimal aggregate state.
-//
-// A decimal SUM/AVG aggregate state whose logical Velox type is VARBINARY may
-// be carried on the GPU in one of two physical forms:
-//
-//   * the 32-byte STRING blob (count int64, overflow int64, sum low uint64,
-//     sum high int64) that CPU Velox uses and that CudfFromVelox produces, or
-//   * a cuDF STRUCT whose children are a subset of {sum DECIMAL128,
-//     count INT64, overflow INT64}, chosen by the producer from two facts it
-//     knows locally: whether the aggregate is AVG and whether the raw input is
-//     DECIMAL64 or DECIMAL128.
-//
-// Struct shapes (child order matters; the shape is recoverable from the child
-// types alone, which is what makes the column self-describing):
-//
-//   kSum64  : [sum]                          fields missing: count=1, ovf=0
-//   kSum128 : [overflow, sum]                fields missing: count=1
-//   kAvg64  : [sum, count]                   fields missing: ovf=0
-//   kAvg128 : [sum, count, overflow]         nothing missing
-//
-// The DECIMAL128 child at index 1 means "overflow precedes it" (kSum128); at
-// index 0 the children that follow are count and then overflow. The struct
-// parent never carries a null mask: a state row is null exactly when `sum` is
-// null. See docs/designs/cudf-self-describing-decimal-aggregate-state.md.
-// ---------------------------------------------------------------------------
-
+/// A decimal SUM/AVG aggregate state whose logical Velox type is VARBINARY
+/// may be carried on the GPU in one of two physical forms:
+///
+///   * the 32-byte STRING blob (count int64, overflow int64, sum low uint64,
+///     sum high int64) that CPU Velox uses and that CudfFromVelox produces, or
+///   * a cuDF STRUCT whose children are a subset of {sum DECIMAL128,
+///     count INT64, overflow INT64}, chosen by the producer from two facts it
+///     knows locally: whether the aggregate is AVG and whether the raw input
+///     is DECIMAL64 or DECIMAL128.
+///
+/// Struct shapes (child order matters; the shape is recoverable from the
+/// child types alone, which is what makes the column self-describing):
+///
+///   kSum64  : [sum]                          fields missing: count=1, ovf=0
+///   kSum128 : [overflow, sum]                fields missing: count=1
+///   kAvg64  : [sum, count]                   fields missing: ovf=0
+///   kAvg128 : [sum, count, overflow]         nothing missing
+///
+/// The struct parent carries no null mask when a producer emits it: a state
+/// row is null exactly when `sum` is null. Consumers nevertheless tolerate a
+/// parent mask (for example after a nullifying gather) and treat a row as
+/// null when the parent or the sum child is null.
+///
+/// Known limitation: GPU producers do not track int128 carries (cuDF's
+/// DECIMAL128 SUM wraps modulo 2^128), so the overflow child they emit is
+/// always 0. A nonzero overflow can only come from a CPU-produced blob and is
+/// honoured when merging and finalizing, following the CPU rules.
 enum class DecimalStateShape : uint8_t {
-  kSum64, // [sum]
-  kSum128, // [overflow, sum]
-  kAvg64, // [sum, count]
-  kAvg128, // [sum, count, overflow]
+  kSum64,
+  kSum128,
+  kAvg64,
+  kAvg128,
 };
+
+VELOX_DECLARE_ENUM_NAME(DecimalStateShape);
+
+/// Child positions of the state fields for one shape. The single source of
+/// truth for the struct layout; nothing else may hard-code child indices.
+struct DecimalStateLayout {
+  static constexpr int kAbsent = -1;
+
+  int sum;
+  int count; // kAbsent when the shape has no count child
+  int overflow; // kAbsent when the shape has no overflow child
+  int numChildren;
+
+  constexpr bool hasCount() const {
+    return count != kAbsent;
+  }
+
+  constexpr bool hasOverflow() const {
+    return overflow != kAbsent;
+  }
+};
+
+DecimalStateLayout decimalStateLayout(DecimalStateShape shape);
 
 /// True if the shape carries a count child.
-constexpr bool decimalStateHasCount(DecimalStateShape shape) {
-  return shape == DecimalStateShape::kAvg64 ||
-      shape == DecimalStateShape::kAvg128;
-}
+bool decimalStateHasCount(DecimalStateShape shape);
 
 /// True if the shape carries an overflow child.
-constexpr bool decimalStateHasOverflow(DecimalStateShape shape) {
-  return shape == DecimalStateShape::kSum128 ||
-      shape == DecimalStateShape::kAvg128;
-}
+bool decimalStateHasOverflow(DecimalStateShape shape);
 
 /// Shape a producer must emit for an aggregate. `isAverage` distinguishes
 /// AVG from SUM; `rawInputIsDecimal128` is true when the aggregate's raw
@@ -148,36 +98,106 @@ DecimalStateShape decimalStateShapeFor(
     bool isAverage,
     bool rawInputIsDecimal128);
 
-/// Flat (un-wrapped) state columns. `count` and `overflow` may be null
-/// pointers when the shape does not carry them.
+/// Describes a decimal SUM/AVG aggregate whose intermediate column (logical
+/// VARBINARY) is carried on the GPU as a self-describing state: the
+/// plan-determined struct shape the aggregate emits and the decimal scale of
+/// the state's sum (the raw input scale), used to decode a scale-less STRING
+/// blob.
+struct DecimalStateInfo {
+  DecimalStateShape shape;
+  int32_t scale;
+};
+
+/// Owned flat state columns. `count` and `overflow` are null pointers when
+/// the state does not carry them.
 struct DecimalStateColumns {
-  std::unique_ptr<cudf::column> sum; // DECIMAL128, never null
+  std::unique_ptr<cudf::column> sum; // DECIMAL128 (DECIMAL64 before wrapping)
   std::unique_ptr<cudf::column> count; // INT64 or nullptr
   std::unique_ptr<cudf::column> overflow; // INT64 or nullptr
 };
 
+/// Kept for the sum/count producers and the CPU-interchange codec below.
+using DecimalSumStateColumns = DecimalStateColumns;
+
+/// Directly reduces DECIMAL64 input into one DECIMAL128 sum and INT64 count.
+DecimalSumStateColumns reduceDecimal64SumCount(
+    const cudf::column_view& input,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+/// CPU-interchange codec, blob to flat columns. Decodes the 32-byte STRING
+/// blob into a DECIMAL128 sum with scale -scale and an INT64 count allocated
+/// from the temporary memory resource (the overflow field is dropped).
+/// Handles empty input, all-null input without touching payload buffers, and
+/// propagates the blob's null mask to both outputs. Production code goes
+/// through flattenDecimalState; this entry point is kept for tests that pin
+/// the blob layout.
+DecimalSumStateColumns deserializeDecimalSumState(
+    const cudf::column_view& stateCol,
+    int32_t scale,
+    cuda::stream_ref stream);
+
+/// CPU-interchange codec, flat columns to blob. Encodes per-row sums
+/// (DECIMAL64 or DECIMAL128) and INT64 counts into the 32-byte STRING blob
+/// with overflow 0. A row is null if the sum or count is null or the count is
+/// zero (buildStateValidityMask). Production code goes through
+/// packDecimalState; this entry point is kept for tests that pin the blob
+/// layout.
+std::unique_ptr<cudf::column> serializeDecimalSumState(
+    const cudf::column_view& sumCol,
+    const cudf::column_view& countCol,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+/// Finalizes AVG from flat state: divides each sum by its count with the
+/// CPU's rounding (DecimalUtil::computeAverage), honouring a nonzero
+/// `overflow` when given, and produces a column of the sum's decimal type.
+/// Rows are null where the sum or count is null or the count is zero.
+/// `overflow` may be a default-constructed (size 0) view when the state does
+/// not carry the field.
+std::unique_ptr<cudf::column> computeDecimalAverage(
+    const cudf::column_view& sumCol,
+    const cudf::column_view& countCol,
+    const cudf::column_view& overflowCol,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
+/// Same as above for a state without an overflow field.
+std::unique_ptr<cudf::column> computeDecimalAverage(
+    const cudf::column_view& sumCol,
+    const cudf::column_view& countCol,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
 /// Producer side. Moves the flat columns into a STRUCT of the given shape.
-/// Children the shape omits are dropped; children the shape requires must be
-/// present (VELOX_CHECK). Casts `sum` to DECIMAL128 (keeping scale) and
-/// `count`/`overflow` to INT64 if needed. The struct is built with
-/// cudf::make_structs_column and NO parent null mask, so no child is copied.
+/// Children the shape omits are dropped. A missing count is an error; a
+/// missing overflow is synthesized as zeros (GPU producers never track
+/// carries). Casts `sum` to DECIMAL128 (keeping scale) and `count`/`overflow`
+/// to INT64 if needed. The struct is built with cudf::make_structs_column and
+/// no parent null mask, so no child is copied.
 std::unique_ptr<cudf::column> wrapDecimalState(
-    DecimalStateColumns&& flat,
+    DecimalStateColumns flat,
     DecimalStateShape shape,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
+/// Inverse of wrapDecimalState for an owned struct: releases the children and
+/// places them by layout without copying. The struct must not carry a parent
+/// null mask (producers never emit one).
+DecimalStateColumns unwrapDecimalState(
+    std::unique_ptr<cudf::column> structColumn);
+
 /// True if `column` is a STRUCT in one of the four documented shapes.
 /// False for STRING and for any other type. Never throws.
-bool isDecimalStateStruct(cudf::column_view const& column);
+bool isDecimalStateStruct(const cudf::column_view& column);
 
 /// Returns the shape of a struct accepted by isDecimalStateStruct. Throws
 /// VeloxRuntimeError otherwise.
-DecimalStateShape decimalStateShapeOf(cudf::column_view const& column);
+DecimalStateShape decimalStateShapeOf(const cudf::column_view& column);
 
 /// True if `column` is either the STRING blob or a decimal state struct,
 /// i.e. anything flattenDecimalState accepts.
-bool isDecimalStateColumn(cudf::column_view const& column);
+bool isDecimalStateColumn(const cudf::column_view& column);
 
 /// Consumer side. Non-owning views over the three state fields plus the
 /// storage that keeps any decoded or synthesized column alive. Views into a
@@ -185,30 +205,35 @@ bool isDecimalStateColumn(cudf::column_view const& column);
 /// input did not carry, and all views for a STRING input, point into `owned`.
 struct FlatDecimalState {
   cudf::column_view sum; // DECIMAL128 with the state's scale
-  cudf::column_view count; // INT64; synthesized 1s if absent
-  cudf::column_view overflow; // INT64; synthesized 0s if absent
-  std::vector<std::unique_ptr<cudf::column>> owned;
+  cudf::column_view count; // INT64; synthesized 1s if absent and requested
+  cudf::column_view overflow; // INT64; synthesized 0s if absent and requested
+  // Storage behind the views above when they do not alias the input: every
+  // field for a STRING input, synthesized fields for a struct input, and the
+  // sum when a struct parent carried a null mask.
+  DecimalStateColumns owned;
 };
 
-/// Flattens a STRING blob (via deserializeDecimalSumState) or any struct shape
-/// into flat fields. `scale` is the decimal scale of the sum and is used only
-/// for STRING input (a struct already carries it on the sum child). Missing
-/// fields are synthesized (count=1, overflow=0) only when the corresponding
-/// `need*` flag is true; otherwise that view is left default-constructed
-/// (size 0) so callers that never read count or overflow pay nothing.
+/// Flattens a STRING blob or any struct shape into flat fields. `scale` is the
+/// decimal scale of the sum and is used only for STRING input (a struct
+/// already carries it on the sum child). Missing fields are synthesized
+/// (count=1, overflow=0) only when the corresponding `need*` flag is true;
+/// otherwise that view is left default-constructed (size 0) so callers that
+/// never read count or overflow pay nothing. Fields a struct carries are
+/// always exposed. Columns are allocated from `mr`.
 FlatDecimalState flattenDecimalState(
-    cudf::column_view const& state,
+    const cudf::column_view& state,
     int32_t scale,
     bool needCount,
     bool needOverflow,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
-/// Decodes a STRING blob into sum, count AND overflow (deserializeDecimalSumState
-/// drops the overflow field). All three outputs carry a copy of the blob's
-/// null mask when it has one. Allocates from `mr`.
-DecimalStateColumns deserializeDecimalSumStateWithOverflow(
-    cudf::column_view const& stateCol,
+/// Unpacks a STRING blob into a struct of the requested shape; the inverse of
+/// packDecimalState. `scale` is the decimal scale of the sum. Used by
+/// normalizeDecimalStateBatches when a blob batch meets struct batches.
+std::unique_ptr<cudf::column> unpackDecimalState(
+    const cudf::column_view& blobColumn,
+    DecimalStateShape shape,
     int32_t scale,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
@@ -225,24 +250,7 @@ DecimalStateColumns deserializeDecimalSumStateWithOverflow(
 /// is non-null), and the second keeps packDecimalState byte- and mask-equal to
 /// serializeDecimalSumState for the same sum/count inputs.
 std::unique_ptr<cudf::column> packDecimalState(
-    cudf::column_view const& structColumn,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr);
-
-/// Unpacks a STRING blob into a struct of the requested shape (used when a
-/// blob batch must be concatenated with struct batches). `scale` is the
-/// decimal scale of the sum.
-std::unique_ptr<cudf::column> unpackDecimalState(
-    cudf::column_view const& blobColumn,
-    DecimalStateShape shape,
-    int32_t scale,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr);
-
-/// Builds a zero-row column in the physical form of `like` (STRING or any
-/// struct shape). Used to re-type empty batches before concatenation.
-std::unique_ptr<cudf::column> makeEmptyDecimalStateLike(
-    cudf::column_view const& like,
+    const cudf::column_view& structColumn,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
@@ -255,15 +263,13 @@ std::unique_ptr<cudf::column> makeEmptyDecimalStateLike(
 ///                                         form, never toward the blob);
 ///   * several struct shapes            -> all widened to kAvg128;
 ///   * zero-row batches of either form  -> re-typed to the chosen form.
-/// Replacement columns are returned and the corresponding entries of `views`
-/// are rebound to them; the caller must keep the returned vector alive until
-/// after cudf::concatenate. Struct batches carry their scale on the `sum`
-/// child and that scale is the one blobs are unpacked to (blobs carry none);
-/// `scale` is used only when no struct batch is present (which makes the call
-/// a no-op), so callers that decode VARBINARY at scale 0 are still correct.
+/// Zero-row batches do not take part in choosing the target form unless every
+/// batch is empty. Blobs are unpacked at the scale carried by the struct
+/// batches' sum child. Replacement columns are returned and the corresponding
+/// entries of `views` are rebound to them; the caller must keep the returned
+/// vector alive until after cudf::concatenate.
 std::vector<std::unique_ptr<cudf::column>> normalizeDecimalStateBatches(
     std::vector<cudf::column_view>& views,
-    int32_t scale,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 

@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/exec/CudfDistinct.h"
+#include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
@@ -114,11 +115,10 @@ void CudfDistinct::doAddInput(RowVectorPtr input) {
   // cudf::distinct would compare physical forms, not logical states.
   for (const auto channel : groupingKeyInputChannels_) {
     VELOX_CHECK(
-        inputType_->childAt(channel)->kind() != TypeKind::VARBINARY ||
-            cudfInput->getTableView().column(channel).type().id() !=
-                cudf::type_id::STRUCT,
-        "CudfDistinct does not support a decimal aggregate state as a "
-        "distinct key (input channel {})",
+        !isDecimalStateUnderVarbinary(
+            inputType_->childAt(channel),
+            cudfInput->getTableView().column(channel)),
+        "Distinct does not support a decimal aggregate state as a key: input channel {}",
         channel);
   }
 
