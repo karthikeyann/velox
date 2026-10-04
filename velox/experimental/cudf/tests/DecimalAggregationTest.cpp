@@ -86,33 +86,6 @@ std::unique_ptr<cudf::column> computeDecimalAverageWithoutOverflow(
   return computeDecimalAverage(sum, count, overflow->view(), stream, mr);
 }
 
-class ScopedEnvVar {
- public:
-  ScopedEnvVar(const char* key, const char* value) : key_(key) {
-    const char* existing = std::getenv(key);
-    if (existing) {
-      oldValue_ = std::string(existing);
-    }
-    if (value) {
-      setenv(key, value, 1);
-    } else {
-      unsetenv(key);
-    }
-  }
-
-  ~ScopedEnvVar() {
-    if (oldValue_) {
-      setenv(key_.c_str(), oldValue_->c_str(), 1);
-    } else {
-      unsetenv(key_.c_str());
-    }
-  }
-
- private:
-  std::string key_;
-  std::optional<std::string> oldValue_;
-};
-
 class CudfDecimalTest : public exec::test::OperatorTestBase {
  protected:
   void SetUp() override {

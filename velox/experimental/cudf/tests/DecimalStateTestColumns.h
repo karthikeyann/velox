@@ -40,6 +40,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -52,6 +53,37 @@
 namespace facebook::velox::cudf_velox::test {
 
 inline constexpr int kBitsPerWord = 8 * sizeof(cudf::bitmask_type);
+
+/// Sets (or, for a null value, unsets) an environment variable for the
+/// lifetime of the object and restores the previous state afterwards. Used
+/// to drive the cuDF large-strings switches (LIBCUDF_LARGE_STRINGS_ENABLED,
+/// LIBCUDF_LARGE_STRINGS_THRESHOLD), which libcudf reads on every call.
+class ScopedEnvVar {
+ public:
+  ScopedEnvVar(const char* key, const char* value) : key_(key) {
+    const char* existing = std::getenv(key);
+    if (existing) {
+      oldValue_ = std::string(existing);
+    }
+    if (value) {
+      setenv(key, value, 1);
+    } else {
+      unsetenv(key);
+    }
+  }
+
+  ~ScopedEnvVar() {
+    if (oldValue_) {
+      setenv(key_.c_str(), oldValue_->c_str(), 1);
+    } else {
+      unsetenv(key_.c_str());
+    }
+  }
+
+ private:
+  std::string key_;
+  std::optional<std::string> oldValue_;
+};
 
 inline constexpr DecimalStateShape kAllDecimalStateShapes[] = {
     DecimalStateShape::kSum64,
