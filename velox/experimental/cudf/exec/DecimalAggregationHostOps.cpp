@@ -28,10 +28,8 @@
 namespace facebook::velox::cudf_velox {
 
 void validateIntermediateColumnType(const cudf::column_view& column) {
-  if (isDecimalStateColumn(column)) {
-    return;
-  }
-  VELOX_FAIL(
+  VELOX_CHECK(
+      isDecimalStateColumn(column),
       "Expected decimal aggregation state (a cuDF STRING blob or a decimal state STRUCT under Velox VARBINARY): {} with {} children",
       cudf::type_to_name(column.type()),
       column.num_children());
@@ -85,26 +83,26 @@ cudf::column_view castDecimal64InputToDecimal128(
   return holder->view();
 }
 
-std::unique_ptr<cudf::column> castCountColumnToInt64(
-    std::unique_ptr<cudf::column> count,
-    cuda::stream_ref stream) {
-  if (count->type().id() != cudf::type_id::INT64) {
-    count = cudf::cast(
-        *count, cudf::data_type{cudf::type_id::INT64}, stream, get_temp_mr());
-  }
-  return count;
-}
-
 namespace {
 
-// Raises the CPU's "Decimal overflow" user errors for a device check
-// outcome.
+// Casts an INT64 state field (count or overflow) that arrived in another
+// integer type. The result is consumed internally, so it uses the temporary
+// memory resource.
+std::unique_ptr<cudf::column> castToInt64(
+    std::unique_ptr<cudf::column> column,
+    cuda::stream_ref stream) {
+  if (column->type().id() != cudf::type_id::INT64) {
+    column = cudf::cast(
+        *column, cudf::data_type{cudf::type_id::INT64}, stream, get_temp_mr());
+  }
+  return column;
+}
+
+// Raises the CPU's "Decimal overflow" user error for a device check outcome.
 void raiseDecimalSumCheck(detail::DecimalSumCheck check) {
   switch (check) {
     case detail::DecimalSumCheck::kOk:
       return;
-    case detail::DecimalSumCheck::kOverflow:
-      VELOX_USER_FAIL("Decimal overflow");
     case detail::DecimalSumCheck::kOutOfRange:
       VELOX_USER_FAIL(
           "Decimal overflow. Sum is not in the range of Decimal Type");
@@ -113,16 +111,6 @@ void raiseDecimalSumCheck(detail::DecimalSumCheck check) {
 }
 
 } // namespace
-
-void validateDecimalSumResult(
-    const cudf::column_view& sum,
-    cuda::stream_ref stream) {
-  VELOX_CHECK(
-      sum.type().id() == cudf::type_id::DECIMAL128,
-      "Decimal sum result requires a DECIMAL128 column: {}",
-      cudf::type_to_name(sum.type()));
-  raiseDecimalSumCheck(detail::checkDecimalSumRange(sum, stream));
-}
 
 std::unique_ptr<cudf::column> finalizeDecimalSum(
     std::unique_ptr<cudf::column> sum,
@@ -135,7 +123,7 @@ std::unique_ptr<cudf::column> finalizeDecimalSum(
       "Decimal sum result requires a DECIMAL128 column: {}",
       cudf::type_to_name(sum->type()));
   if (overflow) {
-    overflow = castCountColumnToInt64(std::move(overflow), stream);
+    overflow = castToInt64(std::move(overflow), stream);
   }
   raiseDecimalSumCheck(
       overflow ? detail::foldDecimalSumOverflow(
@@ -155,9 +143,9 @@ std::unique_ptr<cudf::column> finalizeDecimalAverage(
     const TypePtr& resultType,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  count = castCountColumnToInt64(std::move(count), stream);
+  count = castToInt64(std::move(count), stream);
   if (overflow) {
-    overflow = castCountColumnToInt64(std::move(overflow), stream);
+    overflow = castToInt64(std::move(overflow), stream);
   }
   auto average = computeDecimalAverage(
       sum->view(),

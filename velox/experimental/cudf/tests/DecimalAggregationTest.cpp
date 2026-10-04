@@ -31,6 +31,7 @@
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/functions/lib/aggregates/DecimalAggregate.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/parse/TypeResolver.h"
@@ -52,6 +53,7 @@
 
 #include <folly/String.h>
 
+#include <array>
 #include <cstdlib>
 #include <limits>
 #include <map>
@@ -59,7 +61,7 @@
 #include <set>
 #include <type_traits>
 
-namespace facebook::velox::cudf_velox {
+namespace facebook::velox::cudf_velox::test {
 namespace {
 
 int64_t computeAvgRaw(const std::vector<int64_t>& values) {
@@ -70,6 +72,18 @@ int64_t computeAvgRaw(const std::vector<int64_t>& values) {
   int128_t avg = 0;
   facebook::velox::DecimalUtil::computeAverage(avg, sum, values.size(), 0);
   return static_cast<int64_t>(avg);
+}
+
+// computeDecimalAverage for a state without carries: the overflow field is an
+// all-zero INT64 column.
+std::unique_ptr<cudf::column> computeDecimalAverageWithoutOverflow(
+    const cudf::column_view& sum,
+    const cudf::column_view& count,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  auto overflow =
+      makeInt64Column(std::vector<int64_t>(sum.size(), 0), nullptr, stream);
+  return computeDecimalAverage(sum, count, overflow->view(), stream, mr);
 }
 
 class ScopedEnvVar {
@@ -774,14 +788,13 @@ TEST_F(CudfDecimalTest, decimalSumPartialFinalVarbinary) {
                   .finalAggregation()
                   .planNode();
 
-  auto task = facebook::velox::exec::test::AssertQueryBuilder(
-                  plan, duckDbQueryRunner_)
-                  .assertResults("SELECT k, sum(d) AS s FROM tmp GROUP BY k");
+  auto task =
+      facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
+          .assertResults("SELECT k, sum(d) AS s FROM tmp GROUP BY k");
   const auto stats = exec::toPlanStats(task->taskStats());
   EXPECT_GT(
       stats.at(plan->id())
-          .customStats.count(
-              std::string{kDirectGroupbyFinalizationStat}),
+          .customStats.count(std::string{kDirectGroupbyFinalizationStat}),
       0);
 }
 
@@ -1867,8 +1880,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal64) {
 
   auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverageWithoutOverflow(
+      sumCol->view(), countCol->view(), stream, mr);
 
   auto avgMask = copyNullMask(avgCol->view(), stream);
   auto outAvg = copyColumnData<int64_t>(avgCol->view(), stream);
@@ -1904,8 +1917,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal128) {
 
   auto sumCol = makeDecimalColumn<__int128_t>(sums, 3, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverageWithoutOverflow(
+      sumCol->view(), countCol->view(), stream, mr);
 
   auto avgMask = copyNullMask(avgCol->view(), stream);
   auto outAvg = copyColumnData<__int128_t>(avgCol->view(), stream);
@@ -1940,8 +1953,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal64MostNegativeSum) {
 
   auto sumCol = makeDecimalColumn<int64_t>(sums, 0, &valid, stream);
   auto countCol = makeInt64Column(counts, &valid, stream);
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverageWithoutOverflow(
+      sumCol->view(), countCol->view(), stream, mr);
 
   auto outAvg = copyColumnData<int64_t>(avgCol->view(), stream);
   EXPECT_EQ(outAvg[0], kMin);
@@ -1959,8 +1972,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal128MostNegativeSum) {
 
   auto sumCol = makeDecimalColumn<__int128_t>(sums, 0, &valid, stream);
   auto countCol = makeInt64Column(counts, &valid, stream);
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverageWithoutOverflow(
+      sumCol->view(), countCol->view(), stream, mr);
 
   auto outAvg = copyColumnData<__int128_t>(avgCol->view(), stream);
   EXPECT_EQ(outAvg[0], kMin);
@@ -1976,8 +1989,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal64AllValid) {
 
   auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverageWithoutOverflow(
+      sumCol->view(), countCol->view(), stream, mr);
 
   EXPECT_EQ(avgCol->view().null_count(), 0);
   auto avgMask = copyNullMask(avgCol->view(), stream);
@@ -2013,8 +2026,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal128AllValid) {
 
   auto sumCol = makeDecimalColumn<__int128_t>(sums, 3, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverageWithoutOverflow(
+      sumCol->view(), countCol->view(), stream, mr);
 
   EXPECT_EQ(avgCol->view().null_count(), 0);
   auto avgMask = copyNullMask(avgCol->view(), stream);
@@ -2047,8 +2060,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal64NonNullableInputs) {
   ASSERT_FALSE(sumCol->nullable());
   ASSERT_FALSE(countCol->nullable());
 
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverageWithoutOverflow(
+      sumCol->view(), countCol->view(), stream, mr);
 
   EXPECT_EQ(avgCol->view().null_count(), 0);
   auto avgMask = copyNullMask(avgCol->view(), stream);
@@ -2084,8 +2097,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal128NonNullableInputs) {
   ASSERT_FALSE(sumCol->nullable());
   ASSERT_FALSE(countCol->nullable());
 
-  auto avgCol =
-      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol = computeDecimalAverageWithoutOverflow(
+      sumCol->view(), countCol->view(), stream, mr);
 
   EXPECT_EQ(avgCol->view().null_count(), 0);
   auto avgMask = copyNullMask(avgCol->view(), stream);
@@ -2461,6 +2474,52 @@ std::unique_ptr<cudf::column> makeRawDecimalInput(
   return makeDecimalColumn<int128_t>({100, 0, 0, 0}, 2, &valid, stream);
 }
 
+// The CPU FINAL over decimal partial states.
+struct CpuDecimalFinal {
+  // Whether the merged total (sum + overflow * 2^127) fits int128_t, i.e.
+  // DecimalUtil::adjustSumForOverflow accepts the merged state.
+  bool totalFitsInt128{false};
+  // Unset where the CPU SUM raises "Decimal overflow".
+  std::optional<int128_t> sum;
+  // Unset where the CPU AVG is not compared: the average is not a DECIMAL(38)
+  // value, or the state has more carries than rows (computeAverage requires
+  // overflow <= count).
+  std::optional<int128_t> avg;
+};
+
+// Merges `rows` in order with the CPU accumulator itself
+// (LongDecimalWithOverflowState::mergeWith, which carries past +/-2^127 into
+// the overflow field with DecimalUtil::addWithOverflow) and finalizes the
+// merged state as DecimalSumAggregate and DecimalAverageAggregateBase do.
+CpuDecimalFinal cpuDecimalFinal(const std::vector<HostDecimalState>& rows) {
+  functions::aggregate::LongDecimalWithOverflowState accumulator;
+  std::array<
+      char,
+      functions::aggregate::LongDecimalWithOverflowState::serializedSize()>
+      bytes;
+  for (const auto& row : rows) {
+    encodeDecimalStateRow(row, bytes.data());
+    accumulator.mergeWith(
+        StringView(bytes.data(), static_cast<int32_t>(bytes.size())));
+  }
+  CpuDecimalFinal result;
+  const auto sum =
+      DecimalUtil::adjustSumForOverflow(accumulator.sum, accumulator.overflow);
+  result.totalFitsInt128 = sum.has_value();
+  if (sum.has_value() && DecimalUtil::valueInPrecisionRange(*sum, 38)) {
+    result.sum = *sum;
+  }
+  if (accumulator.overflow <= accumulator.count) {
+    int128_t average{0};
+    DecimalUtil::computeAverage(
+        average, accumulator.sum, accumulator.count, accumulator.overflow);
+    if (DecimalUtil::valueInPrecisionRange(average, 38)) {
+      result.avg = average;
+    }
+  }
+  return result;
+}
+
 } // namespace
 
 TEST_F(CudfDecimalTest, decimalPartialGroupbyEmitsStateStruct) {
@@ -2483,12 +2542,12 @@ TEST_F(CudfDecimalTest, decimalPartialGroupbyEmitsStateStruct) {
     EXPECT_EQ(
         hostDecimalGroups(groupKeys, flat.sum, stream),
         (DecimalGroups{{0, 100}, {1, std::nullopt}}));
-    if (decimalStateHasCount(shapeCase.shape)) {
+    if (decimalStateFields(shapeCase.shape).hasCount) {
       EXPECT_EQ(
           hostDecimalGroups(groupKeys, flat.count, stream),
           (DecimalGroups{{0, 1}, {1, 0}}));
     }
-    if (decimalStateHasOverflow(shapeCase.shape)) {
+    if (decimalStateFields(shapeCase.shape).hasOverflow) {
       EXPECT_EQ(
           hostDecimalGroups(groupKeys, flat.overflow, stream),
           (DecimalGroups{{0, 0}, {1, 0}}));
@@ -2673,13 +2732,22 @@ TEST_F(CudfDecimalTest, decimalFinalAcceptsCpuBlobState) {
 }
 
 // A CPU partial state carries the number of 2^127 carries in its overflow
-// field. Like the CPU (DecimalUtil::adjustSumForOverflow for SUM,
-// DecimalUtil::computeAverage for AVG), the GPU FINAL folds the merged
-// overflow into the merged sum and fails only when the folded SUM is not a
-// DECIMAL(38) value.
+// field. The GPU FINAL must return what the CPU FINAL returns over the same
+// partial states: the expected values come from cpuDecimalFinal, which runs
+// the CPU accumulator's own merge and finalization. The GPU merges the sum
+// children with a wrapping cuDF SUM, so its merged (sum, overflow) pair can
+// differ from the CPU's while denoting the same total; the FINAL must still
+// agree with the CPU. Each case runs through the group-by FINAL, the global
+// (CudfReduce) FINAL, and direct finalization, which the incremental FINAL
+// applies to the state merged by the group-by INTERMEDIATE aggregators.
+//
+// Totals beyond int128_t are a documented limitation: the GPU cannot tell
+// them from their alias modulo 2^128 (see DecimalAggregationState.h). Those
+// cases pin the CPU results only and are not run on the GPU.
 TEST_F(CudfDecimalTest, decimalFinalFoldsBlobOverflowLikeCpu) {
   const auto stream = cudf::get_default_stream();
   const auto mr = cudf::get_current_device_resource_ref();
+  const int128_t tenPow36 = DecimalUtil::kPowersOfTen[36];
   const int128_t tenPow37 = DecimalUtil::kPowersOfTen[37];
   const int128_t twoPow126 = static_cast<int128_t>(1) << 126;
   // The blob sum that, with `overflow` carries of 2^127, represents `value`:
@@ -2693,93 +2761,90 @@ TEST_F(CudfDecimalTest, decimalFinalFoldsBlobOverflowLikeCpu) {
   struct OverflowCase {
     std::string name;
     std::vector<HostDecimalState> rows;
-    // Expected SUM; unset when the CPU fails with "Decimal overflow".
-    std::optional<int128_t> sum;
-    // Expected AVG; unset when the CPU average is not a DECIMAL(38) value and
-    // the case is not checked.
-    std::optional<int128_t> avg;
+    // Hand-derived CPU results, checked against cpuDecimalFinal.
+    CpuDecimalFinal expected;
   };
   const std::vector<OverflowCase> cases = {
       // overflow 1 with a negative sum is a valid state: the value is
       // sum + 2^127 = 10^37. AVG over count 1 is the same value.
-      {"positiveCarry", {{1, 1, wrappedSum(tenPow37, 1)}}, tenPow37, tenPow37},
+      {"positiveCarry",
+       {{1, 1, wrappedSum(tenPow37, 1)}},
+       {true, tenPow37, tenPow37}},
       // overflow -1 with a positive sum: sum - 2^127 = -10^37.
       {"negativeCarry",
        {{1, -1, wrappedSum(-tenPow37, -1)}},
-       -tenPow37,
-       -tenPow37},
+       {true, -tenPow37, -tenPow37}},
       // Two rows merge to count 2, overflow 1, sum 10^37 + 8 - 2^127 (still
       // negative). SUM = 10^37 + 8. AVG: computeAverage divides the two parts
       // separately: 2^127 / 2 = 2^126 rem 0 and (10^37 + 8 - 2^127) / 2 =
       // 5 * 10^36 + 4 - 2^126 rem 0, so the average is 5 * 10^36 + 4.
       {"mergedCarry",
        {{1, 1, wrappedSum(tenPow37, 1)}, {1, 0, 8}},
-       tenPow37 + 8,
-       5 * (tenPow37 / 10) + 4},
+       {true, tenPow37 + 8, 5 * tenPow36 + 4}},
       // As above with 7: the sum part (10^37 + 7 - 2^127) / 2 truncates to
       // 5 * 10^36 + 4 - 2^126 with remainder -1, and the remainder rounds
       // away from zero on its own: -1 / 2 -> -1. The CPU average is
       // 5 * 10^36 + 3, although (10^37 + 7) / 2 = 5 * 10^36 + 3.5.
       {"mergedCarryRounding",
        {{1, 1, wrappedSum(tenPow37, 1)}, {1, 0, 7}},
-       tenPow37 + 7,
-       5 * (tenPow37 / 10) + 3},
-      // count 2, overflow 1, sum 5 + 7 = 12. SUM: overflow 1 with a positive
-      // sum is a real overflow. AVG: (12 + 2^127) / 2 = 2^126 + 6, a valid
-      // DECIMAL(38) value.
-      {"carryWithPositiveSum",
-       {{1, 1, 5}, {1, 0, 7}},
-       std::nullopt,
-       twoPow126 + 6},
-      // overflow 2 never folds into one int128_t.
-      {"doubleCarry", {{1, 2, -5}}, std::nullopt, std::nullopt},
+       {true, tenPow37 + 7, 5 * tenPow36 + 3}},
+      // Two carried states of 10^37 each. The CPU merge adds the two negative
+      // sums with addWithOverflow, which carries -1: (2 * 10^37 - 2^127,
+      // overflow 1). The GPU merge wraps the sum instead: (2 * 10^37,
+      // overflow 2). Both denote 2 * 10^37.
+      {"twoCarriedStates",
+       {{1, 1, wrappedSum(tenPow37, 1)}, {1, 1, wrappedSum(tenPow37, 1)}},
+       {true, 2 * tenPow37, tenPow37}},
+      // Review finding N1. A = 10^37 (count 3, overflow 1, e.g. 9 * 10^37 +
+      // 9 * 10^37 - 8 * 10^37 accumulated on the CPU), B = -9.5 * 10^37. The
+      // CPU merge adds two negative sums whose magnitudes reach 2^127 and
+      // carries -1: (-8.5 * 10^37, overflow 0). The GPU merge wraps the sum
+      // to 2^127 - 8.5 * 10^37 (positive) with overflow 1. SUM -8.5 * 10^37,
+      // AVG -8.5 * 10^37 / 4 = -2.125 * 10^37.
+      {"mergeCarriesPastTwoPow127",
+       {{3, 1, wrappedSum(tenPow37, 1)}, {1, 0, -95 * tenPow36}},
+       {true, -85 * tenPow36, -2125 * (tenPow36 / 100)}},
       // Folds to 15 * 10^37 > 10^38 - 1: out of the DECIMAL(38) range.
       {"foldedOutOfRange",
        {{1, 1, wrappedSum(15 * tenPow37, 1)}},
-       std::nullopt,
-       std::nullopt},
+       {true, std::nullopt, std::nullopt}},
+      // Beyond int128_t, CPU only. count 2, overflow 1, sum 5 + 7 = 12: the
+      // value is 2^127 + 12. SUM: overflow 1 with a positive sum is a real
+      // overflow. AVG: 2^126 + 6, a valid DECIMAL(38) value. The GPU sees the
+      // alias -2^127 + 12.
+      {"carryWithPositiveSum",
+       {{1, 1, 5}, {1, 0, 7}},
+       {false, std::nullopt, twoPow126 + 6}},
+      // Beyond int128_t, CPU only. overflow 2 with count 1: the value
+      // 2^128 - 5. The GPU sees the alias -5.
+      {"doubleCarry", {{1, 2, -5}}, {false, std::nullopt, std::nullopt}},
   };
 
   for (const auto& overflowCase : cases) {
-    // Double-check the hand-computed values against the CPU functions on the
-    // merged state.
-    HostDecimalState merged{0, 0, 0};
-    for (const auto& row : overflowCase.rows) {
-      merged.count += row.count;
-      merged.overflow += row.overflow;
-      merged.sum += row.sum;
-    }
-    const auto cpuSum =
-        DecimalUtil::adjustSumForOverflow(merged.sum, merged.overflow);
-    ASSERT_EQ(
-        cpuSum.has_value() && DecimalUtil::valueInPrecisionRange(*cpuSum, 38),
-        overflowCase.sum.has_value())
+    const auto cpu = cpuDecimalFinal(overflowCase.rows);
+    ASSERT_EQ(cpu.totalFitsInt128, overflowCase.expected.totalFitsInt128)
         << overflowCase.name;
-    if (overflowCase.sum.has_value()) {
-      ASSERT_TRUE(*cpuSum == *overflowCase.sum) << overflowCase.name;
-    }
-    if (overflowCase.avg.has_value()) {
-      int128_t cpuAverage{0};
-      DecimalUtil::computeAverage(
-          cpuAverage, merged.sum, merged.count, merged.overflow);
-      ASSERT_TRUE(cpuAverage == *overflowCase.avg) << overflowCase.name;
+    ASSERT_EQ(cpu.sum, overflowCase.expected.sum) << overflowCase.name;
+    ASSERT_EQ(cpu.avg, overflowCase.expected.avg) << overflowCase.name;
+    if (!cpu.totalFitsInt128) {
+      continue;
     }
 
     std::vector<int64_t> zeroKeys(overflowCase.rows.size(), 0);
     auto keys = makeInt64Column(zeroKeys, nullptr, stream);
     auto blob = makeDecimalStateBlob(overflowCase.rows, nullptr, false, stream);
     for (const bool isSum : {true, false}) {
-      const auto& expected = isSum ? overflowCase.sum : overflowCase.avg;
+      const auto& expected = isSum ? cpu.sum : cpu.avg;
       if (!isSum && !expected.has_value()) {
         continue;
       }
       const std::string aggregate = isSum ? "sum(d)" : "avg(d)";
       SCOPED_TRACE(overflowCase.name + " " + aggregate);
-      auto final = makeDecimalGroupbyAggregator(
-          aggregate,
-          DECIMAL(38, 2),
-          core::AggregationNode::Step::kFinal,
-          pool());
+      auto makeGroupby = [&](core::AggregationNode::Step step) {
+        return makeDecimalGroupbyAggregator(
+            aggregate, DECIMAL(38, 2), step, pool());
+      };
+      auto final = makeGroupby(core::AggregationNode::Step::kFinal);
       auto reduce = makeDecimalReduceAggregator(
           aggregate,
           DECIMAL(38, 2),
@@ -2788,7 +2853,7 @@ TEST_F(CudfDecimalTest, decimalFinalFoldsBlobOverflowLikeCpu) {
       auto runGroupby = [&]() {
         auto run = runGroupbyAggregator(
             *final, keys->view(), blob->view(), stream, mr);
-        return hostDecimalGroups(run.keys->view(), run.output->view(), stream);
+        return hostDecimalValues(run.output->view(), stream);
       };
       auto runReduce = [&]() {
         auto result = reduce.aggregator->doReduce(
@@ -2799,8 +2864,22 @@ TEST_F(CudfDecimalTest, decimalFinalFoldsBlobOverflowLikeCpu) {
             mr);
         return hostDecimalValues(result->view(), stream);
       };
-      // Direct finalization does not merge rows; check it on one-row blobs.
-      auto runFinalize = [&]() {
+      // Direct finalization of the GPU-merged state, as the incremental FINAL
+      // does: the INTERMEDIATE group-by merges the blob rows into one struct
+      // row. A one-row blob is also finalized as is.
+      auto intermediate =
+          makeGroupby(core::AggregationNode::Step::kIntermediate);
+      auto merged = runGroupbyAggregator(
+          *intermediate, keys->view(), blob->view(), stream, mr);
+      ASSERT_EQ(merged.output->size(), 1);
+      auto runFinalizeMerged = [&]() {
+        auto result = final->finalize(
+            std::make_unique<cudf::column>(merged.output->view(), stream, mr),
+            stream,
+            mr);
+        return hostDecimalValues(result->view(), stream);
+      };
+      auto runFinalizeBlob = [&]() {
         auto result = final->finalize(
             std::make_unique<cudf::column>(blob->view(), stream, mr),
             stream,
@@ -2809,16 +2888,19 @@ TEST_F(CudfDecimalTest, decimalFinalFoldsBlobOverflowLikeCpu) {
       };
       const bool oneRow = overflowCase.rows.size() == 1;
       if (expected.has_value()) {
-        EXPECT_EQ(runGroupby(), (DecimalGroups{{0, *expected}}));
-        EXPECT_EQ(runReduce(), (DecimalValues{*expected}));
+        const DecimalValues expectedValues{*expected};
+        EXPECT_EQ(runGroupby(), expectedValues);
+        EXPECT_EQ(runReduce(), expectedValues);
+        EXPECT_EQ(runFinalizeMerged(), expectedValues);
         if (oneRow) {
-          EXPECT_EQ(runFinalize(), (DecimalValues{*expected}));
+          EXPECT_EQ(runFinalizeBlob(), expectedValues);
         }
       } else {
         VELOX_ASSERT_THROW(runGroupby(), "Decimal overflow");
         VELOX_ASSERT_THROW(runReduce(), "Decimal overflow");
+        VELOX_ASSERT_THROW(runFinalizeMerged(), "Decimal overflow");
         if (oneRow) {
-          VELOX_ASSERT_THROW(runFinalize(), "Decimal overflow");
+          VELOX_ASSERT_THROW(runFinalizeBlob(), "Decimal overflow");
         }
       }
     }
@@ -2827,8 +2909,9 @@ TEST_F(CudfDecimalTest, decimalFinalFoldsBlobOverflowLikeCpu) {
   // Without any overflow, the DECIMAL(38) range check fires on the merged
   // sum: (10^38 - 1) + 1.
   const int128_t limit = DecimalUtil::kPowersOfTen[38];
-  auto bigBlob = makeDecimalStateBlob(
-      {{1, 0, limit - 1}, {1, 0, 1}}, nullptr, false, stream);
+  const std::vector<HostDecimalState> bigRows{{1, 0, limit - 1}, {1, 0, 1}};
+  ASSERT_FALSE(cpuDecimalFinal(bigRows).sum.has_value());
+  auto bigBlob = makeDecimalStateBlob(bigRows, nullptr, false, stream);
   auto oneKey = makeInt64Column({0, 0}, nullptr, stream);
   for (const auto& type : {DECIMAL(18, 2), DECIMAL(38, 2)}) {
     SCOPED_TRACE(type->toString());
@@ -2973,4 +3056,4 @@ TEST_F(CudfDecimalTest, decimalGlobalSumAvgMatchesCpu) {
   }
 }
 
-} // namespace facebook::velox::cudf_velox
+} // namespace facebook::velox::cudf_velox::test

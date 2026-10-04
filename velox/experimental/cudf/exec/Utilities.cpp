@@ -124,6 +124,30 @@ bool hasMixedPhysicalForm(
   return false;
 }
 
+} // namespace
+
+std::unique_ptr<cudf::table> concatenateTables(
+    std::vector<std::unique_ptr<cudf::table>> tables,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  // Check for empty vector
+  VELOX_CHECK_GT(tables.size(), 0);
+
+  if (tables.size() == 1) {
+    return std::move(tables[0]);
+  }
+  std::vector<cudf::table_view> tableViews;
+  tableViews.reserve(tables.size());
+  std::transform(
+      tables.begin(),
+      tables.end(),
+      std::back_inserter(tableViews),
+      [&](const auto& tbl) { return tbl->view(); });
+  return cudf::concatenate(tableViews, stream, mr);
+}
+
+namespace {
+
 std::unique_ptr<cudf::table> makeEmptyTable(
     TypePtr const& inputType,
     cuda::stream_ref stream,
@@ -241,26 +265,6 @@ std::vector<std::unique_ptr<cudf::column>> normalizeDecimalStateTableViews(
     tableViews[batch] = cudf::table_view(batchColumns[batch]);
   }
   return replacements;
-}
-
-std::unique_ptr<cudf::table> concatenateTables(
-    std::vector<std::unique_ptr<cudf::table>> tables,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
-  // Check for empty vector
-  VELOX_CHECK_GT(tables.size(), 0);
-
-  if (tables.size() == 1) {
-    return std::move(tables[0]);
-  }
-  std::vector<cudf::table_view> tableViews;
-  tableViews.reserve(tables.size());
-  std::transform(
-      tables.begin(),
-      tables.end(),
-      std::back_inserter(tableViews),
-      [&](const auto& tbl) { return tbl->view(); });
-  return cudf::concatenate(tableViews, stream, mr);
 }
 
 std::unique_ptr<cudf::table> getConcatenatedTable(

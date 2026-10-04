@@ -118,10 +118,12 @@ void unpackDecimalSumState(
 
 /**
  * Per-row decimal average with the CPU's rounding: when the row's overflow is
- * zero this is a half-up integer divide of sum by count; otherwise it is
+ * zero this is a half-up integer divide of sum by count; when the pair is in
+ * the form DecimalUtil::adjustSumForOverflow accepts it is
  * (sum + overflow * 2^127) / count computed without widening past 128 bits,
- * exactly as DecimalUtil::computeAverage does. count == 0 writes zero
- * (validity is applied separately).
+ * exactly as DecimalUtil::computeAverage does; otherwise (a GPU merge that
+ * crossed +-2^127) the overflow is folded modulo 2^128 first and the result
+ * divided half-up. count == 0 writes zero (validity is applied separately).
  *
  * @param sumType DECIMAL64 or DECIMAL128; selects sum storage width via
  *        cudf::type_dispatcher<cudf::dispatch_storage_type>.
@@ -142,15 +144,14 @@ void averageRoundDecimalSum(
     cudf::size_type numRows,
     cuda::stream_ref stream);
 
-/// Outcome of checkDecimalSumRange and foldDecimalSumOverflow, encoded as the
-/// largest code hit by any row.
+/**
+ * Outcome of checkDecimalSumRange and foldDecimalSumOverflow, encoded as the
+ * largest code hit by any row.
+ */
 enum class DecimalSumCheck : int32_t {
   kOk = 0,
-  /// The overflow field could not be folded into the sum
-  /// (DecimalUtil::adjustSumForOverflow would return nullopt).
-  kOverflow = 1,
-  /// The (folded) sum lies outside the DECIMAL(38) range.
-  kOutOfRange = 2,
+  /** The (folded) sum lies outside the DECIMAL(38) range. */
+  kOutOfRange = 1,
 };
 
 /**
@@ -169,10 +170,14 @@ DecimalSumCheck checkDecimalSumRange(
 /**
  * Finalizes merged DECIMAL128 sums the way the CPU FINAL step does, in one
  * device pass and one host sync. For every valid row with a nonzero overflow,
- * folds it into the sum in place following DecimalUtil::adjustSumForOverflow
- * (overflow == 1 with a negative sum, or overflow == -1 with a positive sum,
- * adds overflow * 2^127; anything else is kOverflow). Then checks that the
- * sum lies strictly within +-10^38.
+ * folds it into the sum in place as sum + overflow * 2^127 modulo 2^128 (one
+ * unit of overflow is one int128 carry of DecimalUtil::addWithOverflow). The
+ * fold is exact whenever the true total fits in int128, which includes every
+ * total the CPU accepts, and is applied without a sign predicate because a GPU
+ * merge wraps the sum children modulo 2^128 while summing the overflow
+ * children exactly, so the merged pair need not be in the CPU's canonical form.
+ * Then checks that the folded sum lies strictly within +-10^38. A total beyond
+ * int128 cannot be distinguished from its alias modulo 2^128.
  *
  * @param sum DECIMAL128 column, offset 0, modified in place when a fold
  *        applies.

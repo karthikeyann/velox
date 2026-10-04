@@ -25,6 +25,7 @@
 #include "velox/common/base/tests/GTestUtils.h"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
@@ -36,7 +37,7 @@
 #include <string>
 #include <vector>
 
-namespace facebook::velox::cudf_velox {
+namespace facebook::velox::cudf_velox::test {
 namespace {
 
 int numOwnedColumns(const DecimalStateColumns& owned) {
@@ -67,6 +68,18 @@ DecimalStateRows defaultRows() {
   rows.counts = {1, 2, 3, 2, 1, 1, 4, 5, 1};
   rows.overflows = {0, 0, 0, 0, 0, 0, 1, -1, 0};
   rows.valid = {true, true, true, true, true, true, true, true, false};
+  return rows;
+}
+
+// Rows [begin, all.size()) of `all`.
+DecimalStateRows rowsFrom(const DecimalStateRows& all, size_t begin) {
+  DecimalStateRows rows;
+  for (size_t row = begin; row < all.size(); ++row) {
+    rows.sums.push_back(all.sums[row]);
+    rows.counts.push_back(all.counts[row]);
+    rows.overflows.push_back(all.overflows[row]);
+    rows.valid.push_back(all.valid[row]);
+  }
   return rows;
 }
 
@@ -125,7 +138,8 @@ class DecimalStateFixture {
   }
 
   void expectStructShape(const cudf::column_view& view, Shape shape) {
-    ASSERT_TRUE(isDecimalStateStruct(view)) << decimalStateShapeLabel(shape);
+    ASSERT_TRUE(isDecimalStateStruct(view))
+        << DecimalStateShapeName::toName(shape);
     EXPECT_EQ(decimalStateShapeOf(view), shape);
     EXPECT_FALSE(view.nullable()) << "struct parent must not carry a mask";
   }
@@ -236,11 +250,11 @@ TEST_F(DecimalStateShapeTest, wrapRequiresSumAndCountAndSynthesizesOverflow) {
   }
   // A missing overflow child is the documented default: zeros.
   for (auto shape : {Shape::kSum128, Shape::kAvg128}) {
-    SCOPED_TRACE(decimalStateShapeLabel(shape));
+    SCOPED_TRACE(DecimalStateShapeName::toName(shape));
     DecimalStateColumns noOverflow;
     noOverflow.sum =
         makeDecimalColumn<int128_t>(rows.sums, kScale, &rows.valid, stream_);
-    if (decimalStateHasCount(shape)) {
+    if (decimalStateFields(shape).hasCount) {
       noOverflow.count = makeInt64Column(rows.counts, nullptr, stream_);
     }
     auto structColumn =
@@ -348,7 +362,7 @@ TEST_F(DecimalStateShapeTest, nullRowsSurviveBlobWithCompactedPayload) {
   expectDecimalStateRowsEqual(expected, readBack(blob->view()));
 
   for (auto shape : kAllDecimalStateShapes) {
-    SCOPED_TRACE(decimalStateShapeLabel(shape));
+    SCOPED_TRACE(DecimalStateShapeName::toName(shape));
     auto unpacked =
         unpackDecimalState(blob->view(), shape, kScale, stream_, mr_);
     expectStructShape(unpacked->view(), shape);
@@ -368,6 +382,195 @@ TEST_F(DecimalStateShapeTest, zeroRowBlob) {
   EXPECT_EQ(flat.sum.type().id(), cudf::type_id::DECIMAL128);
   EXPECT_EQ(flat.count.type().id(), cudf::type_id::INT64);
   EXPECT_EQ(flat.overflow.type().id(), cudf::type_id::INT64);
+}
+
+// decimalStateInfoFor takes the raw input type from rawInputTypes and, for an
+// aggregate declared without them, from the call argument when that is a
+// decimal (a raw-input step). A VARBINARY argument (an intermediate state)
+// cannot stand in for it. Note that the group-by and reduce operators only
+// treat an aggregate as a decimal SUM/AVG when rawInputTypes is set
+// (resolveAggregateInfos), so the fallback is reached through this function
+// only.
+TEST_F(DecimalStateShapeTest, stateInfoFallsBackToDecimalArgument) {
+  auto aggregateOver = [](const TypePtr& argumentType,
+                          std::vector<TypePtr> rawInputTypes) {
+    core::AggregationNode::Aggregate aggregate;
+    aggregate.call = std::make_shared<core::CallTypedExpr>(
+        VARBINARY(),
+        std::vector<core::TypedExprPtr>{
+            std::make_shared<core::FieldAccessTypedExpr>(argumentType, "d")},
+        "sum");
+    aggregate.rawInputTypes = std::move(rawInputTypes);
+    return aggregate;
+  };
+  struct Case {
+    TypePtr argument;
+    std::vector<TypePtr> rawInputTypes;
+    bool isAverage;
+    Shape shape;
+    int32_t scale;
+  };
+  for (const auto& [argument, rawInputTypes, isAverage, shape, scale] :
+       std::vector<Case>{
+           {DECIMAL(12, 3), {}, false, Shape::kSum64, 3},
+           {DECIMAL(38, 2), {}, true, Shape::kAvg128, 2},
+           {VARBINARY(), {DECIMAL(18, 4)}, false, Shape::kSum64, 4},
+           {VARBINARY(), {DECIMAL(30, 1)}, true, Shape::kAvg128, 1},
+           // rawInputTypes win over a decimal argument.
+           {DECIMAL(12, 3), {DECIMAL(38, 5)}, false, Shape::kSum128, 5},
+       }) {
+    SCOPED_TRACE(
+        fmt::format(
+            "{} raw input types {} isAverage {}",
+            argument->toString(),
+            rawInputTypes.size(),
+            isAverage));
+    const auto info =
+        decimalStateInfoFor(isAverage, aggregateOver(argument, rawInputTypes));
+    EXPECT_EQ(info.shape, shape);
+    EXPECT_EQ(info.scale, scale);
+  }
+  VELOX_ASSERT_THROW(
+      decimalStateInfoFor(false, aggregateOver(VARBINARY(), {})),
+      "Decimal aggregate requires its raw input type");
+}
+
+// A blob view with a nonzero offset (cudf::slice) flattens and unpacks to the
+// rows of the slice.
+TEST_F(DecimalStateShapeTest, slicedBlob) {
+  const auto rows = defaultRows();
+  auto blob = makeBlob(rows);
+  // Rows [3, 9) include the DECIMAL64 extremes, both 2^100 sums with their
+  // overflows, and the null row.
+  const cudf::size_type begin = 3;
+  const auto end = static_cast<cudf::size_type>(rows.size());
+  const auto sliced = cudf::slice(blob->view(), {begin, end})[0];
+  ASSERT_EQ(sliced.offset(), begin);
+  const auto expected = rowsFrom(rows, begin);
+  expectDecimalStateRowsEqual(expected, readBack(sliced));
+  for (auto shape : kAllDecimalStateShapes) {
+    SCOPED_TRACE(DecimalStateShapeName::toName(shape));
+    auto unpacked = unpackDecimalState(sliced, shape, kScale, stream_, mr_);
+    expectStructShape(unpacked->view(), shape);
+    expectDecimalStateRowsEqual(expected.as(shape), readBack(unpacked->view()));
+  }
+}
+
+// A struct view with a nonzero offset flattens and packs to the rows of the
+// slice.
+TEST_P(DecimalStateShapeParamTest, slicedStruct) {
+  const auto shape = GetParam();
+  const auto rows = defaultRows();
+  auto structColumn = makeStruct(rows, shape);
+  const cudf::size_type begin = 2;
+  const auto end = static_cast<cudf::size_type>(rows.size());
+  const auto sliced = cudf::slice(structColumn->view(), {begin, end})[0];
+  ASSERT_EQ(sliced.offset(), begin);
+  const auto expected = rowsFrom(rows, begin).as(shape);
+  expectFlatMatches(
+      flattenDecimalState(sliced, kScale, true, true, stream_, mr_), expected);
+  const auto packedRows = readDecimalStateBlob(
+      packDecimalState(sliced, stream_, mr_)->view(), stream_);
+  const auto expectedStates = expected.states();
+  ASSERT_EQ(packedRows.size(), expected.size());
+  for (size_t row = 0; row < expected.size(); ++row) {
+    ASSERT_EQ(packedRows[row].has_value(), expected.valid[row])
+        << "row " << row;
+    if (expected.valid[row]) {
+      EXPECT_TRUE(*packedRows[row] == expectedStates[row]) << "row " << row;
+    }
+  }
+}
+
+// A struct whose parent carries a null mask, as after a nullifying gather: a
+// row the parent marks null reads as null in every carried field even where
+// the children are valid, through flatten and pack, also when the masked
+// struct is sliced. Built two ways: a view with an explicit parent mask over
+// valid children, and cudf::gather with an out-of-bounds index under
+// NULLIFY.
+TEST_P(DecimalStateShapeParamTest, parentNullMask) {
+  const auto shape = GetParam();
+  const auto rows = defaultRows();
+  auto structColumn = makeStruct(rows, shape);
+  const auto view = structColumn->view();
+  const auto numRows = static_cast<cudf::size_type>(rows.size());
+
+  // Parent nulls on valid sums (rows 1 and 6) and on the null-sum row 8.
+  std::vector<bool> parentValid(rows.size(), true);
+  parentValid[1] = false;
+  parentValid[6] = false;
+  parentValid[8] = false;
+  auto [parentMask, parentNullCount] = makeNullMask(parentValid, stream_);
+  std::vector<cudf::column_view> children;
+  for (cudf::size_type i = 0; i < view.num_children(); ++i) {
+    children.push_back(view.child(i));
+  }
+  const cudf::column_view masked(
+      view.type(),
+      numRows,
+      nullptr,
+      reinterpret_cast<const cudf::bitmask_type*>(parentMask.data()),
+      parentNullCount,
+      0,
+      children);
+  ASSERT_EQ(masked.null_count(), 3);
+
+  auto expected = rows.as(shape);
+  for (size_t row = 0; row < rows.size(); ++row) {
+    expected.valid[row] = expected.valid[row] && parentValid[row];
+  }
+
+  auto check = [&](const cudf::column_view& state,
+                   const DecimalStateRows& expectedRows) {
+    auto flat = flattenDecimalState(state, kScale, true, true, stream_, mr_);
+    expectFlatMatches(flat, expectedRows);
+    if (decimalStateFields(shape).hasCount) {
+      EXPECT_EQ(validityOf(flat.count, stream_), expectedRows.valid);
+    }
+    if (decimalStateFields(shape).hasOverflow) {
+      EXPECT_EQ(validityOf(flat.overflow, stream_), expectedRows.valid);
+    }
+    const auto packedRows = readDecimalStateBlob(
+        packDecimalState(state, stream_, mr_)->view(), stream_);
+    const auto expectedStates = expectedRows.states();
+    ASSERT_EQ(packedRows.size(), expectedRows.size());
+    for (size_t row = 0; row < expectedRows.size(); ++row) {
+      ASSERT_EQ(packedRows[row].has_value(), expectedRows.valid[row])
+          << "row " << row;
+      if (expectedRows.valid[row]) {
+        EXPECT_TRUE(*packedRows[row] == expectedStates[row]) << "row " << row;
+      }
+    }
+  };
+
+  {
+    SCOPED_TRACE("explicit parent mask");
+    check(masked, expected);
+  }
+  {
+    SCOPED_TRACE("sliced parent mask");
+    check(cudf::slice(masked, {1, numRows})[0], rowsFrom(expected, 1));
+  }
+  {
+    SCOPED_TRACE("nullifying gather");
+    // Gather rows 0..n-1 in order, with an out-of-bounds index in place of
+    // the rows the parent mask above nulls.
+    std::vector<int32_t> indices(rows.size());
+    for (cudf::size_type row = 0; row < numRows; ++row) {
+      indices[row] = parentValid[row] ? row : numRows;
+    }
+    auto gatherMap = makeFixedWidthColumn<int32_t>(
+        cudf::data_type{cudf::type_id::INT32}, indices, nullptr, stream_);
+    auto gathered = cudf::gather(
+        cudf::table_view{{view}},
+        gatherMap->view(),
+        cudf::out_of_bounds_policy::NULLIFY,
+        stream_,
+        mr_);
+    const auto gatheredState = gathered->view().column(0);
+    EXPECT_TRUE(gatheredState.nullable());
+    check(gatheredState, expected);
+  }
 }
 
 TEST_P(DecimalStateShapeParamTest, wrapFlattenRoundTrip) {
@@ -392,12 +595,12 @@ TEST_P(DecimalStateShapeParamTest, wrapFlattenRoundTrip) {
     return false;
   };
   EXPECT_TRUE(aliasesChild(flat.sum));
-  EXPECT_EQ(aliasesChild(flat.count), decimalStateHasCount(shape));
-  EXPECT_EQ(aliasesChild(flat.overflow), decimalStateHasOverflow(shape));
+  EXPECT_EQ(aliasesChild(flat.count), decimalStateFields(shape).hasCount);
+  EXPECT_EQ(aliasesChild(flat.overflow), decimalStateFields(shape).hasOverflow);
   EXPECT_EQ(
       numOwnedColumns(flat.owned),
-      (decimalStateHasCount(shape) ? 0 : 1) +
-          (decimalStateHasOverflow(shape) ? 0 : 1));
+      (decimalStateFields(shape).hasCount ? 0 : 1) +
+          (decimalStateFields(shape).hasOverflow ? 0 : 1));
 }
 
 // pack writes every field the shape carries and fills in the rest, the blob
@@ -500,7 +703,9 @@ INSTANTIATE_TEST_SUITE_P(
     DecimalStateShapes,
     DecimalStateShapeParamTest,
     ::testing::ValuesIn(kAllDecimalStateShapes),
-    [](const auto& info) { return decimalStateShapeLabel(info.param); });
+    [](const auto& info) {
+      return std::string(DecimalStateShapeName::toName(info.param));
+    });
 
 } // namespace
-} // namespace facebook::velox::cudf_velox
+} // namespace facebook::velox::cudf_velox::test

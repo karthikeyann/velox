@@ -1,13 +1,13 @@
 # Self-Describing Decimal Aggregate State for velox-cudf
 
-Status: proposal, not started.
-Written: 2026-10-02. File and line references are against branch
-`perf/cudf-decimal64-global-reduction` at commit `8b8acc1ba9` (merge-base with
-upstream main `af34c8f33a`). Re-verify line numbers before editing.
+Status: implemented on `perf/cudf-decimal-state-self-describing`.
+Written: 2026-10-02; updated to the implementation. File references are to
+`velox/experimental/cudf/` on that branch and name functions rather than
+lines.
 
-This document records the investigation of the branch, the reasons its
-mechanism should not be merged as-is, and a contained replacement that keeps
-its measured memory win.
+This document records why the aggregate state is carried as a self-describing
+struct, the rules that keep it interchangeable with the CPU blob, and the
+code sites that interpret it.
 
 ## 1. Goal
 
@@ -57,34 +57,17 @@ Both sides declare it independently, and nothing enforces agreement.
 Conclusion: the logical intermediate stays VARBINARY. The question is how the
 GPU avoids 32-byte string columns underneath it.
 
-## 3. What the branch does and why it sprawls
+## 3. Why not tag the column
 
-The branch stores only the DECIMAL128 sum under a logical VARBINARY column and
-tags the column with `CudfPhysicalEncoding::kNativeDecimal64SumState`
-(`vector/CudfVector.h:33-45`). Because count and overflow are dropped, a
-valid 32-byte state can be rebuilt only if the column is known to come from a
-DECIMAL64 `sum`. Carrying that provenance is what forces:
-
-- per-column encoding metadata on `CudfVector` that must survive select,
-  slice, split, concat, and partition;
-- an `acceptsNativeDecimalSumState()` opt-in on `CudfOperatorBase`
-  (`exec/CudfOperator.h:134-143`) with five operators opting in and fourteen
-  silently materializing;
-- `exec/NativeDecimalSumEligibility.cpp`, which re-derives from the plan what
-  the data no longer carries;
-- mixing rules in concat and group-by for batches that disagree;
-- restriction to grouped DECIMAL64 `sum`; `avg`, DECIMAL128, and global
-  reductions stay on the blob.
-
-Every future operator must know about the tag or it quietly loses the
-optimization. The branch also has a concrete gap: `UcxPartitionedOutput`
-derives from `exec::Operator`, not `CudfOperatorBase`, and nothing under
-`velox/experimental/ucx-exchange/` reads `physicalEncodings`. A tagged column
-enters `cudf::pack` unmaterialized, and the receiver in `UcxExchange.cpp:196`
-constructs a `CudfVector` with default encodings, which
-`CudfVector::validatePhysicalEncodings` (`vector/CudfVector.cpp:178-182`)
-rejects. The design doc lists remote exchange as a materialization boundary,
-but no code enforces it for UCX.
+An earlier prototype stored only the DECIMAL128 sum under the VARBINARY column
+and tagged the column with a per-column physical-encoding flag. Because count
+and overflow were dropped, a valid blob could be rebuilt only if the column was
+known to come from a DECIMAL64 `sum`, so the provenance had to travel with the
+vector through every operator (select, slice, concat, partition, exchange) and
+be re-derived from the plan where it was lost. Every operator that did not know
+about the tag either materialized the blob or, on the UCX exchange path, failed
+validation. The representation below removes the provenance problem instead of
+plumbing it.
 
 ## 4. Due diligence on the state fields
 
@@ -100,18 +83,34 @@ Verified against the CPU consumer in `DecimalAggregate.h`:
 - `DecimalAverageAggregateBase::computeFinalValue`
   (`AverageAggregateBase.h:403-409`) reads sum, count, and overflow.
 - Nonzero overflow is not an error on the CPU. `addWithOverflow` keeps the
-  low 127 bits of the running sum and counts carries of 2^127 in `overflow`.
-  `DecimalSumAggregate::computeFinalValue` calls
-  `DecimalUtil::adjustSumForOverflow`, which accepts `overflow == 1` with a
-  negative sum and `overflow == -1` with a positive sum (adding
-  `overflow * 2^127`, which wraps back to the exact total), raises
-  "Decimal overflow" for any other nonzero value, and then range-checks
-  against DECIMAL(38). `DecimalUtil::computeAverage` accepts any overflow and
-  returns `(sum + overflow * 2^127) / count` with half-up rounding, computed
-  without widening past 128 bits; the average is not range-checked. The GPU
-  FINAL step reproduces both rules on device (`finalizeDecimalSum`,
-  `finalizeDecimalAverage` in `exec/DecimalAggregationHostOps.h`) in a single
-  pass with one host sync per output batch, and skips the overflow work
+  low 127 bits of each same-sign add and counts the carry in `overflow`, so
+  one unit of overflow is worth exactly 2^127 and the true total is
+  `sum + overflow * 2^127` as an exact integer, with `|sum| < 2^127` after
+  every add (the canonical form). `DecimalSumAggregate::computeFinalValue`
+  calls `DecimalUtil::adjustSumForOverflow`, which accepts `overflow == 1`
+  with a negative sum and `overflow == -1` with a positive sum (adding
+  `overflow * 2^127` modulo 2^128, which is the exact total), raises
+  "Decimal overflow" for any other nonzero value (the total does not fit in
+  int128), and then range-checks against DECIMAL(38).
+  `DecimalUtil::computeAverage` accepts any overflow and returns
+  `(sum + overflow * 2^127) / count` with half-up rounding, computed as a
+  split division without widening past 128 bits; the average is not
+  range-checked.
+- The GPU merge does not preserve the canonical form. cuDF's DECIMAL128 SUM
+  adds the `sum` children modulo 2^128 while the `overflow` children are
+  summed exactly, so after a merge that crosses +-2^127 the pair is a
+  different representative of the same total modulo 2^128, and the CPU's
+  sign predicate would reject a legal total. The GPU FINAL step therefore
+  folds unconditionally: `finalizeDecimalSum` computes
+  `sum + overflow * 2^127` modulo 2^128, which equals the true total whenever
+  it fits in int128 (every total the CPU accepts), and then range-checks
+  against DECIMAL(38). `finalizeDecimalAverage` uses the CPU's split division
+  when the pair is canonical (bit-identical to `computeAverage`) and divides
+  the folded total half-up otherwise; the two differ by at most one ulp in
+  exact-half cases, and the CPU's own result is already order dependent by
+  that ulp because a different accumulation order yields a different
+  canonical pair. Both run on device (`exec/DecimalAggregationHostOps.h`) in a
+  single pass with one host sync per output batch, and skip the overflow work
   entirely for shapes without an overflow child (DECIMAL64 raw input, the
   Q18 path).
 - Overflow is provably zero for DECIMAL64 raw inputs: a DECIMAL64 value fits
@@ -154,34 +153,39 @@ Properties:
   `make_structs_column` superimposing parent nulls onto children (which can
   copy child masks). A state row is null exactly when `sum` is null; cuDF
   group-by SUM yields null for an all-null group, which is the required SUM
-  semantics. Consumers nevertheless tolerate a parent mask (a nullifying
-  gather such as an outer-join probe adds one): `flattenDecimalState` and
-  `packDecimalState` treat a row as null when the parent or the `sum` child
-  is null, folding the parent mask into an owned copy of `sum` only in that
-  case, at zero cost when the parent has no nulls.
+  semantics. `flattenDecimalState` and `packDecimalState` nevertheless
+  tolerate a parent mask (a nullifying gather such as an outer-join probe
+  adds one): a row is null when the parent or the child is null, and the
+  parent mask is folded into an owned copy of every carried child only in
+  that case, at zero cost when the parent has no nulls. The exception is
+  `unwrapDecimalState`, which rejects a parent mask; it is reached only from
+  the group-by's own buffered FINAL state, which never has one.
 
 Known limitation: GPU producers do not track int128 carries. cuDF's
 DECIMAL128 SUM wraps modulo 2^128, so the `overflow` child emitted by a GPU
 producer (kSum128 and kAvg128) is always 0 and `packDecimalState` writes that 0
-into the blob. A DECIMAL(38) total that wraps back into range is therefore
-reported silently wrong, and one that lands out of range is reported as
-"Decimal overflow" even when the true average would be in range. This is the
+into the blob. A total beyond int128 is therefore indistinguishable from its
+alias modulo 2^128: SUM raises "Decimal overflow" when the alias lands outside
+DECIMAL(38) and is silently wrong when it wraps back into range, and AVG,
+which is not range-checked, is silently wrong in both cases. This is the
 pre-existing behaviour of the blob path and is unchanged by this design. The
-overflow field is meaningful only when it came from a CPU-produced state; it
-is honoured on merge (summed across partials) and at FINAL (folded per the CPU
-rules above). Closing the gap needs a carry-tracking reduction for DECIMAL128
-(a custom reduce over `(sum, overflow)` for the global path and a host UDF or
-two-pass approach for `cudf::groupby`).
+overflow field is meaningful only when it came from a CPU-produced state. On
+merge the overflow children are summed exactly but the sum children still
+wrap, so the merged pair is congruent to the true total modulo 2^128 without
+being canonical; FINAL folds it as described in section 4, which is exact for
+every total that fits in int128. Closing the gap needs a carry-tracking
+reduction for DECIMAL128 (a custom reduce over `(sum, overflow)` for the
+global path and a host UDF or two-pass approach for `cudf::groupby`).
 
 Q18 lands on the first row: 16 bytes plus one validity bit per group, the
 same as the branch.
 
-## 6. Where the bytes are interpreted: the only four code sites
+## 6. Where the bytes are interpreted
 
 ### 6.1 `CudfGroupby` and `CudfReduce` (producer and consumer)
 
 - PARTIAL: run the existing SUM and COUNT aggregations (and the fused
-  DECIMAL64 reduce from commit `8b2c9edb13` for global paths), then wrap the
+  DECIMAL64 reduce from commit `2b69b23170` for global paths), then wrap the
   resulting flat columns in a struct of the chosen shape by moving the
   children. No copy, no pack kernel.
 - FINAL and INTERMEDIATE: flatten each incoming state column to flat child
@@ -193,21 +197,26 @@ same as the branch.
   copied. Before the buffered struct is concatenated with a new batch, the
   concat funnel's `normalizeDecimalStateTableViews` brings both to one
   physical form (a CPU-produced blob is unpacked toward the struct). This
-  replaces the raw `cudf::concatenate` at `exec/CudfGroupby.cpp:1951`
-  operating on mixed forms.
+  replaces the raw `cudf::concatenate` of buffered and new state in
+  `computeFinalGroupbyIncrementally` (`exec/CudfGroupby.cpp`) that would
+  have failed on mixed forms.
 - INTERMEDIATE output re-wraps in the plan-determined shape. FINAL output
   folds the merged overflow into the sum and runs the DECIMAL(38) range check
   (`finalizeDecimalSum`) or divides with the CPU's rounding
-  (`finalizeDecimalAverage`), as described in section 4.
+  (`finalizeDecimalAverage`), as described in section 4. Both read the
+  overflow field through `flattenDecimalState`, so a CPU-produced blob and a
+  GPU struct are treated alike.
 
 ### 6.2 `CudfToVelox` (`exec/CudfConversion.cpp`)
 
-After the concat in case B (`:343`) and before `with_arrow::toVeloxColumn`
-(`:346`), pack any VARBINARY column that is physically a STRUCT into the
-32-byte blob using the existing `serializeDecimalSumState` extended for all
-four shapes. This single site covers HTTP exchange (`PartitionedOutputAdapter`
-declares `acceptsGpuInput() == false`, so `ToCudf.cpp:209-212` inserts
-`CudfToVelox` before it), CPU fallback, final output, and any CPU-side spill.
+Both conversion paths (the per-batch output and the buffered concatenated
+output) go through one `exportToVelox` helper, which calls
+`packDecimalStatesForExport` before `with_arrow::toVeloxColumn`: every
+top-level VARBINARY column that is physically a STRUCT is packed into the
+32-byte blob with `packDecimalState`, which handles all four shapes. This
+single site covers HTTP exchange (`PartitionedOutputAdapter` declares
+`acceptsGpuInput() == false`, so `ToCudf.cpp` inserts `CudfToVelox` before
+it), CPU fallback, final output, and any CPU-side spill.
 
 ### 6.3 The concat funnel in `exec/Utilities.cpp`
 
@@ -215,28 +224,33 @@ declares `acceptsGpuInput() == false`, so `ToCudf.cpp:209-212` inserts
 `getConcatenatedCudfVectorsBatched` are used by `CudfBatchConcat`,
 `CudfToVelox`, `CudfGroupby`, `CudfReduce`, `CudfDistinct`, `CudfWindow`,
 `CudfOrderBy`, `CudfHashJoin`, `CudfLocalMerge`, and `CudfNestedLoopJoin`.
-Before `cudf::concatenate`, for each VARBINARY column whose physical form
-differs across batches:
+`normalizeDecimalStateTableViews` (`exec/Utilities.h`) runs before
+`cudf::concatenate`, once per output batch in `getConcatenatedTableBatched`.
+For each top-level VARBINARY column whose physical form differs across
+batches it:
 
-- unpack STRING batches to the struct shape present in the other batches
-  (normalize toward the smaller form, not toward the blob);
-- if struct shapes differ, widen all to the four-child-equivalent full form;
-- treat zero-row batches as wildcards and drop or re-type them.
-  `makeEmptyTable` (`exec/Utilities.cpp:208+`) builds a STRING column for
-  VARBINARY, and a zero-row STRING concatenated with STRUCT batches is a cuDF
-  type-mismatch error.
+- unpacks STRING batches to the struct shape present in the other batches
+  (normalizing toward the smaller form, not toward the blob);
+- if struct shapes differ, widens all to the four-child-equivalent full form;
+- treats zero-row batches as wildcards and drops or re-types them.
+  `makeEmptyTable` (file-local in `exec/Utilities.cpp`) builds a STRING
+  column for VARBINARY, and a zero-row STRING concatenated with STRUCT batches
+  is a cuDF type-mismatch error.
 
-Raw `cudf::concatenate` calls outside the funnel: `CudfGroupby.cpp:1951`
-(handled by 6.1), `CudfDistinct.cpp:83` and `CudfMarkDistinct.cpp:186`
-(only reachable if a state column is a distinct key; guard with a check
-rather than support), `UcxPartitionedOutput.cpp:200` (single-driver inputs,
-always uniform).
+Raw `cudf::concatenate` calls outside the funnel: the group-by's buffered
+state concat (handled by 6.1); `CudfDistinct` and `CudfMarkDistinct`, where
+a state column could only appear as a distinct key, so each now fails with a
+clear error through `isDecimalStateUnderVarbinary` rather than supporting it;
+and `UcxPartitionedOutput` (single-driver inputs, always uniform).
 
 ### 6.4 Expression evaluator
 
-If an expression reads a VARBINARY field whose physical column is a STRUCT,
-pack it first or fail with a clear message. Presto plans never compute on an
-aggregation intermediate, so this is a guard, not a hot path.
+`CudfFilterProject` records at compile time which VARBINARY input channels
+its filter or computed projections read, and checks per batch that none of
+them is physically a STRUCT, failing with a clear message otherwise. Identity
+projections pass the state through untouched, and nothing is ever packed
+here. Presto plans never compute on an aggregation intermediate, so this is a
+guard, not a hot path.
 
 ## 7. Exchange and merge boundaries, verified
 
@@ -274,15 +288,22 @@ every incremental final step.
 | HTTP exchange, either side | blob | blob (materialized at `CudfToVelox`) | blob (packed at `CudfToVelox`) |
 | Transient at `CudfToVelox` | encode temporary | encode temporary | pack temporary, same size |
 | Mixed-representation normalization | n/a | packs struct to blob (grows) | unpacks blob to struct (shrinks) |
-| Buffered state inside FINAL | decoded flat columns | native DECIMAL128 | flat columns, same bytes |
+| Buffered state inside FINAL | decoded flat columns | native DECIMAL128 | struct of the plan shape over those flat columns, same bytes (SUM over DECIMAL128 also merges the 8-byte overflow child, no wider than the baseline's decoded count) |
 | Validity | one string null mask | one null mask | one null mask on `sum`; no parent mask |
 
 No case uses more memory than the branch, and no case uses more than the
 baseline. Two implementation details must hold for that to be true:
 
 - construct the struct with `make_structs_column` passing no parent null
-  mask, so children are moved rather than copied for null superimposition;
-- flatten incoming structs via child `column_view`s, not copies.
+  mask, so children are moved rather than copied for null superimposition
+  (`wrapDecimalState`);
+- flatten incoming structs via child `column_view`s, not copies
+  (`flattenDecimalState`).
+
+Two paths copy, both off the production hot path: a struct that arrives with
+a parent null mask has every carried child copied with the mask folded in,
+and the version-skew widen in `normalizeDecimalStateBatches` copies children
+into the wider struct.
 
 The remaining gap to a compact HTTP wire format is inherent to the Java plan
 type and is addressed only by section 9.
@@ -300,247 +321,35 @@ This proposal does not conflict with it. The struct the GPU produces here is
 what the plan's logical type would become; when the registration changes,
 the pack in 6.2 and the normalization in 6.3 delete themselves.
 
-A one-line core change is worth making now regardless:
-`DecimalAggregate::addIntermediateResults` (`DecimalAggregate.h:173-175`)
+A one-line core change is worth making regardless, and is not part of this
+series: `DecimalAggregate::addIntermediateResults` (`DecimalAggregate.h`)
 does an unchecked `dynamic_cast` to `FlatVector<StringView>`. Replace with
 `VELOX_CHECK_NOT_NULL` so a mismatched intermediate is an error, not a null
 dereference.
 
-## 10. Plan
+## 10. Implementation map
 
-1. Rebase and keep the branch's orthogonal commits as-is: fused DECIMAL64
-   reduce (`8b2c9edb13`), streaming final group-by, and temporaries release.
-   Treat the cuDF fork pin in `CMake/resolve_dependency_modules/cudf.cmake`
-   as a separate decision.
-2. Add shape helpers to `exec/DecimalAggregationState.{h,cpp}`:
-   `wrapDecimalState(flat columns, function, rawType) -> struct`,
-   `flattenDecimalState(column_view) -> flat columns` for STRING or any
-   struct shape, `packDecimalState(struct) -> STRING` for all shapes, and
-   `normalizeDecimalStateBatches(views, rowType)`.
-3. Rewrite the producer and consumer paths in `CudfGroupby` and `CudfReduce`
-   against those helpers (6.1).
-4. Add the pack step to `CudfToVelox` (6.2), the normalization to the concat
-   funnel (6.3), and the evaluator guard (6.4).
-5. Delete `CudfPhysicalEncoding`, `CudfColumnEncoding`, the tag plumbing in
-   `CudfVector`, `acceptsNativeDecimalSumState`, `NativeDecimalSumEligibility`,
-   the opt-ins in `CudfFilterProject`, `CudfLimit`, `CudfLocalPartition`,
-   and `CudfBatchConcat`, and the branch's design notes.
-6. Tests: all four shapes; positive, negative, zero, and cancelling sums;
-   null and all-null groups; DECIMAL64 extremes; DECIMAL(38) range check;
-   mixed STRING and STRUCT batches; zero-row batches; GPU partial to CPU
-   final through `CudfToVelox`; CPU partial to GPU final through
-   `CudfFromVelox`; UCX round trip; local-exchange round trip.
-7. Re-measure Q18 under the two-driver managed-memory configuration used on
-   the branch and confirm the peak holds at about 90 GB.
-8. Separately, open the `VELOX_CHECK_NOT_NULL` change in Velox core and start
-   the registration-level discussion in section 9.
-
-## 11. Resuming this work on 4u8g-tur-0042
-
-Facts gathered on 2026-10-02 from the target host:
-
-- Hostname `4u8g-tur-0042`, user `knataraj`, `$HOME=/home/nfs/knataraj`
-  (NFS, 97% full, about 879 GB free). Root filesystem is local NVMe with
-  about 2.1 TB free. `/raid` is full. `/datasets` is an NFS share with
-  about 32 TB free.
-- 8 GPUs, NVIDIA RTX PRO 6000 Blackwell Server Edition, 96 GB each,
-  driver 595.71.
-- Docker works for this user. GitHub SSH works as `karthikeyann`.
-- `~/.bash_aliases` already defines `docrun`, `docstop`, `compile`, and
-  `tests` (the same file as on the workstation). `docrun` expects to be run
-  from the Velox checkout and needs `~/docker-compose.override.yml`.
-- None of `velox`, `velox-testing`, or `presto` is checked out there yet.
-
-### 11.1 Workspace layout
-
-`velox-testing/presto/scripts/start_presto_helper.sh` requires `presto` and
-`velox` as sibling directories of `velox-testing`. Put all three under one
-workspace root on the local NVMe disk rather than on NFS. Pick a writable
-directory on `/` (check with `df -h /` and `touch`), for example:
-
-```bash
-export WS=/scratch/knataraj      # or another writable path on the local disk
-mkdir -p "$WS" && cd "$WS"
-```
-
-If no local path is writable, use `$HOME` and expect slower builds.
-
-### 11.2 Clone and check out
-
-```bash
-cd "$WS"
-
-# Velox: upstream plus the fork that holds the branch under review.
-git clone git@github.com:karthikeyann/velox.git velox
-cd velox
-git remote add upstream https://github.com/facebookincubator/velox.git
-git remote add shrshi https://github.com/shrshi/velox.git
-git remote add rapids git@github.com:rapidsai/velox.git
-git fetch upstream main
-git fetch shrshi perf/cudf-decimal64-global-reduction
-git checkout -b perf/cudf-decimal64-global-reduction \
-  shrshi/perf/cudf-decimal64-global-reduction
-# Confirm the base this document was written against.
-git merge-base upstream/main HEAD        # expect af34c8f33a
-git log --oneline -1                     # expect 8b8acc1ba9
-cd ..
-
-# Presto: prestodb master is what the workstation uses.
-git clone git@github.com:prestodb/presto.git presto
-git -C presto remote add kn git@github.com:karthikeyann/presto.git
-
-# velox-testing: rapidsai main.
-git clone git@github.com:rapidsai/velox-testing.git velox-testing
-git -C velox-testing remote add kn git@github.com:karthikeyann/velox-testing.git
-```
-
-Copy this document into the Velox checkout if it is not already there:
-
-```bash
-mkdir -p "$WS/velox/docs/designs"
-cp ~/cudf-self-describing-decimal-aggregate-state.md "$WS/velox/docs/designs/"
-```
-
-### 11.3 Create the implementation branch
-
-Do the implementation on a new branch that keeps the orthogonal commits and
-replaces the two encoding commits (section 10, step 1):
-
-```bash
-cd "$WS/velox"
-git checkout -b perf/cudf-decimal-state-self-describing \
-  shrshi/perf/cudf-decimal64-global-reduction
-```
-
-Either revert the two encoding commits and re-add the producer and consumer
-work on top, or cherry-pick the orthogonal commits onto `af34c8f33a` and
-start clean. The orthogonal commits are `8b2c9edb13`, `cb8bf9270b`,
-`d5f87999cb`, `2b4cf3c00c`, `a757c247fb`, `3e5c85b239`, `8b8acc1ba9`. The
-encoding commits to replace are `ff261707e4` and `53bc297a6b`. Note that
-`cb8bf9270b` is almost entirely the two markdown notes in `exec/`; drop
-those files.
-
-### 11.4 Build and unit test (inside Docker)
-
-Velox compile and test commands only work inside the Docker environment.
-From the Velox checkout:
-
-```bash
-cd "$WS/velox"
-docrun                      # starts or attaches to velox-adapters-cuda-knataraj
-# Inside the container the checkout is mounted at /velox.
-cd /velox
-compile                     # CUDA_ARCHITECTURES=native, cuDF, Arrow, Parquet, benchmarks
-cd /velox/_build/release
-ninja -j "$(nproc)"
-```
-
-The UCX exchange is built only if the container has UCX headers and
-libraries. Check `grep UCX_LIBRARY CMakeCache.txt` in the build directory.
-On the workstation it was not found, so the UCX operator tests did not
-build there. The multi-GPU UCX test in section 11.6 goes through the
-Prestissimo images built by velox-testing, which include UCX.
-
-Targeted tests:
-
-```bash
-cd /velox/_build/release
-ctest -R velox_cudf_decimal_aggregation_test --output-on-failure
-ctest -R velox_cudf_aggregation_test --output-on-failure
-ctest -R velox_cudf_vector_test --output-on-failure
-ctest -R velox_cudf_batch_concat_test --output-on-failure
-ctest -R ucx_exchange_test --output-on-failure      # only if UCX was found
-ctest -R cudf --output-on-failure                    # full cuDF suite
-```
-
-Leave Docker with `docstop` when done.
-
-### 11.5 SF1000 decimal data and single-GPU run
-
-velox-testing generates TPC-H with native DECIMAL columns unless
-`--convert-decimals-to-floats` is passed, so the default is the right one for
-this work. Generation at SF1000 produces roughly 1 TB of Parquet; put
-`PRESTO_DATA_DIR` on the local NVMe disk or on `/datasets`. Check first
-whether an SF1000 dataset already exists under `/datasets`.
-
-```bash
-cd "$WS/velox-testing/presto/scripts"
-export PRESTO_DATA_DIR=/datasets/knataraj/presto-data    # or a local path
-
-# Build images from the sibling checkouts and start one GPU worker.
-./start_native_gpu_presto.sh -b native-gpu --build-type release -w 1 -g 0
-
-# Generate data and tables once. Decimals stay DECIMAL by default.
-./setup_benchmark_data_and_tables.sh -b tpch -f 1000 -s tpch_sf1000 \
-  -d tpch_sf1000 -j "$(( $(nproc) / 2 ))"
-
-# Correctness: Q18 plus the decimal-heavy aggregation queries.
-./run_benchmark.sh -b tpch -s tpch_sf1000 -q 1,6,18 -i 1 \
-  -t self-describing-state -o ./benchmark_output
-```
-
-Q1 covers decimal `sum` and `avg` on both DECIMAL64 inputs and computed
-expressions. Q6 covers a global decimal `sum`. Q18 is the memory case. For
-result validation, run the same queries against the Java or native CPU
-variant (`start_java_presto.sh` or `start_native_cpu_presto.sh`) into a
-reference directory and pass it with `--reference-results-dir`.
-
-Memory measurement for Q18 should reproduce the branch's configuration:
-two drivers per task, `cudf.memory_resource=managed`,
-`cudf.concat_optimization_enabled=true`,
-`cudf.batch_size_min_threshold=100000000`,
-`cudf.batch_size_max_threshold=500000000`. The worker template is
-`presto/docker/config/template/overrides/gpu/etc_worker/config_native.properties`;
-edit the generated copy under `presto/docker/config/generated/gpu/` or
-regenerate with `--overwrite-config`. Profile with `run_benchmark.sh -p`,
-which uses `profiler_functions.sh`, and compare peak allocation to the
-branch's reported figure of about 90 GB.
-
-### 11.6 Multi-GPU UCX run
-
-`generate_presto_config.sh` flips `cudf.exchange=true` automatically when
-more than one worker is requested, and `cudf.intra_node_exchange=true` is
-already in the GPU worker template. So the multi-GPU UCX path is:
-
-```bash
-cd "$WS/velox-testing/presto/scripts"
-./stop_presto.sh
-./start_native_gpu_presto.sh -w 8 -g 0,1,2,3,4,5,6,7 --single-container
-./run_benchmark.sh -b tpch -s tpch_sf1000 -q 1,6,18 -i 1 \
-  -t self-describing-state-ucx -o ./benchmark_output
-```
-
-With several workers, the partial-to-final edge for Q18 goes through
-`UcxPartitionedOutput` and `UcxExchange`, which is the path where the branch's
-tag was lost (section 3) and where this design needs no code. Verify:
-
-- results match the single-GPU run and the CPU reference;
-- worker logs show no `validateIntermediateColumnType` or cuDF type-mismatch
-  errors;
-- peak GPU allocation per worker is consistent with 16 bytes per group for
-  the Q18 state column.
-
-Then run the same with `-w 2` to exercise a smaller exchange fan-out, and
-once with a mixed CPU and GPU setup if practical, to hit the string-versus-
-struct normalization in the concat funnel (section 6.3).
-
-### 11.7 Implementation checklist
-
-In this order, each step buildable and testable on its own:
-
-1. Shape helpers in `exec/DecimalAggregationState.{h,cpp}` and kernel
-   extensions in `exec/DecimalAggregationDevice.cu`. Unit-test pack and
-   flatten round trips for all four shapes against the existing
-   `serializeDecimalSumState` and `deserializeDecimalSumState` output.
-2. Widen `validateIntermediateColumnType` in
-   `exec/DecimalAggregationHostOps.cpp` to accept the struct shapes.
-3. `CudfGroupby` and `CudfReduce` producer and consumer (section 6.1).
-   Existing decimal aggregation tests must pass unchanged in results.
-4. `CudfToVelox` pack (section 6.2). GPU partial to CPU final test.
-5. Concat-funnel normalization (section 6.3), including zero-row batches.
-6. Expression evaluator guard (section 6.4).
-7. Delete the tag, opt-in, and eligibility code (section 10, step 5).
-8. Audit every site that builds cuDF columns from a Velox `TypePtr`
-   (`makeEmptyTable` and any empty outputs in joins or partitions) and
-   confirm each flows through the funnel or never meets a struct batch.
-9. SF1000 single-GPU, then multi-GPU UCX (sections 11.5 and 11.6).
+1. Shape helpers in `exec/DecimalAggregationState.{h,cpp}`:
+   `wrapDecimalState(DecimalStateColumns, DecimalStateShape, stream, mr)`,
+   `unwrapDecimalState(struct)`,
+   `flattenDecimalState(view, scale, needCount, needOverflow, stream, mr)`
+   for STRING or any struct shape, `packDecimalState(struct, stream, mr)`
+   for all shapes, `unpackDecimalState(blob, shape, scale, stream, mr)`, and
+   `normalizeDecimalStateBatches(views, stream, mr)`; plus
+   `normalizeDecimalStateTableViews(tableViews, rowType, stream, mr)` in
+   `exec/Utilities.h`. The shape is resolved from the plan by
+   `decimalStateInfoFor` and FINAL goes through `finalizeDecimalSum` and
+   `finalizeDecimalAverage` (`exec/DecimalAggregationHostOps.h`).
+2. Producer and consumer paths in `CudfGroupby` and `CudfReduce` against
+   those helpers (6.1).
+3. The pack step in `CudfToVelox` (6.2), the normalization in the concat
+   funnel (6.3), and the guards in `CudfFilterProject`, `CudfDistinct` and
+   `CudfMarkDistinct` (6.3, 6.4).
+4. Tests: all four shapes; positive, negative, zero, and cancelling sums;
+   null and all-null groups; DECIMAL64 extremes; DECIMAL(38) range check and
+   CPU-blob overflow folding; mixed STRING and STRUCT batches; zero-row
+   batches; GPU partial to CPU final through `CudfToVelox`; CPU partial to
+   GPU final through `CudfFromVelox`; local-exchange round trip. The UCX
+   round trip and the Q18 re-measurement under the two-driver managed-memory
+   configuration remain to be run.
+5. Separately, start the registration-level discussion in section 9.

@@ -47,14 +47,21 @@ namespace facebook::velox::cudf_velox {
 ///   kAvg128 : [sum, count, overflow]         nothing missing
 ///
 /// The struct parent carries no null mask when a producer emits it: a state
-/// row is null exactly when `sum` is null. Consumers nevertheless tolerate a
-/// parent mask (for example after a nullifying gather) and treat a row as
-/// null when the parent or the sum child is null.
+/// row is null exactly when `sum` is null. flattenDecimalState and
+/// packDecimalState nevertheless tolerate a parent mask (for example after a
+/// nullifying gather) and fold it into every child they expose, so a row the
+/// parent marks null is null in sum, count and overflow alike.
+/// unwrapDecimalState does not: it only sees structs the group-by buffered
+/// itself.
 ///
 /// Known limitation: GPU producers do not track int128 carries (cuDF's
 /// DECIMAL128 SUM wraps modulo 2^128), so the overflow child they emit is
-/// always 0. A nonzero overflow can only come from a CPU-produced blob and is
-/// honoured when merging and finalizing, following the CPU rules.
+/// always 0. A nonzero overflow can only come from a CPU-produced blob. On
+/// merge the overflow children are summed exactly while the sum children wrap
+/// modulo 2^128, so the merged pair is congruent to the true total modulo
+/// 2^128 but is not in the CPU's canonical form; FINAL therefore folds it as
+/// sum + overflow * 2^127 modulo 2^128 (see finalizeDecimalSum and
+/// finalizeDecimalAverage in DecimalAggregationHostOps.h).
 enum class DecimalStateShape : uint8_t {
   kSum64,
   kSum128,
@@ -63,27 +70,6 @@ enum class DecimalStateShape : uint8_t {
 };
 
 VELOX_DECLARE_ENUM_NAME(DecimalStateShape);
-
-/// Child positions of the state fields for one shape. The single source of
-/// truth for the struct layout; nothing else may hard-code child indices.
-struct DecimalStateLayout {
-  static constexpr int kAbsent = -1;
-
-  int sum;
-  int count; // kAbsent when the shape has no count child
-  int overflow; // kAbsent when the shape has no overflow child
-  int numChildren;
-
-  constexpr bool hasCount() const {
-    return count != kAbsent;
-  }
-
-  constexpr bool hasOverflow() const {
-    return overflow != kAbsent;
-  }
-};
-
-DecimalStateLayout decimalStateLayout(DecimalStateShape shape);
 
 /// True if the shape carries a count child.
 bool decimalStateHasCount(DecimalStateShape shape);
@@ -150,22 +136,15 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
     rmm::device_async_resource_ref mr);
 
 /// Finalizes AVG from flat state: divides each sum by its count with the
-/// CPU's rounding (DecimalUtil::computeAverage), honouring a nonzero
-/// `overflow` when given, and produces a column of the sum's decimal type.
-/// Rows are null where the sum or count is null or the count is zero.
-/// `overflow` may be a default-constructed (size 0) view when the state does
-/// not carry the field.
+/// CPU's rounding (DecimalUtil::computeAverage for a canonical nonzero
+/// `overflow`, the folded total otherwise; see detail::averageRoundDecimalSum)
+/// and produces a column of the sum's decimal type. Rows are null where the
+/// sum or count is null or the count is zero. `overflow` must be a
+/// default-constructed (size 0) view when the state does not carry the field.
 std::unique_ptr<cudf::column> computeDecimalAverage(
     const cudf::column_view& sumCol,
     const cudf::column_view& countCol,
     const cudf::column_view& overflowCol,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr);
-
-/// Same as above for a state without an overflow field.
-std::unique_ptr<cudf::column> computeDecimalAverage(
-    const cudf::column_view& sumCol,
-    const cudf::column_view& countCol,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
@@ -208,8 +187,8 @@ struct FlatDecimalState {
   cudf::column_view count; // INT64; synthesized 1s if absent and requested
   cudf::column_view overflow; // INT64; synthesized 0s if absent and requested
   // Storage behind the views above when they do not alias the input: every
-  // field for a STRING input, synthesized fields for a struct input, and the
-  // sum when a struct parent carried a null mask.
+  // field for a STRING input, synthesized fields for a struct input, and
+  // every carried field when a struct parent carried a null mask.
   DecimalStateColumns owned;
 };
 
@@ -229,8 +208,10 @@ FlatDecimalState flattenDecimalState(
     rmm::device_async_resource_ref mr);
 
 /// Unpacks a STRING blob into a struct of the requested shape; the inverse of
-/// packDecimalState. `scale` is the decimal scale of the sum. Used by
-/// normalizeDecimalStateBatches when a blob batch meets struct batches.
+/// packDecimalState. `scale` is the decimal scale of the sum. The only
+/// production caller is normalizeDecimalStateBatches (a blob batch meeting
+/// struct batches); it is public so the blob-to-struct direction can be
+/// tested per shape independently of the batch normalization policy.
 std::unique_ptr<cudf::column> unpackDecimalState(
     const cudf::column_view& blobColumn,
     DecimalStateShape shape,

@@ -20,6 +20,7 @@
 // builders and readers for state columns of any physical form, and the
 // GPU-versus-CPU plan comparison those columns feed.
 
+#include "velox/experimental/cudf/exec/DecimalAggregationDevice.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
@@ -48,13 +49,9 @@
 #include <utility>
 #include <vector>
 
-namespace facebook::velox::cudf_velox {
+namespace facebook::velox::cudf_velox::test {
 
 inline constexpr int kBitsPerWord = 8 * sizeof(cudf::bitmask_type);
-
-/// Bytes per row of the CPU decimal state blob: count int64, overflow int64,
-/// sum low uint64, sum high int64 (little endian).
-inline constexpr size_t kDecimalStateBlobBytes = 32;
 
 inline constexpr DecimalStateShape kAllDecimalStateShapes[] = {
     DecimalStateShape::kSum64,
@@ -63,17 +60,24 @@ inline constexpr DecimalStateShape kAllDecimalStateShapes[] = {
     DecimalStateShape::kAvg128,
 };
 
-/// Shape name for test names and traces.
-inline std::string decimalStateShapeLabel(DecimalStateShape shape) {
+/// The fields a struct of `shape` carries besides the sum, per the shape
+/// table in DecimalAggregationState.h. Kept here, independent of the
+/// production layout code, so the tests pin the documented layout.
+struct DecimalStateFields {
+  bool hasCount;
+  bool hasOverflow;
+};
+
+inline DecimalStateFields decimalStateFields(DecimalStateShape shape) {
   switch (shape) {
     case DecimalStateShape::kSum64:
-      return "kSum64";
+      return {false, false};
     case DecimalStateShape::kSum128:
-      return "kSum128";
+      return {false, true};
     case DecimalStateShape::kAvg64:
-      return "kAvg64";
+      return {true, false};
     case DecimalStateShape::kAvg128:
-      return "kAvg128";
+      return {true, true};
   }
   VELOX_UNREACHABLE();
 }
@@ -301,9 +305,10 @@ inline std::unique_ptr<cudf::column> makeDecimalStateBlob(
   std::vector<char> chars;
   for (cudf::size_type row = 0; row < numRows; ++row) {
     if (!compactNullRows || valid == nullptr || (*valid)[row]) {
-      chars.resize(chars.size() + kDecimalStateBlobBytes);
+      chars.resize(chars.size() + detail::kDecimalSumStateSize);
       encodeDecimalStateRow(
-          rows[row], chars.data() + chars.size() - kDecimalStateBlobBytes);
+          rows[row],
+          chars.data() + chars.size() - detail::kDecimalSumStateSize);
     }
     offsets.push_back(static_cast<int32_t>(chars.size()));
   }
@@ -354,7 +359,7 @@ inline std::vector<std::optional<HostDecimalState>> readDecimalStateBlob(
     const auto begin = offsets[view.offset() + row];
     VELOX_CHECK_EQ(
         static_cast<size_t>(offsets[view.offset() + row + 1] - begin),
-        kDecimalStateBlobBytes);
+        detail::kDecimalSumStateSize);
     rows[row] = decodeDecimalStateRow(chars.data() + begin);
   }
   return rows;
@@ -384,10 +389,10 @@ struct DecimalStateRows {
   /// back as count 1 and overflow 0.
   DecimalStateRows as(DecimalStateShape shape) const {
     auto rows = *this;
-    if (!decimalStateHasCount(shape)) {
+    if (!decimalStateFields(shape).hasCount) {
       rows.counts.assign(size(), 1);
     }
-    if (!decimalStateHasOverflow(shape)) {
+    if (!decimalStateFields(shape).hasOverflow) {
       rows.overflows.assign(size(), 0);
     }
     return rows;
@@ -421,10 +426,10 @@ inline std::unique_ptr<cudf::column> makeDecimalStateStruct(
     rmm::device_async_resource_ref mr) {
   DecimalStateColumns flat;
   flat.sum = makeDecimalColumn<int128_t>(rows.sums, scale, &rows.valid, stream);
-  if (decimalStateHasCount(shape)) {
+  if (decimalStateFields(shape).hasCount) {
     flat.count = makeInt64Column(rows.counts, nullptr, stream);
   }
-  if (decimalStateHasOverflow(shape)) {
+  if (decimalStateFields(shape).hasOverflow) {
     flat.overflow = makeInt64Column(rows.overflows, nullptr, stream);
   }
   return wrapDecimalState(std::move(flat), shape, stream, mr);
@@ -497,4 +502,4 @@ inline void assertCudfMatchesCpu(
       .assertResults(expected);
 }
 
-} // namespace facebook::velox::cudf_velox
+} // namespace facebook::velox::cudf_velox::test

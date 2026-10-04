@@ -86,6 +86,40 @@ std::optional<DecimalStateShape> tryDecimalStateShapeOf(
   return std::nullopt;
 }
 
+// Child positions of the state fields for one shape. The single source of
+// truth for the struct layout; nothing else may hard-code child indices.
+struct DecimalStateLayout {
+  static constexpr int kAbsent = -1;
+
+  int sum;
+  int count; // kAbsent when the shape has no count child
+  int overflow; // kAbsent when the shape has no overflow child
+  int numChildren;
+
+  constexpr bool hasCount() const {
+    return count != kAbsent;
+  }
+
+  constexpr bool hasOverflow() const {
+    return overflow != kAbsent;
+  }
+};
+
+DecimalStateLayout decimalStateLayout(DecimalStateShape shape) {
+  constexpr int kAbsent = DecimalStateLayout::kAbsent;
+  switch (shape) {
+    case DecimalStateShape::kSum64:
+      return {0, kAbsent, kAbsent, 1};
+    case DecimalStateShape::kSum128:
+      return {1, kAbsent, 0, 2};
+    case DecimalStateShape::kAvg64:
+      return {0, 1, kAbsent, 2};
+    case DecimalStateShape::kAvg128:
+      return {0, 1, 2, 3};
+  }
+  VELOX_UNREACHABLE();
+}
+
 // Returns a view of child `index` restricted to the parent's row range. For an
 // unsliced parent this is exactly cudf::column_view::child (no device work);
 // for a sliced parent it is cudf::structs_column_view::get_sliced_child, which
@@ -361,41 +395,9 @@ std::unique_ptr<cudf::column> serializeDecimalStateImpl(
       std::move(nullMask));
 }
 
-
 } // namespace
 
-std::unique_ptr<cudf::column> unpackDecimalState(
-    const cudf::column_view& blobColumn,
-    DecimalStateShape shape,
-    int32_t scale,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
-  auto flat = deserializeDecimalStateImpl(
-      blobColumn,
-      scale,
-      decimalStateHasCount(shape),
-      decimalStateHasOverflow(shape),
-      stream,
-      mr);
-  return wrapDecimalState(std::move(flat), shape, stream, mr);
-}
-
 VELOX_DEFINE_ENUM_NAME(DecimalStateShape, decimalStateShapeNames);
-
-DecimalStateLayout decimalStateLayout(DecimalStateShape shape) {
-  constexpr int kAbsent = DecimalStateLayout::kAbsent;
-  switch (shape) {
-    case DecimalStateShape::kSum64:
-      return {0, kAbsent, kAbsent, 1};
-    case DecimalStateShape::kSum128:
-      return {1, kAbsent, 0, 2};
-    case DecimalStateShape::kAvg64:
-      return {0, 1, kAbsent, 2};
-    case DecimalStateShape::kAvg128:
-      return {0, 1, 2, 3};
-  }
-  VELOX_UNREACHABLE();
-}
 
 bool decimalStateHasCount(DecimalStateShape shape) {
   return decimalStateLayout(shape).hasCount();
@@ -521,15 +523,6 @@ std::unique_ptr<cudf::column> computeDecimalAverage(
     average->set_null_mask(std::move(nullMask), nullCount);
   }
   return average;
-}
-
-std::unique_ptr<cudf::column> computeDecimalAverage(
-    const cudf::column_view& sumCol,
-    const cudf::column_view& countCol,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
-  return computeDecimalAverage(
-      sumCol, countCol, cudf::column_view{}, stream, mr);
 }
 
 std::unique_ptr<cudf::column> wrapDecimalState(
@@ -662,25 +655,33 @@ FlatDecimalState flattenDecimalState(
   auto const layout = decimalStateLayout(shape);
   auto const numRows = state.size();
 
-  flat.sum = stateChild(state, layout.sum, stream);
-  if (state.null_count() > 0) {
-    // Producers never emit a parent mask, but a nullifying gather (for example
-    // an outer join probe) adds one. A row is null when the parent or the sum
-    // child is null, so fold the parent mask into an owned copy of the sum.
+  // Producers never emit a parent mask, but a nullifying gather (for example
+  // an outer join probe) adds one. A row is null when the parent or the child
+  // is null, so when the parent has nulls every carried child is exposed as
+  // an owned copy with the parent mask folded in: the merge sums count and
+  // overflow as well as sum, and must skip the same rows in each.
+  auto const parentHasNulls = state.null_count() > 0;
+  auto carriedChild = [&](int index, std::unique_ptr<cudf::column>& storage) {
+    auto child = stateChild(state, index, stream);
+    if (!parentHasNulls) {
+      return child;
+    }
     auto [mask, nullCount] =
-        cudf::bitmask_and(cudf::table_view{{state, flat.sum}}, stream, mr);
-    flat.owned.sum = std::make_unique<cudf::column>(flat.sum, stream, mr);
-    flat.owned.sum->set_null_mask(std::move(mask), nullCount);
-    flat.sum = flat.owned.sum->view();
-  }
+        cudf::bitmask_and(cudf::table_view{{state, child}}, stream, mr);
+    storage = std::make_unique<cudf::column>(child, stream, mr);
+    storage->set_null_mask(std::move(mask), nullCount);
+    return storage->view();
+  };
+
+  flat.sum = carriedChild(layout.sum, flat.owned.sum);
   if (layout.hasCount()) {
-    flat.count = stateChild(state, layout.count, stream);
+    flat.count = carriedChild(layout.count, flat.owned.count);
   } else if (needCount) {
     flat.owned.count = makeConstantInt64Column(1, numRows, stream, mr);
     flat.count = flat.owned.count->view();
   }
   if (layout.hasOverflow()) {
-    flat.overflow = stateChild(state, layout.overflow, stream);
+    flat.overflow = carriedChild(layout.overflow, flat.owned.overflow);
   } else if (needOverflow) {
     flat.owned.overflow = makeConstantInt64Column(0, numRows, stream, mr);
     flat.overflow = flat.owned.overflow->view();
@@ -692,11 +693,7 @@ std::unique_ptr<cudf::column> packDecimalState(
     const cudf::column_view& structColumn,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  VELOX_CHECK(
-      isDecimalStateStruct(structColumn),
-      "Column is not a decimal aggregate state struct: {} with {} children",
-      cudf::type_to_name(structColumn.type()),
-      structColumn.num_children());
+  auto const layout = decimalStateLayout(decimalStateShapeOf(structColumn));
   // The scale argument is unused for a struct; fields the struct carries are
   // exposed without synthesis.
   auto flat = flattenDecimalState(
@@ -706,13 +703,28 @@ std::unique_ptr<cudf::column> packDecimalState(
       /*needOverflow=*/false,
       stream,
       get_temp_mr());
-  auto const layout = decimalStateLayout(decimalStateShapeOf(structColumn));
   return serializeDecimalStateImpl(
       flat.sum,
       layout.hasCount() ? &flat.count : nullptr,
       layout.hasOverflow() ? &flat.overflow : nullptr,
       stream,
       mr);
+}
+
+std::unique_ptr<cudf::column> unpackDecimalState(
+    const cudf::column_view& blobColumn,
+    DecimalStateShape shape,
+    int32_t scale,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  auto flat = deserializeDecimalStateImpl(
+      blobColumn,
+      scale,
+      decimalStateHasCount(shape),
+      decimalStateHasOverflow(shape),
+      stream,
+      mr);
+  return wrapDecimalState(std::move(flat), shape, stream, mr);
 }
 
 std::vector<std::unique_ptr<cudf::column>> normalizeDecimalStateBatches(

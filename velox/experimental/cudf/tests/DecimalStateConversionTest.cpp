@@ -39,7 +39,7 @@
 #include <optional>
 #include <string_view>
 
-namespace facebook::velox::cudf_velox {
+namespace facebook::velox::cudf_velox::test {
 namespace {
 
 using exec::test::AssertQueryBuilder;
@@ -186,17 +186,19 @@ class DecimalStateConversionTest : public exec::test::OperatorTestBase {
     for (vector_size_t row = 0; row < result->size(); ++row) {
       const auto key = keys->valueAt(row);
       SCOPED_TRACE(
-          fmt::format("shape {} key {}", decimalStateShapeLabel(shape), key));
+          fmt::format(
+              "shape {} key {}", DecimalStateShapeName::toName(shape), key));
       const auto& state = expected.at(key);
       if (state.count == 0) {
         EXPECT_TRUE(states->isNullAt(row));
         continue;
       }
       ASSERT_FALSE(states->isNullAt(row));
-      ASSERT_EQ(states->valueAt(row).size(), kDecimalStateBlobBytes);
+      ASSERT_EQ(states->valueAt(row).size(), detail::kDecimalSumStateSize);
       const auto decoded = decodeDecimalStateRow(states->valueAt(row).data());
       EXPECT_TRUE(decoded.sum == state.sum);
-      EXPECT_EQ(decoded.count, decimalStateHasCount(shape) ? state.count : 1);
+      EXPECT_EQ(
+          decoded.count, decimalStateFields(shape).hasCount ? state.count : 1);
       EXPECT_EQ(decoded.overflow, 0);
     }
   }
@@ -224,7 +226,9 @@ INSTANTIATE_TEST_SUITE_P(
     DecimalStateShapes,
     DecimalStateConversionShapeTest,
     ::testing::ValuesIn(kAllDecimalStateShapes),
-    [](const auto& info) { return decimalStateShapeLabel(info.param); });
+    [](const auto& info) {
+      return std::string(DecimalStateShapeName::toName(info.param));
+    });
 
 // Pass-through operators carry the struct untouched: an identity projection
 // that reorders and renames, a filter and a computed projection on another
@@ -352,4 +356,4 @@ TEST_F(DecimalStateConversionTest, gpuPartialCpuFinalMatchesCpu) {
 }
 
 } // namespace
-} // namespace facebook::velox::cudf_velox
+} // namespace facebook::velox::cudf_velox::test

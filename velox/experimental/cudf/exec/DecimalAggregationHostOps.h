@@ -64,26 +64,15 @@ cudf::column_view castDecimal64InputToDecimal128(
     std::unique_ptr<cudf::column>& holder,
     cuda::stream_ref stream);
 
-/// Ensures the partial-row count column is INT64, casting with the temporary
-/// memory resource when the incoming type differs (the result is consumed
-/// internally, not part of operator output).
-std::unique_ptr<cudf::column> castCountColumnToInt64(
-    std::unique_ptr<cudf::column> count,
-    cuda::stream_ref stream);
-
-/// Raises a "Decimal overflow" user error if any valid row of the DECIMAL128
-/// `sum` column lies outside the DECIMAL(38) range. One device pass and one
-/// host sync.
-void validateDecimalSumResult(
-    const cudf::column_view& sum,
-    cuda::stream_ref stream);
-
 /// FINAL step for decimal SUM, matching the CPU DecimalSumAggregate: folds the
-/// merged `overflow` field into `sum` following
-/// DecimalUtil::adjustSumForOverflow (a nullptr `overflow` means the field was
-/// not tracked and is zero), raises a "Decimal overflow" user error where the
-/// CPU would, checks the DECIMAL(38) range, and casts to `resultType`. One
-/// device pass and one host sync for the validation.
+/// merged `overflow` field into `sum` as sum + overflow * 2^127 modulo 2^128
+/// (the exact total of a state produced by DecimalUtil::addWithOverflow,
+/// applied without adjustSumForOverflow's sign predicate because a GPU merge
+/// wraps the sum children; see foldDecimalSumOverflow), raises the CPU's
+/// "Decimal overflow" user error where the folded sum leaves the DECIMAL(38)
+/// range, and casts to `resultType`. A nullptr `overflow` means the field was
+/// not tracked and is zero. One device pass and one host sync for the
+/// validation.
 std::unique_ptr<cudf::column> finalizeDecimalSum(
     std::unique_ptr<cudf::column> sum,
     std::unique_ptr<cudf::column> overflow,
@@ -92,10 +81,11 @@ std::unique_ptr<cudf::column> finalizeDecimalSum(
     rmm::device_async_resource_ref mr);
 
 /// FINAL step for decimal AVG, matching the CPU DecimalAverageAggregateBase:
-/// normalizes `count` to INT64, divides with the rounding of
-/// DecimalUtil::computeAverage (honouring a nonzero `overflow`; nullptr means
-/// the field was not tracked), then casts to `resultType`. Like the CPU, no
-/// range check is applied to the average.
+/// normalizes `count` and `overflow` to INT64, divides with the rounding of
+/// DecimalUtil::computeAverage for a canonical nonzero `overflow` and with the
+/// folded total otherwise (nullptr means the field was not tracked), then
+/// casts to `resultType`. Like the CPU, no range check is applied to the
+/// average.
 std::unique_ptr<cudf::column> finalizeDecimalAverage(
     std::unique_ptr<cudf::column> sum,
     std::unique_ptr<cudf::column> count,
