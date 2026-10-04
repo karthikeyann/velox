@@ -106,11 +106,8 @@ struct DecimalStateColumns {
   std::unique_ptr<cudf::column> overflow; // INT64 or nullptr
 };
 
-/// Kept for the sum/count producers and the CPU-interchange codec below.
-using DecimalSumStateColumns = DecimalStateColumns;
-
 /// Directly reduces DECIMAL64 input into one DECIMAL128 sum and INT64 count.
-DecimalSumStateColumns reduceDecimal64SumCount(
+DecimalStateColumns reduceDecimal64SumCount(
     const cudf::column_view& input,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
@@ -122,7 +119,7 @@ DecimalSumStateColumns reduceDecimal64SumCount(
 /// propagates the blob's null mask to both outputs. Production code goes
 /// through flattenDecimalState; this entry point is kept for tests that pin
 /// the blob layout.
-DecimalSumStateColumns deserializeDecimalSumState(
+DecimalStateColumns deserializeDecimalSumState(
     const cudf::column_view& stateCol,
     int32_t scale,
     cuda::stream_ref stream);

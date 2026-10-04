@@ -579,33 +579,38 @@ struct GroupbyDecimalSumAggregator final : GroupbyDecimalStateAggregator {
       std::vector<cudf::groupby::aggregation_result>& results,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
-    if (step == core::AggregationNode::Step::kPartial) {
-      DecimalStateColumns flat;
-      flat.sum = std::move(results[sumIdx_].results[0]);
-      if (decimalStateHasCount(stateInfo_.shape)) {
-        flat.count = std::move(results[sumIdx_].results[1]);
+    switch (step) {
+      case core::AggregationNode::Step::kSingle: {
+        auto sum = std::move(results[sumIdx_].results[0]);
+        auto const cudfResType = cudf_velox::veloxToCudfDataType(resultType);
+        if (sum->type() != cudfResType) {
+          sum = cudf::cast(*sum, cudfResType, stream, mr);
+        }
+        return sum;
       }
-      return wrapDecimalState(std::move(flat), stateInfo_.shape, stream, mr);
+      case core::AggregationNode::Step::kPartial: {
+        DecimalStateColumns flat;
+        flat.sum = std::move(results[sumIdx_].results[0]);
+        if (decimalStateHasCount(stateInfo_.shape)) {
+          flat.count = std::move(results[sumIdx_].results[1]);
+        }
+        return wrapDecimalState(std::move(flat), stateInfo_.shape, stream, mr);
+      }
+      case core::AggregationNode::Step::kIntermediate:
+        return wrapDecimalState(
+            takeMergedState(results), stateInfo_.shape, stream, mr);
+      case core::AggregationNode::Step::kFinal: {
+        auto merged = takeMergedState(results);
+        return finalizeDecimalSum(
+            std::move(merged.sum),
+            std::move(merged.overflow),
+            resultType,
+            stream,
+            mr);
+      }
     }
-    if (step == core::AggregationNode::Step::kIntermediate) {
-      return wrapDecimalState(
-          takeMergedState(results), stateInfo_.shape, stream, mr);
-    }
-    if (step == core::AggregationNode::Step::kFinal) {
-      auto merged = takeMergedState(results);
-      return finalizeDecimalSum(
-          std::move(merged.sum),
-          std::move(merged.overflow),
-          resultType,
-          stream,
-          mr);
-    }
-    auto sum = std::move(results[sumIdx_].results[0]);
-    auto const cudfResType = cudf_velox::veloxToCudfDataType(resultType);
-    if (sum->type() != cudfResType) {
-      sum = cudf::cast(*sum, cudfResType, stream, mr);
-    }
-    return sum;
+    // All four aggregation steps are handled above.
+    VELOX_UNREACHABLE();
   }
 
   std::unique_ptr<cudf::column> finalize(

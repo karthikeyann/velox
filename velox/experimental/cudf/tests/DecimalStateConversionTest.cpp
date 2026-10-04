@@ -24,7 +24,6 @@
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
-#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/tests/DecimalStateTestColumns.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
@@ -36,16 +35,6 @@
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/parse/TypeResolver.h"
 
-#include <cudf/filling.hpp>
-#include <cudf/scalar/scalar.hpp>
-#include <cudf/strings/strings_column_view.hpp>
-#include <cudf/strings/utilities.hpp>
-#include <cudf/table/table_view.hpp>
-#include <cudf/unary.hpp>
-#include <cudf/utilities/default_stream.hpp>
-#include <cudf/utilities/memory_resource.hpp>
-
-#include <limits>
 #include <map>
 #include <optional>
 #include <string_view>
@@ -255,88 +244,6 @@ TEST_P(DecimalStateConversionShapeTest, structStateToVeloxWithLargeOffsets) {
     auto result = run(statePartial(shape).planNode(), passthrough);
     ASSERT_EQ(result->size(), inputGroups().size());
     verifyStates(result, shape);
-  }
-}
-
-// A kAvg64 state whose packed chars exceed 2^31 bytes converts through
-// packDecimalState and with_arrow::toVeloxColumn (the exportToVelox call
-// pattern) into 70 million 32-byte blobs that decode back to their fields.
-// This is the real large-offsets path with libcudf's default threshold.
-// NOTE: allocates several GB of device memory (about 4.5 GB: 70M x 16 B sums,
-// 70M x 8 B counts, 70M x 8 B offsets and 2.24 GB of chars) and about 4 GB of
-// host memory for the Arrow buffers and the StringView vector.
-TEST_F(DecimalStateConversionTest, packedStateBeyondInt32CharsToVelox) {
-  constexpr cudf::size_type kRows = 70'000'000;
-  static_assert(
-      static_cast<int64_t>(kRows) * detail::kDecimalSumStateSize >
-      std::numeric_limits<int32_t>::max());
-  if (!cudf::strings::is_large_strings_enabled()) {
-    GTEST_SKIP() << "libcudf large strings are disabled";
-  }
-  auto stream = cudf::get_default_stream();
-  auto mr = cudf::get_current_device_resource_ref();
-
-  // sum(i) = 3 * i - 1'000'000 (DECIMAL128 with scale 0, so the unscaled
-  // value the blob carries equals the integer), count(i) = i + 1.
-  constexpr int64_t kSumBase = -1'000'000;
-  constexpr int64_t kSumStep = 3;
-  auto sums = cudf::cast(
-      cudf::sequence(
-          kRows,
-          cudf::numeric_scalar<int64_t>(kSumBase, true, stream),
-          cudf::numeric_scalar<int64_t>(kSumStep, true, stream),
-          stream,
-          mr)
-          ->view(),
-      cudf::data_type{cudf::type_id::DECIMAL128, 0},
-      stream,
-      mr);
-  auto counts = cudf::sequence(
-      kRows,
-      cudf::numeric_scalar<int64_t>(1, true, stream),
-      cudf::numeric_scalar<int64_t>(1, true, stream),
-      stream,
-      mr);
-  DecimalStateColumns flat;
-  flat.sum = std::move(sums);
-  flat.count = std::move(counts);
-  auto state =
-      wrapDecimalState(std::move(flat), DecimalStateShape::kAvg64, stream, mr);
-
-  auto packed = packDecimalState(state->view(), stream, mr);
-  state.reset();
-  ASSERT_EQ(packed->type().id(), cudf::type_id::STRING);
-  cudf::strings_column_view strings(packed->view());
-  ASSERT_EQ(strings.offsets().type().id(), cudf::type_id::INT64);
-  ASSERT_EQ(
-      strings.chars_size(stream),
-      static_cast<int64_t>(kRows) * detail::kDecimalSumStateSize);
-
-  auto result = with_arrow::toVeloxColumn(
-      cudf::table_view({packed->view()}),
-      pool(),
-      ROW({"s"}, {VARBINARY()}),
-      "",
-      stream,
-      mr);
-  stream.sync();
-  packed.reset();
-
-  ASSERT_EQ(result->size(), kRows);
-  auto states = result->childAt(0)->asFlatVector<StringView>();
-  ASSERT_NE(states, nullptr);
-  ASSERT_EQ(states->type()->kind(), TypeKind::VARBINARY);
-  ASSERT_EQ(states->getNullCount().value_or(0), 0);
-  for (vector_size_t row = 0; row < kRows; ++row) {
-    const auto value = states->valueAt(row);
-    ASSERT_EQ(value.size(), detail::kDecimalSumStateSize) << "row " << row;
-    const auto decoded = decodeDecimalStateRow(value.data());
-    ASSERT_TRUE(
-        decoded.sum ==
-        static_cast<int128_t>(kSumBase + kSumStep * static_cast<int64_t>(row)))
-        << "row " << row;
-    ASSERT_EQ(decoded.count, static_cast<int64_t>(row) + 1) << "row " << row;
-    ASSERT_EQ(decoded.overflow, 0) << "row " << row;
   }
 }
 

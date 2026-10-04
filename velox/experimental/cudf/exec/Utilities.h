@@ -27,8 +27,12 @@
 
 namespace facebook::velox::cudf_velox {
 
-/// Concatenates table views into one table. Every concatenation of operator
-/// batches goes through here rather than cudf::concatenate directly: libcudf
+/// Concatenates table views into one table. The batch-concat paths
+/// (concatenateTables, getConcatenatedTable and getConcatenatedTableBatched)
+/// go through here rather than cudf::concatenate directly. The two-way
+/// concatenations in CudfDistinct, CudfMarkDistinct and CudfGroupby still call
+/// cudf::concatenate: with two inputs libcudf only selects the fused path
+/// described next for totals of a few MB, far below its limit. libcudf
 /// concatenates many small string inputs with a fused kernel that takes the
 /// output character count as a 32-bit cudf::size_type, so when the inputs add
 /// up to 2 GB or more of characters the count is truncated and the characters

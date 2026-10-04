@@ -293,18 +293,18 @@ struct ReduceMeanAggregator : ReduceAggregator {
 };
 
 // Materializes reduced sum/count scalars into 1-row columns.
-cudf_velox::DecimalSumStateColumns makeSumCountColumns(
+cudf_velox::DecimalStateColumns makeSumCountColumns(
     cudf::scalar const& sumScalar,
     cudf::scalar const& countScalar,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  cudf_velox::DecimalSumStateColumns cols;
+  cudf_velox::DecimalStateColumns cols;
   cols.sum = cudf::make_column_from_scalar(sumScalar, 1, stream, mr);
   cols.count = cudf::make_column_from_scalar(countScalar, 1, stream, mr);
   return cols;
 }
 
-cudf_velox::DecimalSumStateColumns reduceRawDecimalSumCount(
+cudf_velox::DecimalStateColumns reduceRawDecimalSumCount(
     cudf::column_view inputCol,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
@@ -369,11 +369,8 @@ std::unique_ptr<cudf::column> partialDecimalState(
     const DecimalStateInfo& info,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  auto flat = reduceRawDecimalSumCount(inputCol, stream, mr);
-  if (!decimalStateHasCount(info.shape)) {
-    flat.count.reset();
-  }
-  return wrapDecimalState(std::move(flat), info.shape, stream, mr);
+  return wrapDecimalState(
+      reduceRawDecimalSumCount(inputCol, stream, mr), info.shape, stream, mr);
 }
 
 // kIntermediate: merge incoming state and re-emit the plan shape.

@@ -418,11 +418,11 @@ DecimalStateShape decimalStateShapeFor(
                               : DecimalStateShape::kSum64;
 }
 
-DecimalSumStateColumns reduceDecimal64SumCount(
+DecimalStateColumns reduceDecimal64SumCount(
     const cudf::column_view& input,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  DecimalSumStateColumns result;
+  DecimalStateColumns result;
   result.sum = cudf::make_fixed_width_column(
       cudf::data_type{cudf::type_id::DECIMAL128, input.type().scale()},
       1,
@@ -447,7 +447,7 @@ DecimalSumStateColumns reduceDecimal64SumCount(
   return result;
 }
 
-DecimalSumStateColumns deserializeDecimalSumState(
+DecimalStateColumns deserializeDecimalSumState(
     const cudf::column_view& stateCol,
     int32_t scale,
     cuda::stream_ref stream) {

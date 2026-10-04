@@ -747,6 +747,7 @@ TEST_F(CudfBatchConcatTest, singleZeroColumnBatchSplitsAtMaxThreshold) {
 // written: the offsets are right and the data is whatever the allocation held.
 // A hash join build side at TPC-H SF1000 (Q5, Q8) hits this and loses the
 // nation names. The funnel must keep the characters.
+// NOTE: needs about 2.5 GB of device memory.
 TEST_F(CudfBatchConcatTest, manySmallStringBatchesOverTwoGigabytes) {
   constexpr int kNumBatches = 6'000;
   constexpr cudf::size_type kRowsPerBatch = 40'000;
