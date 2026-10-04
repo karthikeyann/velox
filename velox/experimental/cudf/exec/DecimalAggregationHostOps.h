@@ -27,11 +27,13 @@
 namespace facebook::velox::cudf_velox {
 
 /**
- * Asserts that a column holds serialized decimal aggregate state in the form
- * Velox uses for VARBINARY: a cuDF STRING column whose bytes are the packed
- * sum/count payloads (see serializeDecimalSumState). The payload does not carry
- * scale, so VARBINARY intermediate steps decode at scale 0; the real scale is
- * applied at final cast time.
+ * Asserts that a column holds decimal aggregate state under a Velox VARBINARY
+ * logical type: either a cuDF STRING column whose bytes are the packed
+ * sum/count/overflow payloads (see serializeDecimalSumState) or a
+ * self-describing decimal state STRUCT (see isDecimalStateColumn in
+ * DecimalAggregationState.h). The blob does not carry scale, so VARBINARY
+ * intermediate steps decode it at scale 0; the real scale is applied at final
+ * cast time. A struct carries its scale on the sum child.
  *
  * @param column column to validate.
  */

@@ -41,11 +41,10 @@ namespace {
 
 // Mirrors the CPU LongDecimalWithOverflowState layout so serialized SUM state
 // is interchangeable between CPU and GPU aggregation.
-// TODO: Track int128 overflow as the CPU does (DecimalUtil::addWithOverflow);
-// the `overflow` field is reserved for that and is always 0 until then.
 struct DecimalSumState {
   int64_t count; // count of non-null input rows aggregated
-  int64_t overflow; // net int128 carries (CPU parity); always 0 on GPU for now
+  int64_t overflow; // net int128 carries (CPU parity); 0 unless a producer
+                    // carried an overflow column
   uint64_t lower; // lower 64 bits of the decimal sum
   int64_t upper; // upper 64 bits of the decimal sum (signed)
 };
@@ -109,10 +108,14 @@ struct FillOffsetsFunctor {
   }
 };
 
+// `counts` and `overflows` may be nullptr, in which case the blob fields are
+// filled with 1 and 0 respectively (the values a state that does not carry
+// them is defined to have).
 template <typename SumT, typename OffsetT>
 struct PackStateFunctor {
   cuda::std::span<const SumT> sums;
-  cuda::std::span<const int64_t> counts;
+  const int64_t* counts;
+  const int64_t* overflows;
   cuda::std::span<const OffsetT> offsets;
   uint8_t* chars;
 
@@ -122,8 +125,8 @@ struct PackStateFunctor {
     int64_t upper;
     uint64_t lower;
     splitToWords(sums[idx], upper, lower);
-    state->count = counts[idx];
-    state->overflow = 0;
+    state->count = counts ? counts[idx] : int64_t{1};
+    state->overflow = overflows ? overflows[idx] : int64_t{0};
     state->lower = lower;
     state->upper = upper;
   }
@@ -135,6 +138,7 @@ struct UnpackStateFunctor {
   const uint8_t* chars;
   cuda::std::span<__int128_t> sums;
   cuda::std::span<int64_t> counts;
+  int64_t* overflows; // may be nullptr
   cudf::bitmask_type const* nullMask;
 
   __device__ void operator()(cudf::size_type idx) const {
@@ -147,6 +151,9 @@ struct UnpackStateFunctor {
     int64_t offset = static_cast<int64_t>(offsets[idx]);
     auto* state = reinterpret_cast<const DecimalSumState*>(chars + offset);
     counts[idx] = state->count;
+    if (overflows) {
+      overflows[idx] = state->overflow;
+    }
     sums[idx] = (static_cast<__int128_t>(state->upper) << 64) | state->lower;
   }
 };
@@ -329,6 +336,7 @@ struct unpackDecimalSumStateKernel {
   const uint8_t* chars;
   cudf::mutable_column_view sumView;
   cudf::mutable_column_view countView;
+  int64_t* overflows;
   cudf::size_type numRows;
   cudf::bitmask_type const* nullMask;
   cuda::stream_ref stream;
@@ -346,6 +354,7 @@ struct unpackDecimalSumStateKernel {
               chars,
               cuda::std::span<__int128_t>{sumView.data<__int128_t>(), n},
               cuda::std::span<int64_t>{countView.data<int64_t>(), n},
+              overflows,
               nullMask};
         },
         stream);
@@ -390,6 +399,7 @@ struct averageRoundDecimalSumKernel {
 struct packDecimalSumStateKernel {
   cudf::column_view sumCol;
   const int64_t* counts;
+  const int64_t* overflows;
   cudf::column_view offsetsView;
   uint8_t* chars;
   cudf::size_type numRows;
@@ -405,7 +415,8 @@ struct packDecimalSumStateKernel {
         [&] {
           return PackStateFunctor<SumT, OffsetT>{
               cuda::std::span<const SumT>{sums, n},
-              cuda::std::span<const int64_t>{counts, n},
+              counts,
+              overflows,
               cuda::std::span<const OffsetT>{offsetsView.data<OffsetT>(), n},
               chars};
         },
@@ -435,13 +446,21 @@ void unpackDecimalSumState(
     const uint8_t* chars,
     cudf::mutable_column_view sumView,
     cudf::mutable_column_view countView,
+    int64_t* overflows,
     cudf::size_type numRows,
     cudf::bitmask_type const* nullMask,
     cuda::stream_ref stream) {
   cudf::type_dispatcher(
       cudf::data_type{offsetType},
       unpackDecimalSumStateKernel{
-          offsetsView, chars, sumView, countView, numRows, nullMask, stream});
+          offsetsView,
+          chars,
+          sumView,
+          countView,
+          overflows,
+          numRows,
+          nullMask,
+          stream});
 }
 
 void averageRoundDecimalSum(
@@ -461,6 +480,7 @@ void packDecimalSumState(
     cudf::type_id offsetType,
     cudf::column_view sumCol,
     const int64_t* counts,
+    const int64_t* overflows,
     cudf::column_view offsetsView,
     uint8_t* chars,
     cudf::size_type numRows,
@@ -469,7 +489,7 @@ void packDecimalSumState(
       cudf::data_type{sumType},
       cudf::data_type{offsetType},
       packDecimalSumStateKernel{
-          sumCol, counts, offsetsView, chars, numRows, stream});
+          sumCol, counts, overflows, offsetsView, chars, numRows, stream});
 }
 
 std::pair<cuda::device_buffer<std::byte>, cudf::size_type>

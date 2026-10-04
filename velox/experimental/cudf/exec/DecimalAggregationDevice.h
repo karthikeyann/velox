@@ -62,14 +62,16 @@ void fillOffsetsForDecimalSumState(
     cuda::stream_ref stream);
 
 /**
- * Encodes each row's partial sum and count into the fixed-width device layout
- * used for VARBINARY interchange.
+ * Encodes each row's partial sum, count and overflow into the fixed-width
+ * device layout used for VARBINARY interchange.
  *
  * @param sumType DECIMAL64 or DECIMAL128; selects sum storage width.
  * @param offsetType INT32 or INT64; selects offset storage width. sumType and
  *        offsetType are dispatched via cudf::double_type_dispatcher.
  * @param sumCol per-row sums.
- * @param counts per-row int64 counts.
+ * @param counts per-row int64 counts, or nullptr to write 1 for every row.
+ * @param overflows per-row int64 overflow carries, or nullptr to write 0 for
+ *        every row.
  * @param offsetsView per-row byte offsets into chars.
  * @param chars output payload buffer.
  * @param numRows number of rows.
@@ -80,6 +82,7 @@ void packDecimalSumState(
     cudf::type_id offsetType,
     cudf::column_view sumCol,
     const int64_t* counts,
+    const int64_t* overflows,
     cudf::column_view offsetsView,
     uint8_t* chars,
     cudf::size_type numRows,
@@ -94,6 +97,8 @@ void packDecimalSumState(
  * @param chars packed payload buffer.
  * @param sumView output per-row DECIMAL128 sums.
  * @param countView output per-row counts.
+ * @param overflows output per-row overflow carries, or nullptr to drop the
+ *        overflow field.
  * @param numRows number of rows.
  * @param nullMask device null-mask bitmap; null rows are skipped to avoid
  *        out-of-bounds reads when Arrow compacts null payloads.  Pass nullptr
@@ -106,6 +111,7 @@ void unpackDecimalSumState(
     const uint8_t* chars,
     cudf::mutable_column_view sumView,
     cudf::mutable_column_view countView,
+    int64_t* overflows,
     cudf::size_type numRows,
     cudf::bitmask_type const* nullMask,
     cuda::stream_ref stream);

@@ -23,17 +23,18 @@
 #include "velox/common/base/Exceptions.h"
 
 #include <cudf/unary.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 namespace facebook::velox::cudf_velox {
 
 void validateIntermediateColumnType(cudf::column_view const& column) {
-  // fmt does not understand cudf::type_id enum class
-  auto const colType = static_cast<int>(column.type().id());
-  VELOX_CHECK_EQ(
-      colType,
-      static_cast<int>(cudf::type_id::STRING),
-      "Expected serialized decimal aggregation state: Velox VARBINARY represented as cuDF STRING (got type {})",
-      colType);
+  if (isDecimalStateColumn(column)) {
+    return;
+  }
+  VELOX_FAIL(
+      "Expected decimal aggregation state: Velox VARBINARY represented as a cuDF STRING blob or a decimal state STRUCT ([sum], [overflow, sum], [sum, count] or [sum, count, overflow]); got {} with {} children",
+      cudf::type_to_name(column.type()),
+      column.num_children());
 }
 
 cudf::column_view castDecimal64InputToDecimal128(

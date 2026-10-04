@@ -204,9 +204,26 @@ FlatDecimalState flattenDecimalState(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
+/// Decodes a STRING blob into sum, count AND overflow (deserializeDecimalSumState
+/// drops the overflow field). All three outputs carry a copy of the blob's
+/// null mask when it has one. Allocates from `mr`.
+DecimalStateColumns deserializeDecimalSumStateWithOverflow(
+    cudf::column_view const& stateCol,
+    int32_t scale,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
+
 /// Packs a decimal state struct of any shape into the 32-byte STRING blob
-/// (count/overflow filled in as 1/0 when the shape lacks them). Output null
-/// mask follows the `sum` child. Used by CudfToVelox before Arrow export.
+/// (count/overflow filled in as 1/0 when the shape lacks them). Used by
+/// CudfToVelox before Arrow export.
+///
+/// Validity: when the shape has no count child the output null mask is a copy
+/// of the `sum` child's mask. When it has one, the output follows the same
+/// rule as serializeDecimalSumState (buildStateValidityMask): a row is null if
+/// `sum` or `count` is null or `count` is zero. Both rules agree for every
+/// struct a producer emits (count is non-null and non-zero exactly where sum
+/// is non-null), and the second keeps packDecimalState byte- and mask-equal to
+/// serializeDecimalSumState for the same sum/count inputs.
 std::unique_ptr<cudf::column> packDecimalState(
     cudf::column_view const& structColumn,
     cuda::stream_ref stream,
@@ -240,8 +257,10 @@ std::unique_ptr<cudf::column> makeEmptyDecimalStateLike(
 ///   * zero-row batches of either form  -> re-typed to the chosen form.
 /// Replacement columns are returned and the corresponding entries of `views`
 /// are rebound to them; the caller must keep the returned vector alive until
-/// after cudf::concatenate. `scale` is only consulted when every batch is a
-/// blob (no-op) or when unpacking blobs; struct batches carry their scale.
+/// after cudf::concatenate. Struct batches carry their scale on the `sum`
+/// child and that scale is the one blobs are unpacked to (blobs carry none);
+/// `scale` is used only when no struct batch is present (which makes the call
+/// a no-op), so callers that decode VARBINARY at scale 0 are still correct.
 std::vector<std::unique_ptr<cudf::column>> normalizeDecimalStateBatches(
     std::vector<cudf::column_view>& views,
     int32_t scale,
