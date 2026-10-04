@@ -87,6 +87,19 @@ RowVectorPtr CudfMarkDistinct::doGetOutput() {
     return nullptr;
   }
 
+  // A decimal aggregate state carried as a cuDF STRUCT under a logical
+  // VARBINARY cannot be a distinct key: the raw concatenate of seen keys and
+  // the hash join would compare physical forms, not logical states.
+  const auto& inputRowType = cudfInput->type()->asRow();
+  for (const auto keyIndex : distinctKeyIndices_) {
+    VELOX_CHECK(
+        inputRowType.childAt(keyIndex)->kind() != TypeKind::VARBINARY ||
+            tableView.column(keyIndex).type().id() != cudf::type_id::STRUCT,
+        "CudfMarkDistinct does not support a decimal aggregate state as a "
+        "distinct key (input column {})",
+        keyIndex);
+  }
+
   // Extract key columns from the input batch.
   auto batchKeys = tableView.select(distinctKeyIndices_);
 

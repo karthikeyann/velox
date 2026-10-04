@@ -109,6 +109,19 @@ void CudfDistinct::doAddInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
 
+  // A decimal aggregate state carried as a cuDF STRUCT under a logical
+  // VARBINARY cannot be a distinct key: the raw concatenate below and
+  // cudf::distinct would compare physical forms, not logical states.
+  for (const auto channel : groupingKeyInputChannels_) {
+    VELOX_CHECK(
+        inputType_->childAt(channel)->kind() != TypeKind::VARBINARY ||
+            cudfInput->getTableView().column(channel).type().id() !=
+                cudf::type_id::STRUCT,
+        "CudfDistinct does not support a decimal aggregate state as a "
+        "distinct key (input channel {})",
+        channel);
+  }
+
   if (isPartialOutput_) {
     computePartialDistinctStreaming(cudfInput);
     return;

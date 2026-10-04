@@ -16,8 +16,9 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
-#include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/common/testutil/TestValue.h"
@@ -83,7 +84,149 @@ vector_size_t checkedVectorSize(size_t rowCount) {
       "cuDF vector row count exceeds Velox vector size limit");
   return static_cast<vector_size_t>(rowCount);
 }
+
+// True if two decimal-state candidate columns have the same physical form,
+// i.e. cudf::concatenate would accept them together. STRING columns match
+// regardless of offset width (cudf::concatenate handles mixed INT32/INT64
+// offsets). STRUCT columns match when their direct children have identical
+// data types (which includes the decimal scale). Host-side metadata only.
+bool samePhysicalForm(const cudf::column_view& a, const cudf::column_view& b) {
+  if (a.type() != b.type()) {
+    return false;
+  }
+  if (a.type().id() != cudf::type_id::STRUCT) {
+    return true;
+  }
+  if (a.num_children() != b.num_children()) {
+    return false;
+  }
+  for (cudf::size_type i = 0; i < a.num_children(); ++i) {
+    if (a.child(i).type() != b.child(i).type()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// True if column `col` does not have one physical form across `views`.
+bool hasMixedPhysicalForm(
+    const std::vector<cudf::table_view>& views,
+    cudf::size_type col) {
+  const auto first = views.front().column(col);
+  for (size_t i = 1; i < views.size(); ++i) {
+    if (!samePhysicalForm(first, views[i].column(col))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Velox scale of the sum carried by the first decimal state struct in
+// `columns`, or 0 if every column is a STRING blob. In the all-blob case
+// normalizeDecimalStateBatches is a no-op, so the scale is never consulted.
+int32_t decimalStateScale(const std::vector<cudf::column_view>& columns) {
+  for (const auto& column : columns) {
+    if (!isDecimalStateStruct(column)) {
+      continue;
+    }
+    const auto sumIndex =
+        decimalStateShapeOf(column) == DecimalStateShape::kSum128 ? 1 : 0;
+    // cuDF stores the negated Velox scale.
+    return -column.child(sumIndex).type().scale();
+  }
+  return 0;
+}
 } // namespace
+
+std::vector<std::unique_ptr<cudf::column>> normalizeDecimalStateTableViews(
+    std::vector<cudf::table_view>& tableViews,
+    const TypePtr& tableType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  std::vector<std::unique_ptr<cudf::column>> replacements;
+  if (tableViews.size() <= 1 || tableType == nullptr || !tableType->isRow()) {
+    return replacements;
+  }
+
+  // Candidate columns: logical VARBINARY. Every view of a CudfVector has as
+  // many columns as its row type; tolerate narrower views (e.g. projections)
+  // by only considering indices present in all of them.
+  cudf::size_type numColumns = std::numeric_limits<cudf::size_type>::max();
+  for (const auto& view : tableViews) {
+    numColumns = std::min(numColumns, view.num_columns());
+  }
+  numColumns =
+      std::min(numColumns, static_cast<cudf::size_type>(tableType->size()));
+
+  std::vector<cudf::size_type> mixedColumns;
+  for (cudf::size_type col = 0; col < numColumns; ++col) {
+    if (tableType->childAt(col)->kind() == TypeKind::VARBINARY &&
+        hasMixedPhysicalForm(tableViews, col)) {
+      mixedColumns.push_back(col);
+    }
+  }
+  if (mixedColumns.empty()) {
+    return replacements;
+  }
+
+  // Zero-row views contribute nothing to the result. Drop them while at least
+  // one non-empty view remains, so an empty STRING table from makeEmptyTable
+  // never has to be re-typed. If every view is empty they are all kept and
+  // normalizeDecimalStateBatches re-types them to one form.
+  const bool anyNonEmpty =
+      std::any_of(tableViews.begin(), tableViews.end(), [](const auto& view) {
+        return view.num_rows() > 0;
+      });
+  if (anyNonEmpty) {
+    std::erase_if(
+        tableViews, [](const auto& view) { return view.num_rows() == 0; });
+    if (tableViews.size() <= 1) {
+      return replacements;
+    }
+    std::erase_if(mixedColumns, [&](cudf::size_type col) {
+      return !hasMixedPhysicalForm(tableViews, col);
+    });
+    if (mixedColumns.empty()) {
+      return replacements;
+    }
+  }
+
+  // Materialize per-batch column lists so individual columns can be rebound.
+  std::vector<std::vector<cudf::column_view>> batchColumns;
+  batchColumns.reserve(tableViews.size());
+  for (const auto& view : tableViews) {
+    batchColumns.emplace_back(view.begin(), view.end());
+  }
+
+  std::vector<cudf::column_view> columnViews(tableViews.size());
+  for (const auto col : mixedColumns) {
+    for (size_t b = 0; b < tableViews.size(); ++b) {
+      columnViews[b] = batchColumns[b][col];
+      VELOX_CHECK(
+          isDecimalStateColumn(columnViews[b]),
+          "Cannot concatenate VARBINARY column {} whose physical cuDF type "
+          "differs across batches and is not a decimal aggregate state "
+          "(batch {} has cuDF type id {})",
+          col,
+          b,
+          static_cast<int32_t>(columnViews[b].type().id()));
+    }
+    auto columnReplacements = normalizeDecimalStateBatches(
+        columnViews, decimalStateScale(columnViews), stream, mr);
+    for (size_t b = 0; b < tableViews.size(); ++b) {
+      batchColumns[b][col] = columnViews[b];
+    }
+    std::move(
+        columnReplacements.begin(),
+        columnReplacements.end(),
+        std::back_inserter(replacements));
+  }
+
+  for (size_t b = 0; b < tableViews.size(); ++b) {
+    tableViews[b] = cudf::table_view(batchColumns[b]);
+  }
+  return replacements;
+}
 
 std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,
@@ -155,6 +298,11 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
 
   cudf::detail::join_streams(inputStreams, stream);
 
+  // Bring decimal aggregate state columns to one physical form. The returned
+  // replacement columns back the rebound views until concatenate is enqueued.
+  const auto decimalStateReplacements = normalizeDecimalStateTableViews(
+      tableViews, tableType, stream, get_temp_mr());
+
   // Even for a single input table we must concatenate (copy) rather than
   // release in-place: the output is owned by `stream` but the input buffer was
   // allocated on a different stream, so releasing it would bind deallocation to
@@ -208,7 +356,15 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     }
 
     cudf::detail::join_streams(inputStreams, stream);
-    outputTables.push_back(cudf::concatenate(tableViews, stream, mr));
+    // Normalization is per output batch: each output is uniform, but two
+    // outputs may carry a decimal state column in different physical forms.
+    // Consumers accept either form per batch, and normalizing per batch keeps
+    // peak memory bounded by one output batch.
+    {
+      const auto decimalStateReplacements = normalizeDecimalStateTableViews(
+          tableViews, tableType, stream, get_temp_mr());
+      outputTables.push_back(cudf::concatenate(tableViews, stream, mr));
+    }
 
     // Rebind deallocation to the output stream where possible, then release
     // this group's inputs. Each completed output replaces its source inputs,
