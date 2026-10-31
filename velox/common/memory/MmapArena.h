@@ -41,7 +41,28 @@ class MmapArena {
   ~MmapArena();
 
   void* allocate(uint64_t bytes);
-  void free(void* address, uint64_t bytes);
+
+  /// Returns the block of 'bytes' at 'address' to the arena. The first
+  /// 'residentBytes' of the block, rounded up to a huge page boundary, stay
+  /// mapped and are retained for reuse: a later allocation that gets these
+  /// addresses uses them without page faults and sees their old contents.
+  /// Retained memory elsewhere in the block is advised away.
+  void free(void* address, uint64_t bytes, uint64_t residentBytes);
+
+  /// Stops retaining the memory in [address, address + bytes) and returns how
+  /// many of these bytes were retained. The caller uses this memory from now
+  /// on, e.g. a new allocation or the growth of one.
+  uint64_t takeRetained(void* address, uint64_t bytes);
+
+  /// Advises away retained memory until at least 'targetBytes' are released or
+  /// nothing is retained. Returns the number of bytes released.
+  uint64_t releaseRetained(uint64_t targetBytes);
+
+  /// Returns the number of bytes that free() retained and that are not taken
+  /// or released since.
+  uint64_t retainedBytes() const {
+    return retainedBytes_;
+  }
 
   void* address() const {
     return reinterpret_cast<void*>(address_);
@@ -103,6 +124,14 @@ class MmapArena {
 
   void removeFreeBlock(std::map<uintptr_t, uint64_t>::iterator& itr);
 
+  // Adds [address, address + bytes), which must not overlap a retained range,
+  // to 'retained_'.
+  void addRetained(uintptr_t address, uint64_t bytes);
+
+  // Removes [begin, end) from 'retained_' and returns the number of bytes
+  // removed. Advises away the removed memory if 'adviseAway' is true.
+  uint64_t removeRetained(uintptr_t begin, uintptr_t end, bool adviseAway);
+
   // Total capacity size of this arena.
   const uint64_t byteSize_;
 
@@ -118,6 +147,15 @@ class MmapArena {
   // A sorted look-up structure that stores the block size as key and a set of
   // addresses of that size as value.
   std::map<uint64_t, std::unordered_set<uintptr_t>> freeLookup_;
+
+  // Mapped memory kept by free() for reuse, from start address to size. The
+  // ranges do not overlap and adjacent ones are merged. A range lies in free
+  // blocks or in the part of an allocated block beyond the size of its
+  // allocation, e.g. the unused reserve of a growable contiguous allocation.
+  std::map<uintptr_t, uint64_t> retained_;
+
+  // Sum of the sizes in 'retained_'.
+  uint64_t retainedBytes_{0};
 };
 
 /// A class that manages a set of MmapArenas. It is able to adapt itself by
@@ -131,13 +169,30 @@ class ManagedMmapArenas {
 
   void* allocate(uint64_t bytes);
 
-  void free(void* address, uint64_t bytes);
+  /// Frees the block in the arena that contains 'address'. See
+  /// MmapArena::free(). An empty arena other than the current one is unmapped,
+  /// together with the memory it retained.
+  void free(void* address, uint64_t bytes, uint64_t residentBytes);
+
+  /// See MmapArena::takeRetained().
+  uint64_t takeRetained(void* address, uint64_t bytes);
+
+  /// See MmapArena::releaseRetained().
+  uint64_t releaseRetained(uint64_t targetBytes);
+
+  /// Returns the memory retained by all arenas.
+  uint64_t retainedBytes() const;
 
   const std::map<uintptr_t, std::shared_ptr<MmapArena>>& arenas() const {
     return arenas_;
   }
 
  private:
+  // Returns the arena that contains 'bytes' at 'address'.
+  std::map<uintptr_t, std::shared_ptr<MmapArena>>::iterator findArena(
+      void* address,
+      uint64_t bytes);
+
   // Capacity in bytes for a single MmapArena managed by this.
   const uint64_t singleArenaCapacity_;
 

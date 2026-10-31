@@ -406,8 +406,7 @@ bool MmapAllocator::allocateContiguousImpl(
   if (numLargeCollateralPages > 0) {
     useHugePages(allocation, false);
     if (useMmapArena_) {
-      std::lock_guard<std::mutex> l(arenaMutex_);
-      managedArenas_->free(allocation.data(), allocation.maxSize());
+      freeToArenas(allocation);
     } else {
       if (::munmap(allocation.data(), allocation.maxSize()) < 0) {
         VELOX_MEM_LOG(ERROR) << "munmap got " << folly::errnoStr(errno)
@@ -512,6 +511,9 @@ bool MmapAllocator::allocateContiguousImpl(
     rollbackAllocation(numToMap);
     return false;
   }
+  if (useMmapArena_) {
+    takeFromArenas(data, AllocationTraits::pageBytes(numPages));
+  }
   // Arena-backed allocations are already bound when their arena region is
   // mapped; only direct mmap allocations bind here.
   if (onMap_ && !useMmapArena_) {
@@ -536,8 +538,7 @@ void MmapAllocator::freeContiguousImpl(ContiguousAllocation& allocation) {
   }
   useHugePages(allocation, false);
   if (useMmapArena_) {
-    std::lock_guard<std::mutex> l(arenaMutex_);
-    managedArenas_->free(allocation.data(), allocation.maxSize());
+    freeToArenas(allocation);
   } else {
     if (::munmap(allocation.data(), allocation.maxSize()) < 0) {
       VELOX_MEM_LOG(ERROR) << "munmap returned " << folly::errnoStr(errno)
@@ -548,6 +549,38 @@ void MmapAllocator::freeContiguousImpl(ContiguousAllocation& allocation) {
   numExternalMapped_ -= allocation.numPages();
   numAllocated_ -= allocation.numPages();
   allocation.clear();
+}
+
+void MmapAllocator::freeToArenas(const ContiguousAllocation& allocation) {
+  // The counters change under 'arenaMutex_', so that a concurrent
+  // releaseRetained() cannot subtract the pages before they are added.
+  std::lock_guard<std::mutex> l(arenaMutex_);
+  const auto retainedBefore = managedArenas_->retainedBytes();
+  managedArenas_->free(
+      allocation.data(), allocation.maxSize(), allocation.size());
+  const auto retainedAfter = managedArenas_->retainedBytes();
+  // Usually grows by the pages of 'allocation'. Retaining up to a huge page
+  // boundary adds more. Retained memory in the rest of the block, or in an
+  // arena that became empty and was unmapped, is subtracted.
+  if (retainedAfter >= retainedBefore) {
+    const auto numPages =
+        AllocationTraits::numPages(retainedAfter - retainedBefore);
+    numRetained_ += numPages;
+    numMapped_ += numPages;
+  } else {
+    const auto numPages =
+        AllocationTraits::numPages(retainedBefore - retainedAfter);
+    numRetained_ -= numPages;
+    numMapped_ -= numPages;
+  }
+}
+
+void MmapAllocator::takeFromArenas(void* address, uint64_t bytes) {
+  std::lock_guard<std::mutex> l(arenaMutex_);
+  const auto numPages =
+      AllocationTraits::numPages(managedArenas_->takeRetained(address, bytes));
+  numRetained_ -= numPages;
+  numMapped_ -= numPages;
 }
 
 bool MmapAllocator::growContiguousWithoutRetry(
@@ -593,6 +626,11 @@ bool MmapAllocator::growContiguousWithCapacity(
   }
 
   numExternalMapped_ += increment;
+  if (useMmapArena_) {
+    takeFromArenas(
+        allocation.data<char>() + allocation.size(),
+        AllocationTraits::pageBytes(increment));
+  }
   allocation.set(
       allocation.data(),
       allocation.size() + AllocationTraits::pageBytes(increment),
@@ -674,6 +712,12 @@ void MmapAllocator::markAllMapped(const Allocation& allocation) {
 
 MachinePageCount MmapAllocator::adviseAway(MachinePageCount target) {
   MachinePageCount numAway = 0;
+  if (useMmapArena_) {
+    std::lock_guard<std::mutex> l(arenaMutex_);
+    numAway = AllocationTraits::numPages(
+        managedArenas_->releaseRetained(AllocationTraits::pageBytes(target)));
+    numRetained_ -= numAway;
+  }
   for (int32_t i = sizeClasses_.size() - 1; i >= 0 && numAway < target; --i) {
     for (auto& sizeClass : sizeClasses_[i]) {
       numAway += sizeClass->adviseAway(target - numAway);
@@ -1103,11 +1147,22 @@ bool MmapAllocator::checkConsistency() const {
                            << " recorded= "
                            << numAllocated_ - numExternalMapped_;
   }
-  if (mappedCount != numMapped_ - numExternalMapped_) {
+  if (mappedCount != numMapped_ - numExternalMapped_ - numRetained_) {
     ++numErrors;
     VELOX_MEM_LOG(WARNING) << "Mapped count out of sync. Actual= "
-                           << mappedCount + numExternalMapped_
+                           << mappedCount + numExternalMapped_ + numRetained_
                            << " recorded= " << numMapped_;
+  }
+  if (useMmapArena_) {
+    std::lock_guard<std::mutex> l(arenaMutex_);
+    const auto arenaRetained =
+        AllocationTraits::numPages(managedArenas_->retainedBytes());
+    if (arenaRetained != numRetained_) {
+      ++numErrors;
+      VELOX_MEM_LOG(WARNING)
+          << "Retained count out of sync. Actual= " << arenaRetained
+          << " recorded= " << numRetained_;
+    }
   }
   if (numErrors) {
     VELOX_MEM_LOG(ERROR) << "MmapAllocator::checkConsistency(): " << numErrors
@@ -1130,7 +1185,8 @@ std::string MmapAllocator::toString() const {
               : succinctBytes(
                     capacity() - AllocationTraits::pageBytes(numAllocated())))
       << " allocated pages " << numAllocated_ << " mapped pages " << numMapped_
-      << " external mapped pages " << numExternalMapped_ << std::endl;
+      << " external mapped pages " << numExternalMapped_ << " retained pages "
+      << numRetained_ << std::endl;
   for (auto i = 0; i < sizeClasses_.size(); ++i) {
     const auto size = sizeClassSizes_[i];
     int64_t numAllocated = 0;

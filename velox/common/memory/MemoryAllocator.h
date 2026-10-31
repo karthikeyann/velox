@@ -326,11 +326,12 @@ class MemoryAllocator : public std::enable_shared_from_this<MemoryAllocator> {
   /// false if sufficient free pages do not exist. 'collateral' and 'allocation'
   /// are freed and unmapped or advised away to provide pages to back the new
   /// 'allocation'. This will always succeed if collateral and allocation
-  /// together cover the new size of allocation. 'allocation' is newly mapped
-  /// and hence zeroed. The contents of 'allocation' and 'collateral' are freed
-  /// in all cases, also if the allocation fails. 'reservationCB' is used in the
-  /// same way as allocate does. It may throw and the end state will be
-  /// consistent, with no new allocation and 'allocation' and 'collateral'
+  /// together cover the new size of allocation. The contents of the new
+  /// 'allocation' are undefined: an allocator may reuse memory that was mapped
+  /// for an earlier allocation. The contents of 'allocation' and 'collateral'
+  /// are freed in all cases, also if the allocation fails. 'reservationCB' is
+  /// used in the same way as allocate does. It may throw and the end state will
+  /// be consistent, with no new allocation and 'allocation' and 'collateral'
   /// cleared.
   ///
   /// NOTE: - 'collateral' and passed in 'allocation' are guaranteed

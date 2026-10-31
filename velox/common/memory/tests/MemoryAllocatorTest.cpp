@@ -104,7 +104,7 @@ class MemoryAllocatorTest : public testing::TestWithParam<int> {
       ASSERT_EQ(instance_->kind(), MemoryAllocator::Kind::kMmap);
       ASSERT_EQ(
           instance_->toString(),
-          "Memory Allocator[MMAP total capacity 1.00GB free capacity 1.00GB allocated pages 0 mapped pages 0 external mapped pages 0\n[size 1: 0(0MB) allocated 0 mapped]\n[size 2: 0(0MB) allocated 0 mapped]\n[size 4: 0(0MB) allocated 0 mapped]\n[size 8: 0(0MB) allocated 0 mapped]\n[size 16: 0(0MB) allocated 0 mapped]\n[size 32: 0(0MB) allocated 0 mapped]\n[size 64: 0(0MB) allocated 0 mapped]\n[size 128: 0(0MB) allocated 0 mapped]\n[size 256: 0(0MB) allocated 0 mapped]\n]");
+          "Memory Allocator[MMAP total capacity 1.00GB free capacity 1.00GB allocated pages 0 mapped pages 0 external mapped pages 0 retained pages 0\n[size 1: 0(0MB) allocated 0 mapped]\n[size 2: 0(0MB) allocated 0 mapped]\n[size 4: 0(0MB) allocated 0 mapped]\n[size 8: 0(0MB) allocated 0 mapped]\n[size 16: 0(0MB) allocated 0 mapped]\n[size 32: 0(0MB) allocated 0 mapped]\n[size 64: 0(0MB) allocated 0 mapped]\n[size 128: 0(0MB) allocated 0 mapped]\n[size 256: 0(0MB) allocated 0 mapped]\n]");
     } else {
       ASSERT_EQ(instance_->kind(), MemoryAllocator::Kind::kMalloc);
       ASSERT_EQ(
@@ -503,6 +503,71 @@ TEST_P(MemoryAllocatorTest, onMapWithArena) {
   EXPECT_EQ(mappedBytes.size(), numBindingsAfterInit);
 
   allocator->freeContiguous(large);
+}
+
+TEST_P(MemoryAllocatorTest, retainedWithArena) {
+  if (!useMmap_) {
+    return;
+  }
+  MemoryAllocator::Options options;
+  options.capacity = kCapacityBytes;
+  options.useMmapArena = true;
+  options.mmapArenaCapacityRatio = 1;
+  auto allocator = std::make_shared<MmapAllocator>(options);
+  constexpr MachinePageCount kNumPages = 4096;
+
+  // A freed allocation stays mapped and the next one of the same size reuses
+  // it without mapping more pages.
+  ContiguousAllocation allocation;
+  ASSERT_TRUE(allocator->allocateContiguous(kNumPages, nullptr, allocation));
+  ::memset(allocation.data(), 1, allocation.size());
+  allocator->freeContiguous(allocation);
+  EXPECT_EQ(allocator->numAllocated(), 0);
+  const auto numMapped = allocator->numMapped();
+  EXPECT_GE(numMapped, kNumPages);
+  EXPECT_EQ(allocator->numRetained(), numMapped);
+  EXPECT_TRUE(allocator->checkConsistency());
+
+  ASSERT_TRUE(allocator->allocateContiguous(kNumPages, nullptr, allocation));
+  EXPECT_EQ(allocator->numMapped(), numMapped);
+  EXPECT_EQ(allocator->numRetained(), numMapped - kNumPages);
+  EXPECT_TRUE(allocator->checkConsistency());
+
+  // Growing into retained memory maps no more pages either.
+  allocator->freeContiguous(allocation);
+  ASSERT_TRUE(allocator->allocateContiguous(
+      kNumPages / 4, nullptr, allocation, nullptr, kNumPages));
+  ASSERT_TRUE(allocator->growContiguous(kNumPages / 2, allocation));
+  EXPECT_EQ(allocator->numMapped(), numMapped);
+  EXPECT_EQ(allocator->numRetained(), numMapped - 3 * kNumPages / 4);
+  EXPECT_TRUE(allocator->checkConsistency());
+  allocator->freeContiguous(allocation);
+
+  // Allocations that need the capacity get it from the retained memory.
+  std::vector<Allocation> allocations;
+  const auto largestClass = allocator->sizeClasses().back();
+  const auto capacityPages = AllocationTraits::numPages(allocator->capacity());
+  for (MachinePageCount i = 0; i + largestClass <= capacityPages;
+       i += largestClass) {
+    allocations.emplace_back();
+    ASSERT_TRUE(
+        allocator->allocateNonContiguous(largestClass, allocations.back()));
+  }
+  EXPECT_EQ(allocator->numRetained(), 0);
+  EXPECT_LE(allocator->numMapped(), capacityPages);
+  EXPECT_TRUE(allocator->checkConsistency());
+  for (auto& nonContiguous : allocations) {
+    allocator->freeNonContiguous(nonContiguous);
+  }
+
+  // unmap() releases retained memory too.
+  ASSERT_TRUE(allocator->allocateContiguous(kNumPages, nullptr, allocation));
+  allocator->freeContiguous(allocation);
+  EXPECT_GT(allocator->numRetained(), 0);
+  allocator->unmap(capacityPages);
+  EXPECT_EQ(allocator->numRetained(), 0);
+  EXPECT_EQ(allocator->numMapped(), 0);
+  EXPECT_TRUE(allocator->checkConsistency());
 }
 
 TEST_P(MemoryAllocatorTest, allocationPool) {
@@ -1784,7 +1849,7 @@ class MmapArenaTest : public testing::Test {
 
   void unpadAndFree(MmapArena* arena, void* buffer, uint64_t bytes) {
     memset(buffer, 0x00, bytes);
-    arena->free(buffer, bytes);
+    arena->free(buffer, bytes, /*residentBytes=*/0);
   }
 
   uint64_t randomPowTwo(uint64_t lowerBound, uint64_t upperBound) {
@@ -1870,9 +1935,9 @@ TEST_F(MmapArenaTest, managedMmapArenas) {
     void* alloc2 = managedArenas->allocate(kArenaCapacityBytes);
     EXPECT_EQ(managedArenas->arenas().size(), 2);
 
-    managedArenas->free(alloc2, kArenaCapacityBytes);
+    managedArenas->free(alloc2, kArenaCapacityBytes, /*residentBytes=*/0);
     EXPECT_EQ(managedArenas->arenas().size(), 2);
-    managedArenas->free(alloc1, kArenaCapacityBytes);
+    managedArenas->free(alloc1, kArenaCapacityBytes, /*residentBytes=*/0);
     EXPECT_EQ(managedArenas->arenas().size(), 1);
   }
 
@@ -1895,7 +1960,8 @@ TEST_F(MmapArenaTest, managedMmapArenas) {
     // Free every other allocations so that the single MmapArena is fragmented
     // that it can no longer handle allocations of size larger than kAllocSize
     for (auto address : evenAllocAddresses) {
-      managedArenas->free(reinterpret_cast<void*>(address), kAllocSize);
+      managedArenas->free(
+          reinterpret_cast<void*>(address), kAllocSize, /*residentBytes=*/0);
     }
 
     managedArenas->allocate(kAllocSize * 2);
@@ -1927,8 +1993,8 @@ TEST_F(MmapArenaTest, managedMmapArenasOnMap) {
   ASSERT_THAT(mapped, testing::SizeIs(2));
   EXPECT_EQ(mapped[1].second, kArenaCapacityBytes);
 
-  managedArenas->free(alloc1, kArenaCapacityBytes);
-  managedArenas->free(alloc2, kArenaCapacityBytes);
+  managedArenas->free(alloc1, kArenaCapacityBytes, /*residentBytes=*/0);
+  managedArenas->free(alloc2, kArenaCapacityBytes, /*residentBytes=*/0);
 }
 
 TEST_F(MmapArenaTest, managedMmapArenasFree) {
@@ -2044,14 +2110,20 @@ TEST_F(MmapArenaTest, managedMmapArenasFree) {
       buffers.push_back(Buffer{managedArenas->allocate(allocSize), allocSize});
     }
     for (const auto& freeIndex : testData.freeIndexes) {
-      managedArenas->free(buffers[freeIndex].buffer, buffers[freeIndex].length);
+      managedArenas->free(
+          buffers[freeIndex].buffer,
+          buffers[freeIndex].length,
+          /*residentBytes=*/0);
       buffers[freeIndex].buffer = nullptr;
     }
     for (const auto& allocSize : testData.postFreeAllocSizes) {
       buffers.push_back(Buffer{managedArenas->allocate(allocSize), allocSize});
     }
     for (const auto& freeIndex : testData.postAllocFeeeIndexes) {
-      managedArenas->free(buffers[freeIndex].buffer, buffers[freeIndex].length);
+      managedArenas->free(
+          buffers[freeIndex].buffer,
+          buffers[freeIndex].length,
+          /*residentBytes=*/0);
       buffers[freeIndex].buffer = nullptr;
     }
     ASSERT_EQ(managedArenas->arenas().size(), testData.expectedNumOfAreanas);
@@ -2066,10 +2138,12 @@ TEST_F(MmapArenaTest, managedMmapArenasFreeError) {
     void* alloc1 = managedArenas->allocate(kArenaCapacityBytes / 2);
     void* alloc2 = managedArenas->allocate(kArenaCapacityBytes / 2);
     ASSERT_EQ(managedArenas->arenas().size(), 1);
-    managedArenas->free(alloc1, kArenaCapacityBytes / 2);
-    ASSERT_ANY_THROW(managedArenas->free(alloc1, kArenaCapacityBytes / 2));
-    managedArenas->free(alloc2, kArenaCapacityBytes / 2);
-    ASSERT_ANY_THROW(managedArenas->free(alloc2, kArenaCapacityBytes / 2));
+    managedArenas->free(alloc1, kArenaCapacityBytes / 2, /*residentBytes=*/0);
+    ASSERT_ANY_THROW(managedArenas->free(
+        alloc1, kArenaCapacityBytes / 2, /*residentBytes=*/0));
+    managedArenas->free(alloc2, kArenaCapacityBytes / 2, /*residentBytes=*/0);
+    ASSERT_ANY_THROW(managedArenas->free(
+        alloc2, kArenaCapacityBytes / 2, /*residentBytes=*/0));
   }
   {
     std::unique_ptr<ManagedMmapArenas> managedArenas =
@@ -2078,12 +2152,67 @@ TEST_F(MmapArenaTest, managedMmapArenasFreeError) {
     void* alloc1 = managedArenas->allocate(kArenaCapacityBytes);
     void* alloc2 = managedArenas->allocate(kArenaCapacityBytes);
     ASSERT_EQ(managedArenas->arenas().size(), 2);
-    managedArenas->free(alloc1, kArenaCapacityBytes);
+    managedArenas->free(alloc1, kArenaCapacityBytes, /*residentBytes=*/0);
     ASSERT_EQ(managedArenas->arenas().size(), 1);
-    ASSERT_ANY_THROW(managedArenas->free(alloc1, kArenaCapacityBytes));
-    managedArenas->free(alloc2, kArenaCapacityBytes);
-    ASSERT_ANY_THROW(managedArenas->free(alloc2, kArenaCapacityBytes));
+    ASSERT_ANY_THROW(
+        managedArenas->free(alloc1, kArenaCapacityBytes, /*residentBytes=*/0));
+    managedArenas->free(alloc2, kArenaCapacityBytes, /*residentBytes=*/0);
+    ASSERT_ANY_THROW(
+        managedArenas->free(alloc2, kArenaCapacityBytes, /*residentBytes=*/0));
   }
+}
+
+TEST_F(MmapArenaTest, retained) {
+  constexpr uint64_t kHugePage = AllocationTraits::kHugePageSize;
+  MmapArena arena(kArenaCapacityBytes);
+  // Bytes retained by freeing a block at 'address' with 'residentBytes' in use.
+  const auto retainedFor = [](void* address, uint64_t residentBytes) {
+    const auto begin = reinterpret_cast<uint64_t>(address);
+    return bits::roundUp(begin + residentBytes, kHugePage) - begin;
+  };
+
+  auto* block = arena.allocate(8 * kHugePage);
+  ::memset(block, 1, 8 * kHugePage);
+  arena.free(block, 8 * kHugePage, 8 * kHugePage);
+  EXPECT_EQ(arena.retainedBytes(), 8 * kHugePage);
+  EXPECT_TRUE(arena.checkConsistency());
+
+  // The arena hands out the same addresses again. The new allocation takes the
+  // retained memory it uses, and the rest of the block stays retained.
+  ASSERT_EQ(arena.allocate(4 * kHugePage), block);
+  EXPECT_EQ(arena.takeRetained(block, kHugePage / 2), kHugePage / 2);
+  EXPECT_EQ(arena.takeRetained(block, kHugePage), kHugePage / 2);
+  EXPECT_EQ(arena.retainedBytes(), 7 * kHugePage);
+  EXPECT_TRUE(arena.checkConsistency());
+
+  // Freeing the smaller block retains its resident bytes up to a huge page
+  // boundary and advises away the rest of the block. Memory retained beyond
+  // the block stays.
+  arena.free(block, 4 * kHugePage, kHugePage);
+  EXPECT_EQ(
+      arena.retainedBytes(), retainedFor(block, kHugePage) + 4 * kHugePage);
+  EXPECT_TRUE(arena.checkConsistency());
+
+  // Releases whole huge pages, as few as reach the target.
+  const auto retainedBytes = arena.retainedBytes();
+  EXPECT_EQ(arena.releaseRetained(1), kHugePage);
+  EXPECT_EQ(arena.retainedBytes(), retainedBytes - kHugePage);
+  EXPECT_TRUE(arena.checkConsistency());
+  arena.releaseRetained(retainedBytes);
+  EXPECT_EQ(arena.retainedBytes(), 0);
+  EXPECT_TRUE(arena.checkConsistency());
+
+  // An empty arena that is not the current one is unmapped together with the
+  // memory it retained.
+  ManagedMmapArenas managedArenas(kArenaCapacityBytes);
+  auto* first = managedArenas.allocate(kArenaCapacityBytes);
+  auto* second = managedArenas.allocate(kArenaCapacityBytes);
+  ASSERT_EQ(managedArenas.arenas().size(), 2);
+  managedArenas.free(second, kArenaCapacityBytes, kHugePage);
+  EXPECT_EQ(managedArenas.retainedBytes(), retainedFor(second, kHugePage));
+  managedArenas.free(first, kArenaCapacityBytes, kHugePage);
+  EXPECT_EQ(managedArenas.arenas().size(), 1);
+  EXPECT_EQ(managedArenas.retainedBytes(), retainedFor(second, kHugePage));
 }
 
 TEST_P(MemoryAllocatorTest, unmap) {

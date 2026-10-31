@@ -83,16 +83,27 @@ void* MmapArena::allocate(uint64_t bytes) {
   return result;
 }
 
-void MmapArena::free(void* address, uint64_t bytes) {
+void MmapArena::free(void* address, uint64_t bytes, uint64_t residentBytes) {
   if (address == nullptr || bytes == 0) {
     return;
   }
   bytes = roundBytes(bytes);
-
-  ::madvise(address, bytes, MADV_DONTNEED);
-  freeBytes_ += bytes;
+  VELOX_CHECK_LE(residentBytes, bytes);
 
   const auto curAddr = reinterpret_cast<uintptr_t>(address);
+  // A huge page faulted in for the last resident bytes is mapped up to the
+  // next huge page boundary.
+  const auto retainedEnd = residentBytes == 0
+      ? curAddr
+      : std::min(
+            bits::roundUp(
+                curAddr + residentBytes, AllocationTraits::kHugePageSize),
+            curAddr + bytes);
+  removeRetained(retainedEnd, curAddr + bytes, /*adviseAway=*/true);
+  removeRetained(curAddr, retainedEnd, /*adviseAway=*/false);
+  addRetained(curAddr, retainedEnd - curAddr);
+  freeBytes_ += bytes;
+
   auto curIter = addFreeBlock(curAddr, bytes);
   auto prevIter = freeList_.end();
   uintptr_t prevAddr;
@@ -160,6 +171,92 @@ void MmapArena::free(void* address, uint64_t bytes) {
     freeList_[curAddr] = newFreeSize;
     freeLookup_[newFreeSize].emplace(curAddr);
   }
+}
+
+uint64_t MmapArena::takeRetained(void* address, uint64_t bytes) {
+  const auto begin = reinterpret_cast<uintptr_t>(address);
+  return removeRetained(begin, begin + bytes, /*adviseAway=*/false);
+}
+
+uint64_t MmapArena::releaseRetained(uint64_t targetBytes) {
+  uint64_t releasedBytes{0};
+  while (releasedBytes < targetBytes && !retained_.empty()) {
+    auto iter = retained_.begin();
+    const auto begin = iter->first;
+    const auto rangeBytes = iter->second;
+    // Releases whole huge pages, and no more of them than the target needs.
+    const auto bytes = std::min(
+        rangeBytes,
+        bits::roundUp(
+            targetBytes - releasedBytes, AllocationTraits::kHugePageSize));
+    ::madvise(reinterpret_cast<void*>(begin), bytes, MADV_DONTNEED);
+    retained_.erase(iter);
+    if (bytes < rangeBytes) {
+      retained_.emplace(begin + bytes, rangeBytes - bytes);
+    }
+    releasedBytes += bytes;
+    retainedBytes_ -= bytes;
+  }
+  return releasedBytes;
+}
+
+void MmapArena::addRetained(uintptr_t address, uint64_t bytes) {
+  if (bytes == 0) {
+    return;
+  }
+  auto begin = address;
+  auto end = address + bytes;
+  auto next = retained_.lower_bound(begin);
+  if (next != retained_.begin()) {
+    auto prev = std::prev(next);
+    VELOX_CHECK_LE(prev->first + prev->second, begin);
+    if (prev->first + prev->second == begin) {
+      begin = prev->first;
+      retained_.erase(prev);
+    }
+  }
+  if (next != retained_.end()) {
+    VELOX_CHECK_GE(next->first, end);
+    if (next->first == end) {
+      end += next->second;
+      retained_.erase(next);
+    }
+  }
+  retained_.emplace(begin, end - begin);
+  retainedBytes_ += bytes;
+}
+
+uint64_t
+MmapArena::removeRetained(uintptr_t begin, uintptr_t end, bool adviseAway) {
+  uint64_t removedBytes{0};
+  auto iter = retained_.upper_bound(begin);
+  if (iter != retained_.begin() &&
+      std::prev(iter)->first + std::prev(iter)->second > begin) {
+    --iter;
+  }
+  while (iter != retained_.end() && iter->first < end) {
+    const auto rangeBegin = iter->first;
+    const auto rangeEnd = rangeBegin + iter->second;
+    const auto removedBegin = std::max(rangeBegin, begin);
+    const auto removedEnd = std::min(rangeEnd, end);
+    iter = retained_.erase(iter);
+    if (rangeBegin < removedBegin) {
+      retained_.emplace(rangeBegin, removedBegin - rangeBegin);
+    }
+    if (adviseAway) {
+      ::madvise(
+          reinterpret_cast<void*>(removedBegin),
+          removedEnd - removedBegin,
+          MADV_DONTNEED);
+    }
+    removedBytes += removedEnd - removedBegin;
+    if (removedEnd < rangeEnd) {
+      retained_.emplace(removedEnd, rangeEnd - removedEnd);
+      break;
+    }
+  }
+  retainedBytes_ -= removedBytes;
+  return removedBytes;
 }
 
 void MmapArena::removeFromLookup(uintptr_t addr, uint64_t bytes) {
@@ -252,6 +349,28 @@ bool MmapArena::checkConsistency() const {
     freeLookupTotalBytes += (iter->first * iter->second.size());
   }
 
+  // Retained ranges are inside the arena, ordered, not overlapping and not
+  // adjacent.
+  uint64_t retainedTotalBytes = 0;
+  uintptr_t previousRetainedEnd = 0;
+  for (const auto& [begin, bytes] : retained_) {
+    if (begin <= previousRetainedEnd ||
+        begin < reinterpret_cast<uintptr_t>(address_) ||
+        begin + bytes > arenaEndAddress) {
+      LOG(WARNING) << "MmapArena::checkConsistency(): bad retained range {addr:"
+                   << begin << ", size:" << bytes << "}";
+      numErrors++;
+    }
+    previousRetainedEnd = begin + bytes;
+    retainedTotalBytes += bytes;
+  }
+  if (retainedTotalBytes != retainedBytes_) {
+    LOG(WARNING)
+        << "MmapArena::checkConsistency(): retained bytes out of sync: "
+        << retainedTotalBytes << " vs " << retainedBytes_;
+    numErrors++;
+  }
+
   // Check consistency of freeList_ and freeLookup_ in terms of bytes.
   if (freeListTotalBytes != freeLookupTotalBytes ||
       freeListTotalBytes != freeBytes_) {
@@ -309,7 +428,8 @@ void* ManagedMmapArenas::allocate(uint64_t bytes) {
   return currentArena_->allocate(bytes);
 }
 
-void ManagedMmapArenas::free(void* address, uint64_t bytes) {
+std::map<uintptr_t, std::shared_ptr<MmapArena>>::iterator
+ManagedMmapArenas::findArena(void* address, uint64_t bytes) {
   VELOX_CHECK(!arenas_.empty());
   const auto addressU64 = reinterpret_cast<uintptr_t>(address);
   auto iter = arenas_.lower_bound(addressU64);
@@ -318,9 +438,40 @@ void ManagedMmapArenas::free(void* address, uint64_t bytes) {
     --iter;
     VELOX_CHECK_GE(iter->first + singleArenaCapacity_, addressU64 + bytes);
   }
-  iter->second->free(address, bytes);
+  return iter;
+}
+
+void ManagedMmapArenas::free(
+    void* address,
+    uint64_t bytes,
+    uint64_t residentBytes) {
+  auto iter = findArena(address, bytes);
+  iter->second->free(address, bytes, residentBytes);
   if (iter->second->empty() && iter->second != currentArena_) {
     arenas_.erase(iter);
   }
+}
+
+uint64_t ManagedMmapArenas::takeRetained(void* address, uint64_t bytes) {
+  return findArena(address, bytes)->second->takeRetained(address, bytes);
+}
+
+uint64_t ManagedMmapArenas::releaseRetained(uint64_t targetBytes) {
+  uint64_t releasedBytes{0};
+  for (auto& [_, arena] : arenas_) {
+    if (releasedBytes >= targetBytes) {
+      break;
+    }
+    releasedBytes += arena->releaseRetained(targetBytes - releasedBytes);
+  }
+  return releasedBytes;
+}
+
+uint64_t ManagedMmapArenas::retainedBytes() const {
+  uint64_t bytes{0};
+  for (const auto& [_, arena] : arenas_) {
+    bytes += arena->retainedBytes();
+  }
+  return bytes;
 }
 } // namespace facebook::velox::memory

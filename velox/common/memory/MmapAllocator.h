@@ -130,6 +130,14 @@ class MmapAllocator : public MemoryAllocator {
     return numExternalMapped_;
   }
 
+  /// Returns the number of pages that the arenas keep mapped after their
+  /// contiguous allocations were freed. These pages are counted in
+  /// numMapped() and are released before free size class pages when the
+  /// mapped pages would exceed the capacity.
+  MachinePageCount numRetained() const {
+    return numRetained_;
+  }
+
   uint64_t numMallocBytes() const {
     return numMallocBytes_.readFull();
   }
@@ -368,6 +376,16 @@ class MmapAllocator : public MemoryAllocator {
 
   void freeContiguousImpl(ContiguousAllocation& allocation);
 
+  // Returns 'allocation' to 'managedArenas_', which retain its mapped pages.
+  // Adds the change in retained pages to 'numRetained_' and 'numMapped_'. Does
+  // not remove the pages of 'allocation' from the counters.
+  void freeToArenas(const ContiguousAllocation& allocation);
+
+  // Stops retaining the arena memory in [address, address + bytes), which an
+  // allocation starts to use, and removes it from 'numRetained_' and
+  // 'numMapped_'. The caller counts these pages as mapped for the allocation.
+  void takeFromArenas(void* address, uint64_t bytes);
+
   // Allocates 'bytes' contiguous bytes and returns the pointer to the first
   // byte. If 'bytes' is less than 'maxMallocBytes_', delegates the allocation
   // to malloc. If the size is above that and below the largest size classes'
@@ -411,8 +429,9 @@ class MmapAllocator : public MemoryAllocator {
       MachinePageCount& numUnmapped,
       Allocation& out);
 
-  // Finds at least  'target' unallocated pages in different size classes and
-  // advises them away. Returns the number of pages advised away.
+  // Finds at least 'target' unallocated pages and advises them away, first the
+  // pages retained by the arenas, then free pages in the size classes. Returns
+  // the number of pages advised away.
   MachinePageCount adviseAway(MachinePageCount target);
 
   bool useMalloc(uint64_t bytes);
@@ -465,8 +484,13 @@ class MmapAllocator : public MemoryAllocator {
 
   // Allocations that are larger than largest size classes will be delegated to
   // ManagedMmapArenas, to avoid calling mmap on every allocation.
-  std::mutex arenaMutex_;
+  mutable std::mutex arenaMutex_;
   std::unique_ptr<ManagedMmapArenas> managedArenas_;
+
+  // Pages of freed contiguous allocations that 'managedArenas_' keep mapped
+  // for reuse, so that the next allocations of the same addresses take no page
+  // faults.
+  std::atomic<MachinePageCount> numRetained_{0};
 
   std::shared_ptr<Cache> cache_;
 };

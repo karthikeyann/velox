@@ -80,8 +80,9 @@ void AllocationPool::maybeGrowLastAllocation(uint64_t bytesRequested) {
   const auto updateOffset = currentOffset_ + bytesRequested;
   if (updateOffset > endOfReservedRun()) {
     VELOX_CHECK_GT(bytesInRun_, AllocationTraits::kHugePageSize);
-    const auto bytesToReserve = bits::roundUp(
-        updateOffset - endOfReservedRun(), AllocationTraits::kHugePageSize);
+    const auto bytesToReserve =
+        bits::roundUp(updateOffset, AllocationTraits::kHugePageSize) -
+        endOfReservedRun();
     largeAllocations_.back().grow(AllocationTraits::numPages(bytesToReserve));
     usedBytes_ += bytesToReserve;
   }

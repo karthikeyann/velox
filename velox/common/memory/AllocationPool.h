@@ -64,10 +64,7 @@ class AllocationPool {
 
   /// Returns the number of bytes allocatable without growing 'this'.
   int64_t freeBytes() const {
-    if (largeAllocations_.empty()) {
-      return freeAddressableBytes();
-    }
-    return largeAllocations_.back().size() - currentOffset_;
+    return endOfReservedRun() - currentOffset_;
   }
 
   // Returns pointer to first unallocated byte in the current run.
@@ -115,12 +112,15 @@ class AllocationPool {
   // Returns the offset from 'startOfRun_' after which the last large
   // allocation must be grown. There are mapped addresses all the way
   // to 'bytesInRun_' ut they are not marked used by the
-  // pool/allocator. So use growContiguous() to update this.
-  int64_t endOfReservedRun() {
+  // pool/allocator. So use growContiguous() to update this. A large run starts
+  // at the first huge page boundary in its allocation, so the offset is
+  // smaller than the size of the allocation.
+  int64_t endOfReservedRun() const {
     if (largeAllocations_.empty()) {
       return bytesInRun_;
     }
-    return largeAllocations_.back().size();
+    const auto& allocation = largeAllocations_.back();
+    return allocation.data<char>() + allocation.size() - startOfRun_;
   }
 
   // Returns the number of bytes between first unallocated and the end of the
