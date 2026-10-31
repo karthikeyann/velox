@@ -291,6 +291,12 @@ class VectorHasher {
     bloomFilter_ = std::move(filter);
   }
 
+  /// Drops the Bloom filter, e.g. when the table it was made for gets rows the
+  /// filter does not cover.
+  void clearBloomFilter() {
+    bloomFilter_.reset();
+  }
+
   const common::FilterPtr& getBloomFilter() const {
     return bloomFilter_;
   }

@@ -1517,6 +1517,13 @@ void HashTable<ignoreNullKeys>::rehash(
     bool initNormalizedKeys,
     int8_t spillInputStartPartitionBit) {
   ++numRehashes_;
+  // A Bloom filter covers the rows of the rehash that made it. A join build
+  // that drops duplicate keys rehashes while rows still arrive, and a later
+  // rehash may not make a new filter, e.g. when the table outgrows the size
+  // limit for one.
+  for (auto& hasher : hashers_) {
+    hasher->clearBloomFilter();
+  }
   if (canApplyParallelJoinBuild()) {
     parallelJoinBuild();
     return;

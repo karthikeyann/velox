@@ -862,6 +862,41 @@ TEST_P(HashTableTest, singleKeyGroupByIncreasingKeys) {
   EXPECT_LT(table->stats().numRehashes, 20);
 }
 
+TEST_P(HashTableTest, bloomFilterCoversAllKeysAfterGrowth) {
+  // A join build that drops duplicate keys inserts rows as they arrive and
+  // rehashes as it grows. A Bloom filter made by an early rehash misses the
+  // keys added later, after which the filter no longer fits its size limit.
+  std::vector<std::unique_ptr<VectorHasher>> hashers;
+  hashers.push_back(std::make_unique<VectorHasher>(BIGINT(), 0));
+  auto table = HashTable<true>::createForJoin(
+      std::move(hashers),
+      {},
+      /*allowDuplicates=*/false,
+      /*hasProbedFlag=*/false,
+      /*hasCountFlag=*/false,
+      /*minTableSizeForParallelJoinBuild=*/1'000'000,
+      pool(),
+      /*bloomFilterMaxSize=*/256 << 10);
+  HashLookup lookup(table->hashers(), pool());
+  constexpr int32_t kBatchSize = 10'000;
+  constexpr int32_t kNumBatches = 100;
+  for (auto i = 0; i < kNumBatches; ++i) {
+    auto batch = makeRowVector({makeFlatVector<int64_t>(
+        kBatchSize, [&](auto row) { return (i * kBatchSize + row) * 7; })});
+    SelectivityVector rows(kBatchSize);
+    table->prepareForGroupProbe(
+        lookup, batch, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+    table->groupProbe(lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  }
+  ASSERT_EQ(table->numDistinct(), kNumBatches * kBatchSize);
+  const auto& filter = table->hashers()[0]->getBloomFilter();
+  if (filter != nullptr) {
+    for (int64_t key = 0; key < kNumBatches * kBatchSize; ++key) {
+      ASSERT_TRUE(filter->testInt64(key * 7)) << key;
+    }
+  }
+}
+
 TEST_P(HashTableTest, groupProbeDuplicateNewKeys) {
   // Each batch repeats every new key within one probe window, so later rows
   // must find the groups that earlier rows of the same window inserted.
