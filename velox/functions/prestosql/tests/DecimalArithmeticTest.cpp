@@ -161,6 +161,14 @@ TEST_F(DecimalArithmeticTest, add) {
               std::vector<int128_t>{DecimalUtil::kLongDecimalMax},
               DECIMAL(38, 0))}),
       "Decimal overflow: 1 + 99999999999999999999999999999999999999");
+  // A short argument wider than its declared precision overflows when
+  // rescaled to a short result.
+  VELOX_ASSERT_USER_THROW(
+      testDecimalExpr<TypeKind::BIGINT>(
+          {},
+          "c0 + 0.01",
+          {makeFlatVector<int64_t>({100'000'000'000'000'000}, DECIMAL(3, 0))}),
+      "Decimal overflow: 100000000000000000 + 1");
 }
 
 TEST_F(DecimalArithmeticTest, subtract) {

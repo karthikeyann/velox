@@ -54,15 +54,17 @@ struct DecimalPlusFunction {
 #endif
 #endif
   {
-    int128_t aRescaled;
-    int128_t bRescaled;
+    // Rescales in the result type: a short decimal result has at most 18
+    // digits, so its rescaled arguments fit in 64 bits.
+    R aRescaled;
+    R bRescaled;
     if (mulWithOverflow(
-            a, DecimalArithmetic::powerOfTen(aRescale_), &aRescaled) ||
+            a, R(DecimalArithmetic::powerOfTen(aRescale_)), &aRescaled) ||
         mulWithOverflow(
-            b, DecimalArithmetic::powerOfTen(bRescale_), &bRescaled)) {
+            b, R(DecimalArithmetic::powerOfTen(bRescale_)), &bRescaled)) {
       VELOX_ARITHMETIC_ERROR("Decimal overflow: {} + {}", a, b);
     }
-    out = checkedPlus<R>(R(aRescaled), R(bRescaled));
+    out = checkedPlus<R>(aRescaled, bRescaled);
     DecimalArithmetic::valueInRange(out);
   }
 
@@ -105,15 +107,17 @@ struct DecimalMinusFunction {
 #endif
 #endif
   {
-    int128_t aRescaled;
-    int128_t bRescaled;
+    // Rescales in the result type: a short decimal result has at most 18
+    // digits, so its rescaled arguments fit in 64 bits.
+    R aRescaled;
+    R bRescaled;
     if (mulWithOverflow(
-            a, DecimalArithmetic::powerOfTen(aRescale_), &aRescaled) ||
+            a, R(DecimalArithmetic::powerOfTen(aRescale_)), &aRescaled) ||
         mulWithOverflow(
-            b, DecimalArithmetic::powerOfTen(bRescale_), &bRescaled)) {
+            b, R(DecimalArithmetic::powerOfTen(bRescale_)), &bRescaled)) {
       VELOX_ARITHMETIC_ERROR("Decimal overflow: {} - {}", a, b);
     }
-    out = checkedMinus<R>(R(aRescaled), R(bRescaled));
+    out = checkedMinus<R>(aRescaled, bRescaled);
     DecimalArithmetic::valueInRange(out);
   }
 
@@ -137,8 +141,16 @@ struct DecimalMultiplyFunction {
 
   template <typename R, typename A, typename B>
   VELOX_GPU_COMPATIBLE void call(R& out, const A& a, const B& b) {
-    out = checkedMultiply<R>(checkedMultiply<R>(R(a), R(b)), R(1));
-    DecimalArithmetic::valueInRange(out);
+    if constexpr (
+        std::is_same_v<R, int128_t> && std::is_same_v<A, int64_t> &&
+        std::is_same_v<B, int64_t>) {
+      // The product of two 64-bit factors is at most 2^126 < 10^38, so it
+      // neither overflows nor leaves the decimal range.
+      out = R(a) * R(b);
+    } else {
+      out = checkedMultiply<R>(R(a), R(b));
+      DecimalArithmetic::valueInRange(out);
+    }
   }
 };
 
