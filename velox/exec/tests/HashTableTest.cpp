@@ -817,13 +817,14 @@ TEST_P(HashTableTest, enableRangeWhereCan) {
 }
 
 TEST_P(HashTableTest, arrayProbeNormalizedKey) {
-  auto table = createHashTableForAggregation(ROW({"a"}, {BIGINT()}), 1);
+  auto table = createHashTableForAggregation(ROW({"a", "b"}, BIGINT()), 2);
   auto lookup = std::make_unique<HashLookup>(table->hashers(), pool());
 
   for (auto i = 0; i < 200; ++i) {
     auto data = makeRowVector({
         makeFlatVector<int64_t>(
             10'000, [&](auto row) { return i * 10'000 + row; }),
+        makeFlatVector<int64_t>(10'000, [](auto row) { return row % 2; }),
     });
 
     SelectivityVector rows(5'000);
@@ -838,6 +839,27 @@ TEST_P(HashTableTest, arrayProbeNormalizedKey) {
   }
 
   ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kNormalizedKey);
+}
+
+TEST_P(HashTableTest, singleKeyGroupByIncreasingKeys) {
+  // Every batch has larger keys than the batches before, as when grouping data
+  // sorted on the key. The range of the key keeps growing past what kArray
+  // mode supports.
+  constexpr int32_t kNumBatches = 200;
+  constexpr int32_t kBatchSize = 1'000;
+  auto table = createHashTableForAggregation(ROW({"a"}, BIGINT()), 1);
+  auto lookup = std::make_unique<HashLookup>(table->hashers(), pool());
+  for (auto i = 0; i < kNumBatches; ++i) {
+    auto data = makeRowVector({
+        makeFlatVector<int64_t>(
+            kBatchSize, [&](auto row) { return i * 1'000'000 + row; }),
+    });
+    insertGroups(*data, *lookup, *table);
+  }
+  EXPECT_EQ(table->hashMode(), BaseHashTable::HashMode::kHash);
+  EXPECT_EQ(table->numDistinct(), kNumBatches * kBatchSize);
+  // The table rehashes as it grows, not for each batch.
+  EXPECT_LT(table->stats().numRehashes, 20);
 }
 
 TEST_P(HashTableTest, groupProbeDuplicateNewKeys) {

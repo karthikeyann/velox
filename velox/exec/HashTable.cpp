@@ -1773,6 +1773,17 @@ void HashTable<ignoreNullKeys>::decideHashMode(
     return;
   }
 
+  // A group by on one key that does not fit an array by its range hashes the
+  // key unless it has few distinct values. Mapping each value to an id costs
+  // one more lookup per row. Ids and ranges also make the table rehash every
+  // time a value falls outside the values seen so far, which happens for most
+  // batches when the input is ordered on the key. The normalized key of one
+  // key does not make comparisons faster. A join build keeps ids and ranges,
+  // which let the probe skip values the build does not have.
+  if (!isJoinBuild_ && hashers_.size() == 1 && distinctsWithReserve > 10000) {
+    setHashMode(HashMode::kHash, numNew, spillInputStartPartitionBit);
+    return;
+  }
   if (bestWithReserve < kArrayHashMaxSize ||
       (disableRangeArrayHash_ && bestWithReserve < numDistinct_ * 2)) {
     capacity_ = setHasherMode(hashers_, useRange, rangeSizes, distinctSizes);
