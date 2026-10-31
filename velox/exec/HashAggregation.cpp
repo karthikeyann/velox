@@ -330,15 +330,32 @@ void HashAggregation::maybeIncreasePartialAggregationMemoryUsage(
   // If more than this many are unique at full memory, give up on partial agg.
   constexpr int32_t kPartialMinFinalPct = 40;
   VELOX_DCHECK(isPartialOutput_);
+  // A larger table reduces the output more only when equal keys arrive far
+  // apart. When they arrive close together, as in input clustered on the keys,
+  // the smaller table reduces as much and stays in the CPU caches.
+  constexpr double kMinPctReduction = 0.9;
+  const bool increaseDidNotHelp = pctBeforeMemoryIncrease_.has_value() &&
+      aggregationPct > *pctBeforeMemoryIncrease_ * kMinPctReduction;
   // If size is at max and there still is not enough reduction, abandon partial
   // aggregation.
   if (abandonPartialAggregationEarly(numOutputRows_) ||
       (aggregationPct > kPartialMinFinalPct &&
-       maxPartialAggregationMemoryUsage_ >=
-           maxExtendedPartialAggregationMemoryUsage_)) {
+       (increaseDidNotHelp ||
+        maxPartialAggregationMemoryUsage_ >=
+            maxExtendedPartialAggregationMemoryUsage_))) {
     groupingSet_->abandonPartialAggregation();
     pool()->release();
     abandonedPartialAggregation_ = true;
+    return;
+  }
+  if (partialAggregationMemoryFixed_) {
+    return;
+  }
+  if (increaseDidNotHelp) {
+    maxPartialAggregationMemoryUsage_ = memoryUsageBeforeIncrease_;
+    groupingSet_->resetTable(/*freeTable=*/true);
+    pool()->release();
+    partialAggregationMemoryFixed_ = true;
     return;
   }
   const int64_t extendedPartialAggregationMemoryUsage = std::min(
@@ -355,6 +372,8 @@ void HashAggregation::maybeIncreasePartialAggregationMemoryUsage(
   }
   // Update the aggregation memory usage size limit on memory reservation
   // success.
+  pctBeforeMemoryIncrease_ = aggregationPct;
+  memoryUsageBeforeIncrease_ = maxPartialAggregationMemoryUsage_;
   maxPartialAggregationMemoryUsage_ = extendedPartialAggregationMemoryUsage;
   addRuntimeStat(
       "maxExtendedPartialAggregationMemoryUsage",

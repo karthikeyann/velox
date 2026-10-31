@@ -1314,6 +1314,43 @@ TEST_F(AggregationTest, partialAggregationMemoryLimitIncrease) {
   }
 }
 
+TEST_F(
+    AggregationTest,
+    partialAggregationMemoryKeptWhenLargerTableDoesNotHelp) {
+  // Each key repeats in 4 adjacent rows, so a partial aggregation reduces its
+  // input to 25% whatever the size of its table. After one increase that does
+  // not reduce more, the memory limit goes back and stays.
+  std::vector<RowVectorPtr> vectors;
+  for (auto i = 0; i < 50; ++i) {
+    vectors.push_back(makeRowVector({makeFlatVector<int64_t>(
+        1'000, [&](auto row) { return (i * 1'000 + row) / 4; })}));
+  }
+  createDuckDbTable(vectors);
+  constexpr int64_t kInitialLimit = 1 << 16;
+  core::PlanNodeId aggNodeId;
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .config(
+                      QueryConfig::kMaxPartialAggregationMemory,
+                      std::to_string(kInitialLimit))
+                  .config(
+                      QueryConfig::kMaxExtendedPartialAggregationMemory,
+                      std::to_string(1 << 30))
+                  .plan(
+                      PlanBuilder()
+                          .values(vectors)
+                          .partialAggregation({"c0"}, {"count(1)"})
+                          .capturePlanNodeId(aggNodeId)
+                          .finalAggregation()
+                          .planNode())
+                  .assertResults("SELECT c0, count(1) FROM tmp GROUP BY c0");
+  const auto runtimeStats =
+      toPlanStats(task->taskStats()).at(aggNodeId).customStats;
+  EXPECT_LT(1, runtimeStats.at("flushRowCount").count);
+  EXPECT_EQ(
+      2 * kInitialLimit,
+      runtimeStats.at("maxExtendedPartialAggregationMemoryUsage").max);
+}
+
 TEST_F(AggregationTest, partialAggregationMaybeReservationReleaseCheck) {
   auto vectors = {
       makeRowVector({makeFlatVector<int32_t>(

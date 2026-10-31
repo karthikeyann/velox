@@ -16,6 +16,7 @@
 #pragma once
 
 #include <mutex>
+#include <optional>
 #include <string_view>
 
 #include "velox/exec/GroupingSet.h"
@@ -153,6 +154,16 @@ class HashAggregation : public Operator {
   const int32_t abandonPartialAggregationMinPct_;
 
   int64_t maxPartialAggregationMemoryUsage_;
+
+  // Output percentage of the partial aggregation flush before the last
+  // increase of 'maxPartialAggregationMemoryUsage_', and the limit before that
+  // increase. A later flush that reduces no better undoes the increase.
+  std::optional<double> pctBeforeMemoryIncrease_;
+  int64_t memoryUsageBeforeIncrease_{0};
+
+  // Set once a larger partial aggregation table reduced no better than a
+  // smaller one. Stops further increases.
+  bool partialAggregationMemoryFixed_{false};
 
   // Guards 'groupingSet_' between close() and a peer driver that reads or
   // takes it after all peers finish. Task termination closes waiting peers
