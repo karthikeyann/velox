@@ -872,7 +872,10 @@ bool GroupingSet::getOutput(
       : 0;
   if (numGroups == 0) {
     if (table_ != nullptr) {
-      table_->clear(/*freeTable=*/true);
+      // Before the end of the input, e.g. after a partial aggregation flush,
+      // the table is filled again, so it keeps its size instead of growing
+      // anew.
+      table_->clear(/*freeTable=*/noMoreInput_);
     }
     return false;
   }
