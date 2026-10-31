@@ -1060,47 +1060,35 @@ TpchPlan DuckDbTpchQueryBuilder::getQ14Plan() const {
 
 TpchPlan DuckDbTpchQueryBuilder::getQ15Plan() const {
   Context context;
-  // DuckDB materializes 'revenue' once as a CTE and scans it twice. Velox
-  // plans cannot share a subtree, so each use recomputes it.
-  auto revenue = [&]() {
-    return scan(
-               context,
-               "lineitem",
-               {"l_suppkey", "l_extendedprice", "l_discount"},
-               {"l_shipdate BETWEEN '1996-01-01'::DATE AND '1996-03-31'::DATE"})
-        .project(
-            {"l_suppkey AS supplier_no",
-             "l_extendedprice * (1.00 - l_discount) AS disc_price"})
-        .partialAggregation(
-            {"supplier_no"}, {"sum(disc_price) AS total_revenue"})
-        .localPartition({"supplier_no"})
-        .finalAggregation();
-  };
-  auto maxRevenue =
-      revenue()
-          .partialAggregation({}, {"max(total_revenue) AS max_revenue"})
-          .localPartition(std::vector<std::string>{})
-          .finalAggregation()
-          .planNode();
+  // DuckDB materializes 'revenue' once as a CTE and scans it twice: for the
+  // maximum revenue and for the suppliers that have it. Velox computes it once
+  // and gets the maximum from a window over all its rows.
   auto supplier =
       scan(context, "supplier", {"s_suppkey", "s_name", "s_address", "s_phone"})
           .planNode();
   auto plan =
-      revenue()
-          .hashJoin(
-              {"total_revenue"},
-              {"max_revenue"},
-              maxRevenue,
-              "",
-              {"supplier_no", "total_revenue"})
+      scan(
+          context,
+          "lineitem",
+          {"l_suppkey", "l_extendedprice", "l_discount"},
+          {"l_shipdate BETWEEN '1996-01-01'::DATE AND '1996-03-31'::DATE"})
+          .project(
+              {"l_suppkey AS supplier_no",
+               "l_extendedprice * (1.00 - l_discount) AS disc_price"})
+          .partialAggregation(
+              {"supplier_no"}, {"sum(disc_price) AS total_revenue"})
+          .localPartition({"supplier_no"})
+          .finalAggregation()
+          .localGather()
+          .window({"max(total_revenue) OVER () AS max_revenue"})
+          .filter("total_revenue = max_revenue")
           .hashJoin(
               {"supplier_no"},
               {"s_suppkey"},
               supplier,
               "",
               {"s_suppkey", "s_name", "s_address", "s_phone", "total_revenue"})
-          .orderBy({"s_suppkey"}, true)
-          .localMerge({"s_suppkey"})
+          .orderBy({"s_suppkey"}, false)
           .planNode();
   return finish(context, plan);
 }
