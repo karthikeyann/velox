@@ -2123,6 +2123,57 @@ TEST_P(MemoryAllocatorTest, unmap) {
   }
 }
 
+TEST_P(MemoryAllocatorTest, sizeClassShards) {
+  if (!useMmap_) {
+    return;
+  }
+  const auto pageBytes = AllocationTraits::kPageSize;
+  const auto numPages = AllocationTraits::numPages(instance_->capacity());
+  const auto allocateAndFree = [&](int64_t count) {
+    std::vector<void*> buffers;
+    for (auto i = 0; i < count; ++i) {
+      buffers.push_back(instance_->allocateBytes(pageBytes));
+      ASSERT_NE(buffers.back(), nullptr);
+    }
+    for (auto* buffer : buffers) {
+      instance_->freeBytes(buffer, pageBytes);
+    }
+  };
+
+  // Maps a quarter of the capacity in one-page allocations from one thread.
+  allocateAndFree(numPages / 4);
+  ASSERT_EQ(instance_->numMapped(), numPages / 4);
+
+  // Threads on other CPUs start at other shards. They take the mapped pages of
+  // any shard before mapping new ones.
+  constexpr int32_t kNumThreads = 16;
+  std::vector<std::thread> threads;
+  std::vector<std::vector<void*>> threadBuffers(kNumThreads);
+  for (auto i = 0; i < kNumThreads; ++i) {
+    threads.emplace_back([&, i]() {
+      for (auto j = 0; j < numPages / 4 / kNumThreads; ++j) {
+        threadBuffers[i].push_back(instance_->allocateBytes(pageBytes));
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  ASSERT_EQ(instance_->numMapped(), numPages / 4);
+  ASSERT_EQ(instance_->stats().numAdvise, 0);
+  ASSERT_TRUE(instance_->checkConsistency());
+  for (const auto& threadBuffer : threadBuffers) {
+    for (auto* buffer : threadBuffer) {
+      instance_->freeBytes(buffer, pageBytes);
+    }
+  }
+
+  // Filling the whole capacity takes pages from every shard.
+  allocateAndFree(numPages);
+  ASSERT_EQ(instance_->numAllocated(), 0);
+  ASSERT_TRUE(instance_->checkConsistency());
+}
+
 VELOX_INSTANTIATE_TEST_SUITE_P(
     MemoryAllocatorTestSuite,
     MemoryAllocatorTest,

@@ -173,6 +173,9 @@ class MmapAllocator : public MemoryAllocator {
  private:
   static constexpr uint64_t kAllSet = 0xffffffffffffffff;
 
+  // Maximum number of independently locked shards of one size class.
+  static constexpr int32_t kMaxSizeClassShards = 16;
+
   // Represents a range of virtual addresses used for allocating entries of
   // 'unitSize_' machine pages.
   class SizeClass {
@@ -197,11 +200,27 @@ class MmapAllocator : public MemoryAllocator {
 
     // Allocates 'numPages' from 'this' and appends these to *out.
     // '*numUnmapped' is incremented by the number of pages that are not backed
-    // by memory.
+    // by memory. If 'numUnmapped' is nullptr, allocates only pages backed by
+    // memory. Returns false if fewer than 'numPages' were available; the pages
+    // that were allocated are still appended to 'out'.
     bool allocate(
         ClassPageCount numPages,
-        MachinePageCount& numUnmapped,
+        MachinePageCount* numUnmapped,
         Allocation& out);
+
+    // Same as allocate, except that the caller must hold lock(). If
+    // 'numUnmapped' is nullptr, the allocated pages must all be backed by
+    // memory. Otherwise numUnmapped is updated to be the count of machine
+    // pages needing backing memory to back the allocation.
+    bool allocateLocked(
+        ClassPageCount numPages,
+        MachinePageCount* numUnmapped,
+        Allocation& out);
+
+    // Locks 'this' for allocateLocked().
+    std::unique_lock<std::mutex> lock() {
+      return std::unique_lock<std::mutex>(mutex_);
+    }
 
     // Frees all pages of 'allocation' that fall in this size
     // class. Erases the corresponding runs from 'allocation'.
@@ -228,7 +247,10 @@ class MmapAllocator : public MemoryAllocator {
     // size class page boundary.
     bool isInRange(uint8_t* ptr) const;
 
-    std::string toString() const;
+    // Adds the counts of allocated and of mapped class pages to
+    // 'numAllocated' and 'numMapped'. Returns false if the recorded count of
+    // mapped free pages differs from the bitmaps.
+    bool addPageCounts(int64_t& numAllocated, int64_t& numMapped) const;
 
    private:
     static constexpr int32_t kNoLastLookup = -1;
@@ -238,16 +260,6 @@ class MmapAllocator : public MemoryAllocator {
     // Number of extra 0 uint64's at te end of allocation bitmaps for SIMD
     // checks.
     static constexpr int32_t kSimdTail = 8;
-
-    // Same as allocate, except that this must be called inside
-    // 'mutex_'. If 'numUnmapped' is nullptr, the allocated pages must
-    // all be backed by memory. Otherwise numUnmapped is updated to be
-    // the count of machine pages needing backing memory to back the
-    // allocation.
-    bool allocateLocked(
-        ClassPageCount numPages,
-        MachinePageCount* numUnmapped,
-        Allocation& out);
 
     // Returns the bit offset of the first bit of a 512 bit group in
     // 'pageAllocated_'/'pageMapped_'  that contains at least one mapped free
@@ -389,6 +401,16 @@ class MmapAllocator : public MemoryAllocator {
 
   void markAllMapped(const Allocation& allocation);
 
+  // Allocates 'numPages' class pages of size class 'sizeIndex' into 'out',
+  // starting at the shard of the current CPU. Takes backed pages from all
+  // shards before pages that need backing, so that sharding does not grow the
+  // mapped memory. Returns false if the shards do not have 'numPages' free.
+  bool allocateFromShards(
+      int32_t sizeIndex,
+      ClassPageCount numPages,
+      MachinePageCount& numUnmapped,
+      Allocation& out);
+
   // Finds at least  'target' unallocated pages in different size classes and
   // advises them away. Returns the number of pages advised away.
   MachinePageCount adviseAway(MachinePageCount target);
@@ -426,7 +448,14 @@ class MmapAllocator : public MemoryAllocator {
   // to std::malloc().
   const MachinePageCount capacity_ = 0;
 
-  std::vector<std::unique_ptr<SizeClass>> sizeClasses_;
+  // Shards of each size class, indexed by size class, then shard. Each shard
+  // has its own lock, so that threads allocating the same size rarely wait on
+  // each other. Together, the shards of a size class span 'capacity_'.
+  std::vector<std::vector<std::unique_ptr<SizeClass>>> sizeClasses_;
+
+  // Lowest and one past the highest address of the shards of each size class.
+  // Lets a free skip the size classes that hold none of its runs.
+  std::vector<std::pair<uintptr_t, uintptr_t>> sizeClassRanges_;
 
   // Statistics.
   std::atomic<uint64_t> numAllocations_ = 0;
