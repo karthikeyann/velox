@@ -954,7 +954,7 @@ class QueryConfig {
       hashProbeBloomFilterPushdownMaxSize,
       "hash_probe_bloom_filter_pushdown_max_size",
       uint64_t,
-      0,
+      8UL << 20,
       "Maximum byte size of Bloom filter from hash probe. 0 disables.")
 
   /// Number of probe rows used to decide whether to bypass the build-side

@@ -189,7 +189,7 @@ Generic Configuration
      - Whether hash probe can generate dynamic filter for string types and push down to upstream operators.
    * - hash_probe_bloom_filter_pushdown_max_size
      - integer
-     - 0
+     - 8MB
      - The maximum byte size of Bloom filter that can be generated from hash
        probe.  When set to 0, no Bloom filter will be generated.  To achieve
        optimal performance, this should not be too larger than the CPU cache
