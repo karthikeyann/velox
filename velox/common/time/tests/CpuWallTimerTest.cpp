@@ -108,6 +108,24 @@ TEST_F(CpuWallTimerTest, cpuWallTimer) {
   EXPECT_LT(cpuFirstTime, timing.cpuNanos);
 }
 
+TEST_F(CpuWallTimerTest, cpuWallLapTimer) {
+  constexpr std::chrono::nanoseconds sleepTime{100'000'000};
+  CpuWallLapTimer timer;
+  timer.reset();
+  workAndSleep(sleepTime);
+  const auto first = timer.lap();
+  EXPECT_EQ(1, first.count);
+  EXPECT_LT(sleepTime.count(), first.wallNanos);
+  EXPECT_LT(0, first.cpuNanos);
+  EXPECT_LE(first.cpuNanos, first.wallNanos);
+
+  // The next interval starts where the previous one ended.
+  const auto second = timer.lap();
+  EXPECT_EQ(1, second.count);
+  EXPECT_LT(second.wallNanos, sleepTime.count());
+  EXPECT_LE(second.cpuNanos, second.wallNanos);
+}
+
 TEST_F(CpuWallTimerTest, processCpuWallTimerIncludesBackgroundThreads) {
   constexpr uint32_t numWorkers{4};
   folly::CPUThreadPoolExecutor executor{numWorkers};

@@ -775,6 +775,11 @@ class Driver : public std::enable_shared_from_this<Driver> {
 
   bool trackOperatorCpuUsage_;
 
+  // Times the operator calls that one runInternal() makes when
+  // 'trackOperatorCpuUsage_' is set. The calls run back to back on one thread,
+  // so each call is charged the time since the previous one ended.
+  CpuWallLapTimer operatorTimer_;
+
   // Indicates that a DriverAdapter can rearrange Operators. Set to false at end
   // of DriverFactory::createDriver().
   bool isAdaptable_{true};

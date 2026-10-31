@@ -115,6 +115,24 @@ class DeltaCpuWallTimer {
   F func_;
 };
 
+/// Measures back-to-back intervals on one thread, reading each clock once per
+/// interval rather than twice: the end of one interval is the start of the
+/// next. Reading the thread CPU clock is a system call, so this halves the
+/// cost of timing consecutive calls. Call reset() before the first lap().
+class CpuWallLapTimer {
+ public:
+  /// Starts the first interval.
+  void reset();
+
+  /// Returns the time since the previous lap() or reset() and starts the
+  /// next interval. The returned CPU time does not exceed the wall time.
+  CpuWallTiming lap();
+
+ private:
+  uint64_t cpuTime_{0};
+  std::chrono::steady_clock::time_point wallTime_;
+};
+
 /// Like DeltaCpuWallTimer, but reads the clocks and calls the user callback
 /// only when 'enabled' is true. Reading the thread CPU clock is a system call,
 /// so a disabled timer saves it on a hot path.

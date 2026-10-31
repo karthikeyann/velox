@@ -609,6 +609,9 @@ StopReason Driver::runInternal(
 
     ContinueFuture future = ContinueFuture::makeEmpty();
 
+    if (trackOperatorCpuUsage_) {
+      operatorTimer_.reset();
+    }
     for (;;) {
       for (int32_t i = startingOperator; i >= 0; --i) {
         stop = task()->shouldStop();
@@ -1413,16 +1416,13 @@ void Driver::withDeltaCpuWallTimer(
     return;
   }
 
-  // The delta CpuWallTiming object would be recorded to the corresponding
-  // 'opTimingMember' upon destruction of the timer when withDeltaCpuWallTimer
-  // ends. The timer is created on the stack to avoid heap allocation
-  auto f = [op, opTimingMember, this](const CpuWallTiming& elapsedTime) {
-    auto elapsedSelfTime = processLazyIoStats(*op, elapsedTime);
+  // Records the time to 'opTimingMember' also when 'opFunction' throws.
+  auto recordTiming = folly::makeGuard([&]() {
+    auto elapsedSelfTime = processLazyIoStats(*op, operatorTimer_.lap());
     op->stats().withWLock([&](auto& lockedStats) {
       (lockedStats.*opTimingMember).add(elapsedSelfTime);
     });
-  };
-  DeltaCpuWallTimer<decltype(f)> timer(std::move(f));
+  });
 
   opFunction();
 }

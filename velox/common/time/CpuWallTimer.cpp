@@ -16,6 +16,8 @@
 
 #include "velox/common/time/CpuWallTimer.h"
 
+#include <algorithm>
+
 namespace facebook::velox {
 
 CpuWallTimer::CpuWallTimer(CpuWallTiming& timing)
@@ -33,6 +35,26 @@ CpuWallTimer::~CpuWallTimer() {
   const auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - wallTimeStart_);
   timing_.wallNanos += duration.count();
+}
+
+void CpuWallLapTimer::reset() {
+  cpuTime_ = process::threadCpuNanos();
+  wallTime_ = std::chrono::steady_clock::now();
+}
+
+CpuWallTiming CpuWallLapTimer::lap() {
+  const auto cpuTime = process::threadCpuNanos();
+  const auto wallTime = std::chrono::steady_clock::now();
+  const uint64_t wallNanos =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(wallTime - wallTime_)
+          .count();
+  // One reading of each clock bounds two intervals, so the CPU interval can
+  // extend past the wall interval by the time between the two readings.
+  const CpuWallTiming timing{
+      1, wallNanos, std::min<uint64_t>(cpuTime - cpuTime_, wallNanos)};
+  cpuTime_ = cpuTime;
+  wallTime_ = wallTime;
+  return timing;
 }
 
 } // namespace facebook::velox
