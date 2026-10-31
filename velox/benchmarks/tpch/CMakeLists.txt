@@ -43,3 +43,9 @@ target_link_libraries(
 add_executable(velox_tpch_benchmark TpchBenchmarkMain.cpp)
 
 target_link_libraries(velox_tpch_benchmark velox_tpch_benchmark_lib)
+
+add_executable(velox_duckdb_tpch_benchmark DuckDbTpchBenchmarkMain.cpp DuckDbTpchQueryBuilder.cpp)
+
+target_link_libraries(velox_duckdb_tpch_benchmark velox_tpch_benchmark_lib)
+
+velox_add_test_headers(velox_duckdb_tpch_benchmark DuckDbTpchQueryBuilder.h)
