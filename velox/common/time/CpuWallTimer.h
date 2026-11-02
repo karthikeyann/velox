@@ -115,12 +115,20 @@ class DeltaCpuWallTimer {
   F func_;
 };
 
-/// Measures back-to-back intervals on one thread, reading each clock once per
-/// interval rather than twice: the end of one interval is the start of the
-/// next. Reading the thread CPU clock is a system call, so this halves the
-/// cost of timing consecutive calls. Call reset() before the first lap().
+/// Measures back-to-back intervals on one thread: the end of one interval is
+/// the start of the next. Reading the thread CPU clock is a system call, so it
+/// is read only at the end of intervals of at least kMinCpuClockReadNanos.
+/// A shorter interval gets its wall time as CPU time. A longer interval gets
+/// the CPU time since the previous read less what the shorter intervals in
+/// between got. The CPU time of a shorter interval is too high only by the
+/// time the thread spent off the CPU in it, which is usually zero: a thread
+/// that blocks or is descheduled is usually away for longer than the interval.
+/// Call reset() before the first lap().
 class CpuWallLapTimer {
  public:
+  /// Intervals shorter than this get their wall time as CPU time.
+  static constexpr uint64_t kMinCpuClockReadNanos{100'000};
+
   /// Starts the first interval.
   void reset();
 
@@ -130,6 +138,8 @@ class CpuWallLapTimer {
 
  private:
   uint64_t cpuTime_{0};
+  // CPU time given to intervals that ended after 'cpuTime_' was read.
+  uint64_t unreadCpuNanos_{0};
   std::chrono::steady_clock::time_point wallTime_;
 };
 

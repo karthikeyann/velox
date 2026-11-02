@@ -126,6 +126,32 @@ TEST_F(CpuWallTimerTest, cpuWallLapTimer) {
   EXPECT_LE(second.cpuNanos, second.wallNanos);
 }
 
+TEST_F(CpuWallTimerTest, cpuWallLapTimerReadsCpuClockAfterLongLaps) {
+  const auto cpuBefore = process::threadCpuNanos();
+  CpuWallLapTimer timer;
+  timer.reset();
+  // A short lap gets its wall time as CPU time.
+  uint64_t totalCpuNanos{0};
+  for (auto i = 0; i < 1'000; ++i) {
+    const auto lap = timer.lap();
+    if (lap.wallNanos < CpuWallLapTimer::kMinCpuClockReadNanos) {
+      EXPECT_EQ(lap.cpuNanos, lap.wallNanos);
+    }
+    totalCpuNanos += lap.cpuNanos;
+  }
+  // A long lap reads the CPU clock, so a sleep in it does not count as CPU
+  // time.
+  constexpr std::chrono::nanoseconds sleepTime{100'000'000};
+  workAndSleep(sleepTime);
+  const auto lap = timer.lap();
+  EXPECT_LT(sleepTime.count(), lap.wallNanos);
+  EXPECT_LT(lap.cpuNanos, sleepTime.count());
+  // The long lap gets the CPU time since the clock was last read less what
+  // the short laps got, so the laps add up to no more than the clock.
+  totalCpuNanos += lap.cpuNanos;
+  EXPECT_LE(totalCpuNanos, process::threadCpuNanos() - cpuBefore);
+}
+
 TEST_F(CpuWallTimerTest, processCpuWallTimerIncludesBackgroundThreads) {
   constexpr uint32_t numWorkers{4};
   folly::CPUThreadPoolExecutor executor{numWorkers};
