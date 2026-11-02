@@ -728,6 +728,11 @@ template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::clear(bool freeTable) {
   for (auto* rowContainer : allRows()) {
     rowContainer->clear();
+    // clear() makes room for a normalized key in each new row again. The
+    // table stays in kHash mode, which does not use them.
+    if (hashMode_ == HashMode::kHash) {
+      rowContainer->disableNormalizedKeys();
+    }
   }
   if (table_) {
     if (!freeTable) {

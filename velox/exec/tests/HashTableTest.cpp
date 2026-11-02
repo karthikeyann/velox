@@ -862,6 +862,33 @@ TEST_P(HashTableTest, singleKeyGroupByIncreasingKeys) {
   EXPECT_LT(table->stats().numRehashes, 20);
 }
 
+TEST_P(HashTableTest, clearInHashModeKeepsRowsWithoutNormalizedKeys) {
+  // A partial aggregation clears its table when it flushes and keeps using it.
+  // The table stays in kHash mode, which does not use normalized keys, so rows
+  // made after clear() have no room for one either. More distinct strings than
+  // value ids can number put this table in kHash mode.
+  auto table = createHashTableForAggregation(ROW({"a"}, VARCHAR()), 1);
+  auto lookup = std::make_unique<HashLookup>(table->hashers(), pool());
+  for (auto i = 0; i < 150; ++i) {
+    auto data = makeRowVector({
+        makeFlatVector<std::string>(
+            1'000,
+            [&](auto row) { return fmt::format("key {}", i * 1'000 + row); }),
+    });
+    insertGroups(*data, *lookup, *table);
+  }
+  ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kHash);
+
+  auto* rows = table->rows();
+  const auto rowStride = [&]() {
+    auto* first = rows->newRow();
+    return rows->newRow() - first;
+  };
+  const auto strideBeforeClear = rowStride();
+  table->clear(/*freeTable=*/false);
+  EXPECT_EQ(rowStride(), strideBeforeClear);
+}
+
 TEST_P(HashTableTest, bloomFilterCoversAllKeysAfterGrowth) {
   // A join build that drops duplicate keys inserts rows as they arrive and
   // rehashes as it grows. A Bloom filter made by an early rehash misses the
