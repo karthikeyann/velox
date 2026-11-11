@@ -20,10 +20,10 @@
 // that are never invoked.
 
 #include "velox/experimental/cudf/functions/GpuFunctionLookup.h"
-#include "velox/experimental/cudf/functions/GpuSfiErrors.h"
 #include "velox/experimental/cudf/functions/GpuSfiExpression.h"
 #include "velox/experimental/cudf/tests/GpuTestFunctions.h"
 
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/core/Expressions.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/expression/SignatureBinder.h"
@@ -261,6 +261,7 @@ TEST_F(GpuFunctionRegistryTest, namesAndCollisions) {
               registration.signature,
               registration.launch,
               noInitialize(),
+              /*dependsOnSessionTimeZone=*/false,
               registration.overwrite),
           registration.accepted);
     }
@@ -309,7 +310,11 @@ TEST_F(GpuFunctionRegistryTest, signatures) {
     SCOPED_TRACE(testCase.rendered);
     clearGpuFunctionRegistry();
     ASSERT_TRUE(registerGpuKernel(
-        {"f"}, testCase.signature, launcherA, noInitialize()));
+        {"f"},
+        testCase.signature,
+        launcherA,
+        noInitialize(),
+        /*dependsOnSessionTimeZone=*/false));
     const auto& signature = *gpuFunctionRegistry().at("f").front().signature;
     EXPECT_EQ(signature.toString(), testCase.rendered);
 
@@ -329,11 +334,24 @@ TEST_F(GpuFunctionRegistryTest, signatures) {
   }
 }
 
+// The signature with its "constant " markers dropped. A GPU registration may
+// narrow an argument the CPU reads per row to a constant it reads in
+// initialize(); the type sets must agree either way.
+std::string withoutConstantMarkers(std::string signature) {
+  static constexpr std::string_view kMarker = "constant ";
+  for (auto at = signature.find(kMarker); at != std::string::npos;
+       at = signature.find(kMarker, at)) {
+    signature.erase(at, kMarker.size());
+  }
+  return signature;
+}
+
 // The Presto registration mirrors RegistrationHelpers.h type set for type set,
 // so every GPU signature is one Velox registers under the same name on the CPU,
 // which SignatureBinder matches calls against; the explicit rows pin the type
-// sets per helper, the aliases, both round arities, the decimal functions, and
-// the checked bitwise functions.
+// sets per helper, the aliases, both round arities, the decimal functions, the
+// checked bitwise functions, and the date and time functions over the types
+// the CPU registers them for.
 TEST_F(GpuFunctionRegistryTest, prestoRegistrations) {
   registerPrestoGpuFunctions("");
 
@@ -348,11 +366,13 @@ TEST_F(GpuFunctionRegistryTest, prestoRegistrations) {
     SCOPED_TRACE(name);
     std::vector<std::string> cpuSignatures;
     for (const auto* signature : facebook::velox::getFunctionSignatures(name)) {
-      cpuSignatures.push_back(signature->toString());
+      cpuSignatures.push_back(withoutConstantMarkers(signature->toString()));
     }
     for (const auto& entry : entries) {
       EXPECT_THAT(
-          cpuSignatures, testing::Contains(entry.signature->toString()));
+          cpuSignatures,
+          testing::Contains(
+              withoutConstantMarkers(entry.signature->toString())));
     }
   }
 
@@ -366,46 +386,84 @@ TEST_F(GpuFunctionRegistryTest, prestoRegistrations) {
   };
   auto unaryNumericAndDecimal = unaryNumeric;
   unaryNumericAndDecimal.push_back("(decimal(i1,i5)) -> decimal(i2,i6)");
-  const std::vector<std::pair<std::string, std::vector<std::string>>> expected =
-      {
-          // PlusFunction for floating point, CheckedPlusFunction for integers,
-          // and the decimal function.
-          {"plus",
-           {"(bigint,bigint) -> bigint",
-            "(decimal(i1,i5),decimal(i2,i6)) -> decimal(i3,i7)",
-            "(double,double) -> double",
-            "(integer,integer) -> integer",
-            "(real,real) -> real",
-            "(smallint,smallint) -> smallint",
-            "(tinyint,tinyint) -> tinyint"}},
-          {"abs", unaryNumeric},
-          // Velox registers the numeric ceil under both names and the decimal
-          // one under "ceil" alone.
-          {"ceil", unaryNumericAndDecimal},
-          {"ceiling", unaryNumeric},
-          {"ln", {"(double) -> double"}},
-          {"is_nan", {"(double) -> boolean"}},
-          // Two floating-point types at two arities, and a decimal signature
-          // per arity.
-          {"truncate",
-           {"(decimal(i1,i5),integer) -> decimal(i1,i5)",
-            "(decimal(i1,i5)) -> decimal(i2,i6)",
-            "(double) -> double",
-            "(double,integer) -> double",
-            "(real) -> real",
-            "(real,integer) -> real"}},
-          {"and", {"(boolean...) -> boolean"}},
-          // Every integral pair widens to bigint, as the CPU's bitwise
-          // registration does.
-          {"bit_count",
-           {"(bigint,bigint) -> bigint",
-            "(integer,integer) -> bigint",
-            "(smallint,smallint) -> bigint",
-            "(tinyint,tinyint) -> bigint"}},
-          {"bitwise_arithmetic_shift_right", {"(bigint,bigint) -> bigint"}},
-          {"bitwise_shift_left", {"(bigint,bigint,bigint) -> bigint"}},
-          {"bitwise_logical_shift_right", {"(bigint,bigint,bigint) -> bigint"}},
-      };
+  const std::vector<std::pair<std::string, std::vector<std::string>>> expected = {
+      // PlusFunction for floating point, CheckedPlusFunction for integers,
+      // and the decimal function.
+      {"plus",
+       {"(bigint,bigint) -> bigint",
+        "(decimal(i1,i5),decimal(i2,i6)) -> decimal(i3,i7)",
+        "(double,double) -> double",
+        "(integer,integer) -> integer",
+        "(real,real) -> real",
+        "(smallint,smallint) -> smallint",
+        "(tinyint,tinyint) -> tinyint"}},
+      {"abs", unaryNumeric},
+      // Velox registers the numeric ceil under both names and the decimal
+      // one under "ceil" alone.
+      {"ceil", unaryNumericAndDecimal},
+      {"ceiling", unaryNumeric},
+      {"ln", {"(double) -> double"}},
+      {"is_nan", {"(double) -> boolean"}},
+      // Two floating-point types at two arities, and a decimal signature
+      // per arity.
+      {"truncate",
+       {"(decimal(i1,i5),integer) -> decimal(i1,i5)",
+        "(decimal(i1,i5)) -> decimal(i2,i6)",
+        "(double) -> double",
+        "(double,integer) -> double",
+        "(real) -> real",
+        "(real,integer) -> real"}},
+      {"and", {"(boolean...) -> boolean"}},
+      // Every integral pair widens to bigint, as the CPU's bitwise
+      // registration does.
+      {"bit_count",
+       {"(bigint,bigint) -> bigint",
+        "(integer,integer) -> bigint",
+        "(smallint,smallint) -> bigint",
+        "(tinyint,tinyint) -> bigint"}},
+      {"bitwise_arithmetic_shift_right", {"(bigint,bigint) -> bigint"}},
+      {"bitwise_shift_left", {"(bigint,bigint,bigint) -> bigint"}},
+      {"bitwise_logical_shift_right", {"(bigint,bigint,bigint) -> bigint"}},
+      // The calendar functions, over the three types the CPU registers
+      // them for.
+      {"year",
+       {"(date) -> bigint",
+        "(timestamp with time zone) -> bigint",
+        "(timestamp) -> bigint"}},
+      {"timezone_hour", {"(timestamp with time zone) -> bigint"}},
+      // A constant argument renders as Velox renders Constant<T>.
+      {"from_unixtime",
+       {"(double) -> timestamp",
+        "(double,bigint,bigint) -> timestamp with time zone",
+        "(double,constant varchar) -> timestamp with time zone"}},
+      {"at_timezone",
+       {"(timestamp with time zone,constant varchar) -> timestamp with time zone"}},
+      {"date_trunc",
+       {"(constant varchar,date) -> date",
+        "(constant varchar,timestamp with time zone) -> timestamp with time zone",
+        "(constant varchar,timestamp) -> timestamp"}},
+      {"between",
+       {"(bigint,bigint,bigint) -> boolean",
+        "(date,date,date) -> boolean",
+        "(double,double,double) -> boolean",
+        "(integer,integer,integer) -> boolean",
+        "(real,real,real) -> boolean",
+        "(smallint,smallint,smallint) -> boolean",
+        "(timestamp with time zone,timestamp with time zone,timestamp with time zone) -> boolean",
+        "(timestamp,timestamp,timestamp) -> boolean",
+        "(tinyint,tinyint,tinyint) -> boolean"}},
+      // Every comparison spans the numbers and the three datetime types.
+      {"eq",
+       {"(bigint,bigint) -> boolean",
+        "(date,date) -> boolean",
+        "(double,double) -> boolean",
+        "(integer,integer) -> boolean",
+        "(real,real) -> boolean",
+        "(smallint,smallint) -> boolean",
+        "(timestamp with time zone,timestamp with time zone) -> boolean",
+        "(timestamp,timestamp) -> boolean",
+        "(tinyint,tinyint) -> boolean"}},
+  };
   for (const auto& [name, signatures] : expected) {
     SCOPED_TRACE(name);
     EXPECT_THAT(
@@ -531,7 +589,7 @@ TEST_F(GpuFunctionRegistryTest, decimalKernelsAreKeyedByPhysicalType) {
 // A decimal function's rescale factors come from initialize(), so its
 // registration carries a sized, initializable instance that derives them from
 // the argument scales, while a function without initialize() registers none. A
-// check initialize() fails is reported with its class rather than ignored.
+// check initialize() fails throws Velox's error, as on the CPU.
 TEST_F(GpuFunctionRegistryTest, decimalInstancesAreInitialized) {
   registerPrestoGpuFunctions("");
 
@@ -552,9 +610,7 @@ TEST_F(GpuFunctionRegistryTest, decimalInstancesAreInitialized) {
     std::vector<std::byte> instance(spec.size);
     const std::vector<TypePtr> arguments{DECIMAL(20, left), DECIMAL(20, right)};
     const core::QueryConfig config{{}};
-    EXPECT_EQ(
-        spec.initialize(instance.data(), arguments, config, /*constants=*/{}),
-        static_cast<uint8_t>(ErrorClass::kNone));
+    spec.initialize(instance.data(), arguments, config, /*constants=*/{});
     const auto wider = std::max(left, right);
     EXPECT_EQ(static_cast<int>(instance[0]), wider - left);
     EXPECT_EQ(static_cast<int>(instance[1]), wider - right);
@@ -566,24 +622,19 @@ TEST_F(GpuFunctionRegistryTest, decimalInstancesAreInitialized) {
   const auto& divideSpec = decimalEntriesOf("divide").front()->instanceSpec;
   ASSERT_NE(divideSpec.initialize, nullptr);
   const core::QueryConfig config{{}};
-  struct Case {
-    TypePtr divisor;
-    ErrorClass expected;
-  };
-  for (const auto& [divisor, expected] : std::vector<Case>{
-           {DECIMAL(38, 10), ErrorClass::kNone},
-           {DECIMAL(38, 20), ErrorClass::kUserError},
-       }) {
-    SCOPED_TRACE(divisor->toString());
-    std::vector<std::byte> instance(divideSpec.size);
-    EXPECT_EQ(
-        divideSpec.initialize(
-            instance.data(),
-            {DECIMAL(18, 0), divisor},
-            config,
-            /*constants=*/{}),
-        static_cast<uint8_t>(expected));
-  }
+  std::vector<std::byte> instance(divideSpec.size);
+  divideSpec.initialize(
+      instance.data(),
+      {DECIMAL(18, 0), DECIMAL(38, 10)},
+      config,
+      /*constants=*/{});
+  VELOX_ASSERT_USER_THROW(
+      divideSpec.initialize(
+          instance.data(),
+          {DECIMAL(18, 0), DECIMAL(38, 20)},
+          config,
+          /*constants=*/{}),
+      "Decimal overflow");
 }
 
 // The first bytes of an instance, read back as the integer the test function

@@ -143,7 +143,7 @@ velox_add_cudf_test(
 velox_add_cudf_test(
   NAME velox_cudf_decimal_arithmetic_device_test
   SOURCES DecimalArithmeticDeviceTest.cu
-  LIBS cudf::cudf Folly::folly
+  LIBS cudf::cudf Folly::folly velox_cudf_gpu_sfi_host
 )
 set_target_properties(velox_cudf_decimal_arithmetic_device_test PROPERTIES CUDA_STANDARD 20)
 velox_cudf_use_gpu_shadows(velox_cudf_decimal_arithmetic_device_test)
@@ -279,6 +279,12 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_gpu_sfi_timestamp_test
+  SOURCES Main.cpp GpuSfiTimestampTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_string_function_test
   SOURCES Main.cpp StringFunctionTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib
@@ -353,8 +359,8 @@ velox_add_cudf_test(
 
 add_subdirectory(iceberg)
 
-# Host-only checks of the GpuExec type resolver, GpuTimestamp, the custom-type
-# view and the BitUtil.h shadow's helpers.
+# Host-only checks of the GpuExec type resolver, the custom-type view and the
+# BitUtil.h shadow's helpers.
 velox_add_cudf_test(
   NAME velox_cudf_gpu_types_test
   SOURCES GpuTypesTest.cpp GpuShadowBitUtilTest.cpp
@@ -410,6 +416,8 @@ set_target_properties(
 velox_cudf_use_gpu_shadows(velox_cudf_gpu_function_semantics_test)
 target_link_libraries(
   velox_cudf_gpu_function_semantics_test
+  velox_cudf_gpu_sfi_host
+  velox_type_tz
   cudf::cudf
   fmt::fmt
   GTest::gmock
@@ -446,3 +454,23 @@ add_subdirectory(utils)
 if(${VELOX_ENABLE_SPARK_FUNCTIONS})
   add_subdirectory(sparksql)
 endif()
+
+# Every Velox time zone looked up on the device and compared with tz::TimeZone
+# on the host. Compiled against the real time zone headers, not the shadow
+# ones, so the host half of the comparison is the real library; the device
+# half reads the POD table through GpuTimeZoneDatabase.h.
+velox_add_cudf_test(
+  NAME velox_cudf_gpu_time_zone_database_test
+  SOURCES GpuTimeZoneDatabaseTest.cu
+  LIBS velox_cudf_gpu_sfi_host velox_type_tz cudf::cudf
+)
+set_target_properties(
+  velox_cudf_gpu_time_zone_database_test
+  PROPERTIES CUDA_STANDARD 20 CUDA_SEPARABLE_COMPILATION OFF
+)
+target_compile_options(
+  velox_cudf_gpu_time_zone_database_test
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:--diag-error=20011>
+)
