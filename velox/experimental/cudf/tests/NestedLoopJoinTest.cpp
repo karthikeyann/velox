@@ -16,11 +16,15 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/tests/utils/CustomComparisonKeys.h"
 
 #include "velox/core/Expressions.h"
+#include "velox/exec/OperatorType.h"
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/type/tests/utils/CustomTypesForTesting.h"
 
 #include <fmt/format.h>
 
@@ -47,6 +51,71 @@ class CudfNestedLoopJoinTest : public HiveConnectorTestBase {
         size, [start](auto row) { return start + row; });
   }
 };
+
+TEST_F(
+    CudfNestedLoopJoinTest,
+    unsupportedTypeProjectedOutBeforeNestedLoopJoin) {
+  auto probe = makeRowVector({"p_key"}, {makeFlatVector<int64_t>({1, 2, 3})});
+  auto build = makeRowVector(
+      {"b_key", "marker"},
+      {makeFlatVector<int64_t>({2, 3, 4}),
+       makeMapVector<int64_t, int64_t>(
+           {{{20, 200}}, {{30, 300}}, {{40, 400}}})});
+  auto idGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto buildSource =
+      PlanBuilder(idGenerator).values({build}).project({"b_key"}).planNode();
+  auto plan =
+      PlanBuilder(idGenerator)
+          .values({probe})
+          .nestedLoopJoin(
+              buildSource, "p_key = b_key", {"p_key"}, core::JoinType::kInner)
+          .planNode();
+
+  std::shared_ptr<Task> task;
+  auto result = AssertQueryBuilder(plan)
+                    .config(cudf_velox::CudfConfig::kCudfAllowCpuFallback, true)
+                    .copyResults(pool(), task);
+  auto expected = makeRowVector({"p_key"}, {makeFlatVector<int64_t>({2, 3})});
+  facebook::velox::test::assertEqualVectors(expected, result);
+
+  const auto operatorStats = toOperatorStats(task->taskStats());
+  EXPECT_EQ(operatorStats.count("NestedLoopJoinBuild"), 1);
+  EXPECT_EQ(operatorStats.count("NestedLoopJoinProbe"), 1);
+  EXPECT_EQ(operatorStats.count("CudfNestedLoopJoinBuild"), 0);
+  EXPECT_EQ(operatorStats.count("CudfNestedLoopJoinProbe"), 0);
+}
+
+TEST_F(CudfNestedLoopJoinTest, customComparisonConditionFallsBack) {
+  const auto customType =
+      facebook::velox::test::BIGINT_TYPE_WITH_CUSTOM_COMPARISON();
+  auto probe = makeRowVector(
+      {"p_key"}, {makeFlatVector<int64_t>({1, 257, 2}, customType)});
+  auto build =
+      makeRowVector({"b_key"}, {makeFlatVector<int64_t>({1}, customType)});
+  auto idGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(idGenerator)
+                  .values({probe})
+                  .nestedLoopJoin(
+                      PlanBuilder(idGenerator).values({build}).planNode(),
+                      "p_key = b_key",
+                      {"p_key"},
+                      core::JoinType::kInner)
+                  .planNode();
+
+  std::shared_ptr<Task> task;
+  auto result = AssertQueryBuilder(plan)
+                    .config(cudf_velox::CudfConfig::kCudfAllowCpuFallback, true)
+                    .copyResults(pool(), task);
+  auto expected =
+      makeRowVector({"p_key"}, {makeFlatVector<int64_t>({1, 257}, customType)});
+  facebook::velox::test::assertEqualVectors(expected, result);
+
+  const auto operatorStats = toOperatorStats(task->taskStats());
+  EXPECT_EQ(operatorStats.count("NestedLoopJoinBuild"), 1);
+  EXPECT_EQ(operatorStats.count("NestedLoopJoinProbe"), 1);
+  EXPECT_EQ(operatorStats.count("CudfNestedLoopJoinBuild"), 0);
+  EXPECT_EQ(operatorStats.count("CudfNestedLoopJoinProbe"), 0);
+}
 
 // Test 1: Simple cross join (no filter) - the simplest case
 TEST_F(CudfNestedLoopJoinTest, crossJoin) {
@@ -377,6 +446,31 @@ TEST_F(CudfNestedLoopJoinTest, multipleColumnTypes) {
   assertQuery(plan, "SELECT * FROM t, u");
 }
 
+// cuDF would evaluate the condition on the packed bits, so a join whose
+// condition touches such a column must stay on the CPU.
+TEST_F(CudfNestedLoopJoinTest, customComparisonKeyFallsBackToCpu) {
+  cudf_velox::test_utils::CustomComparisonKeys keys(pool());
+  auto probe = keys.makeRowsInZone(
+      {"t_k", "t_v"}, "America/Los_Angeles", {1, 2, 3}, {1, 2, 3});
+  auto build =
+      keys.makeRowsInZone({"u_k", "u_v"}, "UTC", {1, 2, 4}, {10, 20, 40});
+
+  for (const auto joinType : {core::JoinType::kInner, core::JoinType::kLeft}) {
+    SCOPED_TRACE(core::JoinTypeName::toName(joinType));
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    keys.assertFallsBackToCpu(
+        PlanBuilder(planNodeIdGenerator)
+            .values({probe})
+            .nestedLoopJoin(
+                PlanBuilder(planNodeIdGenerator).values({build}).planNode(),
+                "t_k = u_k",
+                {"t_v", "u_v"},
+                joinType)
+            .planNode(),
+        exec::OperatorType::kNestedLoopJoinProbe);
+  }
+}
+
 // Output column order differs from probe-first/build-second.
 // Verifies name-based column resolution handles arbitrary output layouts.
 TEST_F(CudfNestedLoopJoinTest, reorderedOutputColumns) {
@@ -520,7 +614,7 @@ TEST_F(CudfNestedLoopJoinTest, filteredJoinEmptyProbe) {
 
 // Multi-driver build coordination test.
 // Verifies that multiple build operators correctly coordinate via
-// allPeersFinished(). Build side uses parallelizable values (4 drivers each
+// allPeersArrived(). Build side uses parallelizable values (4 drivers each
 // get all vectors), probe side is non-parallelizable (1 driver reads all).
 // Build data is 4x due to driver replication.
 TEST_F(CudfNestedLoopJoinTest, multiDriverBuild) {
