@@ -24,19 +24,28 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <chrono>
 #include <exception>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
 PinnedBufferPool::PinnedBufferPool(size_t bufferSize, size_t capacity)
-    : bufferSize_(bufferSize) {
+    : bufferSize_(bufferSize),
+      maxBuffers_(
+          std::max<size_t>(1, capacity / std::max<size_t>(1, bufferSize))) {
   VELOX_CHECK_GT(bufferSize_, 0, "Pinned buffer size must be positive");
-  maxBuffers_ = std::max<size_t>(1, capacity / bufferSize_);
 }
 
 PinnedBufferPool::~PinnedBufferPool() {
   std::unique_lock<std::mutex> lock(mutex_);
-  available_.wait(lock, [&]() { return free_.size() == numAllocated_; });
+  // Users hold the pool for as long as they hold a buffer, so a buffer still
+  // out here is a bug. Waiting without bound would turn that bug into a hang.
+  constexpr std::chrono::seconds kMaxWait{30};
+  if (!available_.wait_for(
+          lock, kMaxWait, [&]() { return free_.size() == numAllocated_; })) {
+    LOG(ERROR) << "Leaking " << numAllocated_ - free_.size()
+               << " page-locked staging buffers that were not returned.";
+  }
   if (free_.empty()) {
     return;
   }
@@ -60,11 +69,6 @@ PinnedBufferPool::~PinnedBufferPool() {
   cudaGetLastError();
 }
 
-size_t PinnedBufferPool::maxBuffers() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return maxBuffers_;
-}
-
 size_t PinnedBufferPool::numAllocated() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return numAllocated_;
@@ -72,7 +76,6 @@ size_t PinnedBufferPool::numAllocated() const {
 
 std::unique_ptr<PinnedBufferPool::StagingBuffer> PinnedBufferPool::allocate(
     cudaError_t& status) const {
-  ensureCudaContextForThread();
   auto buffer = std::make_unique<StagingBuffer>();
   void* data{nullptr};
   status = cudaHostAlloc(&data, bufferSize_, cudaHostAllocDefault);
@@ -95,6 +98,9 @@ std::unique_ptr<PinnedBufferPool::StagingBuffer> PinnedBufferPool::allocate(
 }
 
 PinnedBufferPool::Buffer PinnedBufferPool::acquire() {
+  // Bound before a slot is reserved, so that a failure here leaves the pool's
+  // accounting untouched.
+  ensureCudaContextForThread();
   std::unique_lock<std::mutex> lock(mutex_);
   while (true) {
     available_.wait(
@@ -110,7 +116,15 @@ PinnedBufferPool::Buffer PinnedBufferPool::acquire() {
     ++numAllocated_;
     lock.unlock();
     cudaError_t status{cudaSuccess};
-    auto buffer = allocate(status);
+    std::unique_ptr<StagingBuffer> buffer;
+    try {
+      buffer = allocate(status);
+    } catch (...) {
+      lock.lock();
+      --numAllocated_;
+      available_.notify_all();
+      throw;
+    }
     if (buffer != nullptr) {
       return Buffer(buffer.release(), Releaser(this));
     }
@@ -119,19 +133,16 @@ PinnedBufferPool::Buffer PinnedBufferPool::acquire() {
     --numAllocated_;
     // Callers waiting for the reserved slot must re-evaluate.
     available_.notify_all();
-    VELOX_CHECK_GT(
-        numAllocated_,
-        0,
-        "Failed to page-lock a host buffer: {}. Buffer size: {}",
-        cudaGetErrorString(status),
-        bufferSize_);
-    if (maxBuffers_ > numAllocated_) {
-      LOG(WARNING) << "Failed to page-lock a host buffer: "
-                   << cudaGetErrorString(status) << ". Capping the pool at "
-                   << numAllocated_ << " buffers of " << bufferSize_
-                   << " bytes.";
-      maxBuffers_ = numAllocated_;
+    LOG_FIRST_N(WARNING, 10)
+        << "Failed to allocate a page-locked staging buffer: "
+        << cudaGetErrorString(status) << ". Buffer size: " << bufferSize_
+        << ", buffers in the pool: " << numAllocated_;
+    if (numAllocated_ == 0) {
+      return Buffer(nullptr, Releaser(this));
     }
+    // Wait for one of the existing buffers before trying to grow again.
+    available_.wait(
+        lock, [&]() { return !free_.empty() || numAllocated_ == 0; });
   }
 }
 

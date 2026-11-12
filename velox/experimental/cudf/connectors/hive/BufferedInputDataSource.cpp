@@ -24,6 +24,7 @@
 #include <folly/Executor.h>
 
 #include <algorithm>
+#include <atomic>
 #include <exception>
 #include <functional>
 #include <future>
@@ -52,15 +53,31 @@ class ReadTask {
     state_->result.get();
   }
 
+  // Skips the read if it has not started, and waits for it otherwise. For a
+  // read whose result nobody is going to collect.
+  void abandon() noexcept {
+    state_->abandoned = true;
+    state_->run();
+    if (state_->result.valid()) {
+      state_->result.wait();
+    }
+  }
+
  private:
   struct State {
     explicit State(std::function<void()> read)
-        : task(std::move(read)), result(task.get_future()) {}
+        : task([this, read = std::move(read)]() {
+            if (!abandoned) {
+              read();
+            }
+          }),
+          result(task.get_future()) {}
 
     void run() {
       std::call_once(once, [this]() { task(); });
     }
 
+    std::atomic_bool abandoned{false};
     std::once_flag once;
     std::packaged_task<void()> task;
     std::future<void> result;
@@ -69,23 +86,56 @@ class ReadTask {
   std::shared_ptr<State> state_;
 };
 
-// Joins every task, then rethrows the first failure. The reads write through
-// pointers their submitter owns, so none may outlive the join.
-void joinAll(std::vector<ReadTask>& tasks) {
-  std::exception_ptr failure;
-  for (auto& task : tasks) {
-    try {
-      task.join();
-    } catch (...) {
-      if (failure == nullptr) {
-        failure = std::current_exception();
-      }
+// The reads of one device read. The reads write through pointers that the
+// submitter owns, so none may outlive this object: destroying it without
+// joining, as when a submission fails or the result is dropped, skips the
+// reads that have not started and waits for the rest.
+class ReadTasks {
+ public:
+  ReadTasks() = default;
+
+  ReadTasks(ReadTasks&&) = default;
+
+  ReadTasks(const ReadTasks&) = delete;
+  ReadTasks& operator=(const ReadTasks&) = delete;
+  ReadTasks& operator=(ReadTasks&&) = delete;
+
+  ~ReadTasks() {
+    for (auto& task : tasks_) {
+      task.abandon();
     }
   }
-  if (failure != nullptr) {
-    std::rethrow_exception(failure);
+
+  void reserve(size_t numTasks) {
+    tasks_.reserve(numTasks);
   }
-}
+
+  // Submits 'read' to 'executor'.
+  void add(folly::Executor* executor, std::function<void()> read) {
+    tasks_.emplace_back(executor, std::move(read));
+  }
+
+  // Joins every read, then rethrows the first failure.
+  void join() {
+    std::exception_ptr failure;
+    for (auto& task : tasks_) {
+      try {
+        task.join();
+      } catch (...) {
+        if (failure == nullptr) {
+          failure = std::current_exception();
+        }
+      }
+    }
+    tasks_.clear();
+    if (failure != nullptr) {
+      std::rethrow_exception(failure);
+    }
+  }
+
+ private:
+  std::vector<ReadTask> tasks_;
+};
 
 // Copies the first 'size' bytes of 'buffer' to 'dst' and waits for the copy,
 // after which the buffer can be reused.
@@ -96,8 +146,16 @@ void copyToDevice(
   ensureCudaContextForThread();
   CUDF_CUDA_TRY(cudaMemcpyAsync(
       dst, buffer.data, size, cudaMemcpyHostToDevice, buffer.stream));
-  CUDF_CUDA_TRY(cudaEventRecord(buffer.event, buffer.stream));
-  CUDF_CUDA_TRY(cudaEventSynchronize(buffer.event));
+  auto status = cudaEventRecord(buffer.event, buffer.stream);
+  if (status == cudaSuccess) {
+    status = cudaEventSynchronize(buffer.event);
+  }
+  if (status != cudaSuccess) {
+    // The copy is queued and reads the buffer, so the buffer cannot go back
+    // to its pool before the stream has drained.
+    cudaStreamSynchronize(buffer.stream);
+    CUDF_CUDA_TRY(status);
+  }
 }
 
 } // namespace
@@ -160,51 +218,66 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
   const size_t readSize =
       offset >= fileSize_ ? 0 : std::min(size, fileSize_ - offset);
 
-  std::vector<ReadTask> tasks;
+  ReadTasks tasks;
   if (readSize == 0) {
     // Nothing to read.
   } else if (stagingPool_ == nullptr) {
-    tasks.emplace_back(executor, [this, offset, readSize, dst, stream]() {
-      auto hostBuffer = host_read(offset, readSize);
-      ensureCudaContextForThread();
-      CUDF_CUDA_TRY(cudaMemcpyAsync(
-          dst,
-          hostBuffer->data(),
-          hostBuffer->size(),
-          cudaMemcpyDefault,
-          stream.get()));
+    tasks.add(executor, [this, offset, readSize, dst, stream]() {
+      stagePageable(offset, readSize, dst, stream);
     });
-  } else if (input_->hasCache()) {
-    // One read per requested range keeps the cache entries the same as for
-    // any other reader of the range.
-    tasks.emplace_back(executor, [this, offset, readSize, dst]() {
-      stageFromInput(offset, readSize, dst);
+  } else if (input_->hasCache() || input_->getReadFile()->shouldCoalesce()) {
+    // One read of the whole range through the buffered input. That keeps the
+    // cache entries the same as for any other reader of the range, and
+    // leaves the request sizes to the buffered input for a file that asks
+    // for coalesced reads, as files in remote storage do.
+    tasks.add(executor, [this, offset, readSize, dst, stream]() {
+      stageFromInput(offset, readSize, dst, stream);
     });
   } else {
-    // Nothing caches these bytes, so the file is read straight into the
-    // staging buffers, one independent read per buffer.
+    // A local file that nothing caches is read straight into the staging
+    // buffers, one independent read per buffer.
     const auto bufferSize = stagingPool_->bufferSize();
     tasks.reserve((readSize + bufferSize - 1) / bufferSize);
     for (size_t done = 0; done < readSize; done += bufferSize) {
       const auto partSize = std::min(bufferSize, readSize - done);
-      tasks.emplace_back(executor, [this, offset, done, partSize, dst]() {
-        stageFromFile(offset + done, partSize, dst + done);
+      tasks.add(executor, [this, offset, done, partSize, dst, stream]() {
+        stageFromFile(offset + done, partSize, dst + done, stream);
       });
     }
   }
 
   return std::async(
       std::launch::deferred, [tasks = std::move(tasks), readSize]() mutable {
-        joinAll(tasks);
+        tasks.join();
         return readSize;
       });
+}
+
+void BufferedInputDataSource::stagePageable(
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    cuda::stream_ref stream) {
+  auto hostBuffer = host_read(offset, size);
+  ensureCudaContextForThread();
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      dst,
+      hostBuffer->data(),
+      hostBuffer->size(),
+      cudaMemcpyDefault,
+      stream.get()));
 }
 
 void BufferedInputDataSource::stageFromFile(
     size_t offset,
     size_t size,
-    uint8_t* dst) {
+    uint8_t* dst,
+    cuda::stream_ref stream) {
   auto buffer = stagingPool_->acquire();
+  if (buffer == nullptr) {
+    stagePageable(offset, size, dst, stream);
+    return;
+  }
   const auto& file = input_->getInputStream();
   uint64_t readUs{0};
   {
@@ -222,10 +295,15 @@ void BufferedInputDataSource::stageFromFile(
 void BufferedInputDataSource::stageFromInput(
     size_t offset,
     size_t size,
-    uint8_t* dst) {
+    uint8_t* dst,
+    cuda::stream_ref stream) {
+  auto buffer = stagingPool_->acquire();
+  if (buffer == nullptr) {
+    stagePageable(offset, size, dst, stream);
+    return;
+  }
   auto input = input_->read(offset, size, dwio::common::LogType::FILE);
   VELOX_CHECK_NOT_NULL(input, "Buffered input returned no stream");
-  auto buffer = stagingPool_->acquire();
   const auto bufferSize = stagingPool_->bufferSize();
   for (size_t done = 0; done < size; done += bufferSize) {
     const auto partSize = std::min(bufferSize, size - done);

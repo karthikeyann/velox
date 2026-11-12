@@ -1707,12 +1707,12 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      -
      - integer
      - 268435456
-     - Upper bound in bytes on the page-locked host memory one connector holds for staging column chunks. The memory is locked on demand and kept for the connector's lifetime. Reads wait for a free buffer when the pool is at this bound. 0 disables pinned staging.
+     - Upper bound in bytes on the page-locked host memory one connector holds for staging column chunks. Every connector has its own pool, so a process with several cuDF Hive or Iceberg catalogs can hold this much per catalog. The memory is locked on demand, one buffer per concurrent reader, and kept for the connector's lifetime; it is outside the Velox and RMM memory pools. Reads wait for a free buffer when the pool is at this bound. One buffer is always allowed. 0 disables pinned staging.
    * - cudf.hive.pinned-staging-buffer-size
      -
      - integer
      - 4194304
-     - Size in bytes of one page-locked staging buffer. A column chunk range longer than this is read in pieces of this size, in parallel when no cache sits in front of the file.
+     - Size in bytes of one page-locked staging buffer, at least 65536. A local file with no cache in front of it is read in pieces of this size, in parallel, so this is also the request size the storage sees. Files behind a cache and files in remote storage are read through BufferedInput, one read per column chunk range, and only copied through the staging buffers. A read that finds no page-locked memory available stages in pageable memory.
    * - parquet.reader.use-pandas-metadata
      - parquet.reader.use_pandas_metadata
      - bool

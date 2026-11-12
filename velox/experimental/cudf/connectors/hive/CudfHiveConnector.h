@@ -52,6 +52,12 @@ class CudfHiveConnector final
     return true;
   }
 
+  /// Returns the pool of page-locked buffers the connector's scans stage
+  /// column chunks in, or nullptr when the pool size is configured as zero.
+  const std::shared_ptr<PinnedBufferPool>& stagingPool() const {
+    return stagingPool_;
+  }
+
   // TODO (dm): Re-add data sink
 
  protected:

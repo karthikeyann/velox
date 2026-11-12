@@ -65,6 +65,18 @@ TEST_F(PinnedBufferPoolTest, reusesBuffers) {
   EXPECT_EQ(pool.numAllocated(), 2);
 }
 
+// A pool that cannot page-lock any buffer hands out empty handles, keeps its
+// accounting and shuts down without waiting.
+TEST_F(PinnedBufferPoolTest, allocationFailure) {
+  const size_t tooLarge{1ULL << 46};
+  PinnedBufferPool pool(tooLarge, 2 * tooLarge);
+  for (auto i = 0; i < 2; ++i) {
+    auto buffer = pool.acquire();
+    EXPECT_EQ(buffer.get(), nullptr);
+    EXPECT_EQ(pool.numAllocated(), 0);
+  }
+}
+
 TEST_F(PinnedBufferPoolTest, waitsAtCapacity) {
   PinnedBufferPool pool(4'096, 8'192);
   auto first = pool.acquire();

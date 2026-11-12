@@ -28,6 +28,7 @@
 
 #include "velox/common/base/Fs.h"
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/caching/AsyncDataCache.h"
 #include "velox/common/file/FileSystems.h"
 #include "velox/common/file/tests/FaultyFile.h"
 #include "velox/common/file/tests/FaultyFileSystem.h"
@@ -35,6 +36,7 @@
 #include "velox/common/memory/MemoryArbitrator.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/connectors/ConnectorRegistry.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/dwio/common/FileSink.h"
@@ -605,42 +607,79 @@ TEST_P(TableScanTestParameterized, allColumnsWithRowGroupPasses) {
   ASSERT_TRUE(it->second.dynamicFilterStats.empty());
 }
 
-// Column chunks are staged in page-locked buffers far smaller than a chunk,
-// from a pool of two, so every chunk takes several reads that reuse the same
-// buffers. The session switch and a zero pool size turn the staging off.
+// Column chunks are staged in page-locked buffers smaller than a chunk, from a
+// pool of two, so a chunk takes several reads that reuse the same buffers.
+// Covers a file behind the data cache and a file read directly, the session
+// switch, a pool size of zero and the floor on the buffer size.
 TEST_F(TableScanTest, pinnedStaging) {
   using cudf_velox::connector::hive::CudfHiveConfig;
-  auto vectors = makeVectors(10, 1'000);
+  using cudf_velox::connector::hive::CudfHiveConnector;
+  auto vectors = makeVectors(10, 20'000);
   auto filePath = TempFilePath::create();
   writeToFile(filePath->getPath(), vectors);
   createDuckDbTable(vectors);
   auto plan = tableScanNode();
 
-  resetCudfHiveConnector(
-      std::make_shared<config::ConfigBase>(
-          std::unordered_map<std::string, std::string>{
-              {CudfHiveConfig::kPinnedStagingBufferSize, "1024"},
-              {CudfHiveConfig::kPinnedStagingPoolSize, "2048"},
-          }));
-  for (const auto* enabled : {"true", "false"}) {
-    SCOPED_TRACE(enabled);
+  const auto resetConnector = [&](const std::string& bufferSize,
+                                  const std::string& poolSize) {
+    resetCudfHiveConnector(
+        std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>{
+                {CudfHiveConfig::kPinnedStagingBufferSize, bufferSize},
+                {CudfHiveConfig::kPinnedStagingPoolSize, poolSize},
+            }));
+  };
+  const auto stagingPool = [&]() {
+    auto hiveConnector = std::dynamic_pointer_cast<CudfHiveConnector>(
+        facebook::velox::connector::ConnectorRegistry::tryGet(
+            kCudfHiveConnectorId));
+    VELOX_CHECK_NOT_NULL(hiveConnector);
+    return hiveConnector->stagingPool();
+  };
+  const auto scan = [&](bool useCache, bool stagingEnabled) {
+    std::unordered_map<std::string, std::shared_ptr<config::ConfigBase>>
+        connectorConfigs{
+            {kCudfHiveConnectorId,
+             std::make_shared<config::ConfigBase>(
+                 std::unordered_map<std::string, std::string>{
+                     {CudfHiveConfig::kPinnedStagingEnabledSession,
+                      stagingEnabled ? "true" : "false"},
+                 })},
+        };
+    // Without a cache the scan reads the file straight into the staging
+    // buffers; with one it reads through the cache.
+    auto queryCtx = core::QueryCtx::create(
+        executor_.get(),
+        core::QueryConfig(std::unordered_map<std::string, std::string>{}),
+        connectorConfigs,
+        useCache ? cache::AsyncDataCache::getInstance() : nullptr);
     AssertQueryBuilder(plan, duckDbQueryRunner_)
-        .connectorSessionProperty(
-            kCudfHiveConnectorId,
-            CudfHiveConfig::kPinnedStagingEnabledSession,
-            enabled)
+        .queryCtx(queryCtx)
         .splits(makeCudfHiveConnectorSplits({filePath, filePath}))
         .assertResults("SELECT * FROM tmp UNION ALL SELECT * FROM tmp");
+  };
+
+  for (const auto useCache : {true, false}) {
+    SCOPED_TRACE(fmt::format("useCache {}", useCache));
+    resetConnector("65536", "131072");
+    scan(useCache, true);
+    EXPECT_GT(stagingPool()->numAllocated(), 0);
+    EXPECT_LE(stagingPool()->numAllocated(), 2);
+
+    resetConnector("65536", "131072");
+    scan(useCache, false);
+    EXPECT_EQ(stagingPool()->numAllocated(), 0);
   }
 
-  resetCudfHiveConnector(
-      std::make_shared<config::ConfigBase>(
-          std::unordered_map<std::string, std::string>{
-              {CudfHiveConfig::kPinnedStagingPoolSize, "0"},
-          }));
-  AssertQueryBuilder(plan, duckDbQueryRunner_)
-      .splits(makeCudfHiveConnectorSplits({filePath}))
-      .assertResults("SELECT * FROM tmp");
+  resetConnector("65536", "0");
+  EXPECT_EQ(stagingPool(), nullptr);
+  scan(false, true);
+
+  VELOX_ASSERT_USER_THROW(
+      resetConnector("1024", "131072"),
+      "Staging buffer size is below its minimum: "
+      "cudf.hive.pinned-staging-buffer-size");
+  resetConnector("65536", "131072");
 }
 
 // Splits prepared in the background by the preloader must produce the same

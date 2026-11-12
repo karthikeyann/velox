@@ -50,7 +50,7 @@ class PinnedBufferPool {
   class Releaser {
    public:
     /// Creates a releaser for buffers of 'pool'.
-    explicit Releaser(PinnedBufferPool* pool = nullptr) : pool_(pool) {}
+    explicit Releaser(PinnedBufferPool* pool) : pool_(pool) {}
 
     /// Returns 'buffer' to the pool.
     void operator()(StagingBuffer* buffer) const {
@@ -70,7 +70,9 @@ class PinnedBufferPool {
   /// down to a whole number of buffers, but never below one buffer.
   PinnedBufferPool(size_t bufferSize, size_t capacity);
 
-  /// Waits until every buffer has been returned, then unlocks and frees them.
+  /// Unlocks and frees the buffers. Every buffer must have been returned: the
+  /// destructor waits a bounded time for the ones that have not, then leaks
+  /// them.
   ~PinnedBufferPool();
 
   PinnedBufferPool(const PinnedBufferPool&) = delete;
@@ -82,20 +84,23 @@ class PinnedBufferPool {
   }
 
   /// Returns the number of buffers the pool may page-lock.
-  size_t maxBuffers() const;
+  size_t maxBuffers() const {
+    return maxBuffers_;
+  }
 
   /// Returns the number of buffers page-locked so far.
   size_t numAllocated() const;
 
   /// Checks a buffer out of the pool. When every buffer is checked out and
-  /// the pool is at capacity, waits for one to be returned. A failure to
-  /// page-lock more memory caps the pool at the buffers it already has; it
-  /// throws only when the pool has none.
+  /// the pool is at capacity, waits for one to be returned. When the pool
+  /// cannot page-lock another buffer, waits for one of those it has, and
+  /// returns an empty handle if it has none. Requires cuDF to be registered.
   Buffer acquire();
 
  private:
   // Page-locks a buffer and creates its stream and event. Returns nullptr,
-  // with 'status' set, when any of that fails.
+  // with 'status' set, when any of that fails. Requires a CUDA context on the
+  // calling thread.
   std::unique_ptr<StagingBuffer> allocate(cudaError_t& status) const;
 
   // Puts 'buffer' back on the free list and wakes the waiters.
@@ -103,11 +108,12 @@ class PinnedBufferPool {
 
   const size_t bufferSize_;
 
+  // Upper bound on 'numAllocated_'.
+  const size_t maxBuffers_;
+
   mutable std::mutex mutex_;
   // Signalled when a buffer is returned or an allocation attempt fails.
   std::condition_variable available_;
-  // Upper bound on 'numAllocated_'. Lowered when page-locking fails.
-  size_t maxBuffers_;
   // Buffers page-locked or being page-locked.
   size_t numAllocated_{0};
   // Buffers page-locked and not checked out. Owned by the pool.

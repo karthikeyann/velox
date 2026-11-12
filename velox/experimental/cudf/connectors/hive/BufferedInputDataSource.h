@@ -35,8 +35,9 @@ namespace facebook::velox::cudf_velox::connector::hive {
 // contiguous buffers.
 class BufferedInputDataSource : public cudf::io::datasource {
  public:
-  // 'stagingPool' supplies the page-locked buffers that device reads stage
-  // file bytes in. Device reads stage in pageable memory when it is null.
+  /// 'stagingPool' supplies the page-locked buffers that device reads stage
+  /// file bytes in. Device reads stage in pageable memory when it is null,
+  /// and for a read that finds the pool unable to page-lock any buffer.
   BufferedInputDataSource(
       std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input,
       std::shared_ptr<PinnedBufferPool> stagingPool);
@@ -56,9 +57,14 @@ class BufferedInputDataSource : public cudf::io::datasource {
 
   [[nodiscard]] bool supports_device_read() const override;
 
-  // Reads on the IO executor, or on the thread waiting for the returned
-  // future when that gets to a read first. The bytes are on the device when
-  // the future completes, whatever work is queued on 'stream'.
+  /// Reads on the IO executor, or on the thread waiting for the returned
+  /// future when that gets to a read first. A local file that nothing caches
+  /// is read in pieces of one staging buffer; any other file is read through
+  /// the buffered input, one read per call. With staging buffers the bytes are
+  /// on the device when the future completes; without them the copy is queued
+  /// on 'stream'. Destroying the future without waiting skips the reads that
+  /// have not started and waits for the rest, so 'dst' can be released right
+  /// after.
   std::future<size_t> device_read_async(
       size_t offset,
       size_t size,
@@ -68,13 +74,32 @@ class BufferedInputDataSource : public cudf::io::datasource {
  private:
   void readContiguous(size_t offset, size_t size, uint8_t* dst);
 
+  // Reads 'size' bytes at 'offset' into pageable memory and queues their copy
+  // to 'dst' on 'stream'.
+  void stagePageable(
+      size_t offset,
+      size_t size,
+      uint8_t* dst,
+      cuda::stream_ref stream);
+
   // Reads 'size' bytes at 'offset' straight from the file into one staging
   // buffer and copies them to 'dst'. 'size' must fit in a staging buffer.
-  void stageFromFile(size_t offset, size_t size, uint8_t* dst);
+  // Stages in pageable memory, with the copy on 'stream', when the pool has
+  // no buffer to give.
+  void stageFromFile(
+      size_t offset,
+      size_t size,
+      uint8_t* dst,
+      cuda::stream_ref stream);
 
   // Reads 'size' bytes at 'offset' through the buffered input, one staging
-  // buffer at a time, and copies them to 'dst'.
-  void stageFromInput(size_t offset, size_t size, uint8_t* dst);
+  // buffer at a time, and copies them to 'dst'. Stages in pageable memory,
+  // with the copy on 'stream', when the pool has no buffer to give.
+  void stageFromInput(
+      size_t offset,
+      size_t size,
+      uint8_t* dst,
+      cuda::stream_ref stream);
 
   std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input_;
   const size_t fileSize_;

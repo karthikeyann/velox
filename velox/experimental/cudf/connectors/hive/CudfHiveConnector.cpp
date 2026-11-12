@@ -43,10 +43,10 @@ std::shared_ptr<PinnedBufferPool> createPinnedStagingPool(
     return nullptr;
   }
   const auto bufferSize = config.pinnedStagingBufferSize();
-  VELOX_USER_CHECK_GT(
+  VELOX_USER_CHECK_GE(
       bufferSize,
-      0,
-      "{} must be positive",
+      CudfHiveConfig::kMinPinnedStagingBufferSize,
+      "Staging buffer size is below its minimum: {}",
       CudfHiveConfig::kPinnedStagingBufferSize);
   return std::make_shared<PinnedBufferPool>(bufferSize, poolSize);
 }

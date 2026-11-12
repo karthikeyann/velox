@@ -107,16 +107,24 @@ class CudfHiveConfig {
       "cudf.hive.pinned_staging_enabled";
 
   // Upper bound, in bytes, on the page-locked host memory a connector holds
-  // for staging column chunks. The memory is locked on demand and kept for
-  // the connector's lifetime; reads wait for a free buffer at the bound.
+  // for staging column chunks. Each connector has its own pool. The memory is
+  // locked on demand, one buffer per concurrent reader, and kept for the
+  // connector's lifetime; reads wait for a free buffer at the bound. One
+  // buffer is always allowed. 0 disables the staging.
   static constexpr const char* kPinnedStagingPoolSize =
       "cudf.hive.pinned-staging-pool-size";
 
-  // Size, in bytes, of one staging buffer. Also the largest single read
-  // issued to a file that no cache sits in front of: longer column chunk
-  // ranges are split into reads of this size that run in parallel.
+  // Size, in bytes, of one staging buffer, at least
+  // kMinPinnedStagingBufferSize. Also the size of the reads issued to a local
+  // file that no cache sits in front of: a longer column chunk range is split
+  // into reads of this size that run in parallel. Other files are read
+  // through BufferedInput, one read per range.
   static constexpr const char* kPinnedStagingBufferSize =
       "cudf.hive.pinned-staging-buffer-size";
+
+  // Smallest accepted staging buffer size. A range takes one queued read per
+  // buffer, so a tiny buffer would flood the IO executor.
+  static constexpr uint64_t kMinPinnedStagingBufferSize = 64 << 10;
 
   // Writer config options
 
