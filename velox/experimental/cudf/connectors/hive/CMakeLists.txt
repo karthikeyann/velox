@@ -23,6 +23,7 @@ add_library(
   CudfHiveTableHandle.cpp
   CudfSplitReader.cpp
   CudfSplitReaderByteFetch.cpp
+  PinnedBufferPool.cpp
 )
 
 target_link_libraries(
