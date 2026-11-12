@@ -230,12 +230,7 @@ class ScheduledRead {
   void wait() {
     // The range is complete when the wait returns or throws.
     const auto read = std::move(read_);
-    uint64_t waitNanos{0};
-    FetchScheduler::ReadStats cost;
-    {
-      NanosecondWallTimer timer(&waitNanos);
-      cost = scheduler_->wait(*read);
-    }
+    const auto cost = scheduler_->wait(*read);
     if (stats_ == nullptr) {
       return;
     }
@@ -254,7 +249,6 @@ class ScheduledRead {
     add(BufferedInputDataSource::kFetchCopyWallNanos,
         cost.copyNanos,
         Unit::kNanos);
-    add(BufferedInputDataSource::kFetchWaitWallNanos, waitNanos, Unit::kNanos);
     add(BufferedInputDataSource::kFetchCopyBusyPercent,
         cost.copyBusyPercent,
         Unit::kNone);

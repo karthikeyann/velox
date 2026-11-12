@@ -494,7 +494,17 @@ void CudfSplitReader::setupChunkingForCurrentPass(
   startColumnChunkFetch();
 
   // Wait for all reads of the pass to complete.
-  passState_->fetch.wait();
+  uint64_t waitNanos{0};
+  {
+    NanosecondWallTimer timer(&waitNanos);
+    passState_->fetch.wait();
+  }
+  if (ioStats_ != nullptr) {
+    ioStats_->addCounter(
+        kFetchWaitWallNanos,
+        RuntimeCounter(
+            static_cast<int64_t>(waitNanos), RuntimeCounter::Unit::kNanos));
+  }
 
   splitReader_->setup_chunking_for_all_columns(
       chunkReadLimit_,

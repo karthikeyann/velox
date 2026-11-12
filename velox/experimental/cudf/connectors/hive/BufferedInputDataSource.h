@@ -51,8 +51,6 @@ class BufferedInputDataSource : public cudf::io::datasource {
   /// Time from queueing a piece's copy to the device to its completion,
   /// summed over pieces.
   static constexpr const char* kFetchCopyWallNanos = "cudfFetchCopyWallNanos";
-  /// Time the consumer of a read was blocked waiting for it.
-  static constexpr const char* kFetchWaitWallNanos = "cudfFetchWaitWallNanos";
   /// Share of a read's time in the scheduler during which the copy streams
   /// had work, in percent. The mean over reads tells how busy the copy stage
   /// was.

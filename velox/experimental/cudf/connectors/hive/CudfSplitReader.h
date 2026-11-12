@@ -70,6 +70,11 @@ std::optional<cudf::type_id> constantTimestampType(
 
 class CudfSplitReader : public NvtxHelper {
  public:
+  /// Runtime statistic of the time a scan waited for the column chunks of a
+  /// row group pass to be on the device, one sample per pass, whichever way
+  /// the chunks are fetched.
+  static constexpr const char* kFetchWaitWallNanos = "cudfFetchWaitWallNanos";
+
   CudfSplitReader(
       std::shared_ptr<CudfHiveConnectorSplit> split,
       std::shared_ptr<const ::facebook::velox::connector::hive::HiveTableHandle>
