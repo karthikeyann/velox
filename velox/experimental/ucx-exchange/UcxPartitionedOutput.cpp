@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <iterator>
 #include <limits>
+#include <span>
 #include "velox/core/PlanNode.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
@@ -601,8 +602,11 @@ void UcxPartitionedOutput::splitAndEnqueue(
   // table, which the loop below would index out of bounds. Such payloads are
   // routed to equalPartitionRowCountOnly instead and never arrive here.
   VELOX_CHECK_GT(tableView.num_columns(), 0);
-  auto contiguousTables =
-      cudf::contiguous_split(tableView, offsets, stream, get_output_mr());
+  auto contiguousTables = cudf::contiguous_split(
+      tableView,
+      std::span<cudf::size_type const>{offsets},
+      stream,
+      get_output_mr());
 
   // Synchronize the stream to ensure CUDA operations complete before enqueuing.
   // UCXX/UCX is not stream-aware, so without syncing, data could be sent before
