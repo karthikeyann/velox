@@ -1713,6 +1713,16 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      - integer
      - 4194304
      - Size in bytes of one page-locked staging buffer, at least 65536. A local file with no cache in front of it is read in pieces of this size, in parallel, so this is also the request size the storage sees. Files behind a cache and files in remote storage are read through BufferedInput, one read per column chunk range, and only copied through the staging buffers. A read that finds no page-locked memory available stages in pageable memory.
+   * - parquet.reader.use-tile-decode
+     - parquet.reader.use_tile_decode
+     - bool
+     - false
+     - Whether pages of flat fixed-width columns (PLAIN and dictionary encoded INT32, INT64, FLOAT and DOUBLE) are decoded by libcudf's tile decode kernels, which split a page into tiles decoded by one warp each. All other pages are decoded as usual. Results do not depend on this option. Maps to ``enable_use_tile_decode`` in `libcudf parquet_reader_options <https://docs.rapids.ai/api/libcudf/stable/classcudf_1_1io_1_1parquet__reader__options>`_.
+   * - parquet.reader.use-jit-decode-filter
+     - parquet.reader.use_jit_decode_filter
+     - bool
+     - false
+     - Whether conjuncts of the pushed-down filter that compare one fixed-width column with literals are evaluated by kernels that libcudf links at runtime for the scan. With ``parquet.reader.use-tile-decode`` also on, such a conjunct is evaluated while its column is decoded. The first scan with a new filter shape waits for its kernels to be linked; set ``LIBCUDF_KERNEL_CACHE_PATH`` to a persistent local directory so that later processes reuse them. Results do not depend on this option. Maps to ``enable_use_jit_decode_filter`` in `libcudf parquet_reader_options <https://docs.rapids.ai/api/libcudf/stable/classcudf_1_1io_1_1parquet__reader__options>`_.
    * - parquet.reader.use-pandas-metadata
      - parquet.reader.use_pandas_metadata
      - bool

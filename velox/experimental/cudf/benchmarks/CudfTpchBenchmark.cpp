@@ -27,7 +27,11 @@
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 
+#include <cudf/io/parquet.hpp>
+
 #include <experimental/cudf/connectors/hive/CudfHiveConnector.h>
+
+#include <iostream>
 
 DECLARE_int64(max_coalesced_bytes);
 DECLARE_string(max_coalesced_distance_bytes);
@@ -64,6 +68,18 @@ DEFINE_bool(
     cudf_hive_use_buffered_input,
     true,
     "Use BufferedInputDataSource instead of KvikIO for cuDF Hive reads");
+
+DEFINE_bool(
+    cudf_parquet_use_tile_decode,
+    false,
+    "Decode pages of flat fixed-width columns with libcudf's tile decode "
+    "kernels");
+
+DEFINE_bool(
+    cudf_parquet_use_jit_decode_filter,
+    false,
+    "Evaluate single-column conjuncts of pushed-down filters with kernels "
+    "that libcudf links at runtime for the scan");
 
 DEFINE_bool(
     cudf_hive_preload_column_chunks,
@@ -123,6 +139,12 @@ void CudfTpchBenchmark::initialize() {
         [cudf_velox::connector::hive::CudfHiveConfig::kUseBufferedInput] =
             std::to_string(FLAGS_cudf_hive_use_buffered_input);
     cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kUseTileDecode] =
+            std::to_string(FLAGS_cudf_parquet_use_tile_decode);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kUseJitDecodeFilter] =
+            std::to_string(FLAGS_cudf_parquet_use_jit_decode_filter);
+    cudfHiveConfigurationValues
         [cudf_velox::connector::hive::CudfHiveConfig::kPreloadColumnChunks] =
             std::to_string(FLAGS_cudf_hive_preload_column_chunks);
     cudfHiveConfigurationValues
@@ -175,6 +197,12 @@ CudfTpchBenchmark::makeConnectorProperties() {
       CudfHiveCfg::kUseBufferedInput,
       std::to_string(FLAGS_cudf_hive_use_buffered_input));
   cfg->set(
+      CudfHiveCfg::kUseTileDecode,
+      std::to_string(FLAGS_cudf_parquet_use_tile_decode));
+  cfg->set(
+      CudfHiveCfg::kUseJitDecodeFilter,
+      std::to_string(FLAGS_cudf_parquet_use_jit_decode_filter));
+  cfg->set(
       CudfHiveCfg::kPreloadColumnChunks,
       std::to_string(FLAGS_cudf_hive_preload_column_chunks));
   cfg->set(
@@ -218,6 +246,15 @@ CudfTpchBenchmark::listSplits(
 }
 
 void CudfTpchBenchmark::shutdown() {
+  if (FLAGS_cudf_parquet_use_jit_decode_filter) {
+    // Shows whether the pushed-down filters were evaluated by the linked
+    // kernels at all, and where.
+    const auto stats = cudf::io::get_parquet_jit_filter_stats();
+    std::cout << "cuDF Parquet JIT decode filter: " << stats.decoded
+              << " predicates answered while decoding, " << stats.evaluated
+              << " evaluated after decoding, " << stats.fallback
+              << " filters evaluated as expressions" << std::endl;
+  }
   cudf_velox::unregisterCudf();
   TpchBenchmark::shutdown();
 }

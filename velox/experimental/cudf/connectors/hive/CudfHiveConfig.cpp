@@ -122,6 +122,27 @@ cudf::data_type CudfHiveConfig::timestampTypeSession(
   return cudf::data_type(cudf::type_id{unit});
 }
 
+bool CudfHiveConfig::isUseTileDecode() const {
+  return config_->get<bool>(kUseTileDecode, false);
+}
+
+bool CudfHiveConfig::isUseTileDecodeSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kUseTileDecodeSession, config_->get<bool>(kUseTileDecode, false));
+}
+
+bool CudfHiveConfig::isUseJitDecodeFilter() const {
+  return config_->get<bool>(kUseJitDecodeFilter, false);
+}
+
+bool CudfHiveConfig::isUseJitDecodeFilterSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kUseJitDecodeFilterSession,
+      config_->get<bool>(kUseJitDecodeFilter, false));
+}
+
 bool CudfHiveConfig::useBufferedInput() const {
   return config_->get<bool>(kUseBufferedInput, true);
 }

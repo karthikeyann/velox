@@ -74,6 +74,22 @@ class CudfHiveConfig {
   static constexpr const char* kTimestampTypeSession =
       "parquet.reader.timestamp_type";
 
+  // Whether pages of flat fixed-width columns are decoded by libcudf's tile
+  // decode kernels. Results do not depend on it.
+  static constexpr const char* kUseTileDecode =
+      "parquet.reader.use-tile-decode";
+  static constexpr const char* kUseTileDecodeSession =
+      "parquet.reader.use_tile_decode";
+
+  // Whether single-column conjuncts of the pushed-down filter are evaluated by
+  // kernels that libcudf links at runtime for the scan, while the column is
+  // decoded if the tile decode kernels are also on. Results do not depend on
+  // it.
+  static constexpr const char* kUseJitDecodeFilter =
+      "parquet.reader.use-jit-decode-filter";
+  static constexpr const char* kUseJitDecodeFilterSession =
+      "parquet.reader.use_jit_decode_filter";
+
   // Whether to use the BufferedInput source for CudfHiveDataSource. The
   // buffered source takes advantage of the `AsyncDataCache` if available. The
   // `AsyncDataCache` is controlled (default: enabled) using the
@@ -189,6 +205,12 @@ class CudfHiveConfig {
 
   cudf::data_type timestampType() const;
   cudf::data_type timestampTypeSession(const config::ConfigBase* session) const;
+
+  bool isUseTileDecode() const;
+  bool isUseTileDecodeSession(const config::ConfigBase* session) const;
+
+  bool isUseJitDecodeFilter() const;
+  bool isUseJitDecodeFilterSession(const config::ConfigBase* session) const;
 
   bool useBufferedInput() const;
   bool useBufferedInputSession(const config::ConfigBase* session) const;

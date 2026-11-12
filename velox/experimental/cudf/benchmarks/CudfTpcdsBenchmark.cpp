@@ -27,6 +27,10 @@
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 
+#include <cudf/io/parquet.hpp>
+
+#include <iostream>
+
 DECLARE_string(data_path);
 DECLARE_string(data_format);
 DECLARE_int64(max_coalesced_bytes);
@@ -54,6 +58,18 @@ DEFINE_int32(
     "Preferred output batch size in rows for cudf operators.");
 
 DEFINE_bool(velox_cudf_table_scan, true, "Enable cuDF table scan");
+
+DEFINE_bool(
+    cudf_parquet_use_tile_decode,
+    false,
+    "Decode pages of flat fixed-width columns with libcudf's tile decode "
+    "kernels");
+
+DEFINE_bool(
+    cudf_parquet_use_jit_decode_filter,
+    false,
+    "Evaluate single-column conjuncts of pushed-down filters with kernels "
+    "that libcudf links at runtime for the scan");
 
 DEFINE_string(
     cudf_properties,
@@ -118,11 +134,26 @@ CudfTpcdsBenchmark::makeConnectorProperties() {
       CudfHiveCfg::kMaxPassReadLimit,
       std::to_string(FLAGS_cudf_pass_read_limit));
   cfg->set(CudfHiveCfg::kAllowMismatchedCudfHiveSchemas, "true");
+  cfg->set(
+      CudfHiveCfg::kUseTileDecode,
+      std::to_string(FLAGS_cudf_parquet_use_tile_decode));
+  cfg->set(
+      CudfHiveCfg::kUseJitDecodeFilter,
+      std::to_string(FLAGS_cudf_parquet_use_jit_decode_filter));
 
   return cfg;
 }
 
 void CudfTpcdsBenchmark::shutdown() {
+  if (FLAGS_cudf_parquet_use_jit_decode_filter) {
+    // Shows whether the pushed-down filters were evaluated by the linked
+    // kernels at all, and where.
+    const auto stats = cudf::io::get_parquet_jit_filter_stats();
+    std::cout << "cuDF Parquet JIT decode filter: " << stats.decoded
+              << " predicates answered while decoding, " << stats.evaluated
+              << " evaluated after decoding, " << stats.fallback
+              << " filters evaluated as expressions" << std::endl;
+  }
   // CudfTpcdsQueryBuilder::shutdown() handles unregisterCudf().
   TpcdsBenchmark::shutdown();
 }

@@ -1787,6 +1787,79 @@ TEST_F(TableScanTest, filterPushdown) {
       "SELECT count(*) FROM tmp");
 }
 
+// The tile decode kernels and the kernels that evaluate pushed-down range
+// filters are switched by session properties. The scan returns the same rows
+// with any combination of them.
+TEST_F(TableScanTest, tileDecodeAndJitDecodeFilter) {
+  using cudf_velox::connector::hive::CudfHiveConfig;
+  auto rowType = ROW({"c0", "c1", "c2"}, {INTEGER(), BIGINT(), BIGINT()});
+  auto filePaths = makeFilePaths(4);
+  auto vectors = makeVectors(4, 1'000, rowType);
+  for (int32_t i = 0; i < vectors.size(); i++) {
+    writeToFile(filePaths[i]->getPath(), vectors[i]);
+  }
+  createDuckDbTable(vectors);
+
+  // c1 >= 0 and c2 < 0, nulls rejected.
+  common::SubfieldFilters subfieldFilters =
+      common::test::SubfieldFiltersBuilder()
+          .add(
+              "c1",
+              std::make_unique<common::BigintRange>(
+                  int64_t(0), std::numeric_limits<int64_t>::max(), false))
+          .add(
+              "c2",
+              std::make_unique<common::BigintRange>(
+                  std::numeric_limits<int64_t>::min(), int64_t(-1), false))
+          .build();
+  auto tableHandle = makeTableHandle(
+      "parquet_table", rowType, std::move(subfieldFilters), nullptr);
+  auto assignments =
+      facebook::velox::exec::test::HiveConnectorTestBase::allRegularColumns(
+          rowType);
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .outputType(ROW({"c0", "c1"}, {INTEGER(), BIGINT()}))
+                  .tableHandle(tableHandle)
+                  .assignments(assignments)
+                  .endTableScan()
+                  .planNode();
+
+  for (const auto* tileDecode : {"false", "true"}) {
+    for (const auto* jitDecodeFilter : {"false", "true"}) {
+      SCOPED_TRACE(
+          fmt::format(
+              "tile decode {}, JIT decode filter {}",
+              tileDecode,
+              jitDecodeFilter));
+      const auto before = cudf::io::get_parquet_jit_filter_stats();
+      AssertQueryBuilder(plan, duckDbQueryRunner_)
+          .connectorSessionProperty(
+              kCudfHiveConnectorId,
+              CudfHiveConfig::kUseTileDecodeSession,
+              tileDecode)
+          .connectorSessionProperty(
+              kCudfHiveConnectorId,
+              CudfHiveConfig::kUseJitDecodeFilterSession,
+              jitDecodeFilter)
+          .splits(makeCudfHiveConnectorSplits(filePaths))
+          .assertResults("SELECT c0, c1 FROM tmp WHERE c1 >= 0 AND c2 < 0");
+      // With the JIT decode filter on, both range filters are evaluated by
+      // linked kernels: the filter never runs as an expression. The
+      // environment can also turn the option on, so nothing is expected of
+      // the counters when the session leaves it off.
+      const auto after = cudf::io::get_parquet_jit_filter_stats();
+      EXPECT_EQ(after.fallback, before.fallback);
+      if (std::string_view(jitDecodeFilter) == "true") {
+        EXPECT_GT(
+            (after.decoded - before.decoded) +
+                (after.evaluated - before.evaluated),
+            0);
+      }
+    }
+  }
+}
+
 // Presto pushes an equality on a column into the scan and re-creates the
 // column above it as a constant projection. When the scan reads no other
 // column, that projection sits over a zero-column input and still runs on the
