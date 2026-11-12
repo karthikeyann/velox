@@ -49,6 +49,8 @@
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
+#include <folly/ScopeGuard.h>
+
 #include <algorithm>
 #include <limits>
 #include <memory>
@@ -248,9 +250,64 @@ CudfSplitReader::CudfSplitReader(
       hiveConfig.isFileColumnNamesReadAsLowerCase(sessionProperties);
 }
 
+namespace {
+
+// Returns the total size of 'byteRanges'.
+uint64_t numBytesOf(
+    cudf::host_span<const cudf::io::text::byte_range_info> byteRanges) {
+  uint64_t numBytes{0};
+  for (const auto& byteRange : byteRanges) {
+    numBytes += byteRange.size();
+  }
+  return numBytes;
+}
+
+} // namespace
+
+// The fetch of a prepared split's first pass, on offer to the fetch-ahead
+// budget. The budget starts it from whichever thread makes room, while the
+// reader may at the same moment be taken over by the driver that reads the
+// split, so both sides go through 'mutex'.
+class CudfSplitReader::FetchAhead : public FetchAheadBudget::Candidate {
+ public:
+  FetchAhead(
+      CudfSplitReader* reader,
+      std::vector<cudf::io::text::byte_range_info> byteRanges,
+      uint64_t numBytes)
+      : reader_(reader),
+        byteRanges_(std::move(byteRanges)),
+        numBytes_(numBytes) {}
+
+  bool start() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (reader_ == nullptr) {
+      return false;
+    }
+    auto* reader = std::exchange(reader_, nullptr);
+    ensureCudaContextForThread();
+    reader->startFetch(byteRanges_, numBytes_, /*isHeld=*/true);
+    return true;
+  }
+
+  // Makes start() do nothing from now on. Returns once no start() is
+  // running.
+  void withdraw() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    reader_ = nullptr;
+  }
+
+ private:
+  std::mutex mutex_;
+  // Null once the fetch has started or the offer was withdrawn.
+  CudfSplitReader* reader_;
+  const std::vector<cudf::io::text::byte_range_info> byteRanges_;
+  const uint64_t numBytes_;
+};
+
 CudfSplitReader::~CudfSplitReader() {
   // A split abandoned before it is read, e.g. when the task is cancelled while
   // the preloader prepares it, can still have reads in flight or queued.
+  withdrawFetchOffer();
   if (passState_ == nullptr) {
     return;
   }
@@ -463,6 +520,12 @@ std::optional<CudfSplitReader::TableChunk> CudfSplitReader::readNextChunk() {
 void CudfSplitReader::startColumnChunkFetch() {
   // Return if there's no passes or if the fetch is already started or if
   // the chunking is already setup.
+  // From here on the fetch-ahead budget leaves the fetch to this thread.
+  withdrawFetchOffer();
+  if (passState_ != nullptr and passState_->isAhead) {
+    passState_->isAhead = false;
+    fetchScheduler_->fetchAhead().claim();
+  }
   if (passState_ == nullptr or
       passState_->currentPass >= passState_->passes.size() or
       passState_->fetch.pending.valid() or passState_->isChunkingSetup) {
@@ -477,15 +540,66 @@ void CudfSplitReader::startColumnChunkFetch() {
       splitReader_
           ->all_column_chunks_byte_ranges(rowGroupIndices, readerOptions_)
           .first;
+  startFetch(
+      columnChunkByteRanges,
+      numBytesOf(columnChunkByteRanges),
+      /*isHeld=*/false);
+}
 
+void CudfSplitReader::startFetch(
+    cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
+    uint64_t numBytes,
+    bool isHeld) {
   nvtxRangePush("startColumnChunkFetch");
+  SCOPE_EXIT {
+    nvtxRangePop();
+  };
   passState_->fetch = fetchByteRangesAsync(
       dataSource_,
-      columnChunkByteRanges,
+      byteRanges,
       serializeIoRequests_,
       stream_,
       {get_temp_mr(), get_temp_mr()});
-  nvtxRangePop();
+  // Counted once the fetch exists: a fetch that fails to start holds nothing.
+  if (fetchScheduler_ != nullptr) {
+    if (!isHeld) {
+      fetchScheduler_->fetchAhead().hold(numBytes);
+    }
+    passState_->heldBytes = numBytes;
+    passState_->isAhead = isHeld;
+  }
+}
+
+bool CudfSplitReader::offerColumnChunkFetch() {
+  if (fetchScheduler_ == nullptr) {
+    return false;
+  }
+  if (passState_ == nullptr or fetchAhead_ != nullptr or
+      passState_->currentPass >= passState_->passes.size() or
+      passState_->fetch.pending.valid() or passState_->isChunkingSetup) {
+    return true;
+  }
+  // The byte ranges are worked out here, on the thread that prepares the
+  // split, so that the thread that starts the fetch does not use the reader.
+  auto byteRanges =
+      splitReader_
+          ->all_column_chunks_byte_ranges(
+              passState_->passes[passState_->currentPass], readerOptions_)
+          .first;
+  const auto numBytes = numBytesOf(byteRanges);
+  fetchAhead_ =
+      std::make_shared<FetchAhead>(this, std::move(byteRanges), numBytes);
+  fetchScheduler_->fetchAhead().offer(fetchAhead_, numBytes);
+  return true;
+}
+
+void CudfSplitReader::withdrawFetchOffer() {
+  if (fetchAhead_ != nullptr) {
+    fetchScheduler_->fetchAhead().withdraw(fetchAhead_.get());
+    // Waits for a start that is running.
+    fetchAhead_->withdraw();
+    fetchAhead_.reset();
+  }
 }
 
 void CudfSplitReader::setupChunkingForCurrentPass(
@@ -519,12 +633,22 @@ void CudfSplitReader::setupChunkingForCurrentPass(
 }
 
 void CudfSplitReader::releaseCurrentPassData() {
+  SCOPE_EXIT {
+    if (passState_->heldBytes > 0) {
+      auto& budget = fetchScheduler_->fetchAhead();
+      if (std::exchange(passState_->isAhead, false)) {
+        budget.claim();
+      }
+      budget.release(std::exchange(passState_->heldBytes, 0));
+    }
+  };
   // Queued or active reads can still write into the buffers being released.
   passState_->fetch.wait();
   passState_->fetch = {};
 }
 
 void CudfSplitReader::resetSplit() {
+  withdrawFetchOffer();
   if (passState_ != nullptr) {
     releaseCurrentPassData();
   }

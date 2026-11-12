@@ -206,7 +206,21 @@ bool CudfHiveConfig::fetchSchedulerEnabledSession(
 }
 
 uint32_t CudfHiveConfig::fetchSchedulerMaxReaders() const {
-  return config_->get<uint32_t>(kFetchSchedulerMaxReaders, 16);
+  return config_->get<uint32_t>(kFetchSchedulerMaxReaders, 0);
+}
+
+bool CudfHiveConfig::fetchAheadEnabled() const {
+  return config_->get<bool>(kFetchAheadEnabled, true);
+}
+
+bool CudfHiveConfig::fetchAheadEnabledSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kFetchAheadEnabledSession, config_->get<bool>(kFetchAheadEnabled, true));
+}
+
+uint64_t CudfHiveConfig::fetchAheadBytes() const {
+  return config_->get<uint64_t>(kFetchAheadBytes, 0);
 }
 
 bool CudfHiveConfig::immutableFiles() const {

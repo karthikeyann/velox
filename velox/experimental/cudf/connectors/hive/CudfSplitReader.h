@@ -130,6 +130,14 @@ class CudfSplitReader : public NvtxHelper {
   /// for them. Does nothing when they are already in flight or complete.
   void startColumnChunkFetch();
 
+  /// Offers the reads of the column chunks of the first pass to the
+  /// connector's fetch-ahead budget, which starts them when the device memory
+  /// it bounds has room for them, possibly on another thread. For a split
+  /// prepared ahead of the driver that will read it; the offer must be the
+  /// last use of the reader by the thread that prepares the split. Returns
+  /// false when there is no budget to offer to.
+  bool offerColumnChunkFetch();
+
   /// Get the stream.
   cuda::stream_ref stream() const {
     return stream_;
@@ -256,7 +264,30 @@ class CudfSplitReader : public NvtxHelper {
 
     // Owns the device data of the current pass.
     ByteRangeFetch fetch;
+
+    // Bytes of the current pass's column chunks counted in the fetch-ahead
+    // budget. Zero when its fetch has not started or there is no budget.
+    uint64_t heldBytes{0};
+
+    // Whether the budget started the current pass's fetch and the reader has
+    // not asked for it yet.
+    bool isAhead{false};
   };
+
+  // The offer of the first pass's fetch to the fetch-ahead budget.
+  class FetchAhead;
+
+  // Start the reads of 'byteRanges', the column chunks of the current pass.
+  // 'isHeld' says whether the fetch-ahead budget already counts 'numBytes'
+  // for them.
+  void startFetch(
+      cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
+      uint64_t numBytes,
+      bool isHeld);
+
+  // Withdraws the offer made to the fetch-ahead budget, if any: after this
+  // the budget no longer starts the fetch.
+  void withdrawFetchOffer();
 
   // Setup the cuDF reader options
   void setupReaderOptions();
@@ -288,6 +319,8 @@ class CudfSplitReader : public NvtxHelper {
 
   // Row group passes and byte fetch states.
   std::unique_ptr<RowGroupPassState> passState_;
+  // Set while the first pass's fetch is on offer to the fetch-ahead budget.
+  std::shared_ptr<FetchAhead> fetchAhead_;
   bool serializeIoRequests_{false};
 
   // Chunk and pass read limits resolved from the session when the reader is

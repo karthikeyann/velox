@@ -99,8 +99,9 @@ class CudfHiveConfig {
   static constexpr const char* kUseBufferedInputSession =
       "cudf.hive.use_buffered_input";
 
-  // Whether background split preparation starts reading the first column-chunk
-  // pass. Disable to keep queued preloaded splits metadata-only.
+  // Whether background split preparation offers the first column-chunk pass
+  // to the fetch-ahead budget, as kFetchAheadEnabled does. Without a budget
+  // (staging pool size 0) the preparation starts reading it.
   static constexpr const char* kPreloadColumnChunks =
       "cudf.hive.preload-column-chunks";
   static constexpr const char* kPreloadColumnChunksSession =
@@ -149,13 +150,30 @@ class CudfHiveConfig {
       "cudf.hive.fetch_scheduler_enabled";
 
   // Upper bound on the reader threads of a connector's fetch scheduler, at
-  // most kMaxFetchSchedulerReaders. The scheduler chooses how many of them
-  // read at a time.
+  // most kMaxFetchSchedulerReaders. Zero stands for half of the CPUs the
+  // process may run on, divided by the number of devices it sees, between 4
+  // and 64. The scheduler chooses how many of them read at a time.
   static constexpr const char* kFetchSchedulerMaxReaders =
       "cudf.hive.fetch-scheduler-max-readers";
 
   // Largest accepted bound on the reader threads of a fetch scheduler.
   static constexpr uint32_t kMaxFetchSchedulerReaders = 256;
+
+  // Whether the column chunks of splits prepared ahead of the drivers are
+  // fetched ahead too, while the device memory held by fetched and not yet
+  // decoded column chunks stays within the fetch-ahead budget. Has no effect
+  // without the fetch scheduler's staging pool. kPreloadColumnChunks asks
+  // for the same, whatever this says.
+  static constexpr const char* kFetchAheadEnabled =
+      "cudf.hive.fetch-ahead-enabled";
+  static constexpr const char* kFetchAheadEnabledSession =
+      "cudf.hive.fetch_ahead_enabled";
+
+  // Capacity in bytes of a fetch-ahead budget of the connector's own. Zero
+  // makes the connector use the budget all connectors of the process share:
+  // one sixteenth of the device's memory, and no more than a quarter of what
+  // is free when it is created.
+  static constexpr const char* kFetchAheadBytes = "cudf.hive.fetch-ahead-bytes";
 
   // Smallest accepted staging buffer size. A range takes one queued read per
   // buffer, so a tiny buffer would flood the IO executor.
@@ -257,6 +275,17 @@ class CudfHiveConfig {
   /// Returns the upper bound on the reader threads of the connector's fetch
   /// scheduler.
   uint32_t fetchSchedulerMaxReaders() const;
+
+  /// Returns whether the column chunks of splits prepared ahead are fetched
+  /// ahead within the fetch-ahead budget.
+  bool fetchAheadEnabled() const;
+
+  /// Returns fetchAheadEnabled() unless 'session' overrides it.
+  bool fetchAheadEnabledSession(const config::ConfigBase* session) const;
+
+  /// Returns the capacity of the fetch-ahead budget in bytes, zero when it
+  /// is to be taken from the device's memory.
+  uint64_t fetchAheadBytes() const;
 
   bool immutableFiles() const;
 

@@ -750,10 +750,18 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   // Check if preloaded splits should start pre-fetching the first pass of
   // column chunks.
   const bool isPreloadedSplit = split->dataSource != nullptr;
-  if (isPreloadedSplit &&
-      cudfHiveConfig_->preloadColumnChunksSession(
-          connectorQueryCtx_->sessionProperties())) {
-    cudfSplitReader_->startColumnChunkFetch();
+  if (isPreloadedSplit) {
+    const auto* sessionProperties = connectorQueryCtx_->sessionProperties();
+    const bool preloadColumnChunks =
+        cudfHiveConfig_->preloadColumnChunksSession(sessionProperties);
+    if (preloadColumnChunks ||
+        cudfHiveConfig_->fetchAheadEnabledSession(sessionProperties)) {
+      // The last use of the reader on this thread: from here on the budget
+      // may start the fetch on another one.
+      if (!cudfSplitReader_->offerColumnChunkFetch() && preloadColumnChunks) {
+        cudfSplitReader_->startColumnChunkFetch();
+      }
+    }
   }
 
   // TODO: `completedBytes_` should be updated in `next()` as we read more and

@@ -1692,7 +1692,7 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      - cudf.hive.preload_column_chunks
      - bool
      - false
-     - Whether background split preparation starts fetching the first column-chunk pass. Active splits always start fetching when activated. Enabling this can overlap I/O with the previous split, but retains one pass of device buffers per preloaded split.
+     - Whether background split preparation offers the first column-chunk pass to the fetch-ahead budget, which ``cudf.hive.fetch-ahead-enabled`` already asks for by default. The pass is fetched ahead while the budget has room. With a staging pool size of 0 there is no budget, and the preparation starts the fetch itself, which retains one pass of device buffers per prepared split.
    * - cudf.hive.serialize-io-requests
      - cudf.hive.serialize_io_requests
      - bool
@@ -1717,12 +1717,22 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      - cudf.hive.fetch_scheduler_enabled
      - bool
      - true
-     - Whether the column chunks staged in page-locked buffers are moved to the device by the connector's fetch scheduler, which all scans of the connector share. The scheduler reads with its own threads and chooses how many of them read at a time, so a scan behaves the same whichever thread starts it and however many threads the IO executor has. It serves the column chunks of a split that a driver is waiting for before those of splits loaded ahead. When false, each read runs on a thread of the IO executor. Has no effect when ``cudf.hive.pinned-staging-enabled`` is false or the staging pool size is 0. A scan that uses the scheduler reports ``cudfFetch*`` runtime statistics.
+     - Whether the column chunks staged in page-locked buffers are moved to the device by the connector's fetch scheduler, which all scans of the connector share. The scheduler reads with its own threads and chooses how many of them read at a time, so a scan behaves the same whichever thread starts it and however many threads the IO executor has. It serves the column chunks of a split that a driver is waiting for before those fetched ahead. When false, each read runs on a thread of the IO executor. Has no effect when ``cudf.hive.pinned-staging-enabled`` is false or the staging pool size is 0. A scan that uses the scheduler reports ``cudfFetch*`` runtime statistics.
    * - cudf.hive.fetch-scheduler-max-readers
      -
      - integer
-     - 16
-     - Upper bound on the reader threads of a connector's fetch scheduler, between 1 and 256. The scheduler adds a reader while column chunks wait for one and the copies to the device have idle time, and removes one while column chunks wait for a staging buffer, so this is a limit and not a setting to tune. Every connector has its own scheduler and threads; the threads start with the connector's first scan.
+     - 0
+     - Upper bound on the reader threads of a connector's fetch scheduler, at most 256. 0 takes half of the CPUs the process may run on, divided by the number of devices it sees, between 4 and 64. The scheduler measures the bytes per second that reach the device and keeps as many readers at work as raise that rate, so this is a limit and not a setting to tune. Every connector has its own scheduler and threads; the threads start with the connector's first scan.
+   * - cudf.hive.fetch-ahead-enabled
+     - cudf.hive.fetch_ahead_enabled
+     - bool
+     - true
+     - Whether the column chunks of the splits that Velox prepares ahead of the drivers are fetched ahead as well, while the device memory held by fetched and not yet decoded column chunks stays within the fetch-ahead budget. One fetch may always be ahead of its driver. This keeps the storage and the link to the device busy while the drivers decode, whatever the number of drivers. Has no effect when the staging pool size is 0.
+   * - cudf.hive.fetch-ahead-bytes
+     -
+     - integer
+     - 0
+     - Capacity in bytes of a fetch-ahead budget of the connector's own: the device memory that column chunks fetched ahead may bring the total held by the connector's scans to. A fetch that a driver is waiting for is not held back by it. 0 makes the connector use the budget that all cuDF connectors of the process share, which is one sixteenth of the device's memory and no more than a quarter of what is free when the first scan creates it.
    * - parquet.reader.use-tile-decode
      - parquet.reader.use_tile_decode
      - bool

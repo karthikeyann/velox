@@ -49,11 +49,6 @@ std::shared_ptr<FetchScheduler> createFetchScheduler(
       "Staging buffer size is below its minimum: {}",
       CudfHiveConfig::kPinnedStagingBufferSize);
   const auto maxReaders = config.fetchSchedulerMaxReaders();
-  VELOX_USER_CHECK_GT(
-      maxReaders,
-      0,
-      "Fetch scheduler reader bound must be at least 1: {}",
-      CudfHiveConfig::kFetchSchedulerMaxReaders);
   VELOX_USER_CHECK_LE(
       maxReaders,
       CudfHiveConfig::kMaxFetchSchedulerReaders,
@@ -61,6 +56,7 @@ std::shared_ptr<FetchScheduler> createFetchScheduler(
       CudfHiveConfig::kFetchSchedulerMaxReaders);
   FetchScheduler::Options options;
   options.maxReaders = maxReaders;
+  options.fetchAheadBytes = config.fetchAheadBytes();
   return std::make_shared<FetchScheduler>(
       std::make_shared<PinnedBufferPool>(bufferSize, poolSize), options);
 }

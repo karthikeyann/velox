@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
+#include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
@@ -737,6 +738,14 @@ TEST_F(TableScanTest, fetchScheduler) {
     const auto planStats = toPlanStats(task->taskStats());
     const auto& scanStats =
         planStats.at(plan->id()).operatorStatsFor("TableScan");
+    // The scan reports its wait for column chunks whichever way they are
+    // fetched, once per row group pass.
+    const auto fetchWait = scanStats.customStats.find(
+        cudf_velox::connector::hive::CudfSplitReader::kFetchWaitWallNanos);
+    EXPECT_TRUE(fetchWait != scanStats.customStats.end());
+    if (fetchWait != scanStats.customStats.end()) {
+      EXPECT_GE(fetchWait->second.count, 2);
+    }
     const auto fetchBytes = scanStats.customStats.find(
         cudf_velox::connector::hive::BufferedInputDataSource::kFetchBytes);
     const auto numBytes = scheduler->stats().bytes - bytesBefore;
@@ -763,6 +772,80 @@ TEST_F(TableScanTest, fetchScheduler) {
   const auto stats = scheduler->stats();
   EXPECT_LE(stats.maxRunningReaders, 3);
   EXPECT_LE(stats.maxBuffersInUse, 4);
+}
+
+// One driver reads many small files. The column chunks of the splits
+// prepared ahead of it are fetched ahead too, within the fetch-ahead budget,
+// unless the session turns that off; either way the scan returns the same
+// rows and gives back every byte it held.
+TEST_F(TableScanTest, fetchAhead) {
+  using cudf_velox::connector::hive::CudfHiveConfig;
+  using cudf_velox::connector::hive::CudfHiveConnector;
+  constexpr int32_t kNumFiles{12};
+  auto filePaths = makeFilePaths(kNumFiles);
+  auto vectors = makeVectors(kNumFiles, 5'000);
+  for (auto i = 0; i < vectors.size(); ++i) {
+    writeToFile(filePaths[i]->getPath(), vectors[i]);
+  }
+  createDuckDbTable(vectors);
+  auto plan = tableScanNode();
+
+  // Returns the counters of the budget after a scan with 'capacity'.
+  const auto scan = [&](uint64_t capacity, bool fetchAhead) {
+    resetCudfHiveConnector(
+        std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>{
+                {CudfHiveConfig::kFetchAheadBytes, std::to_string(capacity)},
+            }));
+    auto hiveConnector = std::dynamic_pointer_cast<CudfHiveConnector>(
+        facebook::velox::connector::ConnectorRegistry::tryGet(
+            kCudfHiveConnectorId));
+    VELOX_CHECK_NOT_NULL(hiveConnector);
+    AssertQueryBuilder(plan, duckDbQueryRunner_)
+        .maxDrivers(1)
+        .config(core::QueryConfig::kMaxSplitPreloadPerDriver, "4")
+        .connectorSessionProperty(
+            kCudfHiveConnectorId,
+            CudfHiveConfig::kFetchAheadEnabledSession,
+            fetchAhead ? "true" : "false")
+        .splits(makeCudfHiveConnectorSplits(filePaths))
+        .assertResults("SELECT * FROM tmp");
+    return hiveConnector->fetchScheduler()->fetchAhead().stats();
+  };
+
+  // Without fetch-ahead the one driver holds the column chunks of one split
+  // at a time, so the most it held is the largest split.
+  uint64_t largestSplit{0};
+  {
+    SCOPED_TRACE("off");
+    const auto stats = scan(1ULL << 30, false);
+    EXPECT_EQ(stats.numOffered, 0);
+    EXPECT_EQ(stats.numStartedAhead, 0);
+    EXPECT_EQ(stats.heldBytes, 0);
+    EXPECT_GT(stats.maxHeldBytes, 0);
+    largestSplit = stats.maxHeldBytes;
+  }
+  {
+    SCOPED_TRACE("room for every split");
+    const auto stats = scan(1ULL << 30, true);
+    EXPECT_GT(stats.numOffered, 0);
+    EXPECT_GT(stats.numStartedAhead, 0);
+    EXPECT_EQ(stats.numWaiting, 0);
+    EXPECT_EQ(stats.heldBytes, 0);
+    EXPECT_LE(stats.maxHeldBytes, kNumFiles * largestSplit);
+  }
+  {
+    SCOPED_TRACE("room for one split ahead");
+    // A capacity of one byte lets a fetch start ahead only when nothing is
+    // held, so at most one split is held ahead of the one being read.
+    const auto stats = scan(1, true);
+    EXPECT_GT(stats.numOffered, 0);
+    EXPECT_EQ(stats.heldBytes, 0);
+    EXPECT_LE(stats.maxHeldBytes, 2 * largestSplit);
+  }
+  resetCudfHiveConnector(
+      std::make_shared<config::ConfigBase>(
+          std::unordered_map<std::string, std::string>{}));
 }
 
 // Splits prepared in the background by the preloader must produce the same

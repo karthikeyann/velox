@@ -237,9 +237,8 @@ TEST_F(FetchSchedulerTest, admission) {
   const auto stats = scheduler->stats();
   EXPECT_EQ(stats.maxRunningReaders, 2);
   EXPECT_EQ(stats.numReaders, 2);
-  // Two readers get one buffer to fill and one being copied each, plus one
-  // per copy stream.
-  EXPECT_LE(stats.maxBuffersInUse, 6);
+  // A reader holds one staging buffer.
+  EXPECT_LE(stats.maxBuffersInUse, 2);
 }
 
 // Ranges are served group by group in the order the groups asked, except
@@ -510,122 +509,142 @@ TEST_F(FetchSchedulerTest, concurrentSubmitters) {
   EXPECT_LE(scheduler->pool()->numAllocated(), 4);
 }
 
-TEST_F(FetchSchedulerTest, nextNumReaders) {
+// One measurement of 'bytesPerSecond' over a millisecond.
+FetchScheduler::ControlWindow measured(double bytesPerSecond) {
+  return {
+      .saturatedNanos = 1'000'000,
+      .bytes = static_cast<uint64_t>(bytesPerSecond / 1'000)};
+}
+
+TEST_F(FetchSchedulerTest, nextControlState) {
+  using State = FetchScheduler::ControlState;
+  using Phase = State::Phase;
   Options options;
   options.minReaders = 2;
   options.maxReaders = 8;
-  using Window = FetchScheduler::ControlWindow;
+  options.numHoldPeriods = 2;
 
-  // Nothing measured.
-  EXPECT_EQ(FetchScheduler::nextNumReaders(options, 4, Window{}), 4);
-  // Ranges waited for a reader while the copy streams were mostly idle.
-  EXPECT_EQ(
-      FetchScheduler::nextNumReaders(
-          options,
-          4,
-          Window{
-              .activeNanos = 100,
-              .copyBusyNanos = 50,
-              .readerLimitedNanos = 90}),
-      5);
-  EXPECT_EQ(
-      FetchScheduler::nextNumReaders(
-          options,
-          8,
-          Window{
-              .activeNanos = 100,
-              .copyBusyNanos = 50,
-              .readerLimitedNanos = 90}),
-      8);
-  // Ranges waited for a reader, but the copy streams had no time left.
-  EXPECT_EQ(
-      FetchScheduler::nextNumReaders(
-          options,
-          4,
-          Window{
-              .activeNanos = 100,
-              .copyBusyNanos = 95,
-              .readerLimitedNanos = 90}),
-      4);
-  // The copy streams were idle, but no range waited for a reader.
-  EXPECT_EQ(
-      FetchScheduler::nextNumReaders(
-          options, 4, Window{.activeNanos = 100, .copyBusyNanos = 10}),
-      4);
-  // Ranges waited for staging buffers: the copies cannot keep up.
-  EXPECT_EQ(
-      FetchScheduler::nextNumReaders(
-          options,
-          4,
-          Window{
-              .activeNanos = 100,
-              .copyBusyNanos = 100,
-              .bufferLimitedNanos = 30}),
-      3);
-  EXPECT_EQ(
-      FetchScheduler::nextNumReaders(
-          options,
-          2,
-          Window{
-              .activeNanos = 100,
-              .copyBusyNanos = 100,
-              .bufferLimitedNanos = 30}),
-      2); // The count of readers is never zero.
+  // Nothing measured: nothing changes.
+  State state{.numReaders = 4};
+  auto next = FetchScheduler::nextControlState(options, state, {});
+  EXPECT_EQ(next.numReaders, 4);
+  EXPECT_EQ(next.phase, Phase::kHold);
+  EXPECT_EQ(next.baseRate, 0);
+
+  // While it holds, the controller averages the rate and counts down.
+  state = {.numReaders = 4, .baseRate = 1'000e6, .numHoldsLeft = 2};
+  next = FetchScheduler::nextControlState(options, state, measured(2'000e6));
+  EXPECT_EQ(next.numReaders, 4);
+  EXPECT_EQ(next.phase, Phase::kHold);
+  EXPECT_EQ(next.numHoldsLeft, 1);
+  EXPECT_DOUBLE_EQ(next.baseRate, 1'250e6);
+
+  // After the hold it tries one more.
+  state = {.numReaders = 4, .baseRate = 1'000e6};
+  next = FetchScheduler::nextControlState(options, state, measured(1'000e6));
+  EXPECT_EQ(next.numReaders, 5);
+  EXPECT_EQ(next.phase, Phase::kTryMore);
+
+  // The fifth reader is kept when the rate rises by an eighth, half of its
+  // share of a quarter, and the sixth is tried right away.
+  state = {.numReaders = 5, .phase = Phase::kTryMore, .baseRate = 1'000e6};
+  next = FetchScheduler::nextControlState(options, state, measured(1'130e6));
+  EXPECT_EQ(next.numReaders, 6);
+  EXPECT_EQ(next.phase, Phase::kTryMore);
+  EXPECT_DOUBLE_EQ(next.baseRate, 1'130e6);
+  // Otherwise the controller goes back to four, holds, and tries fewer next.
+  next = FetchScheduler::nextControlState(options, state, measured(1'120e6));
+  EXPECT_EQ(next.numReaders, 4);
+  EXPECT_EQ(next.phase, Phase::kHold);
+  EXPECT_EQ(next.numHoldsLeft, 2);
+  EXPECT_FALSE(next.tryMoreNext);
+  EXPECT_DOUBLE_EQ(next.baseRate, 1'000e6);
+  state = next;
+  state.numHoldsLeft = 0;
+  next = FetchScheduler::nextControlState(options, state, measured(1'000e6));
+  EXPECT_EQ(next.numReaders, 3);
+  EXPECT_EQ(next.phase, Phase::kTryFewer);
+
+  // Three readers are kept when the rate falls by less than a sixteenth, a
+  // quarter of the fourth reader's share, and two are tried right away.
+  state = {.numReaders = 3, .phase = Phase::kTryFewer, .baseRate = 1'000e6};
+  next = FetchScheduler::nextControlState(options, state, measured(940e6));
+  EXPECT_EQ(next.numReaders, 2);
+  EXPECT_EQ(next.phase, Phase::kTryFewer);
+  EXPECT_DOUBLE_EQ(next.baseRate, 940e6);
+  // Otherwise the controller goes back to four, holds, and tries more next.
+  next = FetchScheduler::nextControlState(options, state, measured(930e6));
+  EXPECT_EQ(next.numReaders, 4);
+  EXPECT_EQ(next.phase, Phase::kHold);
+  EXPECT_TRUE(next.tryMoreNext);
+
+  // The bounds end a run of kept trials.
+  state = {.numReaders = 8, .phase = Phase::kTryMore, .baseRate = 1'000e6};
+  next = FetchScheduler::nextControlState(options, state, measured(2'000e6));
+  EXPECT_EQ(next.numReaders, 8);
+  EXPECT_EQ(next.phase, Phase::kHold);
+  state = {.numReaders = 2, .phase = Phase::kTryFewer, .baseRate = 1'000e6};
+  next = FetchScheduler::nextControlState(options, state, measured(1'000e6));
+  EXPECT_EQ(next.numReaders, 2);
+  EXPECT_EQ(next.phase, Phase::kHold);
+  // At a bound only the other direction is tried.
+  state = {.numReaders = 8, .baseRate = 1'000e6, .tryMoreNext = true};
+  next = FetchScheduler::nextControlState(options, state, measured(1'000e6));
+  EXPECT_EQ(next.numReaders, 7);
+  EXPECT_EQ(next.phase, Phase::kTryFewer);
+
+  // With nothing delivered at all, fewer readers are never kept.
+  state = {.numReaders = 3, .phase = Phase::kTryFewer};
+  next = FetchScheduler::nextControlState(options, state, measured(0));
+  EXPECT_EQ(next.numReaders, 4);
+  EXPECT_EQ(next.phase, Phase::kHold);
+
   VELOX_ASSERT_THROW(
-      FetchScheduler::nextNumReaders(options, 0, Window{}), "(0 vs. 0)");
+      FetchScheduler::nextControlState(options, State{.numReaders = 0}, {}),
+      "(0 vs. 0)");
 }
 
-// The rule settles where the readers deliver what the copies can take, from
-// either side, and at the upper bound when the copies are never the limit.
-TEST_F(FetchSchedulerTest, nextNumReadersConverges) {
+// The controller settles at the fewest readers that deliver what the copies
+// can take, from either side, and at the upper bound when the copies are
+// never the limit.
+TEST_F(FetchSchedulerTest, nextControlStateConverges) {
+  using State = FetchScheduler::ControlState;
   Options options;
   options.minReaders = 1;
-  options.maxReaders = 16;
-  // What the controller measures with 'numReaders' readers of 'readRate'
-  // each in front of copies of 'copyRate', when ranges are always queued.
-  const auto measure = [](size_t numReaders, double readRate, double copyRate) {
-    FetchScheduler::ControlWindow window;
-    window.activeNanos = 1'000'000;
-    const auto delivered = numReaders * readRate;
-    if (delivered > copyRate) {
-      // The copies never stop, and the readers stand by for staging buffers
-      // for the share of the time they are ahead.
-      window.copyBusyNanos = window.activeNanos;
-      window.bufferLimitedNanos = static_cast<uint64_t>(
-          window.activeNanos * (1 - copyRate / delivered));
-      window.readerLimitedNanos =
-          window.activeNanos - window.bufferLimitedNanos;
-    } else {
-      window.copyBusyNanos =
-          static_cast<uint64_t>(window.activeNanos * (delivered / copyRate));
-      window.readerLimitedNanos = window.activeNanos;
-    }
-    return window;
-  };
+  options.maxReaders = 32;
+  options.numHoldPeriods = 3;
+  // Returns the number of readers the controller holds after many
+  // measurements, when each reader delivers 'readRate' and the copies take
+  // at most 'copyRate'.
   const auto settle = [&](size_t numReaders, double readRate, double copyRate) {
-    for (int i = 0; i < 100; ++i) {
-      numReaders = FetchScheduler::nextNumReaders(
-          options, numReaders, measure(numReaders, readRate, copyRate));
+    State state{.numReaders = numReaders};
+    std::vector<size_t> held;
+    for (int i = 0; i < 400; ++i) {
+      const auto rate = std::min(state.numReaders * readRate, copyRate);
+      state = FetchScheduler::nextControlState(options, state, measured(rate));
+      if (i >= 300 && state.phase == State::Phase::kHold) {
+        held.push_back(state.numReaders);
+      }
     }
-    return numReaders;
+    EXPECT_FALSE(held.empty());
+    // It holds one number in the end.
+    EXPECT_THAT(held, testing::Each(held.front()));
+    return held.front();
   };
 
-  // Page-cache reads of 3.6 GB/s per reader in front of a 22 GB/s link: six
-  // readers deliver 21.6 GB/s.
-  EXPECT_THAT(
-      settle(1, 3.6, 22), testing::AllOf(testing::Ge(6), testing::Le(8)));
-  EXPECT_THAT(
-      settle(16, 3.6, 22), testing::AllOf(testing::Ge(6), testing::Le(8)));
-  // The same readers in front of a 146 GB/s link, and a drive that gives
-  // sixteen readers 6 GB/s between them in front of the 22 GB/s link: the
-  // copies always wait.
-  EXPECT_EQ(settle(1, 3.6, 146), 16);
-  EXPECT_EQ(settle(4, 0.375, 22), 16);
+  // Readers of 4 GB/s in front of a 23 GB/s link: six deliver all of it.
+  EXPECT_EQ(settle(1, 4e9, 23e9), 6);
+  EXPECT_EQ(settle(8, 4e9, 23e9), 6);
+  EXPECT_EQ(settle(32, 4e9, 23e9), 6);
+  // Readers of 15 GB/s in front of a 300 GB/s link: twenty.
+  EXPECT_EQ(settle(8, 15e9, 300e9), 20);
+  // Readers that never fill the link.
+  EXPECT_EQ(settle(8, 4e9, 300e9), 32);
 }
 
-// While ranges wait for a reader and none waits for a staging buffer, the
-// controller adds readers up to its bound. The fills stand at a gate, so the
-// waiting is a state and not a matter of timing.
+// While ranges wait for a reader and nothing is delivered, the controller
+// adds readers up to its bound. The fills stand at a gate, so the waiting is
+// a state and not a matter of timing.
 TEST_F(FetchSchedulerTest, raisesReadersWhileRangesWait) {
   const auto content = makeContent(kBufferSize);
   Options options;
@@ -633,6 +652,8 @@ TEST_F(FetchSchedulerTest, raisesReadersWhileRangesWait) {
   options.maxReaders = 4;
   options.initialReaders = 1;
   options.controlPeriod = std::chrono::microseconds(100);
+  // No further trial once the bound is reached.
+  options.numHoldPeriods = 1'000'000;
   auto scheduler = makeScheduler(options, 16);
   Gate gate;
   constexpr size_t kNumPieces{32};
@@ -654,10 +675,8 @@ TEST_F(FetchSchedulerTest, raisesReadersWhileRangesWait) {
   auto stats = scheduler->stats();
   EXPECT_EQ(stats.numReaders, 4);
   EXPECT_EQ(stats.numRaises, 3);
-  EXPECT_GT(stats.readerLimitedNanos, 0);
-  // The bound holds however long the ranges wait.
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  EXPECT_EQ(scheduler->stats().numReaders, 4);
+  EXPECT_GT(stats.saturatedNanos, 0);
+  EXPECT_EQ(stats.numLowers, 0);
   EXPECT_EQ(gate.maxInside(), 4);
 
   gate.open();

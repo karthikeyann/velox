@@ -114,8 +114,21 @@ DEFINE_bool(
 
 DEFINE_uint32(
     cudf_hive_fetch_scheduler_max_readers,
-    16,
-    "Upper bound on the reader threads of the fetch scheduler");
+    0,
+    "Upper bound on the reader threads of the fetch scheduler; 0 takes half "
+    "of the hardware threads, between 4 and 64");
+
+DEFINE_bool(
+    cudf_hive_fetch_ahead_enabled,
+    true,
+    "Fetch the column chunks of splits prepared ahead of the drivers within "
+    "the fetch-ahead budget");
+
+DEFINE_uint64(
+    cudf_hive_fetch_ahead_bytes,
+    0,
+    "Capacity of the fetch-ahead budget in bytes; 0 takes one sixteenth of "
+    "the device's memory");
 
 DEFINE_string(
     cudf_properties,
@@ -176,6 +189,12 @@ void CudfTpchBenchmark::initialize() {
     cudfHiveConfigurationValues[cudf_velox::connector::hive::CudfHiveConfig::
                                     kFetchSchedulerMaxReaders] =
         std::to_string(FLAGS_cudf_hive_fetch_scheduler_max_readers);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kFetchAheadEnabled] =
+            std::to_string(FLAGS_cudf_hive_fetch_ahead_enabled);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kFetchAheadBytes] =
+            std::to_string(FLAGS_cudf_hive_fetch_ahead_bytes);
     auto cudfHiveProperties = std::make_shared<const config::ConfigBase>(
         std::move(cudfHiveConfigurationValues));
 
@@ -240,6 +259,12 @@ CudfTpchBenchmark::makeConnectorProperties() {
   cfg->set(
       CudfHiveCfg::kFetchSchedulerMaxReaders,
       std::to_string(FLAGS_cudf_hive_fetch_scheduler_max_readers));
+  cfg->set(
+      CudfHiveCfg::kFetchAheadEnabled,
+      std::to_string(FLAGS_cudf_hive_fetch_ahead_enabled));
+  cfg->set(
+      CudfHiveCfg::kFetchAheadBytes,
+      std::to_string(FLAGS_cudf_hive_fetch_ahead_bytes));
   cfg->set(CudfHiveCfg::kAllowMismatchedCudfHiveSchemas, "true");
 
   return cfg;

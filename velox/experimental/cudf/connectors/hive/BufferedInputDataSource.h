@@ -48,12 +48,12 @@ class BufferedInputDataSource : public cudf::io::datasource {
   /// staging buffers of its later pieces when one reader fills them in turn.
   static constexpr const char* kFetchQueuedWallNanos =
       "cudfFetchQueuedWallNanos";
-  /// Time from queueing a piece's copy to the device to its completion,
-  /// summed over pieces.
+  /// Time the scheduler's readers waited for the copies of a read's pieces
+  /// to the device, summed over pieces.
   static constexpr const char* kFetchCopyWallNanos = "cudfFetchCopyWallNanos";
-  /// Share of a read's time in the scheduler during which the copy streams
-  /// had work, in percent. The mean over reads tells how busy the copy stage
-  /// was.
+  /// Share of a read's time in the scheduler during which a copy to the
+  /// device was in flight, in percent. The mean over reads tells how busy
+  /// the link to the device was.
   static constexpr const char* kFetchCopyBusyPercent =
       "cudfFetchCopyBusyPercent";
   /// Share of a read's time in the scheduler during which reads waited for
