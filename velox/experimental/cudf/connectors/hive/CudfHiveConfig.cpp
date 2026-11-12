@@ -209,6 +209,10 @@ uint32_t CudfHiveConfig::fetchSchedulerMaxReaders() const {
   return config_->get<uint32_t>(kFetchSchedulerMaxReaders, 0);
 }
 
+uint32_t CudfHiveConfig::fetchSchedulerMinReaders() const {
+  return config_->get<uint32_t>(kFetchSchedulerMinReaders, 1);
+}
+
 bool CudfHiveConfig::fetchAheadEnabled() const {
   return config_->get<bool>(kFetchAheadEnabled, true);
 }

@@ -118,6 +118,12 @@ DEFINE_uint32(
     "Upper bound on the reader threads of the fetch scheduler; 0 takes half "
     "of the hardware threads, between 4 and 64");
 
+DEFINE_uint32(
+    cudf_hive_fetch_scheduler_min_readers,
+    1,
+    "Fewest readers the fetch scheduler keeps at work; equal to the upper "
+    "bound it pins the reader count");
+
 DEFINE_bool(
     cudf_hive_fetch_ahead_enabled,
     true,
@@ -129,6 +135,11 @@ DEFINE_uint64(
     0,
     "Capacity of the fetch-ahead budget in bytes; 0 takes one sixteenth of "
     "the device's memory");
+
+DEFINE_uint32(
+    cudf_num_splits_per_file,
+    1,
+    "Number of splits each data file is cut into for the cuDF table scan");
 
 DEFINE_string(
     cudf_properties,
@@ -189,6 +200,9 @@ void CudfTpchBenchmark::initialize() {
     cudfHiveConfigurationValues[cudf_velox::connector::hive::CudfHiveConfig::
                                     kFetchSchedulerMaxReaders] =
         std::to_string(FLAGS_cudf_hive_fetch_scheduler_max_readers);
+    cudfHiveConfigurationValues[cudf_velox::connector::hive::CudfHiveConfig::
+                                    kFetchSchedulerMinReaders] =
+        std::to_string(FLAGS_cudf_hive_fetch_scheduler_min_readers);
     cudfHiveConfigurationValues
         [cudf_velox::connector::hive::CudfHiveConfig::kFetchAheadEnabled] =
             std::to_string(FLAGS_cudf_hive_fetch_ahead_enabled);
@@ -260,6 +274,9 @@ CudfTpchBenchmark::makeConnectorProperties() {
       CudfHiveCfg::kFetchSchedulerMaxReaders,
       std::to_string(FLAGS_cudf_hive_fetch_scheduler_max_readers));
   cfg->set(
+      CudfHiveCfg::kFetchSchedulerMinReaders,
+      std::to_string(FLAGS_cudf_hive_fetch_scheduler_min_readers));
+  cfg->set(
       CudfHiveCfg::kFetchAheadEnabled,
       std::to_string(FLAGS_cudf_hive_fetch_ahead_enabled));
   cfg->set(
@@ -283,7 +300,7 @@ CudfTpchBenchmark::listSplits(
     // filePaths)
     std::vector<std::shared_ptr<connector::ConnectorSplit>> result;
     auto temp = HiveConnectorTestBase::makeHiveConnectorSplits(
-        path, 1, plan.dataFileFormat);
+        path, FLAGS_cudf_num_splits_per_file, plan.dataFileFormat);
     for (auto& i : temp) {
       result.push_back(i);
     }

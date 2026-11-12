@@ -521,40 +521,61 @@ TEST_F(FetchSchedulerTest, nextControlState) {
   using Phase = State::Phase;
   Options options;
   options.minReaders = 2;
-  options.maxReaders = 8;
+  options.maxReaders = 20;
   options.numHoldPeriods = 2;
+  const auto holding = [](size_t numReaders, double baseRate) {
+    return State{
+        .numReaders = numReaders,
+        .numHeldReaders = numReaders,
+        .baseRate = baseRate};
+  };
+  const auto trying = [](Phase phase, size_t numHeld, size_t numReaders) {
+    return State{
+        .numReaders = numReaders,
+        .numHeldReaders = numHeld,
+        .phase = phase,
+        .baseRate = 1'000e6};
+  };
 
   // Nothing measured: nothing changes.
-  State state{.numReaders = 4};
-  auto next = FetchScheduler::nextControlState(options, state, {});
+  auto next = FetchScheduler::nextControlState(options, holding(4, 0), {});
   EXPECT_EQ(next.numReaders, 4);
   EXPECT_EQ(next.phase, Phase::kHold);
   EXPECT_EQ(next.baseRate, 0);
 
   // While it holds, the controller averages the rate and counts down.
-  state = {.numReaders = 4, .baseRate = 1'000e6, .numHoldsLeft = 2};
+  auto state = holding(4, 1'000e6);
+  state.numHoldsLeft = 2;
   next = FetchScheduler::nextControlState(options, state, measured(2'000e6));
   EXPECT_EQ(next.numReaders, 4);
   EXPECT_EQ(next.phase, Phase::kHold);
   EXPECT_EQ(next.numHoldsLeft, 1);
   EXPECT_DOUBLE_EQ(next.baseRate, 1'250e6);
 
-  // After the hold it tries one more.
-  state = {.numReaders = 4, .baseRate = 1'000e6};
-  next = FetchScheduler::nextControlState(options, state, measured(1'000e6));
+  // After the hold it tries a quarter more, at least one.
+  next = FetchScheduler::nextControlState(
+      options, holding(4, 1'000e6), measured(1'000e6));
   EXPECT_EQ(next.numReaders, 5);
+  EXPECT_EQ(next.numHeldReaders, 4);
   EXPECT_EQ(next.phase, Phase::kTryMore);
+  next = FetchScheduler::nextControlState(
+      options, holding(12, 1'000e6), measured(1'000e6));
+  EXPECT_EQ(next.numReaders, 15);
+  EXPECT_EQ(next.numHeldReaders, 12);
 
-  // The fifth reader is kept when the rate rises by an eighth, half of its
-  // share of a quarter, and the sixth is tried right away.
-  state = {.numReaders = 5, .phase = Phase::kTryMore, .baseRate = 1'000e6};
+  // Three more readers on top of twelve are kept when the rate rises by an
+  // eighth, half of their share of a quarter, and more are tried right away.
+  state = trying(Phase::kTryMore, 12, 15);
   next = FetchScheduler::nextControlState(options, state, measured(1'130e6));
-  EXPECT_EQ(next.numReaders, 6);
+  EXPECT_EQ(next.numHeldReaders, 15);
+  EXPECT_EQ(next.numReaders, 18);
   EXPECT_EQ(next.phase, Phase::kTryMore);
   EXPECT_DOUBLE_EQ(next.baseRate, 1'130e6);
-  // Otherwise the controller goes back to four, holds, and tries fewer next.
+  // Otherwise the controller goes back to twelve, holds, and tries fewer
+  // next: an eighth fewer, at least one.
   next = FetchScheduler::nextControlState(options, state, measured(1'120e6));
-  EXPECT_EQ(next.numReaders, 4);
+  EXPECT_EQ(next.numReaders, 12);
+  EXPECT_EQ(next.numHeldReaders, 12);
   EXPECT_EQ(next.phase, Phase::kHold);
   EXPECT_EQ(next.numHoldsLeft, 2);
   EXPECT_FALSE(next.tryMoreNext);
@@ -562,66 +583,111 @@ TEST_F(FetchSchedulerTest, nextControlState) {
   state = next;
   state.numHoldsLeft = 0;
   next = FetchScheduler::nextControlState(options, state, measured(1'000e6));
-  EXPECT_EQ(next.numReaders, 3);
+  EXPECT_EQ(next.numReaders, 11);
+  EXPECT_EQ(next.numHeldReaders, 12);
   EXPECT_EQ(next.phase, Phase::kTryFewer);
+  state = holding(16, 1'000e6);
+  state.tryMoreNext = false;
+  next = FetchScheduler::nextControlState(options, state, measured(1'000e6));
+  EXPECT_EQ(next.numReaders, 14);
 
-  // Three readers are kept when the rate falls by less than a sixteenth, a
-  // quarter of the fourth reader's share, and two are tried right away.
-  state = {.numReaders = 3, .phase = Phase::kTryFewer, .baseRate = 1'000e6};
-  next = FetchScheduler::nextControlState(options, state, measured(940e6));
-  EXPECT_EQ(next.numReaders, 2);
+  // Fourteen of sixteen readers are kept when the rate falls by less than a
+  // thirty-second, a quarter of the share of the two left out, and fewer
+  // still are tried right away.
+  state = trying(Phase::kTryFewer, 16, 14);
+  next = FetchScheduler::nextControlState(options, state, measured(970e6));
+  EXPECT_EQ(next.numHeldReaders, 14);
+  EXPECT_EQ(next.numReaders, 13);
   EXPECT_EQ(next.phase, Phase::kTryFewer);
-  EXPECT_DOUBLE_EQ(next.baseRate, 940e6);
-  // Otherwise the controller goes back to four, holds, and tries more next.
-  next = FetchScheduler::nextControlState(options, state, measured(930e6));
-  EXPECT_EQ(next.numReaders, 4);
+  EXPECT_DOUBLE_EQ(next.baseRate, 970e6);
+  // Otherwise the controller goes back to sixteen, holds, and tries more
+  // next.
+  next = FetchScheduler::nextControlState(options, state, measured(960e6));
+  EXPECT_EQ(next.numReaders, 16);
   EXPECT_EQ(next.phase, Phase::kHold);
   EXPECT_TRUE(next.tryMoreNext);
 
-  // The bounds end a run of kept trials.
-  state = {.numReaders = 8, .phase = Phase::kTryMore, .baseRate = 1'000e6};
+  // The bounds end a run of kept trials and limit a trial.
+  next = FetchScheduler::nextControlState(
+      options, holding(18, 1'000e6), measured(1'000e6));
+  EXPECT_EQ(next.numReaders, 20);
+  state = trying(Phase::kTryMore, 18, 20);
   next = FetchScheduler::nextControlState(options, state, measured(2'000e6));
-  EXPECT_EQ(next.numReaders, 8);
+  EXPECT_EQ(next.numReaders, 20);
   EXPECT_EQ(next.phase, Phase::kHold);
-  state = {.numReaders = 2, .phase = Phase::kTryFewer, .baseRate = 1'000e6};
+  state = trying(Phase::kTryFewer, 3, 2);
   next = FetchScheduler::nextControlState(options, state, measured(1'000e6));
   EXPECT_EQ(next.numReaders, 2);
   EXPECT_EQ(next.phase, Phase::kHold);
   // At a bound only the other direction is tried.
-  state = {.numReaders = 8, .baseRate = 1'000e6, .tryMoreNext = true};
-  next = FetchScheduler::nextControlState(options, state, measured(1'000e6));
-  EXPECT_EQ(next.numReaders, 7);
+  next = FetchScheduler::nextControlState(
+      options, holding(20, 1'000e6), measured(1'000e6));
+  EXPECT_EQ(next.numReaders, 18);
   EXPECT_EQ(next.phase, Phase::kTryFewer);
 
+  // Readers that wait for copies half of their time are not given company:
+  // after a hold fewer are tried, and a trial of more is not kept whatever
+  // the rate.
+  auto copyLimited = measured(2'000e6);
+  copyLimited.readerBusyNanos = 1'000;
+  copyLimited.copyWaitNanos = 500;
+  next = FetchScheduler::nextControlState(
+      options, holding(8, 1'000e6), copyLimited);
+  EXPECT_EQ(next.numReaders, 7);
+  EXPECT_EQ(next.phase, Phase::kTryFewer);
+  next = FetchScheduler::nextControlState(
+      options, trying(Phase::kTryMore, 8, 10), copyLimited);
+  EXPECT_EQ(next.numReaders, 8);
+  EXPECT_EQ(next.phase, Phase::kHold);
+  copyLimited.copyWaitNanos = 499;
+  next = FetchScheduler::nextControlState(
+      options, trying(Phase::kTryMore, 8, 10), copyLimited);
+  EXPECT_EQ(next.numReaders, 12);
+  EXPECT_EQ(next.phase, Phase::kTryMore);
+
   // With nothing delivered at all, fewer readers are never kept.
-  state = {.numReaders = 3, .phase = Phase::kTryFewer};
+  state = trying(Phase::kTryFewer, 4, 3);
+  state.baseRate = 0;
   next = FetchScheduler::nextControlState(options, state, measured(0));
   EXPECT_EQ(next.numReaders, 4);
   EXPECT_EQ(next.phase, Phase::kHold);
 
   VELOX_ASSERT_THROW(
-      FetchScheduler::nextControlState(options, State{.numReaders = 0}, {}),
+      FetchScheduler::nextControlState(options, holding(0, 0), {}),
       "(0 vs. 0)");
 }
 
-// The controller settles at the fewest readers that deliver what the copies
-// can take, from either side, and at the upper bound when the copies are
-// never the limit.
+// The controller settles near the fewest readers that deliver what the
+// copies can take, from either side, and at the upper bound when the copies
+// are never the limit.
 TEST_F(FetchSchedulerTest, nextControlStateConverges) {
   using State = FetchScheduler::ControlState;
   Options options;
   options.minReaders = 1;
   options.maxReaders = 32;
   options.numHoldPeriods = 3;
+  // What the controller measures with 'numReaders' readers that fill
+  // 'readRate' bytes per second each, in front of copies that run one after
+  // the other at 'copyRate', when ranges are always queued: a reader fills
+  // its buffer and then waits for the copies ahead of its own.
+  const auto model = [](size_t numReaders, double readRate, double copyRate) {
+    const double readTime = 1 / readRate;
+    const double copyTime = 1 / copyRate;
+    const double cycle = std::max(readTime + copyTime, numReaders * copyTime);
+    auto window = measured(numReaders / cycle);
+    window.readerBusyNanos = window.saturatedNanos * numReaders;
+    window.copyWaitNanos = static_cast<uint64_t>(
+        window.readerBusyNanos * (cycle - readTime) / cycle);
+    return window;
+  };
   // Returns the number of readers the controller holds after many
-  // measurements, when each reader delivers 'readRate' and the copies take
-  // at most 'copyRate'.
+  // measurements.
   const auto settle = [&](size_t numReaders, double readRate, double copyRate) {
-    State state{.numReaders = numReaders};
+    State state{.numReaders = numReaders, .numHeldReaders = numReaders};
     std::vector<size_t> held;
     for (int i = 0; i < 400; ++i) {
-      const auto rate = std::min(state.numReaders * readRate, copyRate);
-      state = FetchScheduler::nextControlState(options, state, measured(rate));
+      state = FetchScheduler::nextControlState(
+          options, state, model(state.numReaders, readRate, copyRate));
       if (i >= 300 && state.phase == State::Phase::kHold) {
         held.push_back(state.numReaders);
       }
@@ -632,12 +698,20 @@ TEST_F(FetchSchedulerTest, nextControlStateConverges) {
     return held.front();
   };
 
-  // Readers of 4 GB/s in front of a 23 GB/s link: six deliver all of it.
-  EXPECT_EQ(settle(1, 4e9, 23e9), 6);
-  EXPECT_EQ(settle(8, 4e9, 23e9), 6);
-  EXPECT_EQ(settle(32, 4e9, 23e9), 6);
-  // Readers of 15 GB/s in front of a 300 GB/s link: twenty.
-  EXPECT_EQ(settle(8, 15e9, 300e9), 20);
+  // Readers of 4 GB/s in front of a 23 GB/s link: seven keep it busy. From
+  // 32 the controller comes down without a single trial of more, because
+  // the readers mostly wait.
+  EXPECT_EQ(settle(1, 4e9, 23e9), 7);
+  EXPECT_EQ(settle(8, 4e9, 23e9), 7);
+  EXPECT_EQ(settle(32, 4e9, 23e9), 7);
+  // Readers of 15 GB/s in front of a 310 GB/s link: twenty-two keep it busy,
+  // and the controller, which moves several readers at a time there, stays
+  // within one of that.
+  EXPECT_THAT(
+      settle(8, 15e9, 310e9), testing::AllOf(testing::Ge(21), testing::Le(23)));
+  EXPECT_THAT(
+      settle(32, 15e9, 310e9),
+      testing::AllOf(testing::Ge(21), testing::Le(23)));
   // Readers that never fill the link.
   EXPECT_EQ(settle(8, 4e9, 300e9), 32);
 }

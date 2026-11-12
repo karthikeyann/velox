@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/FetchScheduler.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
@@ -105,8 +106,16 @@ std::shared_ptr<FetchAheadBudget> sharedFetchAheadBudget() {
     size_t freeBytes{0};
     size_t totalBytes{0};
     CUDF_CUDA_TRY(cudaMemGetInfo(&freeBytes, &totalBytes));
-    budget = std::make_shared<FetchAheadBudget>(
-        std::min(totalBytes / 16, freeBytes / 4));
+    auto capacity = totalBytes / 16;
+    // With a pool or an arena the device's free memory says how much the
+    // process has not reserved, which is unrelated to what it can use.
+    const auto& memoryResource = CudfConfig::getInstance().memoryResource;
+    const bool isPooled = memoryResource.find("pool") != std::string::npos ||
+        memoryResource.find("arena") != std::string::npos;
+    if (!isPooled) {
+      capacity = std::min(capacity, freeBytes / 4);
+    }
+    budget = std::make_shared<FetchAheadBudget>(capacity);
   }
   return budget;
 }
@@ -200,13 +209,46 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
     return next;
   }
   const double rate = window.bytes * 1e9 / window.saturatedNanos;
+  // Readers that wait for copies half of the time have a queue of copies in
+  // front of them.
+  const bool isCopyLimited = window.readerBusyNanos > 0 &&
+      window.copyWaitNanos * 2 >= window.readerBusyNanos;
   using Phase = ControlState::Phase;
-  const auto hold = [&]() {
+  const auto hold = [&](size_t numReaders) {
     next.phase = Phase::kHold;
+    next.numReaders = numReaders;
+    next.numHeldReaders = numReaders;
     next.numHoldsLeft = options.numHoldPeriods;
+  };
+  // Starts a trial of more readers than 'numHeld', or holds at the bound.
+  const auto tryMore = [&](size_t numHeld) {
+    const auto numReaders = std::min(
+        options.maxReaders, numHeld + std::max<size_t>(1, numHeld / 4));
+    if (numReaders == numHeld) {
+      hold(numHeld);
+      return;
+    }
+    next.phase = Phase::kTryMore;
+    next.numHeldReaders = numHeld;
+    next.numReaders = numReaders;
+  };
+  // Starts a trial of fewer readers than 'numHeld', or holds at the bound.
+  const auto tryFewer = [&](size_t numHeld) {
+    const auto step = std::max<size_t>(1, numHeld / 8);
+    const auto numReaders = numHeld > options.minReaders + step
+        ? numHeld - step
+        : options.minReaders;
+    if (numReaders == numHeld) {
+      hold(numHeld);
+      return;
+    }
+    next.phase = Phase::kTryFewer;
+    next.numHeldReaders = numHeld;
+    next.numReaders = numReaders;
   };
   switch (state.phase) {
     case Phase::kHold: {
+      next.numHeldReaders = state.numReaders;
       next.baseRate =
           state.baseRate == 0 ? rate : (3 * state.baseRate + rate) / 4;
       if (state.numHoldsLeft > 0) {
@@ -215,47 +257,39 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
       }
       const bool canTryMore = state.numReaders < options.maxReaders;
       const bool canTryFewer = state.numReaders > options.minReaders;
-      if (canTryMore && (state.tryMoreNext || !canTryFewer)) {
-        next.phase = Phase::kTryMore;
-        ++next.numReaders;
+      if (canTryMore && !isCopyLimited && (state.tryMoreNext || !canTryFewer)) {
+        tryMore(state.numReaders);
       } else if (canTryFewer) {
-        next.phase = Phase::kTryFewer;
-        --next.numReaders;
+        tryFewer(state.numReaders);
       }
       break;
     }
     case Phase::kTryMore: {
-      // 'numReaders' is the held number plus one.
-      const double share = 1.0 / (state.numReaders - 1);
-      if (rate >= state.baseRate * (1 + share / 2)) {
+      // The share of the rate that the added readers would bring if every
+      // reader brought as much as the held ones.
+      const double share =
+          static_cast<double>(state.numReaders - state.numHeldReaders) /
+          state.numHeldReaders;
+      if (rate >= state.baseRate * (1 + share / 2) && !isCopyLimited) {
         next.baseRate = rate;
-        if (state.numReaders < options.maxReaders) {
-          ++next.numReaders;
-        } else {
-          hold();
-        }
+        tryMore(state.numReaders);
       } else {
-        --next.numReaders;
         next.tryMoreNext = false;
-        hold();
+        hold(state.numHeldReaders);
       }
       break;
     }
     case Phase::kTryFewer: {
-      // 'numReaders' is the held number minus one.
-      const double share = 1.0 / (state.numReaders + 1);
+      const double share =
+          static_cast<double>(state.numHeldReaders - state.numReaders) /
+          state.numHeldReaders;
       // Nothing delivered says nothing in favour of fewer readers.
       if (rate > 0 && rate >= state.baseRate * (1 - share / 4)) {
         next.baseRate = rate;
-        if (state.numReaders > options.minReaders) {
-          --next.numReaders;
-        } else {
-          hold();
-        }
+        tryFewer(state.numReaders);
       } else {
-        ++next.numReaders;
         next.tryMoreNext = true;
-        hold();
+        hold(state.numHeldReaders);
       }
       break;
     }
@@ -275,6 +309,7 @@ FetchScheduler::FetchScheduler(
   VELOX_CHECK_LE(options_.minReaders, options_.maxReaders);
   control_.numReaders = std::clamp(
       options_.initialReaders, options_.minReaders, options_.maxReaders);
+  control_.numHeldReaders = control_.numReaders;
 }
 
 FetchScheduler::~FetchScheduler() {
@@ -334,6 +369,8 @@ void FetchScheduler::ensureStarted() {
   options_.maxReaders = readers_.size();
   options_.minReaders = std::min(options_.minReaders, options_.maxReaders);
   control_.numReaders = std::min(control_.numReaders, options_.maxReaders);
+  control_.numHeldReaders =
+      std::min(control_.numHeldReaders, options_.maxReaders);
   started_ = true;
 }
 
@@ -458,6 +495,8 @@ void FetchScheduler::advance(Clock::time_point now) {
   // for them to do.
   stats_.saturatedNanos += elapsed;
   window_.saturatedNanos += elapsed;
+  window_.readerBusyNanos += elapsed * numRunning_;
+  window_.copyWaitNanos += elapsed * numCopies_;
   uint64_t periodNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              options_.controlPeriod)
                              .count();

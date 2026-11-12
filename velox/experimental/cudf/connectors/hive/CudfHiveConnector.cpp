@@ -55,6 +55,25 @@ std::shared_ptr<FetchScheduler> createFetchScheduler(
       "Fetch scheduler reader bound is above its maximum: {}",
       CudfHiveConfig::kFetchSchedulerMaxReaders);
   FetchScheduler::Options options;
+  const auto minReaders = config.fetchSchedulerMinReaders();
+  VELOX_USER_CHECK_GT(
+      minReaders,
+      0,
+      "Fetch scheduler needs at least one reader: {}",
+      CudfHiveConfig::kFetchSchedulerMinReaders);
+  VELOX_USER_CHECK_LE(
+      minReaders,
+      CudfHiveConfig::kMaxFetchSchedulerReaders,
+      "Fetch scheduler reader count is above its maximum: {}",
+      CudfHiveConfig::kFetchSchedulerMinReaders);
+  if (maxReaders > 0) {
+    VELOX_USER_CHECK_LE(
+        minReaders,
+        maxReaders,
+        "Fetch scheduler has fewer readers at most than at least: {}",
+        CudfHiveConfig::kFetchSchedulerMaxReaders);
+  }
+  options.minReaders = minReaders;
   options.maxReaders = maxReaders;
   options.fetchAheadBytes = config.fetchAheadBytes();
   return std::make_shared<FetchScheduler>(

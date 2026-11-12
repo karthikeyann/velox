@@ -61,19 +61,19 @@ class FetchScheduler {
     /// on, divided by the number of devices it sees, between 4 and 64.
     size_t maxReaders{0};
     /// Readers at work before the first measurement.
-    size_t initialReaders{8};
+    size_t initialReaders{16};
     /// Time with ranges waiting for a reader that one measurement of the
     /// controller covers while it holds a number of readers. The measurement
     /// of a trial covers twice as much.
     std::chrono::microseconds controlPeriod{10'000};
     /// Measurements the controller stays with a number of readers before it
     /// tries another.
-    size_t numHoldPeriods{8};
+    size_t numHoldPeriods{3};
     /// Capacity in bytes of a fetch-ahead budget of the scheduler's own.
     /// Zero makes the scheduler use the budget that all schedulers of the
     /// process share for the device: one sixteenth of the device's memory,
-    /// and no more than a quarter of what is free when the budget is
-    /// created.
+    /// and, unless cuDF allocates from a pool or an arena, no more than a
+    /// quarter of what is free when the budget is created.
     uint64_t fetchAheadBytes{0};
   };
 
@@ -83,6 +83,11 @@ class FetchScheduler {
     uint64_t saturatedNanos{0};
     /// Bytes that reached the device in that time.
     uint64_t bytes{0};
+    /// Time readers were at work in that time, filling a buffer or waiting
+    /// for its copy, summed over readers.
+    uint64_t readerBusyNanos{0};
+    /// Part of 'readerBusyNanos' spent waiting for copies.
+    uint64_t copyWaitNanos{0};
   };
 
   /// Where the controller stands between two measurements.
@@ -91,14 +96,17 @@ class FetchScheduler {
     enum class Phase {
       /// The number the controller stays with.
       kHold,
-      /// One more than that number, on trial.
+      /// More than that number, on trial.
       kTryMore,
-      /// One fewer than that number, on trial.
+      /// Fewer than that number, on trial.
       kTryFewer,
     };
 
     /// Readers allowed now.
     size_t numReaders{1};
+    /// The number the controller stays with, to which it returns from a
+    /// trial that is not kept. Equal to 'numReaders' while it holds.
+    size_t numHeldReaders{1};
     Phase phase{Phase::kHold};
     /// Bytes per second measured with the number the controller stays
     /// with. Zero before the first measurement.
@@ -203,11 +211,15 @@ class FetchScheduler {
 
   /// Returns where the controller stands after measuring 'window' in
   /// 'state'. While it holds a number of readers it averages the rate, and
-  /// after the hold periods it tries one more reader or one fewer, in turn.
-  /// One more is kept when the rate rises by at least half of that reader's
-  /// share, 1 / (2 x readers), and then the next one is tried right away.
-  /// One fewer is kept when the rate falls by less than a quarter of that
-  /// share. A trial that is not kept goes back to the held number.
+  /// after the hold periods it tries more readers or fewer, in turn: a
+  /// quarter more, an eighth fewer, at least one. More are kept when the
+  /// rate rises by at least half of what the added readers would bring if
+  /// each brought as much as the others, and then more are tried right
+  /// away. Fewer are kept when the rate falls by less than a quarter of the
+  /// share of the readers left out, and then fewer still are tried. A trial
+  /// that is not kept goes back to the held number. While the readers spend
+  /// half of their time or more waiting for copies, the copies are the
+  /// limit: more readers are neither tried nor kept, and fewer are tried.
   static ControlState nextControlState(
       const Options& options,
       const ControlState& state,
