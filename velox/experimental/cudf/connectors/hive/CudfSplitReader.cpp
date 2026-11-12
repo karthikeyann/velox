@@ -312,7 +312,7 @@ CudfSplitReader::~CudfSplitReader() {
     return;
   }
   try {
-    releaseCurrentPassData();
+    abandonCurrentPassData();
   } catch (const std::exception& e) {
     // The data of a failed read is being dropped anyway, so the failure must
     // not propagate out of the destructor.
@@ -571,7 +571,9 @@ void CudfSplitReader::startFetch(
 }
 
 bool CudfSplitReader::offerColumnChunkFetch() {
-  if (fetchScheduler_ == nullptr) {
+  // Only the scheduler serves the fetches somebody waits for before those
+  // started ahead, so only its fetches are started ahead.
+  if (!isScheduled_) {
     return false;
   }
   if (passState_ == nullptr or fetchAhead_ != nullptr or
@@ -632,29 +634,41 @@ void CudfSplitReader::setupChunkingForCurrentPass(
   passState_->isChunkingSetup = true;
 }
 
+void CudfSplitReader::releaseHeldBytes() {
+  if (passState_->heldBytes > 0) {
+    auto& budget = fetchScheduler_->fetchAhead();
+    if (std::exchange(passState_->isAhead, false)) {
+      budget.claim();
+    }
+    budget.release(std::exchange(passState_->heldBytes, 0));
+  }
+}
+
 void CudfSplitReader::releaseCurrentPassData() {
   SCOPE_EXIT {
-    if (passState_->heldBytes > 0) {
-      auto& budget = fetchScheduler_->fetchAhead();
-      if (std::exchange(passState_->isAhead, false)) {
-        budget.claim();
-      }
-      budget.release(std::exchange(passState_->heldBytes, 0));
-    }
+    releaseHeldBytes();
   };
   // Queued or active reads can still write into the buffers being released.
   passState_->fetch.wait();
   passState_->fetch = {};
 }
 
+void CudfSplitReader::abandonCurrentPassData() {
+  SCOPE_EXIT {
+    releaseHeldBytes();
+  };
+  passState_->fetch.abandon(isScheduled_);
+}
+
 void CudfSplitReader::resetSplit() {
   withdrawFetchOffer();
   if (passState_ != nullptr) {
-    releaseCurrentPassData();
+    abandonCurrentPassData();
   }
   splitReader_.reset();
   passState_.reset();
   dataSource_.reset();
+  isScheduled_ = false;
   fileMetaDatas_.clear();
   pushdownFilterExpr_ = subfieldFilterAst_;
   hasSplitSpecificPushdownFilter_ = false;
@@ -836,6 +850,7 @@ void CudfSplitReader::setupCudfDataSource() {
       fetchScheduler = fetchScheduler_;
     }
   }
+  isScheduled_ = fetchScheduler != nullptr;
   dataSource_ = std::make_unique<BufferedInputDataSource>(
       std::move(bufferedInput),
       std::move(stagingPool),

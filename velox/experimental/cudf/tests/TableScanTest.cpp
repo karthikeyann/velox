@@ -789,9 +789,22 @@ TEST_F(TableScanTest, fetchAhead) {
   }
   createDuckDbTable(vectors);
   auto plan = tableScanNode();
+  const auto limitPlan = [&](int64_t limit) {
+    return PlanBuilder(pool_.get())
+        .startTableScan()
+        .outputType(rowType_)
+        .tableHandle(makeTableHandle())
+        .endTableScan()
+        .limit(0, limit, false)
+        .planNode();
+  };
 
-  // Returns the counters of the budget after a scan with 'capacity'.
-  const auto scan = [&](uint64_t capacity, bool fetchAhead) {
+  // Returns the counters of the budget after a scan with 'capacity' that
+  // reads the first 'limit' rows, or every row when that is zero.
+  const auto scanWith = [&](uint64_t capacity,
+                            bool fetchAhead,
+                            bool scheduled,
+                            int64_t limit) {
     resetCudfHiveConnector(
         std::make_shared<config::ConfigBase>(
             std::unordered_map<std::string, std::string>{
@@ -801,16 +814,32 @@ TEST_F(TableScanTest, fetchAhead) {
         facebook::velox::connector::ConnectorRegistry::tryGet(
             kCudfHiveConnectorId));
     VELOX_CHECK_NOT_NULL(hiveConnector);
-    AssertQueryBuilder(plan, duckDbQueryRunner_)
-        .maxDrivers(1)
+    AssertQueryBuilder builder(
+        limit > 0 ? limitPlan(limit) : plan, duckDbQueryRunner_);
+    builder.maxDrivers(1)
         .config(core::QueryConfig::kMaxSplitPreloadPerDriver, "4")
         .connectorSessionProperty(
             kCudfHiveConnectorId,
             CudfHiveConfig::kFetchAheadEnabledSession,
             fetchAhead ? "true" : "false")
-        .splits(makeCudfHiveConnectorSplits(filePaths))
-        .assertResults("SELECT * FROM tmp");
+        .connectorSessionProperty(
+            kCudfHiveConnectorId,
+            CudfHiveConfig::kFetchSchedulerEnabledSession,
+            scheduled ? "true" : "false")
+        .splits(makeCudfHiveConnectorSplits(filePaths));
+    if (limit > 0) {
+      auto result = builder.copyResults(pool_.get());
+      EXPECT_EQ(result->size(), limit);
+      result.reset();
+    } else {
+      builder.assertResults("SELECT * FROM tmp");
+    }
+    // The splits the scan did not get to are given up with their task.
+    waitForAllTasksToBeDeleted();
     return hiveConnector->fetchScheduler()->fetchAhead().stats();
+  };
+  const auto scan = [&](uint64_t capacity, bool fetchAhead) {
+    return scanWith(capacity, fetchAhead, true, 0);
   };
 
   // Without fetch-ahead the one driver holds the column chunks of one split
@@ -842,6 +871,24 @@ TEST_F(TableScanTest, fetchAhead) {
     EXPECT_GT(stats.numOffered, 0);
     EXPECT_EQ(stats.heldBytes, 0);
     EXPECT_LE(stats.maxHeldBytes, 2 * largestSplit);
+  }
+  {
+    SCOPED_TRACE("scheduler off");
+    // Only fetches that go through the scheduler are started ahead.
+    const auto stats = scanWith(1ULL << 30, true, false, 0);
+    EXPECT_EQ(stats.numOffered, 0);
+    EXPECT_EQ(stats.heldBytes, 0);
+    EXPECT_LE(stats.maxHeldBytes, largestSplit);
+  }
+  {
+    SCOPED_TRACE("scan that stops early");
+    // The scan ends after its first rows, with fetches started ahead that
+    // no driver asked for. They are given up, and every byte comes back.
+    const auto stats = scanWith(1ULL << 30, true, true, 10);
+    EXPECT_GT(stats.numOffered, 0);
+    EXPECT_EQ(stats.heldBytes, 0);
+    EXPECT_EQ(stats.numAhead, 0);
+    EXPECT_EQ(stats.numWaiting, 0);
   }
   resetCudfHiveConnector(
       std::make_shared<config::ConfigBase>(

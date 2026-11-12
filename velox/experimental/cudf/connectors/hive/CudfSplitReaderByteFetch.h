@@ -44,6 +44,13 @@ struct ByteRangeFetch {
 
   // Waits for reads and rethrows any failure. No-op when complete.
   void wait();
+
+  // Gives up the fetch and its device buffers. With 'dropsUnstartedReads',
+  // for a data source whose futures drop the reads that have not started
+  // when they are destroyed, only the reads in progress are waited for;
+  // otherwise every read is, and a failure is rethrown after the buffers are
+  // released.
+  void abandon(bool dropsUnstartedReads);
 };
 
 // Starts cuDF's asynchronous byte-range fetch. Wait for returned fetch before

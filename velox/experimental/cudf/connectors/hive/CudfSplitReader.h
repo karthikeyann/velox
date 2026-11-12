@@ -135,7 +135,9 @@ class CudfSplitReader : public NvtxHelper {
   /// it bounds has room for them, possibly on another thread. For a split
   /// prepared ahead of the driver that will read it; the offer must be the
   /// last use of the reader by the thread that prepares the split. Returns
-  /// false when there is no budget to offer to.
+  /// false when the split's reads do not go through the fetch scheduler,
+  /// whose ordering is what keeps a fetch started ahead from delaying one a
+  /// driver waits for.
   bool offerColumnChunkFetch();
 
   /// Get the stream.
@@ -306,6 +308,14 @@ class CudfSplitReader : public NvtxHelper {
   // Wait for any reads of the current pass, then release its column chunk data.
   void releaseCurrentPassData();
 
+  // Release the column chunk data of a pass that will not be decoded, and
+  // the reads of it that have not started when the data source can drop
+  // them.
+  void abandonCurrentPassData();
+
+  // Give back to the fetch-ahead budget what the current pass holds.
+  void releaseHeldBytes();
+
   std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
   // Moves the column chunks the buffered input data source reads to the
   // device, and owns the page-locked buffers they are staged in. Can be null.
@@ -322,6 +332,10 @@ class CudfSplitReader : public NvtxHelper {
   // Set while the first pass's fetch is on offer to the fetch-ahead budget.
   std::shared_ptr<FetchAhead> fetchAhead_;
   bool serializeIoRequests_{false};
+  // Whether the data source's reads go through the fetch scheduler. Its
+  // futures then drop the reads that have not started when destroyed, and
+  // its fetches can be started ahead.
+  bool isScheduled_{false};
 
   // Chunk and pass read limits resolved from the session when the reader is
   // created.

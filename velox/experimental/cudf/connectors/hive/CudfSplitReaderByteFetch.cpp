@@ -20,6 +20,7 @@
 #include <cudf/io/parquet_io_utils.hpp>
 
 #include <algorithm>
+#include <exception>
 #include <functional>
 #include <iterator>
 #include <utility>
@@ -30,6 +31,26 @@ namespace facebook::velox::cudf_velox::connector::hive {
 void ByteRangeFetch::wait() {
   if (pending.valid()) {
     pending.get();
+  }
+}
+
+void ByteRangeFetch::abandon(bool dropsUnstartedReads) {
+  // The reads write to the buffers, so the future goes first: member-wise
+  // assignment would release the buffers before it.
+  std::exception_ptr failure;
+  if (dropsUnstartedReads) {
+    pending = {};
+  } else {
+    try {
+      wait();
+    } catch (...) {
+      failure = std::current_exception();
+    }
+  }
+  data.clear();
+  buffers.clear();
+  if (failure != nullptr) {
+    std::rethrow_exception(failure);
   }
 }
 

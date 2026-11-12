@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
+#include "velox/experimental/cudf/connectors/hive/CudfSplitReaderByteFetch.h"
 #include "velox/experimental/cudf/connectors/hive/PinnedBufferPool.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
@@ -492,6 +493,52 @@ TEST_F(BufferedInputDataSourceTest, abandonedDeviceReadInProgress) {
     const auto numReads = file_->numReads();
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     EXPECT_EQ(file_->numReads(), numReads);
+  }
+}
+
+// A fetch of several ranges that is given up waits for the reads in progress.
+// With a data source whose futures drop the reads that have not started it
+// reads nothing more; otherwise it reads everything first.
+TEST_F(BufferedInputDataSourceTest, abandonedFetch) {
+  const auto content = makeContent(1 << 20);
+  const auto numPieces = content.size() / kBufferSize;
+  for (const bool dropsUnstartedReads : {true, false}) {
+    SCOPED_TRACE(dropsUnstartedReads);
+    std::shared_ptr<cudf::io::datasource> dataSource =
+        makeDataSource(content, {.pinned = true, .scheduled = true});
+    std::promise<void> started;
+    std::promise<void> resume;
+    auto resumed = resume.get_future().share();
+    std::once_flag startedOnce;
+    file_->setReadHook([&]() {
+      std::call_once(startedOnce, [&]() { started.set_value(); });
+      resumed.wait();
+    });
+    auto stream = cudfGlobalStreamPool().get_stream();
+    const std::vector<cudf::io::text::byte_range_info> byteRanges{
+        {0, static_cast<int64_t>(content.size() / 2)},
+        {static_cast<int64_t>(content.size() / 2),
+         static_cast<int64_t>(content.size() / 2)},
+    };
+    auto fetch = fetchByteRangesAsync(
+        dataSource, byteRanges, false, stream, {get_temp_mr(), get_temp_mr()});
+    started.get_future().wait();
+
+    auto abandoned = std::async(
+        std::launch::async, [&]() { fetch.abandon(dropsUnstartedReads); });
+    EXPECT_EQ(
+        abandoned.wait_for(std::chrono::milliseconds(100)),
+        std::future_status::timeout);
+    resume.set_value();
+    abandoned.get();
+    EXPECT_TRUE(fetch.buffers.empty());
+    EXPECT_FALSE(fetch.pending.valid());
+    if (dropsUnstartedReads) {
+      // Only the reads that stood at the hook ran: one per staging buffer.
+      EXPECT_LE(file_->numReads(), 2);
+    } else {
+      EXPECT_EQ(file_->numReads(), numPieces);
+    }
   }
 }
 
