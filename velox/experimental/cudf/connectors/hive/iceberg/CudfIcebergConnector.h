@@ -16,6 +16,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/iceberg/IcebergConnector.h"
@@ -61,6 +62,9 @@ class CudfIcebergConnector final
 
  private:
   const std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
+  // Page-locked buffers the connector's scans stage column chunks in. Null
+  // when the pool size is configured as zero.
+  const std::shared_ptr<PinnedBufferPool> stagingPool_;
   const std::shared_ptr<velox::connector::hive::iceberg::IcebergConfig>
       icebergConfig_;
 };

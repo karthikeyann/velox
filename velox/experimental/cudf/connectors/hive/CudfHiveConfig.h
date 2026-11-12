@@ -96,6 +96,28 @@ class CudfHiveConfig {
   static constexpr const char* kSerializeIoRequestsSession =
       "cudf.hive.serialize_io_requests";
 
+  // Whether column chunks read through the BufferedInput source are staged in
+  // page-locked host buffers on their way to the device. The buffers are
+  // reused across reads, and a file that no cache sits in front of is read
+  // straight into them. Disable to stage in freshly allocated pageable
+  // memory.
+  static constexpr const char* kPinnedStagingEnabled =
+      "cudf.hive.pinned-staging-enabled";
+  static constexpr const char* kPinnedStagingEnabledSession =
+      "cudf.hive.pinned_staging_enabled";
+
+  // Upper bound, in bytes, on the page-locked host memory a connector holds
+  // for staging column chunks. The memory is locked on demand and kept for
+  // the connector's lifetime; reads wait for a free buffer at the bound.
+  static constexpr const char* kPinnedStagingPoolSize =
+      "cudf.hive.pinned-staging-pool-size";
+
+  // Size, in bytes, of one staging buffer. Also the largest single read
+  // issued to a file that no cache sits in front of: longer column chunk
+  // ranges are split into reads of this size that run in parallel.
+  static constexpr const char* kPinnedStagingBufferSize =
+      "cudf.hive.pinned-staging-buffer-size";
+
   // Writer config options
 
   /// Whether new data can be inserted into a CudfHive file
@@ -168,6 +190,13 @@ class CudfHiveConfig {
 
   bool serializeIoRequests() const;
   bool serializeIoRequestsSession(const config::ConfigBase* session) const;
+
+  bool pinnedStagingEnabled() const;
+  bool pinnedStagingEnabledSession(const config::ConfigBase* session) const;
+
+  uint64_t pinnedStagingPoolSize() const;
+
+  uint64_t pinnedStagingBufferSize() const;
 
   bool immutableFiles() const;
 

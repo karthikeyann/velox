@@ -96,6 +96,7 @@ TEST_F(CudfSplitReaderTest, setsPushdownFilterAfterReadingMetadata) {
       ioExecutor_.get(),
       connectorQueryCtx.get(),
       std::make_shared<CudfHiveConfig>(properties),
+      nullptr,
       std::make_shared<io::IoStatistics>(),
       std::make_shared<IoStats>(),
       &logicalFilter);
@@ -173,6 +174,7 @@ TEST_F(CudfSplitReaderTest, timestampTypeFollowsSession) {
                 std::make_shared<config::ConfigBase>(
                     std::unordered_map<std::string, std::string>(
                         connectorConfig))),
+            nullptr,
             std::make_shared<io::IoStatistics>(),
             std::make_shared<IoStats>(),
             nullptr);

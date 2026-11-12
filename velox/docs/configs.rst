@@ -1698,6 +1698,21 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      - bool
      - false
      - Whether to serialize I/O submission batches to prevent requests from concurrent splits from interleaving.
+   * - cudf.hive.pinned-staging-enabled
+     - cudf.hive.pinned_staging_enabled
+     - bool
+     - true
+     - Whether column chunks read through BufferedInput are staged in page-locked host buffers on their way to the device. The buffers come from a bounded pool that is reused across reads, and a file with no cache in front of it is read straight into them. When false, each read stages in freshly allocated pageable memory.
+   * - cudf.hive.pinned-staging-pool-size
+     -
+     - integer
+     - 268435456
+     - Upper bound in bytes on the page-locked host memory one connector holds for staging column chunks. The memory is locked on demand and kept for the connector's lifetime. Reads wait for a free buffer when the pool is at this bound. 0 disables pinned staging.
+   * - cudf.hive.pinned-staging-buffer-size
+     -
+     - integer
+     - 4194304
+     - Size in bytes of one page-locked staging buffer. A column chunk range longer than this is read in pieces of this size, in parallel when no cache sits in front of the file.
    * - parquet.reader.use-pandas-metadata
      - parquet.reader.use_pandas_metadata
      - bool

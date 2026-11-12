@@ -63,6 +63,7 @@ class CudfIcebergSplitReader : public CudfSplitReader {
       folly::Executor* executor,
       const ::facebook::velox::connector::ConnectorQueryCtx* connectorQueryCtx,
       const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
+      const std::shared_ptr<PinnedBufferPool>& stagingPool,
       const std::shared_ptr<const velox_hive::HiveConfig>& hiveConfig,
       const std::shared_ptr<io::IoStatistics>& ioStatistics,
       const std::shared_ptr<IoStats>& ioStats,

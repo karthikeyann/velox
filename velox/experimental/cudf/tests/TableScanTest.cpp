@@ -605,6 +605,44 @@ TEST_P(TableScanTestParameterized, allColumnsWithRowGroupPasses) {
   ASSERT_TRUE(it->second.dynamicFilterStats.empty());
 }
 
+// Column chunks are staged in page-locked buffers far smaller than a chunk,
+// from a pool of two, so every chunk takes several reads that reuse the same
+// buffers. The session switch and a zero pool size turn the staging off.
+TEST_F(TableScanTest, pinnedStaging) {
+  using cudf_velox::connector::hive::CudfHiveConfig;
+  auto vectors = makeVectors(10, 1'000);
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+  createDuckDbTable(vectors);
+  auto plan = tableScanNode();
+
+  resetCudfHiveConnector(
+      std::make_shared<config::ConfigBase>(
+          std::unordered_map<std::string, std::string>{
+              {CudfHiveConfig::kPinnedStagingBufferSize, "1024"},
+              {CudfHiveConfig::kPinnedStagingPoolSize, "2048"},
+          }));
+  for (const auto* enabled : {"true", "false"}) {
+    SCOPED_TRACE(enabled);
+    AssertQueryBuilder(plan, duckDbQueryRunner_)
+        .connectorSessionProperty(
+            kCudfHiveConnectorId,
+            CudfHiveConfig::kPinnedStagingEnabledSession,
+            enabled)
+        .splits(makeCudfHiveConnectorSplits({filePath, filePath}))
+        .assertResults("SELECT * FROM tmp UNION ALL SELECT * FROM tmp");
+  }
+
+  resetCudfHiveConnector(
+      std::make_shared<config::ConfigBase>(
+          std::unordered_map<std::string, std::string>{
+              {CudfHiveConfig::kPinnedStagingPoolSize, "0"},
+          }));
+  AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .splits(makeCudfHiveConnectorSplits({filePath}))
+      .assertResults("SELECT * FROM tmp");
+}
+
 // Splits prepared in the background by the preloader must produce the same
 // results as splits prepared on the driver thread.
 TEST_F(TableScanTest, preloadSplits) {

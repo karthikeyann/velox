@@ -51,6 +51,7 @@ CudfIcebergConnector::CudfIcebergConnector(
     folly::Executor* executor)
     : velox::connector::hive::HiveConnector(id, config, executor),
       cudfHiveConfig_(std::make_shared<CudfHiveConfig>(config)),
+      stagingPool_(createPinnedStagingPool(*cudfHiveConfig_)),
       icebergConfig_(
           std::make_shared<velox::connector::hive::iceberg::IcebergConfig>(
               connectorConfig())) {
@@ -73,6 +74,7 @@ std::unique_ptr<DataSource> CudfIcebergConnector::createDataSource(
         ioExecutor_,
         connectorQueryCtx,
         cudfHiveConfig_,
+        stagingPool_,
         hiveConfig_);
   }
 

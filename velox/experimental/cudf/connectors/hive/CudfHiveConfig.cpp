@@ -154,6 +154,25 @@ bool CudfHiveConfig::serializeIoRequestsSession(
       config_->get<bool>(kSerializeIoRequests, false));
 }
 
+bool CudfHiveConfig::pinnedStagingEnabled() const {
+  return config_->get<bool>(kPinnedStagingEnabled, true);
+}
+
+bool CudfHiveConfig::pinnedStagingEnabledSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kPinnedStagingEnabledSession,
+      config_->get<bool>(kPinnedStagingEnabled, true));
+}
+
+uint64_t CudfHiveConfig::pinnedStagingPoolSize() const {
+  return config_->get<uint64_t>(kPinnedStagingPoolSize, 256ULL << 20);
+}
+
+uint64_t CudfHiveConfig::pinnedStagingBufferSize() const {
+  return config_->get<uint64_t>(kPinnedStagingBufferSize, 4ULL << 20);
+}
+
 bool CudfHiveConfig::immutableFiles() const {
   return config_->get<bool>(kImmutableFiles, false);
 }

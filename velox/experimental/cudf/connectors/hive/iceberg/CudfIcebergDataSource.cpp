@@ -38,6 +38,7 @@ CudfIcebergDataSource::CudfIcebergDataSource(
     folly::Executor* executor,
     const velox_connector::ConnectorQueryCtx* connectorQueryCtx,
     const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
+    const std::shared_ptr<PinnedBufferPool>& stagingPool,
     const std::shared_ptr<const velox_hive::HiveConfig>& hiveConfig)
     : CudfHiveDataSource(
           outputType,
@@ -47,6 +48,7 @@ CudfIcebergDataSource::CudfIcebergDataSource(
           executor,
           connectorQueryCtx,
           cudfHiveConfig,
+          stagingPool,
           // The Iceberg split reader resolves partition columns per data file.
           PartitionKeySource::kSplitReader),
       hiveConfig_(hiveConfig) {
@@ -106,6 +108,7 @@ CudfIcebergDataSource::createCudfSplitReader() {
       executor_,
       connectorQueryCtx_,
       cudfHiveConfig_,
+      stagingPool_,
       hiveConfig_,
       ioStatistics_,
       ioStats_,

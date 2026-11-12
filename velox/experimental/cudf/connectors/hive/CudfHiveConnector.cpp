@@ -31,8 +31,24 @@ CudfHiveConnector::CudfHiveConnector(
     std::shared_ptr<const facebook::velox::config::ConfigBase> config,
     folly::Executor* executor)
     : ::facebook::velox::connector::hive::HiveConnector(id, config, executor),
-      cudfHiveConfig_(std::make_shared<CudfHiveConfig>(config)) {
+      cudfHiveConfig_(std::make_shared<CudfHiveConfig>(config)),
+      stagingPool_(createPinnedStagingPool(*cudfHiveConfig_)) {
   VLOG(1) << "cuDF Hive connector created";
+}
+
+std::shared_ptr<PinnedBufferPool> createPinnedStagingPool(
+    const CudfHiveConfig& config) {
+  const auto poolSize = config.pinnedStagingPoolSize();
+  if (poolSize == 0) {
+    return nullptr;
+  }
+  const auto bufferSize = config.pinnedStagingBufferSize();
+  VELOX_USER_CHECK_GT(
+      bufferSize,
+      0,
+      "{} must be positive",
+      CudfHiveConfig::kPinnedStagingBufferSize);
+  return std::make_shared<PinnedBufferPool>(bufferSize, poolSize);
 }
 
 std::unique_ptr<DataSource> CudfHiveConnector::createDataSource(
@@ -54,7 +70,8 @@ std::unique_ptr<DataSource> CudfHiveConnector::createDataSource(
         &fileHandleFactory_,
         ioExecutor_,
         connectorQueryCtx,
-        cudfHiveConfig_);
+        cudfHiveConfig_,
+        stagingPool_);
   }
 
   return std::make_unique<::facebook::velox::connector::hive::HiveDataSource>(

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
+#include "velox/experimental/cudf/connectors/hive/PinnedBufferPool.h"
 
 #include "velox/connectors/hive/HiveConnector.h"
 
@@ -56,7 +57,16 @@ class CudfHiveConnector final
  protected:
   // TODO (dm): rename parquetconfig
   const std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
+
+  // Page-locked buffers the connector's scans stage column chunks in. Null
+  // when the pool size is configured as zero.
+  const std::shared_ptr<PinnedBufferPool> stagingPool_;
 };
+
+/// Creates the pool of page-locked staging buffers 'config' describes.
+/// Returns nullptr when the configured pool size is zero.
+std::shared_ptr<PinnedBufferPool> createPinnedStagingPool(
+    const CudfHiveConfig& config);
 
 class CudfHiveConnectorFactory
     : public ::facebook::velox::connector::hive::HiveConnectorFactory {

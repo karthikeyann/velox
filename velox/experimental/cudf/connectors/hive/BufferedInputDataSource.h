@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/connectors/hive/PinnedBufferPool.h"
+
 #include "velox/dwio/common/BufferedInput.h"
 
 #include <cudf/io/datasource.hpp>
@@ -33,8 +35,11 @@ namespace facebook::velox::cudf_velox::connector::hive {
 // contiguous buffers.
 class BufferedInputDataSource : public cudf::io::datasource {
  public:
-  explicit BufferedInputDataSource(
-      std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input);
+  // 'stagingPool' supplies the page-locked buffers that device reads stage
+  // file bytes in. Device reads stage in pageable memory when it is null.
+  BufferedInputDataSource(
+      std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input,
+      std::shared_ptr<PinnedBufferPool> stagingPool);
 
   [[nodiscard]] size_t size() const override;
 
@@ -51,6 +56,9 @@ class BufferedInputDataSource : public cudf::io::datasource {
 
   [[nodiscard]] bool supports_device_read() const override;
 
+  // Reads on the IO executor, or on the thread waiting for the returned
+  // future when that gets to a read first. The bytes are on the device when
+  // the future completes, whatever work is queued on 'stream'.
   std::future<size_t> device_read_async(
       size_t offset,
       size_t size,
@@ -60,8 +68,18 @@ class BufferedInputDataSource : public cudf::io::datasource {
  private:
   void readContiguous(size_t offset, size_t size, uint8_t* dst);
 
+  // Reads 'size' bytes at 'offset' straight from the file into one staging
+  // buffer and copies them to 'dst'. 'size' must fit in a staging buffer.
+  void stageFromFile(size_t offset, size_t size, uint8_t* dst);
+
+  // Reads 'size' bytes at 'offset' through the buffered input, one staging
+  // buffer at a time, and copies them to 'dst'.
+  void stageFromInput(size_t offset, size_t size, uint8_t* dst);
+
   std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input_;
   const size_t fileSize_;
+  // Null when device reads stage in pageable memory.
+  const std::shared_ptr<PinnedBufferPool> stagingPool_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

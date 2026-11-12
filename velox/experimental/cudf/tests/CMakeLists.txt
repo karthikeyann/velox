@@ -115,7 +115,7 @@ velox_add_cudf_test(
 
 velox_add_cudf_test(
   NAME velox_cudf_split_reader_test
-  SOURCES Main.cpp CudfSplitReaderTest.cpp PinnedBufferPoolTest.cpp
+  SOURCES Main.cpp BufferedInputDataSourceTest.cpp CudfSplitReaderTest.cpp PinnedBufferPoolTest.cpp
   LIBS velox_cudf_exec_test_lib velox_cudf_hive_connector
 )
 

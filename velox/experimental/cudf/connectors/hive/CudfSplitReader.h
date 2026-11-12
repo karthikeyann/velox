@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderByteFetch.h"
+#include "velox/experimental/cudf/connectors/hive/PinnedBufferPool.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 
 #include "velox/common/io/IoStatistics.h"
@@ -79,6 +80,7 @@ class CudfSplitReader : public NvtxHelper {
       folly::Executor* executor,
       const ConnectorQueryCtx* connectorQueryCtx,
       const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
+      const std::shared_ptr<PinnedBufferPool>& stagingPool,
       const std::shared_ptr<io::IoStatistics>& ioStatistics,
       const std::shared_ptr<IoStats>& ioStats,
       const cudf::ast::expression* subfieldFilterAst);
@@ -269,6 +271,9 @@ class CudfSplitReader : public NvtxHelper {
   void releaseCurrentPassData();
 
   std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
+  // Page-locked buffers the buffered input data source stages column chunks
+  // in. Can be null.
+  std::shared_ptr<PinnedBufferPool> stagingPool_;
   memory::MemoryPool* pool_;
 
   // cuDF split reader stuff.

@@ -75,6 +75,21 @@ DEFINE_bool(
     false,
     "Serialize I/O submissions to prevent interleaving between concurrent splits");
 
+DEFINE_bool(
+    cudf_hive_pinned_staging_enabled,
+    true,
+    "Stage column chunks in page-locked host buffers on their way to the device");
+
+DEFINE_uint64(
+    cudf_hive_pinned_staging_pool_size,
+    256ULL << 20,
+    "Upper bound in bytes on the page-locked staging memory; 0 disables it");
+
+DEFINE_uint64(
+    cudf_hive_pinned_staging_buffer_size,
+    4ULL << 20,
+    "Size in bytes of one page-locked staging buffer");
+
 DEFINE_string(
     cudf_properties,
     "",
@@ -113,6 +128,15 @@ void CudfTpchBenchmark::initialize() {
     cudfHiveConfigurationValues
         [cudf_velox::connector::hive::CudfHiveConfig::kSerializeIoRequests] =
             std::to_string(FLAGS_cudf_hive_serialize_io_requests);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kPinnedStagingEnabled] =
+            std::to_string(FLAGS_cudf_hive_pinned_staging_enabled);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kPinnedStagingPoolSize] =
+            std::to_string(FLAGS_cudf_hive_pinned_staging_pool_size);
+    cudfHiveConfigurationValues[cudf_velox::connector::hive::CudfHiveConfig::
+                                    kPinnedStagingBufferSize] =
+        std::to_string(FLAGS_cudf_hive_pinned_staging_buffer_size);
     auto cudfHiveProperties = std::make_shared<const config::ConfigBase>(
         std::move(cudfHiveConfigurationValues));
 
@@ -156,6 +180,15 @@ CudfTpchBenchmark::makeConnectorProperties() {
   cfg->set(
       CudfHiveCfg::kSerializeIoRequests,
       std::to_string(FLAGS_cudf_hive_serialize_io_requests));
+  cfg->set(
+      CudfHiveCfg::kPinnedStagingEnabled,
+      std::to_string(FLAGS_cudf_hive_pinned_staging_enabled));
+  cfg->set(
+      CudfHiveCfg::kPinnedStagingPoolSize,
+      std::to_string(FLAGS_cudf_hive_pinned_staging_pool_size));
+  cfg->set(
+      CudfHiveCfg::kPinnedStagingBufferSize,
+      std::to_string(FLAGS_cudf_hive_pinned_staging_buffer_size));
   cfg->set(CudfHiveCfg::kAllowMismatchedCudfHiveSchemas, "true");
 
   return cfg;

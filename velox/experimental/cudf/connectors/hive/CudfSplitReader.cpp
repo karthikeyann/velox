@@ -191,6 +191,7 @@ CudfSplitReader::CudfSplitReader(
     folly::Executor* executor,
     const ConnectorQueryCtx* connectorQueryCtx,
     const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
+    const std::shared_ptr<PinnedBufferPool>& stagingPool,
     const std::shared_ptr<io::IoStatistics>& ioStatistics,
     const std::shared_ptr<IoStats>& ioStats,
     const cudf::ast::expression* subfieldFilterAst)
@@ -209,6 +210,7 @@ CudfSplitReader::CudfSplitReader(
       ioStatistics_(ioStatistics),
       ioStats_(ioStats),
       cudfHiveConfig_(cudfHiveConfig),
+      stagingPool_(stagingPool),
       pool_(connectorQueryCtx->memoryPool()),
       baseReaderOpts_(pool_),
       subfieldFilterAst_(subfieldFilterAst),
@@ -690,8 +692,10 @@ void CudfSplitReader::setupCudfDataSource() {
     makeKvikioDataSource();
     return;
   }
-  dataSource_ =
-      std::make_unique<BufferedInputDataSource>(std::move(bufferedInput));
+  const bool usePinnedStaging = cudfHiveConfig_->pinnedStagingEnabledSession(
+      connectorQueryCtx_->sessionProperties());
+  dataSource_ = std::make_unique<BufferedInputDataSource>(
+      std::move(bufferedInput), usePinnedStaging ? stagingPool_ : nullptr);
 }
 
 void CudfSplitReader::setupReaderOptions() {
