@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
@@ -680,6 +681,88 @@ TEST_F(TableScanTest, pinnedStaging) {
       "Staging buffer size is below its minimum: "
       "cudf.hive.pinned-staging-buffer-size");
   resetConnector("65536", "131072");
+}
+
+// The fetch scheduler moves the column chunks of a scan to the device unless
+// the session turns it off, for a file behind the data cache and for a file
+// read directly. The limits cut each split into several passes.
+TEST_F(TableScanTest, fetchScheduler) {
+  using cudf_velox::connector::hive::CudfHiveConfig;
+  using cudf_velox::connector::hive::CudfHiveConnector;
+  auto vectors = makeVectors(10, 20'000);
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+  createDuckDbTable(vectors);
+  auto plan = tableScanNode();
+
+  resetCudfHiveConnector(
+      std::make_shared<config::ConfigBase>(
+          std::unordered_map<std::string, std::string>{
+              {CudfHiveConfig::kPinnedStagingBufferSize, "65536"},
+              {CudfHiveConfig::kPinnedStagingPoolSize, "262144"},
+              {CudfHiveConfig::kFetchSchedulerMaxReaders, "3"},
+          }));
+  auto hiveConnector = std::dynamic_pointer_cast<CudfHiveConnector>(
+      facebook::velox::connector::ConnectorRegistry::tryGet(
+          kCudfHiveConnectorId));
+  ASSERT_NE(hiveConnector, nullptr);
+  const auto scheduler = hiveConnector->fetchScheduler();
+  ASSERT_NE(scheduler, nullptr);
+
+  // Returns the bytes the scan moved through the scheduler.
+  const auto scan = [&](bool useCache, bool scheduled) {
+    const auto toString = [](bool value) { return value ? "true" : "false"; };
+    std::unordered_map<std::string, std::shared_ptr<config::ConfigBase>>
+        connectorConfigs{
+            {kCudfHiveConnectorId,
+             std::make_shared<config::ConfigBase>(
+                 std::unordered_map<std::string, std::string>{
+                     {CudfHiveConfig::kFetchSchedulerEnabledSession,
+                      toString(scheduled)},
+                     {CudfHiveConfig::kMaxChunkReadLimitSession, "65536"},
+                     {CudfHiveConfig::kMaxPassReadLimitSession, "262144"},
+                 })},
+        };
+    auto queryCtx = core::QueryCtx::create(
+        executor_.get(),
+        core::QueryConfig(std::unordered_map<std::string, std::string>{}),
+        connectorConfigs,
+        useCache ? cache::AsyncDataCache::getInstance() : nullptr);
+    const auto bytesBefore = scheduler->stats().bytes;
+    auto task =
+        AssertQueryBuilder(plan, duckDbQueryRunner_)
+            .queryCtx(queryCtx)
+            .splits(makeCudfHiveConnectorSplits({filePath, filePath}))
+            .assertResults("SELECT * FROM tmp UNION ALL SELECT * FROM tmp");
+    const auto planStats = toPlanStats(task->taskStats());
+    const auto& scanStats =
+        planStats.at(plan->id()).operatorStatsFor("TableScan");
+    const auto fetchBytes = scanStats.customStats.find(
+        cudf_velox::connector::hive::BufferedInputDataSource::kFetchBytes);
+    const auto numBytes = scheduler->stats().bytes - bytesBefore;
+    // The scan reports the bytes the scheduler moved for it.
+    if (numBytes == 0) {
+      EXPECT_TRUE(fetchBytes == scanStats.customStats.end());
+    } else {
+      EXPECT_TRUE(fetchBytes != scanStats.customStats.end());
+      if (fetchBytes != scanStats.customStats.end()) {
+        EXPECT_EQ(fetchBytes->second.sum, numBytes);
+      }
+    }
+    return numBytes;
+  };
+
+  for (const auto useCache : {true, false}) {
+    SCOPED_TRACE(fmt::format("useCache {}", useCache));
+    const auto numBytes = scan(useCache, true);
+    EXPECT_GT(numBytes, 0);
+    // With the scheduler off the scan reads as it did without one.
+    EXPECT_EQ(scan(useCache, false), 0);
+    EXPECT_EQ(scan(useCache, true), numBytes);
+  }
+  const auto stats = scheduler->stats();
+  EXPECT_LE(stats.maxRunningReaders, 3);
+  EXPECT_LE(stats.maxBuffersInUse, 4);
 }
 
 // Splits prepared in the background by the preloader must produce the same

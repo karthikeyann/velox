@@ -199,14 +199,95 @@ void copyToDevice(
   }
 }
 
+// A range handed to a fetch scheduler. The scheduler's readers write through
+// pointers that the submitter owns, so the range may not outlive this object:
+// destroying it without waiting drops the pieces that have not started and
+// waits for the rest.
+class ScheduledRead {
+ public:
+  ScheduledRead(
+      std::shared_ptr<FetchScheduler> scheduler,
+      std::shared_ptr<FetchScheduler::Read> read,
+      std::shared_ptr<IoStats> stats)
+      : scheduler_(std::move(scheduler)),
+        read_(std::move(read)),
+        stats_(std::move(stats)) {}
+
+  ScheduledRead(ScheduledRead&&) = default;
+
+  ScheduledRead(const ScheduledRead&) = delete;
+  ScheduledRead& operator=(const ScheduledRead&) = delete;
+  ScheduledRead& operator=(ScheduledRead&&) = delete;
+
+  ~ScheduledRead() {
+    if (read_ != nullptr) {
+      scheduler_->cancel(*read_);
+    }
+  }
+
+  // Waits for the bytes to be on the device, rethrows a failure and reports
+  // what the range cost. Called at most once.
+  void wait() {
+    // The range is complete when the wait returns or throws.
+    const auto read = std::move(read_);
+    uint64_t waitNanos{0};
+    FetchScheduler::ReadStats cost;
+    {
+      NanosecondWallTimer timer(&waitNanos);
+      cost = scheduler_->wait(*read);
+    }
+    if (stats_ == nullptr) {
+      return;
+    }
+    using Unit = RuntimeCounter::Unit;
+    const auto add = [&](const char* name, uint64_t value, Unit unit) {
+      stats_->addCounter(
+          name, RuntimeCounter(static_cast<int64_t>(value), unit));
+    };
+    add(BufferedInputDataSource::kFetchBytes, cost.bytes, Unit::kBytes);
+    add(BufferedInputDataSource::kFetchReadWallNanos,
+        cost.readNanos,
+        Unit::kNanos);
+    add(BufferedInputDataSource::kFetchQueuedWallNanos,
+        cost.queuedNanos,
+        Unit::kNanos);
+    add(BufferedInputDataSource::kFetchCopyWallNanos,
+        cost.copyNanos,
+        Unit::kNanos);
+    add(BufferedInputDataSource::kFetchWaitWallNanos, waitNanos, Unit::kNanos);
+    add(BufferedInputDataSource::kFetchCopyBusyPercent,
+        cost.copyBusyPercent,
+        Unit::kNone);
+    add(BufferedInputDataSource::kFetchReaderLimitedPercent,
+        cost.readerLimitedPercent,
+        Unit::kNone);
+    add(BufferedInputDataSource::kFetchBufferLimitedPercent,
+        cost.bufferLimitedPercent,
+        Unit::kNone);
+    add(BufferedInputDataSource::kFetchReaders, cost.numReaders, Unit::kNone);
+  }
+
+ private:
+  std::shared_ptr<FetchScheduler> scheduler_;
+  // Null once waited for.
+  std::shared_ptr<FetchScheduler::Read> read_;
+  std::shared_ptr<IoStats> stats_;
+};
+
 } // namespace
 
 BufferedInputDataSource::BufferedInputDataSource(
     std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input,
-    std::shared_ptr<PinnedBufferPool> stagingPool)
+    std::shared_ptr<PinnedBufferPool> stagingPool,
+    std::shared_ptr<FetchScheduler> fetchScheduler,
+    std::shared_ptr<IoStats> fetchStats)
     : input_(std::move(input)),
       fileSize_(input_->getReadFile()->size()),
-      stagingPool_(std::move(stagingPool)) {}
+      stagingPool_(std::move(stagingPool)),
+      fetchScheduler_(std::move(fetchScheduler)),
+      fetchGroup_(
+          fetchScheduler_ != nullptr ? fetchScheduler_->makeGroup() : nullptr),
+      fetchStats_(std::move(fetchStats)) {}
 
 size_t BufferedInputDataSource::size() const {
   return fileSize_;
@@ -254,10 +335,16 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
     size_t size,
     uint8_t* dst,
     cuda::stream_ref stream) {
-  auto* executor = input_->executor();
-  VELOX_CHECK_NOT_NULL(executor, "IO executor is not initialized");
   const size_t readSize =
       offset >= fileSize_ ? 0 : std::min(size, fileSize_ - offset);
+  if (fetchScheduler_ != nullptr) {
+    if (readSize == 0) {
+      return std::async(std::launch::deferred, []() { return size_t{0}; });
+    }
+    return scheduleDeviceRead(offset, readSize, dst);
+  }
+  auto* executor = input_->executor();
+  VELOX_CHECK_NOT_NULL(executor, "IO executor is not initialized");
 
   ReadTasks tasks(executor);
   if (readSize == 0) {
@@ -294,6 +381,71 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
       });
 }
 
+std::future<size_t> BufferedInputDataSource::scheduleDeviceRead(
+    size_t offset,
+    size_t size,
+    uint8_t* dst) {
+  std::shared_ptr<FetchScheduler::Read> read;
+  if (input_->hasCache() || input_->getReadFile()->shouldCoalesce()) {
+    // One read of the whole range through the buffered input, opened by the
+    // reader that gets to it. That keeps the cache entries the same as for
+    // any other reader of the range, and leaves the request sizes to the
+    // buffered input for a file that asks for coalesced reads, as files in
+    // remote storage do.
+    read = fetchScheduler_->submit(
+        fetchGroup_,
+        size,
+        dst,
+        FetchScheduler::FillOrder::kSequential,
+        [this,
+         offset,
+         size,
+         stream = std::shared_ptr<dwio::common::SeekableInputStream>()](
+            uint8_t* buffer, size_t /*pieceOffset*/, size_t pieceSize) mutable {
+          if (stream == nullptr) {
+            stream = input_->read(offset, size, dwio::common::LogType::FILE);
+            VELOX_CHECK_NOT_NULL(stream, "Buffered input returned no stream");
+          }
+          stream->readFully(reinterpret_cast<char*>(buffer), pieceSize);
+        });
+  } else {
+    // A local file that nothing caches is read straight into the staging
+    // buffers, one independent read per buffer.
+    read = fetchScheduler_->submit(
+        fetchGroup_,
+        size,
+        dst,
+        FetchScheduler::FillOrder::kAny,
+        [this, offset](uint8_t* buffer, size_t pieceOffset, size_t pieceSize) {
+          readFromFile(offset + pieceOffset, pieceSize, buffer);
+        });
+  }
+  return std::async(
+      std::launch::deferred,
+      [scheduled = ScheduledRead(fetchScheduler_, std::move(read), fetchStats_),
+       size]() mutable {
+        scheduled.wait();
+        return size;
+      });
+}
+
+void BufferedInputDataSource::readFromFile(
+    size_t offset,
+    size_t size,
+    uint8_t* buffer) {
+  const auto& file = input_->getInputStream();
+  uint64_t readUs{0};
+  {
+    MicrosecondWallTimer timer(&readUs);
+    file->read(buffer, size, offset, dwio::common::LogType::FILE);
+  }
+  if (auto* stats = file->getStats()) {
+    stats->read().increment(size);
+    stats->queryThreadIoLatencyUs().increment(readUs);
+    stats->storageReadLatencyUs().increment(readUs);
+  }
+}
+
 void BufferedInputDataSource::stagePageable(
     size_t offset,
     size_t size,
@@ -319,17 +471,7 @@ void BufferedInputDataSource::stageFromFile(
     stagePageable(offset, size, dst, stream);
     return;
   }
-  const auto& file = input_->getInputStream();
-  uint64_t readUs{0};
-  {
-    MicrosecondWallTimer timer(&readUs);
-    file->read(buffer->data, size, offset, dwio::common::LogType::FILE);
-  }
-  if (auto* stats = file->getStats()) {
-    stats->read().increment(size);
-    stats->queryThreadIoLatencyUs().increment(readUs);
-    stats->storageReadLatencyUs().increment(readUs);
-  }
+  readFromFile(offset, size, buffer->data);
   copyToDevice(*buffer, size, dst);
 }
 

@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/connectors/hive/FetchScheduler.h"
 #include "velox/experimental/cudf/connectors/hive/PinnedBufferPool.h"
 
+#include "velox/common/file/File.h"
 #include "velox/dwio/common/BufferedInput.h"
 
 #include <cudf/io/datasource.hpp>
@@ -35,12 +37,51 @@ namespace facebook::velox::cudf_velox::connector::hive {
 // contiguous buffers.
 class BufferedInputDataSource : public cudf::io::datasource {
  public:
+  /// Runtime statistics of the device reads that go through a fetch
+  /// scheduler, added to the 'fetchStats' of the constructor once per read.
+  /// Bytes copied to the device.
+  static constexpr const char* kFetchBytes = "cudfFetchBytes";
+  /// Time the scheduler's readers spent reading from the file or the
+  /// buffered input.
+  static constexpr const char* kFetchReadWallNanos = "cudfFetchReadWallNanos";
+  /// Time a read waited to be admitted: for its first reader, and for the
+  /// staging buffers of its later pieces when one reader fills them in turn.
+  static constexpr const char* kFetchQueuedWallNanos =
+      "cudfFetchQueuedWallNanos";
+  /// Time from queueing a piece's copy to the device to its completion,
+  /// summed over pieces.
+  static constexpr const char* kFetchCopyWallNanos = "cudfFetchCopyWallNanos";
+  /// Time the consumer of a read was blocked waiting for it.
+  static constexpr const char* kFetchWaitWallNanos = "cudfFetchWaitWallNanos";
+  /// Share of a read's time in the scheduler during which the copy streams
+  /// had work, in percent. The mean over reads tells how busy the copy stage
+  /// was.
+  static constexpr const char* kFetchCopyBusyPercent =
+      "cudfFetchCopyBusyPercent";
+  /// Share of a read's time in the scheduler during which reads waited for
+  /// a reader, in percent.
+  static constexpr const char* kFetchReaderLimitedPercent =
+      "cudfFetchReaderLimitedPercent";
+  /// Share of a read's time in the scheduler during which reads waited for
+  /// a staging buffer, in percent. A high share means the copies to the
+  /// device are the limit.
+  static constexpr const char* kFetchBufferLimitedPercent =
+      "cudfFetchBufferLimitedPercent";
+  /// Readers the scheduler allowed when a read completed. Minimum, maximum
+  /// and mean over reads show how the reader count moved.
+  static constexpr const char* kFetchReaders = "cudfFetchReaders";
+
   /// 'stagingPool' supplies the page-locked buffers that device reads stage
   /// file bytes in. Device reads stage in pageable memory when it is null,
   /// and for a read that finds the pool unable to page-lock any buffer.
+  /// With a 'fetchScheduler', device reads are handed to it and staged in
+  /// its buffers instead, and what they cost is added to 'fetchStats' when
+  /// that is not null.
   BufferedInputDataSource(
       std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input,
-      std::shared_ptr<PinnedBufferPool> stagingPool);
+      std::shared_ptr<PinnedBufferPool> stagingPool,
+      std::shared_ptr<FetchScheduler> fetchScheduler,
+      std::shared_ptr<IoStats> fetchStats);
 
   [[nodiscard]] size_t size() const override;
 
@@ -57,10 +98,11 @@ class BufferedInputDataSource : public cudf::io::datasource {
 
   [[nodiscard]] bool supports_device_read() const override;
 
-  /// Reads on the IO executor, or on the thread waiting for the returned
-  /// future when that gets to a read first. A local file that nothing caches
-  /// is read in pieces of one staging buffer; any other file is read through
-  /// the buffered input, one read per call. With staging buffers the bytes are
+  /// Reads through the fetch scheduler when there is one, and otherwise on
+  /// the IO executor, or on the thread waiting for the returned future when
+  /// that gets to a read first. A local file that nothing caches is read in
+  /// pieces of one staging buffer; any other file is read through the
+  /// buffered input, one read per call. With staging buffers the bytes are
   /// on the device when the future completes; without them the copy is queued
   /// on 'stream'. Destroying the future without waiting skips the reads that
   /// have not started and waits for the rest, so 'dst' can be released right
@@ -73,6 +115,14 @@ class BufferedInputDataSource : public cudf::io::datasource {
 
  private:
   void readContiguous(size_t offset, size_t size, uint8_t* dst);
+
+  // Reads 'size' bytes at 'offset' straight from the file into 'buffer' and
+  // counts them in the I/O statistics.
+  void readFromFile(size_t offset, size_t size, uint8_t* buffer);
+
+  // Hands the read of 'size' bytes at 'offset' to the fetch scheduler.
+  std::future<size_t>
+  scheduleDeviceRead(size_t offset, size_t size, uint8_t* dst);
 
   // Reads 'size' bytes at 'offset' into pageable memory and queues their copy
   // to 'dst' on 'stream'.
@@ -105,6 +155,13 @@ class BufferedInputDataSource : public cudf::io::datasource {
   const size_t fileSize_;
   // Null when device reads stage in pageable memory.
   const std::shared_ptr<PinnedBufferPool> stagingPool_;
+  // Null when device reads run on the IO executor.
+  const std::shared_ptr<FetchScheduler> fetchScheduler_;
+  // The device reads of this data source, which the scheduler serves
+  // together. Null without a scheduler.
+  const std::shared_ptr<FetchScheduler::Group> fetchGroup_;
+  // Receives what the scheduled device reads cost. Can be null.
+  const std::shared_ptr<IoStats> fetchStats_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

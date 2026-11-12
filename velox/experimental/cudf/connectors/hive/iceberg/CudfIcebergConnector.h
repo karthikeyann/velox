@@ -62,9 +62,10 @@ class CudfIcebergConnector final
 
  private:
   const std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
-  // Page-locked buffers the connector's scans stage column chunks in. Null
-  // when the pool size is configured as zero.
-  const std::shared_ptr<PinnedBufferPool> stagingPool_;
+  // Moves the column chunks of the connector's scans to the device, and owns
+  // the page-locked buffers they are staged in. Null when the pool size is
+  // configured as zero.
+  const std::shared_ptr<FetchScheduler> fetchScheduler_;
   const std::shared_ptr<velox::connector::hive::iceberg::IcebergConfig>
       icebergConfig_;
 };

@@ -411,7 +411,7 @@ CudfHiveDataSource::CudfHiveDataSource(
     folly::Executor* executor,
     const ConnectorQueryCtx* connectorQueryCtx,
     const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
-    const std::shared_ptr<PinnedBufferPool>& stagingPool)
+    const std::shared_ptr<FetchScheduler>& fetchScheduler)
     : CudfHiveDataSource(
           outputType,
           tableHandle,
@@ -420,7 +420,7 @@ CudfHiveDataSource::CudfHiveDataSource(
           executor,
           connectorQueryCtx,
           cudfHiveConfig,
-          stagingPool,
+          fetchScheduler,
           PartitionKeySource::kDataSource) {}
 
 CudfHiveDataSource::CudfHiveDataSource(
@@ -431,14 +431,14 @@ CudfHiveDataSource::CudfHiveDataSource(
     folly::Executor* executor,
     const ConnectorQueryCtx* connectorQueryCtx,
     const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
-    const std::shared_ptr<PinnedBufferPool>& stagingPool,
+    const std::shared_ptr<FetchScheduler>& fetchScheduler,
     PartitionKeySource partitionKeySource)
     : NvtxHelper(
           nvtx3::rgb{80, 171, 241}, // CudfHive blue,
           std::nullopt,
           fmt::format("[{}]", tableHandle->name())),
       cudfHiveConfig_(cudfHiveConfig),
-      stagingPool_(stagingPool),
+      fetchScheduler_(fetchScheduler),
       fileHandleFactory_(fileHandleFactory),
       executor_(executor),
       connectorQueryCtx_(connectorQueryCtx),
@@ -639,7 +639,7 @@ std::unique_ptr<CudfSplitReader> CudfHiveDataSource::createCudfSplitReader() {
       executor_,
       connectorQueryCtx_,
       cudfHiveConfig_,
-      stagingPool_,
+      fetchScheduler_,
       ioStatistics_,
       ioStats_,
       subfieldFilterAst_);

@@ -56,7 +56,7 @@ class CudfIcebergDataSource : public ::facebook::velox::cudf_velox::connector::
       folly::Executor* executor,
       const velox_connector::ConnectorQueryCtx* connectorQueryCtx,
       const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
-      const std::shared_ptr<PinnedBufferPool>& stagingPool,
+      const std::shared_ptr<FetchScheduler>& fetchScheduler,
       const std::shared_ptr<const velox_hive::HiveConfig>& hiveConfig);
 
   // Override to also adopt the Iceberg split of the background-prepared

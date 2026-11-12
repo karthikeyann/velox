@@ -150,6 +150,9 @@ struct Staging {
   bool hasCache{false};
   // Whether the file asks for coalesced reads, as remote files do.
   bool coalesce{false};
+  // Whether a fetch scheduler moves the bytes to the device. Otherwise the
+  // reads run on the IO executor.
+  bool scheduled{false};
 
   // Whether the file is read straight into the staging buffers, one read per
   // buffer. Otherwise it is read through the buffered input.
@@ -159,7 +162,11 @@ struct Staging {
 
   std::string toString() const {
     return fmt::format(
-        "pinned {} hasCache {} coalesce {}", pinned, hasCache, coalesce);
+        "pinned {} hasCache {} coalesce {} scheduled {}",
+        pinned,
+        hasCache,
+        coalesce,
+        scheduled);
   }
 };
 
@@ -168,6 +175,9 @@ constexpr Staging kStagings[] = {
     {.pinned = true},
     {.pinned = true, .hasCache = true},
     {.pinned = true, .coalesce = true},
+    {.pinned = true, .scheduled = true},
+    {.pinned = true, .hasCache = true, .scheduled = true},
+    {.pinned = true, .coalesce = true, .scheduled = true},
 };
 
 constexpr size_t kBufferSize{4'096};
@@ -204,6 +214,11 @@ class BufferedInputDataSourceTest : public ::facebook::velox::cudf_velox::exec::
         ? std::make_shared<PinnedBufferPool>(
               options.bufferSize, options.numBuffers * options.bufferSize)
         : nullptr;
+    fetchScheduler_ = staging.scheduled
+        ? std::make_shared<FetchScheduler>(
+              stagingPool_, FetchScheduler::Options{})
+        : nullptr;
+    fetchStats_ = std::make_shared<IoStats>();
     file_ = std::make_shared<FailingReadFile>(content, options.failOffset);
     file_->setShouldCoalesce(staging.coalesce);
     stats_ = std::make_unique<io::IoStatistics>();
@@ -214,7 +229,9 @@ class BufferedInputDataSourceTest : public ::facebook::velox::cudf_velox::exec::
             stats_.get(),
             options.executor != nullptr ? options.executor : ioExecutor_.get(),
             staging.hasCache),
-        stagingPool_);
+        stagingPool_,
+        fetchScheduler_,
+        fetchStats_);
   }
 
   std::unique_ptr<BufferedInputDataSource> makeDataSource(
@@ -250,6 +267,13 @@ class BufferedInputDataSourceTest : public ::facebook::velox::cudf_velox::exec::
   // memory.
   std::shared_ptr<PinnedBufferPool> stagingPool_;
 
+  // The scheduler of the data source made last. Null when its reads run on
+  // the IO executor.
+  std::shared_ptr<FetchScheduler> fetchScheduler_;
+
+  // What the scheduled reads of the data source made last cost.
+  std::shared_ptr<IoStats> fetchStats_;
+
   // The file of the data source made last.
   std::shared_ptr<FailingReadFile> file_;
 
@@ -269,6 +293,18 @@ TEST_F(BufferedInputDataSourceTest, deviceRead) {
     EXPECT_EQ(deviceRead(*dataSource, 0, content.size()), content);
     // Every byte is counted once.
     EXPECT_EQ(stats_->rawBytesRead(), content.size());
+    const auto fetchStats = fetchStats_->stats();
+    if (staging.scheduled) {
+      const auto& fetchBytes =
+          fetchStats.at(BufferedInputDataSource::kFetchBytes);
+      EXPECT_EQ(fetchBytes.sum, content.size());
+      EXPECT_EQ(fetchBytes.count, 1);
+      EXPECT_GT(
+          fetchStats.at(BufferedInputDataSource::kFetchReadWallNanos).sum, 0);
+      EXPECT_GE(fetchStats.at(BufferedInputDataSource::kFetchReaders).min, 1);
+    } else {
+      EXPECT_TRUE(fetchStats.empty());
+    }
     // Only a local file that nothing caches is read one staging buffer at a
     // time; otherwise the buffered input chooses the read size.
     if (staging.direct()) {
@@ -341,6 +377,12 @@ TEST_F(BufferedInputDataSourceTest, deviceReadWithoutPageLockedMemory) {
         makeDataSource(content, staging, {.bufferSize = 1ULL << 46});
     EXPECT_EQ(deviceRead(*dataSource, 0, content.size()), content);
     EXPECT_EQ(deviceRead(*dataSource, 77, 5'000), content.substr(77, 5'000));
+    // Short reads are on the device when the read completes, like long ones.
+    for (size_t offset = 0; offset < 100; ++offset) {
+      ASSERT_EQ(
+          deviceRead(*dataSource, offset, 3'000), content.substr(offset, 3'000))
+          << offset;
+    }
     EXPECT_EQ(stagingPool_->numAllocated(), 0);
   }
 }
@@ -392,6 +434,9 @@ TEST_F(BufferedInputDataSourceTest, deviceReadSubmittedFromIoThread) {
 TEST_F(BufferedInputDataSourceTest, abandonedDeviceRead) {
   const auto content = makeContent(1 << 20);
   for (const auto staging : kStagings) {
+    if (staging.scheduled) {
+      continue;
+    }
     SCOPED_TRACE(staging.toString());
     HoldingExecutor executor(std::numeric_limits<int32_t>::max());
     auto dataSource = makeDataSource(content, staging, {.executor = &executor});
@@ -411,32 +456,68 @@ TEST_F(BufferedInputDataSourceTest, abandonedDeviceRead) {
 // must wait for that read, which writes to the destination until it is done.
 TEST_F(BufferedInputDataSourceTest, abandonedDeviceReadInProgress) {
   const auto content = makeContent(1 << 20);
-  // With this staging the device read is a single read, and its copy has
-  // landed when the read returns.
-  auto dataSource = makeDataSource(content, {.pinned = true, .hasCache = true});
-  std::promise<void> started;
-  std::promise<void> resume;
-  auto resumed = resume.get_future().share();
-  std::once_flag startedOnce;
-  file_->setReadHook([&]() {
-    std::call_once(startedOnce, [&]() { started.set_value(); });
-    resumed.wait();
-  });
-  auto stream = cudfGlobalStreamPool().get_stream();
-  rmm::device_buffer device(content.size(), stream, get_temp_mr());
-  auto pending = dataSource->device_read_async(
-      0, content.size(), static_cast<uint8_t*>(device.data()), stream);
-  started.get_future().wait();
+  // With a cache in front the device read is a single read through the
+  // buffered input, and its copy has landed when the read returns. With a
+  // scheduler and no cache several readers are inside the file at once.
+  for (const Staging staging :
+       {Staging{.pinned = true, .hasCache = true},
+        Staging{.pinned = true, .hasCache = true, .scheduled = true},
+        Staging{.pinned = true, .scheduled = true}}) {
+    SCOPED_TRACE(staging.toString());
+    auto dataSource = makeDataSource(content, staging);
+    std::promise<void> started;
+    std::promise<void> resume;
+    auto resumed = resume.get_future().share();
+    std::once_flag startedOnce;
+    file_->setReadHook([&]() {
+      std::call_once(startedOnce, [&]() { started.set_value(); });
+      resumed.wait();
+    });
+    auto stream = cudfGlobalStreamPool().get_stream();
+    rmm::device_buffer device(content.size(), stream, get_temp_mr());
+    auto pending = dataSource->device_read_async(
+        0, content.size(), static_cast<uint8_t*>(device.data()), stream);
+    started.get_future().wait();
 
-  auto dropped =
-      std::async(std::launch::async, [pending = std::move(pending)]() mutable {
-        pending = std::future<size_t>();
-      });
-  EXPECT_EQ(
-      dropped.wait_for(std::chrono::milliseconds(100)),
-      std::future_status::timeout);
-  resume.set_value();
-  dropped.get();
+    auto dropped = std::async(
+        std::launch::async, [pending = std::move(pending)]() mutable {
+          pending = std::future<size_t>();
+        });
+    EXPECT_EQ(
+        dropped.wait_for(std::chrono::milliseconds(100)),
+        std::future_status::timeout);
+    resume.set_value();
+    dropped.get();
+    // Nothing reads once the result is gone.
+    const auto numReads = file_->numReads();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(file_->numReads(), numReads);
+  }
+}
+
+// A scheduled device read whose result is dropped is cancelled: when the
+// future is gone, no read is running or still to run.
+TEST_F(BufferedInputDataSourceTest, abandonedScheduledDeviceRead) {
+  const auto content = makeContent(4 << 20);
+  for (const auto staging : kStagings) {
+    if (!staging.scheduled) {
+      continue;
+    }
+    SCOPED_TRACE(staging.toString());
+    auto dataSource = makeDataSource(content, staging);
+    auto stream = cudfGlobalStreamPool().get_stream();
+    {
+      rmm::device_buffer device(content.size(), stream, get_temp_mr());
+      auto pending = dataSource->device_read_async(
+          0, content.size(), static_cast<uint8_t*>(device.data()), stream);
+    }
+    const auto numReads = file_->numReads();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(file_->numReads(), numReads);
+
+    // The scheduler serves the next read.
+    EXPECT_EQ(deviceRead(*dataSource, 0, 100'000), content.substr(0, 100'000));
+  }
 }
 
 // A submission that fails part way through a device read must not leave the

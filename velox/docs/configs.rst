@@ -1713,6 +1713,16 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      - integer
      - 4194304
      - Size in bytes of one page-locked staging buffer, at least 65536. A local file with no cache in front of it is read in pieces of this size, in parallel, so this is also the request size the storage sees. Files behind a cache and files in remote storage are read through BufferedInput, one read per column chunk range, and only copied through the staging buffers. A read that finds no page-locked memory available stages in pageable memory.
+   * - cudf.hive.fetch-scheduler-enabled
+     - cudf.hive.fetch_scheduler_enabled
+     - bool
+     - true
+     - Whether the column chunks staged in page-locked buffers are moved to the device by the connector's fetch scheduler, which all scans of the connector share. The scheduler reads with its own threads and chooses how many of them read at a time, so a scan behaves the same whichever thread starts it and however many threads the IO executor has. It serves the column chunks of a split that a driver is waiting for before those of splits loaded ahead. When false, each read runs on a thread of the IO executor. Has no effect when ``cudf.hive.pinned-staging-enabled`` is false or the staging pool size is 0. A scan that uses the scheduler reports ``cudfFetch*`` runtime statistics.
+   * - cudf.hive.fetch-scheduler-max-readers
+     -
+     - integer
+     - 16
+     - Upper bound on the reader threads of a connector's fetch scheduler, between 1 and 256. The scheduler adds a reader while column chunks wait for one and the copies to the device have idle time, and removes one while column chunks wait for a staging buffer, so this is a limit and not a setting to tune. Every connector has its own scheduler and threads; the threads start with the connector's first scan.
    * - parquet.reader.use-tile-decode
      - parquet.reader.use_tile_decode
      - bool

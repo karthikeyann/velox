@@ -80,7 +80,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
       folly::Executor* executor,
       const ConnectorQueryCtx* connectorQueryCtx,
       const std::shared_ptr<CudfHiveConfig>& CudfHiveConfig,
-      const std::shared_ptr<PinnedBufferPool>& stagingPool);
+      const std::shared_ptr<FetchScheduler>& fetchScheduler);
 
   void addSplit(std::shared_ptr<ConnectorSplit> split) override;
 
@@ -136,7 +136,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
       folly::Executor* executor,
       const ConnectorQueryCtx* connectorQueryCtx,
       const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
-      const std::shared_ptr<PinnedBufferPool>& stagingPool,
+      const std::shared_ptr<FetchScheduler>& fetchScheduler,
       PartitionKeySource partitionKeySource);
 
   // Virtual method to create a `CudfSplitReader` or subclass for the data
@@ -152,8 +152,9 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
       tableHandle_;
 
   const std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
-  // Page-locked buffers split readers stage column chunks in. Can be null.
-  const std::shared_ptr<PinnedBufferPool> stagingPool_;
+  // Moves the column chunks split readers read to the device, and owns the
+  // page-locked buffers they are staged in. Can be null.
+  const std::shared_ptr<FetchScheduler> fetchScheduler_;
   facebook::velox::FileHandleFactory* const fileHandleFactory_;
   folly::Executor* const executor_;
   const ConnectorQueryCtx* const connectorQueryCtx_;

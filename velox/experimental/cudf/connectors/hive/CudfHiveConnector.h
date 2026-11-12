@@ -17,7 +17,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
-#include "velox/experimental/cudf/connectors/hive/PinnedBufferPool.h"
+#include "velox/experimental/cudf/connectors/hive/FetchScheduler.h"
 
 #include "velox/connectors/hive/HiveConnector.h"
 
@@ -54,8 +54,15 @@ class CudfHiveConnector final
 
   /// Returns the pool of page-locked buffers the connector's scans stage
   /// column chunks in, or nullptr when the pool size is configured as zero.
-  const std::shared_ptr<PinnedBufferPool>& stagingPool() const {
-    return stagingPool_;
+  std::shared_ptr<PinnedBufferPool> stagingPool() const {
+    return fetchScheduler_ != nullptr ? fetchScheduler_->pool() : nullptr;
+  }
+
+  /// Returns the scheduler that moves the column chunks of the connector's
+  /// scans to the device, or nullptr when the staging pool size is
+  /// configured as zero.
+  const std::shared_ptr<FetchScheduler>& fetchScheduler() const {
+    return fetchScheduler_;
   }
 
   // TODO (dm): Re-add data sink
@@ -64,14 +71,16 @@ class CudfHiveConnector final
   // TODO (dm): rename parquetconfig
   const std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
 
-  // Page-locked buffers the connector's scans stage column chunks in. Null
-  // when the pool size is configured as zero.
-  const std::shared_ptr<PinnedBufferPool> stagingPool_;
+  // Moves the column chunks of the connector's scans to the device, and owns
+  // the page-locked buffers they are staged in. Null when the pool size is
+  // configured as zero.
+  const std::shared_ptr<FetchScheduler> fetchScheduler_;
 };
 
-/// Creates the pool of page-locked staging buffers 'config' describes.
-/// Returns nullptr when the configured pool size is zero.
-std::shared_ptr<PinnedBufferPool> createPinnedStagingPool(
+/// Creates the fetch scheduler 'config' describes, with its pool of
+/// page-locked staging buffers. Returns nullptr when the configured pool size
+/// is zero.
+std::shared_ptr<FetchScheduler> createFetchScheduler(
     const CudfHiveConfig& config);
 
 class CudfHiveConnectorFactory

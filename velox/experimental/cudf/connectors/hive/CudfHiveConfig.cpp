@@ -194,6 +194,21 @@ uint64_t CudfHiveConfig::pinnedStagingBufferSize() const {
   return config_->get<uint64_t>(kPinnedStagingBufferSize, 4ULL << 20);
 }
 
+bool CudfHiveConfig::fetchSchedulerEnabled() const {
+  return config_->get<bool>(kFetchSchedulerEnabled, true);
+}
+
+bool CudfHiveConfig::fetchSchedulerEnabledSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kFetchSchedulerEnabledSession,
+      config_->get<bool>(kFetchSchedulerEnabled, true));
+}
+
+uint32_t CudfHiveConfig::fetchSchedulerMaxReaders() const {
+  return config_->get<uint32_t>(kFetchSchedulerMaxReaders, 16);
+}
+
 bool CudfHiveConfig::immutableFiles() const {
   return config_->get<bool>(kImmutableFiles, false);
 }

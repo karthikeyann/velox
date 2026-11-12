@@ -138,6 +138,25 @@ class CudfHiveConfig {
   static constexpr const char* kPinnedStagingBufferSize =
       "cudf.hive.pinned-staging-buffer-size";
 
+  // Whether the column chunks staged in page-locked buffers are moved to the
+  // device by the connector's fetch scheduler, which every scan of the
+  // connector shares. It reads with its own threads, as many at a time as
+  // the storage and the copies to the device can use. Disable to read on the
+  // IO executor. Has no effect when pinned staging is off.
+  static constexpr const char* kFetchSchedulerEnabled =
+      "cudf.hive.fetch-scheduler-enabled";
+  static constexpr const char* kFetchSchedulerEnabledSession =
+      "cudf.hive.fetch_scheduler_enabled";
+
+  // Upper bound on the reader threads of a connector's fetch scheduler, at
+  // most kMaxFetchSchedulerReaders. The scheduler chooses how many of them
+  // read at a time.
+  static constexpr const char* kFetchSchedulerMaxReaders =
+      "cudf.hive.fetch-scheduler-max-readers";
+
+  // Largest accepted bound on the reader threads of a fetch scheduler.
+  static constexpr uint32_t kMaxFetchSchedulerReaders = 256;
+
   // Smallest accepted staging buffer size. A range takes one queued read per
   // buffer, so a tiny buffer would flood the IO executor.
   static constexpr uint64_t kMinPinnedStagingBufferSize = 64 << 10;
@@ -227,6 +246,17 @@ class CudfHiveConfig {
   uint64_t pinnedStagingPoolSize() const;
 
   uint64_t pinnedStagingBufferSize() const;
+
+  /// Returns whether scans move staged column chunks to the device through
+  /// the connector's fetch scheduler.
+  bool fetchSchedulerEnabled() const;
+
+  /// Returns fetchSchedulerEnabled() unless 'session' overrides it.
+  bool fetchSchedulerEnabledSession(const config::ConfigBase* session) const;
+
+  /// Returns the upper bound on the reader threads of the connector's fetch
+  /// scheduler.
+  uint32_t fetchSchedulerMaxReaders() const;
 
   bool immutableFiles() const;
 

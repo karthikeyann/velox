@@ -175,7 +175,10 @@ void CudfEqualityDeleteFileReader::directReadEqualityDeleteFile(
   auto sourceInfo = [&]() {
     if (bufferedInput) {
       dataSource = std::make_shared<BufferedInputDataSource>(
-          std::move(bufferedInput), /*stagingPool=*/nullptr);
+          std::move(bufferedInput),
+          /*stagingPool=*/nullptr,
+          /*fetchScheduler=*/nullptr,
+          /*fetchStats=*/nullptr);
       return cudf::io::source_info{dataSource.get()};
     }
     return cudf::io::source_info{deleteFile.filePath};

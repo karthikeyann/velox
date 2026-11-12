@@ -32,11 +32,11 @@ CudfHiveConnector::CudfHiveConnector(
     folly::Executor* executor)
     : ::facebook::velox::connector::hive::HiveConnector(id, config, executor),
       cudfHiveConfig_(std::make_shared<CudfHiveConfig>(config)),
-      stagingPool_(createPinnedStagingPool(*cudfHiveConfig_)) {
+      fetchScheduler_(createFetchScheduler(*cudfHiveConfig_)) {
   VLOG(1) << "cuDF Hive connector created";
 }
 
-std::shared_ptr<PinnedBufferPool> createPinnedStagingPool(
+std::shared_ptr<FetchScheduler> createFetchScheduler(
     const CudfHiveConfig& config) {
   const auto poolSize = config.pinnedStagingPoolSize();
   if (poolSize == 0) {
@@ -48,7 +48,21 @@ std::shared_ptr<PinnedBufferPool> createPinnedStagingPool(
       CudfHiveConfig::kMinPinnedStagingBufferSize,
       "Staging buffer size is below its minimum: {}",
       CudfHiveConfig::kPinnedStagingBufferSize);
-  return std::make_shared<PinnedBufferPool>(bufferSize, poolSize);
+  const auto maxReaders = config.fetchSchedulerMaxReaders();
+  VELOX_USER_CHECK_GT(
+      maxReaders,
+      0,
+      "Fetch scheduler reader bound must be at least 1: {}",
+      CudfHiveConfig::kFetchSchedulerMaxReaders);
+  VELOX_USER_CHECK_LE(
+      maxReaders,
+      CudfHiveConfig::kMaxFetchSchedulerReaders,
+      "Fetch scheduler reader bound is above its maximum: {}",
+      CudfHiveConfig::kFetchSchedulerMaxReaders);
+  FetchScheduler::Options options;
+  options.maxReaders = maxReaders;
+  return std::make_shared<FetchScheduler>(
+      std::make_shared<PinnedBufferPool>(bufferSize, poolSize), options);
 }
 
 std::unique_ptr<DataSource> CudfHiveConnector::createDataSource(
@@ -71,7 +85,7 @@ std::unique_ptr<DataSource> CudfHiveConnector::createDataSource(
         ioExecutor_,
         connectorQueryCtx,
         cudfHiveConfig_,
-        stagingPool_);
+        fetchScheduler_);
   }
 
   return std::make_unique<::facebook::velox::connector::hive::HiveDataSource>(

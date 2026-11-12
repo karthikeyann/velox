@@ -191,7 +191,7 @@ CudfSplitReader::CudfSplitReader(
     folly::Executor* executor,
     const ConnectorQueryCtx* connectorQueryCtx,
     const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
-    const std::shared_ptr<PinnedBufferPool>& stagingPool,
+    const std::shared_ptr<FetchScheduler>& fetchScheduler,
     const std::shared_ptr<io::IoStatistics>& ioStatistics,
     const std::shared_ptr<IoStats>& ioStats,
     const cudf::ast::expression* subfieldFilterAst)
@@ -210,7 +210,7 @@ CudfSplitReader::CudfSplitReader(
       ioStatistics_(ioStatistics),
       ioStats_(ioStats),
       cudfHiveConfig_(cudfHiveConfig),
-      stagingPool_(stagingPool),
+      fetchScheduler_(fetchScheduler),
       pool_(connectorQueryCtx->memoryPool()),
       baseReaderOpts_(pool_),
       subfieldFilterAst_(subfieldFilterAst),
@@ -692,10 +692,21 @@ void CudfSplitReader::setupCudfDataSource() {
     makeKvikioDataSource();
     return;
   }
-  const bool usePinnedStaging = cudfHiveConfig_->pinnedStagingEnabledSession(
-      connectorQueryCtx_->sessionProperties());
+  const auto* sessionProperties = connectorQueryCtx_->sessionProperties();
+  std::shared_ptr<PinnedBufferPool> stagingPool;
+  std::shared_ptr<FetchScheduler> fetchScheduler;
+  if (fetchScheduler_ != nullptr &&
+      cudfHiveConfig_->pinnedStagingEnabledSession(sessionProperties)) {
+    stagingPool = fetchScheduler_->pool();
+    if (cudfHiveConfig_->fetchSchedulerEnabledSession(sessionProperties)) {
+      fetchScheduler = fetchScheduler_;
+    }
+  }
   dataSource_ = std::make_unique<BufferedInputDataSource>(
-      std::move(bufferedInput), usePinnedStaging ? stagingPool_ : nullptr);
+      std::move(bufferedInput),
+      std::move(stagingPool),
+      std::move(fetchScheduler),
+      ioStats_);
 }
 
 void CudfSplitReader::setupReaderOptions() {

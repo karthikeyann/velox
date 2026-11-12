@@ -106,6 +106,17 @@ DEFINE_uint64(
     4ULL << 20,
     "Size in bytes of one page-locked staging buffer");
 
+DEFINE_bool(
+    cudf_hive_fetch_scheduler_enabled,
+    true,
+    "Move staged column chunks to the device with the connector's fetch "
+    "scheduler instead of on the IO executor");
+
+DEFINE_uint32(
+    cudf_hive_fetch_scheduler_max_readers,
+    16,
+    "Upper bound on the reader threads of the fetch scheduler");
+
 DEFINE_string(
     cudf_properties,
     "",
@@ -159,6 +170,12 @@ void CudfTpchBenchmark::initialize() {
     cudfHiveConfigurationValues[cudf_velox::connector::hive::CudfHiveConfig::
                                     kPinnedStagingBufferSize] =
         std::to_string(FLAGS_cudf_hive_pinned_staging_buffer_size);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kFetchSchedulerEnabled] =
+            std::to_string(FLAGS_cudf_hive_fetch_scheduler_enabled);
+    cudfHiveConfigurationValues[cudf_velox::connector::hive::CudfHiveConfig::
+                                    kFetchSchedulerMaxReaders] =
+        std::to_string(FLAGS_cudf_hive_fetch_scheduler_max_readers);
     auto cudfHiveProperties = std::make_shared<const config::ConfigBase>(
         std::move(cudfHiveConfigurationValues));
 
@@ -217,6 +234,12 @@ CudfTpchBenchmark::makeConnectorProperties() {
   cfg->set(
       CudfHiveCfg::kPinnedStagingBufferSize,
       std::to_string(FLAGS_cudf_hive_pinned_staging_buffer_size));
+  cfg->set(
+      CudfHiveCfg::kFetchSchedulerEnabled,
+      std::to_string(FLAGS_cudf_hive_fetch_scheduler_enabled));
+  cfg->set(
+      CudfHiveCfg::kFetchSchedulerMaxReaders,
+      std::to_string(FLAGS_cudf_hive_fetch_scheduler_max_readers));
   cfg->set(CudfHiveCfg::kAllowMismatchedCudfHiveSchemas, "true");
 
   return cfg;
