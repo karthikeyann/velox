@@ -119,6 +119,7 @@ velox_add_cudf_test(
     Main.cpp
     BufferedInputDataSourceTest.cpp
     CudfSplitReaderTest.cpp
+    FetchAheadBudgetTest.cpp
     FetchSchedulerTest.cpp
     PinnedBufferPoolTest.cpp
   LIBS velox_cudf_exec_test_lib velox_cudf_hive_connector gmock
