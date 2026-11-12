@@ -14,9 +14,14 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/connectors/hive/PinnedBufferPool.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
+
+#include <cuda_runtime_api.h>
+
+#include <folly/ScopeGuard.h>
 
 #include <chrono>
 #include <cstring>
@@ -75,6 +80,33 @@ TEST_F(PinnedBufferPoolTest, allocationFailure) {
     EXPECT_EQ(buffer.get(), nullptr);
     EXPECT_EQ(pool.numAllocated(), 0);
   }
+}
+
+// An acquire that throws before it has a buffer leaves the pool's accounting
+// as it was. A slot left reserved would shrink the pool and make its
+// destructor wait for a buffer that does not exist.
+TEST_F(PinnedBufferPoolTest, acquireWithoutCudaContext) {
+  int device{-1};
+  ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+  PinnedBufferPool pool(4'096, 8'192);
+  {
+    // No thread can bind a CUDA context while no device is registered.
+    setCudfContextDevice(-1);
+    SCOPE_EXIT {
+      setCudfContextDevice(device);
+    };
+    VELOX_ASSERT_THROW(
+        pool.acquire(),
+        "cuDF is not yet registered. Please call registerCudf() first.");
+  }
+  // With a slot left reserved, the second acquire below would never return.
+  ASSERT_EQ(pool.numAllocated(), 0);
+
+  auto first = pool.acquire();
+  auto second = pool.acquire();
+  EXPECT_NE(first.get(), nullptr);
+  EXPECT_NE(second.get(), nullptr);
+  EXPECT_EQ(pool.numAllocated(), 2);
 }
 
 TEST_F(PinnedBufferPoolTest, waitsAtCapacity) {

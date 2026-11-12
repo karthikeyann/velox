@@ -33,9 +33,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -43,8 +45,8 @@
 namespace facebook::velox::cudf_velox::connector::hive {
 namespace {
 
-// An in-memory file that counts its reads and fails those that reach
-// 'failOffset'.
+// An in-memory file that counts its reads, calls 'readHook' at the start of
+// each and fails those that reach 'failOffset'.
 class FailingReadFile : public InMemoryReadFile {
  public:
   FailingReadFile(std::string content, uint64_t failOffset)
@@ -56,6 +58,9 @@ class FailingReadFile : public InMemoryReadFile {
       void* buf,
       const FileIoContext& context = {}) const override {
     ++numReads_;
+    if (readHook_ != nullptr) {
+      readHook_();
+    }
     if (offset + length > failOffset_) {
       VELOX_FAIL("Injected read failure at offset: {}", offset);
     }
@@ -66,9 +71,15 @@ class FailingReadFile : public InMemoryReadFile {
     return numReads_;
   }
 
+  // Reads do not synchronize with this, so it must be set before the first.
+  void setReadHook(std::function<void()> readHook) {
+    readHook_ = std::move(readHook);
+  }
+
  private:
   const uint64_t failOffset_;
   mutable std::atomic_int32_t numReads_{0};
+  std::function<void()> readHook_;
 };
 
 // An executor that holds what it is given until drain() runs it, and fails
@@ -394,6 +405,38 @@ TEST_F(BufferedInputDataSourceTest, abandonedDeviceRead) {
     executor.drain();
     EXPECT_EQ(file_->numReads(), 0);
   }
+}
+
+// A device read whose result is dropped while one of its reads is running
+// must wait for that read, which writes to the destination until it is done.
+TEST_F(BufferedInputDataSourceTest, abandonedDeviceReadInProgress) {
+  const auto content = makeContent(1 << 20);
+  // With this staging the device read is a single read, and its copy has
+  // landed when the read returns.
+  auto dataSource = makeDataSource(content, {.pinned = true, .hasCache = true});
+  std::promise<void> started;
+  std::promise<void> resume;
+  auto resumed = resume.get_future().share();
+  std::once_flag startedOnce;
+  file_->setReadHook([&]() {
+    std::call_once(startedOnce, [&]() { started.set_value(); });
+    resumed.wait();
+  });
+  auto stream = cudfGlobalStreamPool().get_stream();
+  rmm::device_buffer device(content.size(), stream, get_temp_mr());
+  auto pending = dataSource->device_read_async(
+      0, content.size(), static_cast<uint8_t*>(device.data()), stream);
+  started.get_future().wait();
+
+  auto dropped =
+      std::async(std::launch::async, [pending = std::move(pending)]() mutable {
+        pending = std::future<size_t>();
+      });
+  EXPECT_EQ(
+      dropped.wait_for(std::chrono::milliseconds(100)),
+      std::future_status::timeout);
+  resume.set_value();
+  dropped.get();
 }
 
 // A submission that fails part way through a device read must not leave the
