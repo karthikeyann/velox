@@ -29,8 +29,11 @@
 #include <rmm/device_buffer.hpp>
 
 #include <folly/Executor.h>
+#include <folly/executors/IOThreadPoolExecutor.h>
 
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <limits>
 #include <memory>
 #include <string>
@@ -329,6 +332,48 @@ TEST_F(BufferedInputDataSourceTest, deviceReadWithoutPageLockedMemory) {
     EXPECT_EQ(deviceRead(*dataSource, 77, 5'000), content.substr(77, 5'000));
     EXPECT_EQ(stagingPool_->numAllocated(), 0);
   }
+}
+
+// An IO thread pool runs what one of its own threads submits on that same
+// thread. A device read submitted from a pool thread, as when a split is
+// prepared in the background, must still be read by the other threads: here
+// the submitting thread stays busy until some reads have run.
+TEST_F(BufferedInputDataSourceTest, deviceReadSubmittedFromIoThread) {
+  const auto content = makeContent(1 << 20);
+  folly::IOThreadPoolExecutor executor(4);
+  auto dataSource =
+      makeDataSource(content, {.pinned = true}, {.executor = &executor});
+  auto stream = cudfGlobalStreamPool().get_stream();
+  rmm::device_buffer device(content.size(), stream, get_temp_mr());
+
+  std::promise<std::future<size_t>> submitted;
+  std::promise<void> release;
+  executor.add([&]() {
+    submitted.set_value(dataSource->device_read_async(
+        0, content.size(), static_cast<uint8_t*>(device.data()), stream));
+    release.get_future().wait();
+  });
+  auto pending = submitted.get_future().get();
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (file_->numReads() == 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_GT(file_->numReads(), 0);
+  release.set_value();
+
+  EXPECT_EQ(pending.get(), content.size());
+  std::string result(content.size(), '\0');
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      result.data(),
+      device.data(),
+      result.size(),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  stream.sync();
+  EXPECT_EQ(result, content);
 }
 
 // A device read whose result is dropped must not leave reads behind that

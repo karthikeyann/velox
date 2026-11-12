@@ -22,6 +22,9 @@
 #include "velox/common/time/Timer.h"
 
 #include <folly/Executor.h>
+#include <folly/executors/IOThreadPoolExecutor.h>
+#include <folly/io/async/EventBase.h>
+#include <folly/io/async/EventBaseManager.h>
 
 #include <algorithm>
 #include <atomic>
@@ -41,9 +44,12 @@ namespace {
 // whichever gets to it first.
 class ReadTask {
  public:
-  ReadTask(folly::Executor* executor, std::function<void()> read)
-      : state_(std::make_shared<State>(std::move(read))) {
-    executor->add([state = state_]() { state->run(); });
+  explicit ReadTask(std::function<void()> read)
+      : state_(std::make_shared<State>(std::move(read))) {}
+
+  // Returns what an executor thread calls to run the read.
+  folly::Func runner() const {
+    return [state = state_]() { state->run(); };
   }
 
   // Runs the read unless it has started, waits for it and rethrows its
@@ -92,7 +98,30 @@ class ReadTask {
 // reads that have not started and waits for the rest.
 class ReadTasks {
  public:
-  ReadTasks() = default;
+  // The reads are submitted to 'executor'.
+  explicit ReadTasks(folly::Executor* executor) : executor_(executor) {
+    // An IO thread pool runs what one of its own threads submits on that
+    // same thread. Reads submitted from such a thread, as when a split is
+    // prepared in the background, would run one after the other, so they are
+    // handed to the pool's threads in turn instead.
+    auto* ioPool = dynamic_cast<folly::IOThreadPoolExecutorBase*>(executor);
+    if (ioPool == nullptr) {
+      return;
+    }
+    const auto* current =
+        folly::EventBaseManager::get()->getExistingEventBase();
+    if (current == nullptr) {
+      return;
+    }
+    auto eventBases = ioPool->getAllEventBases();
+    const bool onPoolThread = std::any_of(
+        eventBases.begin(), eventBases.end(), [&](const auto& eventBase) {
+          return eventBase.get() == current;
+        });
+    if (onPoolThread) {
+      eventBases_ = std::move(eventBases);
+    }
+  }
 
   ReadTasks(ReadTasks&&) = default;
 
@@ -110,9 +139,17 @@ class ReadTasks {
     tasks_.reserve(numTasks);
   }
 
-  // Submits 'read' to 'executor'.
-  void add(folly::Executor* executor, std::function<void()> read) {
-    tasks_.emplace_back(executor, std::move(read));
+  // Submits 'read' to the executor.
+  void add(std::function<void()> read) {
+    auto runner = tasks_.emplace_back(std::move(read)).runner();
+    if (eventBases_.empty()) {
+      executor_->add(std::move(runner));
+      return;
+    }
+    static std::atomic_size_t nextThread{0};
+    const auto index = nextThread.fetch_add(1, std::memory_order_relaxed);
+    eventBases_[index % eventBases_.size()]->runInEventBaseThread(
+        std::move(runner));
   }
 
   // Joins every read, then rethrows the first failure.
@@ -134,6 +171,10 @@ class ReadTasks {
   }
 
  private:
+  folly::Executor* const executor_;
+  // The threads of the executor, when the reads are handed to them in turn.
+  // Empty when the executor chooses the thread.
+  std::vector<folly::Executor::KeepAlive<folly::EventBase>> eventBases_;
   std::vector<ReadTask> tasks_;
 };
 
@@ -218,11 +259,11 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
   const size_t readSize =
       offset >= fileSize_ ? 0 : std::min(size, fileSize_ - offset);
 
-  ReadTasks tasks;
+  ReadTasks tasks(executor);
   if (readSize == 0) {
     // Nothing to read.
   } else if (stagingPool_ == nullptr) {
-    tasks.add(executor, [this, offset, readSize, dst, stream]() {
+    tasks.add([this, offset, readSize, dst, stream]() {
       stagePageable(offset, readSize, dst, stream);
     });
   } else if (input_->hasCache() || input_->getReadFile()->shouldCoalesce()) {
@@ -230,7 +271,7 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
     // cache entries the same as for any other reader of the range, and
     // leaves the request sizes to the buffered input for a file that asks
     // for coalesced reads, as files in remote storage do.
-    tasks.add(executor, [this, offset, readSize, dst, stream]() {
+    tasks.add([this, offset, readSize, dst, stream]() {
       stageFromInput(offset, readSize, dst, stream);
     });
   } else {
@@ -240,7 +281,7 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
     tasks.reserve((readSize + bufferSize - 1) / bufferSize);
     for (size_t done = 0; done < readSize; done += bufferSize) {
       const auto partSize = std::min(bufferSize, readSize - done);
-      tasks.add(executor, [this, offset, done, partSize, dst, stream]() {
+      tasks.add([this, offset, done, partSize, dst, stream]() {
         stageFromFile(offset + done, partSize, dst + done, stream);
       });
     }
