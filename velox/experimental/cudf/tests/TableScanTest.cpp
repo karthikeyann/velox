@@ -944,9 +944,14 @@ TEST_P(TableScanTestParameterized, fetchAheadClaimed) {
 
     // The driver has decoded the first split and waits for its batch to be
     // taken. A split prepared ahead offers its fetch, which starts.
-    while (fetchAheadStats().numStartedAhead == 0) {
+    // Bounded, so that a scan that starts nothing ahead fails the test.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (fetchAheadStats().numStartedAhead == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    ASSERT_GT(fetchAheadStats().numStartedAhead, 0);
     // The start thread runs the starts in the order they were posted.
     folly::Baton<> started;
     cudfHiveConnector()->fetchAheadContext()->post([&]() { started.post(); });

@@ -521,6 +521,73 @@ TEST_F(FetchAheadBudgetTest, withdrawOfRunningStart) {
   budget.release(10, 0, kAwaited);
 }
 
+// While a start suspension is in scope nothing starts ahead: what a consumer
+// frees between two of its fetches does not go to a fetch ahead of the one
+// it asks for next.
+TEST_F(FetchAheadBudgetTest, suspendedStarts) {
+  FetchAheadBudget budget(100);
+  holdReceived(budget, 60, 0);
+  // The first is the one fetch the scan may always have ahead; the second
+  // has no room until the consumer gives its 60 bytes back.
+  budget.offer(fetch("later"), 50, kLater, 0);
+  budget.offer(fetch("other"), 50, kLater, 0);
+  EXPECT_THAT(log_.names(), testing::ElementsAre("later"));
+  {
+    FetchAheadBudget::ScopedStartSuspension suspension(&budget);
+    budget.release(60, 0, kReceived);
+    EXPECT_THAT(log_.names(), testing::ElementsAre("later"));
+    EXPECT_EQ(budget.stats().numWaitingConsumers, 1);
+    // The consumer's next fetch.
+    budget.hold(60, 0);
+  }
+  // The consumer awaits its fetch: still nothing starts ahead of it.
+  EXPECT_THAT(log_.names(), testing::ElementsAre("later"));
+  EXPECT_EQ(budget.stats().numWaitingConsumers, 0);
+  budget.receive(0);
+  EXPECT_THAT(log_.names(), testing::ElementsAre("later"));
+  claimReceived(budget, 0);
+  EXPECT_THAT(log_.names(), testing::ElementsAre("later", "other"));
+  // A suspension of no budget does nothing.
+  FetchAheadBudget::ScopedStartSuspension none(nullptr);
+}
+
+// A start that is queued on the context's thread and then taken back does
+// not keep the context alive: the context is destroyed where its last owner
+// drops it, not on its own thread.
+TEST_F(FetchAheadBudgetTest, contextOutlivesNoQueuedStart) {
+  auto context = std::make_shared<FetchAheadContext>(100);
+  std::weak_ptr<FetchAheadContext> weak = context;
+  holdReceived(context->budget(), 0, 0);
+  folly::Baton<> busy;
+  folly::Baton<> release;
+  context->post([&]() {
+    busy.post();
+    release.wait();
+  });
+  busy.wait();
+  int numStarts{0};
+  auto start = std::make_shared<PostedFetchStart>(
+      &context->budget(),
+      10,
+      /*scan=*/0,
+      [raw = context.get()](std::function<void()> task) {
+        raw->post(std::move(task));
+      },
+      [&]() { ++numStarts; });
+  context->budget().offer(start, 10, kLater, 0);
+  EXPECT_EQ(context->budget().stats().numAhead, 1);
+  start->withdraw();
+  start.reset();
+  EXPECT_EQ(context->budget().stats().numAhead, 0);
+  context->budget().release(0, 0, kReceived);
+  // The queued task is all that is left of the start.
+  EXPECT_EQ(context.use_count(), 1);
+  release.post();
+  context.reset();
+  EXPECT_TRUE(weak.expired());
+  EXPECT_EQ(numStarts, 0);
+}
+
 // A task posted from a thread of an IO executor runs on the context's own
 // thread, after the tasks posted before it.
 TEST_F(FetchAheadBudgetTest, contextStartThread) {

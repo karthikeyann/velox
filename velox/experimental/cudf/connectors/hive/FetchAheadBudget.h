@@ -88,7 +88,8 @@ class FetchAheadBudget {
     uint64_t numAhead{0};
     /// Fetches started ahead that their consumers asked for afterwards.
     uint64_t numClaimed{0};
-    /// Consumers blocked waiting for bytes now.
+    /// Consumers blocked waiting for bytes now, and start suspensions in
+    /// scope.
     uint64_t numWaitingConsumers{0};
   };
 
@@ -142,6 +143,24 @@ class FetchAheadBudget {
 
   /// Ends a waitBegin(), and starts the offered fetches that can start now.
   void waitEnd() noexcept;
+
+  /// Keeps the budget from starting offered fetches while in scope, and
+  /// starts those that can start when it ends. For a consumer that gives
+  /// bytes back and asks for its next fetch in one step: what it frees must
+  /// not go to a fetch started ahead of the one it is about to ask for.
+  class ScopedStartSuspension {
+   public:
+    /// Does nothing when 'budget' is null.
+    explicit ScopedStartSuspension(FetchAheadBudget* budget);
+
+    ~ScopedStartSuspension();
+
+    ScopedStartSuspension(const ScopedStartSuspension&) = delete;
+    ScopedStartSuspension& operator=(const ScopedStartSuspension&) = delete;
+
+   private:
+    FetchAheadBudget* const budget_;
+  };
 
   /// How soon the consumer of an offered fetch gets to it.
   enum class Distance {

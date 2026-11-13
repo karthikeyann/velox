@@ -260,7 +260,6 @@ CudfSplitReader::CudfSplitReader(
         connectorQueryCtx_->queryId(),
         connectorQueryCtx_->taskId(),
         connectorQueryCtx_->planNodeId()));
-    fetchAheadBudget_->attach(fetchAheadScan_);
   }
   if (dynamicFilters) {
     const auto filterRowType = ROW(readColumnNames_, readColumnTypes_);
@@ -289,6 +288,11 @@ CudfSplitReader::CudfSplitReader(
       hiveConfig.maxCoalescedDistanceBytes(sessionProperties));
   caseInsensitiveColumnNames_ =
       hiveConfig.isFileColumnNamesReadAsLowerCase(sessionProperties);
+  // Last: the destructor, which detaches, does not run when a constructor
+  // throws.
+  if (fetchAheadBudget_ != nullptr) {
+    fetchAheadBudget_->attach(fetchAheadScan_);
+  }
 }
 
 CudfSplitReader::~CudfSplitReader() {
@@ -505,6 +509,8 @@ std::optional<CudfSplitReader::TableChunk> CudfSplitReader::readNextChunk() {
   // I/O for the next pass, unless it was fetched ahead, while the caller
   // consumes this table.
   if (not splitReader_->has_next_table_chunk()) {
+    // What the pass frees is not for a fetch ahead of the next pass.
+    FetchAheadBudget::ScopedStartSuspension suspension(fetchAheadBudget_);
     advancePass();
     if (passState_->currentPass < passState_->passes.size()) {
       startColumnChunkFetch();
@@ -524,6 +530,8 @@ std::optional<CudfSplitReader::TableChunk> CudfSplitReader::readNextChunk() {
 }
 
 void CudfSplitReader::startColumnChunkFetch() {
+  // The reader asks for the pass: nothing starts ahead of it meanwhile.
+  FetchAheadBudget::ScopedStartSuspension suspension(fetchAheadBudget_);
   // From here on the fetch-ahead budget leaves the fetch to this thread.
   withdrawFetchOffer();
   if (passState_ != nullptr and
@@ -622,7 +630,9 @@ void CudfSplitReader::offerPassFetch(
       fetchAheadBudget_,
       numBytes,
       fetchAheadScan_,
-      [context = fetchAheadContext_](std::function<void()> task) {
+      // Not the shared pointer: a start that is queued must not keep the
+      // context alive. The reader does, and takes every offer back.
+      [context = fetchAheadContext_.get()](std::function<void()> task) {
         context->post(std::move(task));
       },
       [this, &target, stream, byteRanges = std::move(byteRanges), numBytes]() {
@@ -633,12 +643,22 @@ void CudfSplitReader::offerPassFetch(
 }
 
 void CudfSplitReader::withdrawFetchOffer() {
-  if (fetchAhead_ != nullptr) {
-    fetchAheadBudget_->withdraw(fetchAhead_.get());
-    // Waits for a start that is running, and takes back one that is only
-    // queued: the caller then starts the fetch itself.
-    fetchAhead_->withdraw();
-    fetchAhead_.reset();
+  if (fetchAhead_ == nullptr) {
+    return;
+  }
+  const auto offer = std::move(fetchAhead_);
+  std::exception_ptr failure;
+  try {
+    fetchAheadBudget_->withdraw(offer.get());
+  } catch (...) {
+    failure = std::current_exception();
+  }
+  // Waits for a start that is running, and takes back one that is only
+  // queued: the caller then starts the fetch itself. Also when the budget
+  // failed above, so that no start runs on a reader that may be gone.
+  offer->withdraw();
+  if (failure != nullptr) {
+    std::rethrow_exception(failure);
   }
 }
 
