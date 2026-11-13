@@ -236,6 +236,19 @@ class HashBuild final : public Operator {
 
   void addRuntimeStats();
 
+  // Publishes the dynamic filters the plan fragment declares for this join to
+  // the task, from the build-side keys in 'table'. Opts out of every filter if
+  // 'table' is nullptr, which says that no table holds all the build-side
+  // rows, or if filtering the probe side is not correct for this join.
+  void publishDynamicFilters(const BaseHashTable* table);
+
+  // Opts out of the dynamic filters that this build cannot make, so that the
+  // scans waiting for them do not wait for the rest of the build: every
+  // filter if the join or the way it runs rules filters out or once the table
+  // stops analyzing keys, and the filter of a key with too many distinct
+  // values when no bloom filter will be made.
+  void optOutOfDynamicFiltersEarly();
+
   // Indicates if this hash build operator is under non-reclaimable state or
   // not.
   bool nonReclaimableState() const;
@@ -354,6 +367,9 @@ class HashBuild final : public Operator {
   // True if we are considering use of normalized keys or array hash tables. Set
   // to false when the dataset is no longer suitable.
   bool analyzeKeys_;
+
+  // True while optOutOfDynamicFiltersEarly() has something left to check.
+  bool checkDynamicFilterOptOut_{false};
 
   // Temporary space for hash numbers.
   raw_vector<uint64_t> hashes_;

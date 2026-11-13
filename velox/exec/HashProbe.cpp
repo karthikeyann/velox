@@ -402,32 +402,11 @@ void HashProbe::pushdownDynamicFilters() {
           .hashProbeStringDynamicFilterPushdownEnabled();
   auto numFilters = driver->pushdownFilters(
       this, keyChannels_, [&](column_index_t keyIndex) -> common::FilterPtr {
-        auto& hasher = *table_->hashers()[keyIndex];
-        if (hasher.typeKind() == TypeKind::VARCHAR ||
-            hasher.typeKind() == TypeKind::VARBINARY) {
-          if (!hashProbeStringDynamicFilterPushdownEnabled) {
-            return nullptr;
-          }
-          // A custom logical type may have a connector-specific physical
-          // representation that differs from its in-memory representation, so
-          // generic code here cannot assume the two are byte-equivalent. A
-          // pushed-down filter is evaluated by the scan against the physical
-          // bytes, so producing one from in-memory values could drop matching
-          // rows. Skip the filter and let the hash join do the matching; this
-          // costs an optimization, not correctness.
-          // TODO: Restore pushdown for VARCHAR/VARBINARY-backed custom types
-          // whose connector physical representation is known to match the
-          // in-memory one, rather than skipping every custom type.
-          if (customTypeExists(hasher.type()->name())) {
-            return nullptr;
-          }
-        }
-        common::FilterPtr filter = hasher.getFilter(false);
-        if (!filter) {
-          filter = hasher.getBloomFilter();
-          if (!filter) {
-            return nullptr;
-          }
+        auto filter = table_->hashers()[keyIndex]->getJoinKeyFilter(
+            hashProbeStringDynamicFilterPushdownEnabled);
+        if (filter != nullptr &&
+            filter->kind() ==
+                common::FilterKind::kBigintValuesUsingBloomFilter) {
           auto* bloomFilter =
               checkedPointerCast<const common::BigintValuesUsingBloomFilter>(
                   filter.get());

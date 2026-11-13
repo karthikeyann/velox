@@ -128,6 +128,10 @@ class CudfHashJoinBuild : public CudfJoinBuild {
   void buildAndPublish(std::vector<CudfVectorPtr> inputs) override;
 
  private:
+  // Opts out of the dynamic filters the plan fragment declares for this join
+  // and that are not published yet. Table scans wait for them.
+  void optOutOfDynamicFilters();
+
   std::shared_ptr<const core::HashJoinNode> joinNode_;
 };
 

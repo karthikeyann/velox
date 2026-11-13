@@ -1301,6 +1301,19 @@ class QueryConfig {
       false,
       "Enable scaled table scan processing based on memory usage.")
 
+  /// The longest time, in milliseconds, a table scan waits before reading for
+  /// the dynamic filters that the plan fragment declares for it
+  /// (core::DynamicFilterTarget). After that it reads without the missing
+  /// filters and applies each when it arrives. 0 means do not wait.
+  VELOX_QUERY_CONFIG(
+      kTableScanDynamicFilterMaxWaitMs,
+      tableScanDynamicFilterMaxWaitMs,
+      "table_scan_dynamic_filter_max_wait_ms",
+      uint64_t,
+      10'000,
+      "Longest wait of a table scan for its declared dynamic filters, in "
+      "milliseconds. 0 disables waiting.")
+
   /// The query memory usage ratio for scan controller to decide if it can
   /// increase running scan threads.
   VELOX_QUERY_CONFIG(

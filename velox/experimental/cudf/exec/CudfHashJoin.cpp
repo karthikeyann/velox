@@ -313,7 +313,20 @@ void CudfHashJoinBuild::recordInputStats(const CudfVector& input) {
   }
 }
 
+void CudfHashJoinBuild::optOutOfDynamicFilters() {
+  auto* task = operatorCtx_->task().get();
+  for (const auto& source : task->dynamicFilters().sources(planNodeId())) {
+    task->publishDynamicFilter(source.filterId, nullptr);
+  }
+}
+
 void CudfHashJoinBuild::buildAndPublish(std::vector<CudfVectorPtr> inputs) {
+  SCOPE_EXIT {
+    // Every way out of the build resolves the filters of this join.
+    optOutOfDynamicFilters();
+  };
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfHashJoinBuild::buildAndPublish", this);
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "CudfHashJoinBuild: build batches count: " << inputs.size();
     if (!inputs.empty()) {

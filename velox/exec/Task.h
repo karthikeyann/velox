@@ -27,6 +27,7 @@
 #include "velox/exec/MergeSource.h"
 #include "velox/exec/PartitionedOutputFactory.h"
 #include "velox/exec/ScaledScanController.h"
+#include "velox/exec/TaskDynamicFilters.h"
 #include "velox/exec/TaskStats.h"
 #include "velox/exec/TaskStructs.h"
 #include "velox/exec/trace/TraceCtx.h"
@@ -332,6 +333,40 @@ class Task : public std::enable_shared_from_this<Task> {
   /// as in addSplitWithSequence(). Throws if 'split' has neither a connector
   /// split nor a barrier.
   void addSplit(const core::PlanNodeId& planNodeId, exec::Split&& split);
+
+  /// Publishes a dynamic filter that a hash join of this task makes for table
+  /// scans outside of its pipeline. The plan fragment lists the filter in
+  /// 'dynamicFilterSources'. Called by the operator of the join when its build
+  /// side is complete. 'filter' must pass every non-null build-side value of
+  /// the key; nullptr means the join cannot describe its keys, which disables
+  /// the filter. The task's own scans that wait for the filter get it right
+  /// away. Only the first call for a filter has an effect.
+  void publishDynamicFilter(
+      const std::string& filterId,
+      common::FilterPtr filter);
+
+  /// Delivers a dynamic filter that joins of other tasks make to the table
+  /// scans of this task. The plan fragment lists the filter in
+  /// 'dynamicFilterTargets' and not in 'dynamicFilterSources'. 'filter' must
+  /// pass every non-null build-side value of the key in every task that makes
+  /// the filter; nullptr disables the filter and the scans stop waiting for
+  /// it. Only the first call for a filter has an effect, and a call after the
+  /// task ended has none.
+  void addDynamicFilter(const std::string& filterId, common::FilterPtr filter);
+
+  /// Returns a future that completes when the dynamic filter is published or
+  /// delivered, with the filter or nullptr if it is disabled. Completes with
+  /// nullptr if the task ends first. Used to collect the filters of the tasks
+  /// that make a filter before delivering their combination to the tasks that
+  /// apply it.
+  folly::SemiFuture<common::FilterPtr> dynamicFilterFuture(
+      const std::string& filterId);
+
+  /// Returns the dynamic filters of this task that travel outside of a
+  /// pipeline. Used by the operators that publish, wait for and apply them.
+  TaskDynamicFilters& dynamicFilters() {
+    return *dynamicFilters_;
+  }
 
   /// We mark that for the given group there would be no more splits coming.
   void noMoreSplitsForGroup(
@@ -1409,6 +1444,9 @@ class Task : public std::enable_shared_from_this<Task> {
   std::shared_ptr<core::QueryCtx> queryCtx_;
 
   core::PlanFragment planFragment_;
+
+  // Dynamic filters declared by 'planFragment_'.
+  std::unique_ptr<TaskDynamicFilters> dynamicFilters_;
 
   // First node in the plan fragment that does not support barrier processing.
   // Barrier is supported when the task is under single threaded execution mode

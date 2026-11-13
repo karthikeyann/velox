@@ -26,8 +26,36 @@ namespace facebook::velox::exec {
 
 namespace {
 
+// Gives 'dataSource' the filter of each column that has a filter in
+// 'taskFilters', the dynamic filters from outside of the pipeline: the
+// pipeline's filter of the column in 'pushdownFilters', if any, combined with
+// them. A data source replaces the filter of a column with the one it is given,
+// so it gets the combination. The pipeline's filters are only read: the other
+// drivers of the pipeline may be reading.
+void addTaskDynamicFilters(
+    const std::vector<TaskDynamicFilters::ScanFilter>& taskFilters,
+    const PushdownFilters& pushdownFilters,
+    connector::DataSource& dataSource) {
+  folly::F14FastMap<column_index_t, common::FilterPtr> filters;
+  for (const auto& taskFilter : taskFilters) {
+    auto [it, isNew] = filters.try_emplace(taskFilter.outputChannel);
+    if (isNew) {
+      if (const auto pipelineIt =
+              pushdownFilters.filters.find(taskFilter.outputChannel);
+          pipelineIt != pushdownFilters.filters.end()) {
+        it->second = pipelineIt->second;
+      }
+    }
+    common::Filter::merge(taskFilter.filter, it->second);
+  }
+  for (const auto& [channel, filter] : filters) {
+    dataSource.addDynamicFilter(channel, filter);
+  }
+}
+
 std::unique_ptr<connector::DataSource> createDataSource(
     folly::Synchronized<PushdownFilters>& pushdownFilters,
+    const std::vector<TaskDynamicFilters::ScanFilter>& taskFilters,
     connector::Connector& connector,
     const RowTypePtr& outputType,
     const connector::ConnectorTableHandlePtr& tableHandle,
@@ -46,6 +74,7 @@ std::unique_ptr<connector::DataSource> createDataSource(
       for (auto outIndex : lk->dynamicFilteredColumns) {
         dataSource->addDynamicFilter(outIndex, lk->filters.at(outIndex));
       }
+      addTaskDynamicFilters(taskFilters, *lk, *dataSource);
       return dataSource;
     }
   }
@@ -64,6 +93,7 @@ std::unique_ptr<connector::DataSource> createDataSource(
   for (auto outIndex : lk->dynamicFilteredColumns) {
     dataSource->addDynamicFilter(outIndex, lk->filters.at(outIndex));
   }
+  addTaskDynamicFilters(taskFilters, *lk, *dataSource);
   return dataSource;
 }
 
@@ -117,6 +147,11 @@ TableScan::TableScan(
           driverCtx_->queryConfig().tableScanGetOutputTimeLimitMs()),
       outputBatchRowsOverride_(
           driverCtx_->queryConfig().tableScanOutputBatchRowsOverride()),
+      hasTaskDynamicFilters_(
+          driverCtx_->task->dynamicFilters().hasTargets(planNodeId()) &&
+          connector_->canAddDynamicFilter()),
+      dynamicFilterMaxWait_(
+          driverCtx_->queryConfig().tableScanDynamicFilterMaxWaitMs()),
       scaledController_(driverCtx_->task->getScaledScanControllerLocked(
           driverCtx_->splitGroupId,
           planNodeId())) {
@@ -149,6 +184,9 @@ RowVectorPtr TableScan::getOutput() {
   blockingReason_ = BlockingReason::kNotBlocked;
 
   if (noMoreSplits_) {
+    return nullptr;
+  }
+  if (waitForDynamicFilters()) {
     return nullptr;
   }
   // Check if we need to wait for scale up. We expect only wait once on startup.
@@ -199,6 +237,12 @@ RowVectorPtr TableScan::getOutput() {
 
     checkPreload();
     if (needNewSplit_) {
+      if (hasTaskDynamicFilters_ &&
+          driverCtx_->task->dynamicFilters().numArrived(planNodeId()) !=
+              numTaskDynamicFilters_) {
+        // A filter arrived after the scan stopped waiting.
+        applyTaskDynamicFilters(nullptr);
+      }
       const auto hasNewSplit = getSplit();
       if (!hasNewSplit) {
         VELOX_CHECK(needNewSplit_);
@@ -368,6 +412,7 @@ bool TableScan::getSplit() {
         connectorSplit->connectorId, planNodeId(), connectorPool_);
     dataSource_ = createDataSource(
         driverCtx_->driver->pushdownFilters()->at(0),
+        taskFilters_,
         *connector_,
         outputType_,
         tableHandle_,
@@ -428,6 +473,74 @@ bool TableScan::getSplit() {
   return true;
 }
 
+bool TableScan::waitForDynamicFilters() {
+  if (dynamicFilterWaitDone_) {
+    return false;
+  }
+  if (!hasTaskDynamicFilters_) {
+    dynamicFilterWaitDone_ = true;
+    return false;
+  }
+  if (!dynamicFilterWaitWatch_.has_value()) {
+    dynamicFilterWaitWatch_.emplace();
+  }
+  ContinueFuture future = ContinueFuture::makeEmpty();
+  const auto numPending = applyTaskDynamicFilters(&future);
+  const auto waited = dynamicFilterWaitWatch_->elapsed();
+  if (numPending > 0 && waited < dynamicFilterMaxWait_) {
+    // The wait must not fail the task when the time is up.
+    blockingFuture_ =
+        std::move(future)
+            .within(dynamicFilterMaxWait_ - waited)
+            .deferError(
+                folly::tag_t<folly::FutureTimeout>{},
+                [](const folly::FutureTimeout&) { return folly::unit; });
+    blockingReason_ = BlockingReason::kWaitForDynamicFilter;
+    return true;
+  }
+  dynamicFilterWaitDone_ = true;
+  if (numPending > 0) {
+    // The drivers of this scan that start later do not wait again.
+    driverCtx_->task->dynamicFilters().stopWaiting(planNodeId());
+  }
+  auto lockedStats = stats_.wlock();
+  lockedStats->addRuntimeStat(
+      std::string(TableScan::kDynamicFilterWaitWallNanos),
+      RuntimeCounter(
+          std::chrono::nanoseconds(waited).count(),
+          RuntimeCounter::Unit::kNanos));
+  if (numPending > 0) {
+    lockedStats->addRuntimeStat(
+        std::string(TableScan::kDynamicFiltersTimedOut),
+        RuntimeCounter(numPending));
+  }
+  return false;
+}
+
+int32_t TableScan::applyTaskDynamicFilters(ContinueFuture* future) {
+  const auto numApplied = taskFilters_.size();
+  const auto numPending = driverCtx_->task->dynamicFilters().poll(
+      planNodeId(), numTaskDynamicFilters_, taskFilters_, future);
+  if (taskFilters_.size() == numApplied) {
+    return numPending;
+  }
+  if (dataSource_ != nullptr) {
+    auto lk = driverCtx_->driver->pushdownFilters()->at(0).rlock();
+    addTaskDynamicFilters(taskFilters_, *lk, *dataSource_);
+  }
+  auto lockedStats = stats_.wlock();
+  for (auto i = numApplied; i < taskFilters_.size(); ++i) {
+    if (!taskFilters_[i].producerNodeId.empty()) {
+      lockedStats->dynamicFilterStats.producerNodeIds.emplace(
+          taskFilters_[i].producerNodeId);
+    }
+  }
+  lockedStats->addRuntimeStat(
+      std::string(DriverStats::kDynamicFiltersAccepted),
+      RuntimeCounter(taskFilters_.size() - numApplied));
+  return numPending;
+}
+
 bool TableScan::shouldWaitForScaleUp() {
   if (scaledController_ == nullptr) {
     return false;
@@ -467,6 +580,7 @@ void TableScan::preload(
            split->connectorId, planNodeId(), connectorPool_),
        task = operatorCtx_->task(),
        pushdownFilters = driverCtx_->driver->pushdownFilters(),
+       planNodeId = planNodeId(),
        split]() -> std::unique_ptr<connector::DataSource> {
         if (task->isCancelled()) {
           return nullptr;
@@ -479,8 +593,14 @@ void TableScan::preload(
              },
              &debugString});
 
+        // The filters from outside of the pipeline that have arrived by now.
+        std::vector<TaskDynamicFilters::ScanFilter> taskFilters;
+        uint32_t numTaskFilters{0};
+        task->dynamicFilters().poll(
+            planNodeId, numTaskFilters, taskFilters, nullptr);
         auto dataSource = createDataSource(
             pushdownFilters->at(0),
+            taskFilters,
             *connector,
             type,
             table,
@@ -529,6 +649,8 @@ void TableScan::addDynamicFilterLocked(
     for (auto channel : filters.dynamicFilteredColumns) {
       dataSource_->addDynamicFilter(channel, filters.filters.at(channel));
     }
+    // The data source replaced the filters of these columns.
+    addTaskDynamicFilters(taskFilters_, filters, *dataSource_);
   }
   stats_.wlock()->dynamicFilterStats.producerNodeIds.emplace(producer);
 }

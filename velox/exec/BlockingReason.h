@@ -65,6 +65,9 @@ enum class BlockingReason {
   /// Used by HashAggregation with a global grouping set: a driver waits for its
   /// peers so only the last one emits the default rows on empty input.
   kWaitForAggregationPeers,
+  /// Used by TableScan: it waits, before reading, for the dynamic filters that
+  /// hash joins outside of its pipeline make for it.
+  kWaitForDynamicFilter,
 };
 
 VELOX_DECLARE_ENUM_NAME(BlockingReason);

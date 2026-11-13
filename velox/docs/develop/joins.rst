@@ -427,6 +427,21 @@ to HiveConnector.
 
 * dynamicFiltersAccepted - number of dynamic filters received
 
+A plan fragment can also declare dynamic filters that leave the pipeline of
+their join: for a table scan behind a local exchange or in another task (see
+core::PlanFragment::dynamicFilterSources and dynamicFilterTargets). HashBuild
+publishes such a filter when the build side is complete and reports it in
+dynamicFiltersProduced. The scan waits for its declared filters before it reads
+and reports:
+
+* dynamicFilterWaitWallNanos - time the scan waited for its declared filters
+  before it started to read
+* blockedWaitForDynamicFilterWallNanos, blockedWaitForDynamicFilterTimes - the
+  time and number of times a driver of the scan was blocked in that wait
+* dynamicFiltersTimedOut - number of declared filters that had not arrived when
+  the scan stopped waiting, see table_scan_dynamic_filter_max_wait_ms; the scan
+  applies them to the splits it reads after they arrive
+
 Memory Layout
 -------------
 

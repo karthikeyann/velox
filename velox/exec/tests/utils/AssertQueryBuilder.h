@@ -58,6 +58,16 @@ class AssertQueryBuilder {
     return *this;
   }
 
+  /// Declares the dynamic filters that travel outside of a pipeline. See
+  /// core::PlanFragment::dynamicFilterSources and dynamicFilterTargets.
+  AssertQueryBuilder& dynamicFilters(
+      std::vector<core::DynamicFilterSource> sources,
+      std::vector<core::DynamicFilterTarget> targets) {
+    params_.dynamicFilterSources = std::move(sources);
+    params_.dynamicFilterTargets = std::move(targets);
+    return *this;
+  }
+
   /// Sets a callback invoked with the Task after it is created but before it is
   /// started, allowing tests to tweak runtime task state.
   AssertQueryBuilder& beforeTaskStart(std::function<void(Task&)> callback) {

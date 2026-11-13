@@ -708,6 +708,14 @@ Table Scan
        increasing the number of running scan threads, and stop once exceeds this
        ratio. The value is in the range of [0, 1]. This only applies if
        'table_scan_scaled_processing_enabled' is true.
+   * - table_scan_dynamic_filter_max_wait_ms
+     - integer
+     - 10000
+     - The longest time, in milliseconds, a table scan waits before reading for
+       the dynamic filters that the plan fragment declares for it: filters made
+       by hash joins outside of the scan's pipeline, in the same task or in
+       another task. After that the scan reads without the missing filters and
+       applies each when it arrives. 0 means the scan does not wait.
    * - table_scan_output_batch_rows_override
      - integer
      - 0

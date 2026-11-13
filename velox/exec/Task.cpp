@@ -529,6 +529,7 @@ Task::Task(
   maybeInitTrace();
 
   initSplitListeners();
+  dynamicFilters_ = std::make_unique<TaskDynamicFilters>(planFragment_);
 }
 
 void Task::initSplitListeners() {
@@ -3270,6 +3271,8 @@ ContinueFuture Task::terminate(TaskState terminalState) {
     promise.setValue();
   }
 
+  dynamicFilters_->close();
+
   for (auto& bridge : oldBridges) {
     bridge->cancel();
   }
@@ -3619,6 +3622,23 @@ ContinueFuture Task::stateChangeFuture(uint64_t maxWaitMicros) {
     return std::move(future).within(std::chrono::microseconds(maxWaitMicros));
   }
   return std::move(future);
+}
+
+void Task::publishDynamicFilter(
+    const std::string& filterId,
+    common::FilterPtr filter) {
+  dynamicFilters_->publish(filterId, std::move(filter));
+}
+
+void Task::addDynamicFilter(
+    const std::string& filterId,
+    common::FilterPtr filter) {
+  dynamicFilters_->add(filterId, std::move(filter));
+}
+
+folly::SemiFuture<common::FilterPtr> Task::dynamicFilterFuture(
+    const std::string& filterId) {
+  return dynamicFilters_->future(filterId);
 }
 
 ContinueFuture Task::taskCompletionFuture() {

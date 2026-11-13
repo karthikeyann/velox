@@ -155,6 +155,7 @@ set(
   FileExchangeTest.cpp
   CursorTest.cpp
   SplitLifecycleTest.cpp
+  TaskDynamicFilterTest.cpp
 )
 
 set(

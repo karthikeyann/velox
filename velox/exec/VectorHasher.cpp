@@ -782,6 +782,35 @@ std::unique_ptr<common::Filter> VectorHasher::getFilter(
   }
 }
 
+common::FilterPtr VectorHasher::getJoinKeyFilter(bool stringEnabled) const {
+  if (typeKind_ == TypeKind::VARCHAR || typeKind_ == TypeKind::VARBINARY) {
+    if (!stringEnabled) {
+      return nullptr;
+    }
+    // A custom logical type may have a connector-specific physical
+    // representation that differs from its in-memory representation, so
+    // generic code here cannot assume the two are byte-equivalent. A
+    // pushed-down filter is evaluated by the scan against the physical
+    // bytes, so producing one from in-memory values could drop matching
+    // rows. Skip the filter and let the hash join do the matching; this
+    // costs an optimization, not correctness.
+    // TODO: Restore pushdown for VARCHAR/VARBINARY-backed custom types
+    // whose connector physical representation is known to match the
+    // in-memory one, rather than skipping every custom type.
+    if (customTypeExists(type_->name())) {
+      return nullptr;
+    }
+    if (!distinctOverflow_ && uniqueValues_.empty()) {
+      // A set of strings cannot be empty.
+      return std::make_shared<common::AlwaysFalse>();
+    }
+  }
+  if (common::FilterPtr filter = getFilter(false)) {
+    return filter;
+  }
+  return bloomFilter_;
+}
+
 namespace {
 template <typename T>
 // Adds 'reserve' to either end of the range between 'min' and 'max' while

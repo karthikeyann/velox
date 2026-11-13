@@ -38,6 +38,41 @@ enum class ExecutionStrategy {
 
 std::string executionStrategyToString(ExecutionStrategy strategy);
 
+/// Declares that a hash join of a plan fragment makes a dynamic filter from the
+/// build-side values of one of its join keys, to be applied by table scans
+/// outside of the join's pipeline: in another pipeline of the same task or in
+/// another task. See DynamicFilterTarget for the receiving side.
+///
+/// Table scans wait for the filter, so the operator that implements the build
+/// side of the join must resolve it with Task::publishDynamicFilter() on every
+/// way out of the build, with nullptr if it cannot make the filter.
+struct DynamicFilterSource {
+  /// Identifies the filter within the query. The targets of the filter carry
+  /// the same id.
+  std::string filterId;
+
+  /// The HashJoinNode that makes the filter.
+  PlanNodeId joinNodeId;
+
+  /// Position of the key in the join's list of keys.
+  column_index_t keyIndex{0};
+};
+
+/// Declares that a table scan of a plan fragment applies a dynamic filter that
+/// a hash join outside of the scan's pipeline makes. The scan waits for the
+/// filter before it reads. The filter is advisory: the join that makes it
+/// still filters the rows, so a scan may apply it late, partly or not at all.
+struct DynamicFilterTarget {
+  /// Identifies the filter within the query.
+  std::string filterId;
+
+  /// The TableScanNode that applies the filter.
+  PlanNodeId scanNodeId;
+
+  /// The output column of the scan the filter applies to.
+  column_index_t outputChannel{0};
+};
+
 /// Contains some information on how to execute the fragment of a plan.
 /// Used to construct Task.
 struct PlanFragment {
@@ -56,6 +91,20 @@ struct PlanFragment {
   /// When unset, AssignUniqueId falls back to the value carried on its plan
   /// node (0 in the canonical construction path).
   std::optional<int32_t> taskUniqueId{};
+
+  /// Dynamic filters the hash joins of this fragment make for table scans
+  /// outside of their pipelines. Filter ids are unique in this list. The
+  /// operator of the join publishes each filter with
+  /// Task::publishDynamicFilter() when the build side is complete.
+  std::vector<DynamicFilterSource> dynamicFilterSources;
+
+  /// Dynamic filters the table scans of this fragment wait for and apply. A
+  /// filter listed in 'dynamicFilterSources' as well stays inside the task:
+  /// the task hands it to its scans when the join publishes it. Any other
+  /// filter comes from other tasks and whoever runs the tasks delivers it with
+  /// Task::addDynamicFilter(). One filter can have targets on several scans,
+  /// one per scan.
+  std::vector<DynamicFilterTarget> dynamicFilterTargets;
 
   /// Returns true if the fragment uses grouped execution strategy meaning that
   /// at least one pipeline has a leaf node that should run grouped execution.
