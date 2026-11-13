@@ -313,6 +313,55 @@ void CudfHashJoinBuild::recordInputStats(const CudfVector& input) {
   }
 }
 
+void CudfHashJoinBuild::publishDynamicFilters(
+    const std::vector<std::shared_ptr<cudf::table>>& tables,
+    const std::vector<cudf::size_type>& keyIndices,
+    cuda::stream_ref stream) {
+  auto* task = operatorCtx_->task().get();
+  const auto& sources = task->dynamicFilters().sources(planNodeId());
+  // The tables of one split group hold a part of the build side.
+  if (sources.empty() || !CudfConfig::getInstance().dynamicFilterEnabled ||
+      !exec::TaskDynamicFilters::canFilterProbeSide(*joinNode_) ||
+      operatorCtx_->driverCtx()->splitGroupId != exec::kUngroupedGroupId) {
+    return;
+  }
+  const auto& buildType = joinNode_->sources()[1]->outputType();
+  int32_t numPublished{0};
+  for (const auto& source : sources) {
+    const auto keyIndex = keyIndices[source.keyIndex];
+    std::vector<cudf::column_view> keys;
+    keys.reserve(tables.size());
+    for (const auto& table : tables) {
+      keys.push_back(table->get_column(keyIndex).view());
+    }
+    BuildKeyFilter keyFilter;
+    try {
+      keyFilter =
+          makeBuildKeyFilter(keys, buildType->childAt(keyIndex), stream);
+    } catch (const std::exception& e) {
+      // The filter is an optimization. The join opts out of it and goes on.
+      LOG(WARNING) << "Failed to make the dynamic filter " << source.filterId
+                   << ": " << e.what();
+      continue;
+    }
+    // A large build side knows only the bounds of its keys, which rarely
+    // leave rows out, so it sends no filter.
+    if (keyFilter.filter == nullptr || !keyFilter.exact) {
+      continue;
+    }
+    // The join still runs, so a scan may apply the filter in part.
+    task->publishDynamicFilter(
+        source.filterId,
+        connector::hive::makeAdvisoryFilter(std::move(keyFilter.filter)));
+    ++numPublished;
+  }
+  if (numPublished > 0) {
+    addRuntimeStat(
+        std::string(exec::DriverStats::kDynamicFiltersProduced),
+        RuntimeCounter(numPublished));
+  }
+}
+
 void CudfHashJoinBuild::optOutOfDynamicFilters() {
   auto* task = operatorCtx_->task().get();
   for (const auto& source : task->dynamicFilters().sources(planNodeId())) {
@@ -405,6 +454,8 @@ void CudfHashJoinBuild::buildAndPublish(std::vector<CudfVectorPtr> inputs) {
   for (auto& tbl : tbls) {
     shared_tbls.push_back(std::move(tbl));
   }
+  publishDynamicFilters(shared_tbls, buildKeyIndices, stream);
+
   // set hash table to CudfHashJoinBridge
   auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
       operatorCtx_->driverCtx()->splitGroupId, planNodeId());
