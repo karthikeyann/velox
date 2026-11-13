@@ -41,30 +41,33 @@ namespace facebook::velox::cudf_velox::connector::hive {
 /// scheduler waits for the copies in the order they were started.
 ///
 /// Neither the number of readers at work nor the way copies are waited for
-/// is configured. A controller measures the bytes per second that reach the
-/// device while ranges wait for a reader, and from time to time tries more
-/// readers, fewer readers or the other way of waiting: it keeps what raises
-/// the rate, and gives up readers whose absence does not lower it. Which way
-/// of waiting delivers more depends on the machine: where filling buffers
-/// slows the copies that run meanwhile, a reader that waits delivers more;
-/// where it does not, a reader that waits is idle for nothing. The result
-/// does not depend on the thread that submits a range.
+/// is configured. Which way of waiting delivers more depends on the machine:
+/// where filling buffers slows the copies that run meanwhile, a reader that
+/// waits delivers more; where it does not, a reader that waits is idle for
+/// nothing. The scheduler measures a copy against a fill when its readers
+/// start and chooses by that. A controller then measures the bytes per
+/// second that reach the device while ranges wait for a reader, and from
+/// time to time tries more readers, fewer readers or the other way of
+/// waiting, and keeps what raises the rate. The result does not depend on
+/// the thread that submits a range.
 ///
 /// Ranges belong to groups. The ranges of a group that a consumer is waiting
 /// for are served before those nobody waits for yet. Among the groups waited
-/// for, the one with the fewest bytes left to read goes first, so that a
-/// small scan, such as the build side of a join, is not held up behind a
-/// large one; groups of one size are served one after the other in the order
-/// they asked, as are the groups nobody waits for, so the ranges of one
-/// consumer arrive together.
+/// for, one with at most a quarter of the bytes of another left to read goes
+/// ahead of it, so that a small scan, such as the build side of a join, is
+/// not held up behind a large one. A group that later ones have been served
+/// ahead of for 'maxOvertakenBytes' goes first in turn, so a large group is
+/// delayed and not starved. Otherwise groups are served one after the other
+/// in the order they asked, so the ranges of one consumer arrive together.
 ///
 /// Thread-safe.
 class FetchScheduler {
  public:
   /// How the copy of a filled staging buffer is waited for.
   enum class CopyMode {
-    /// The controller measures both ways and stays with the one that
-    /// delivers more.
+    /// Chosen by prefersQueuedCopies() from a measurement made when the
+    /// readers start. From time to time the controller measures the other
+    /// way against it and changes when that delivers clearly more.
     kAuto,
     /// The reader that filled the buffer waits for its copy before it fills
     /// another.
@@ -94,6 +97,9 @@ class FetchScheduler {
     /// How copies are waited for. Anything but kAuto pins it, which is
     /// meant for measurements.
     CopyMode copyMode{CopyMode::kAuto};
+    /// Bytes of groups that asked later that are served ahead of a group a
+    /// consumer waits for, before that group goes first.
+    uint64_t maxOvertakenBytes{256ULL << 20};
     /// Capacity in bytes of a fetch-ahead budget of the scheduler's own.
     /// Zero makes the scheduler use the budget that all schedulers of the
     /// process share for the device: one sixteenth of the device's memory.
@@ -151,6 +157,9 @@ class FetchScheduler {
     double copyTrialRate{0};
     /// Measurements left before the next trial.
     size_t numHoldsLeft{0};
+    /// Trials of more readers that were not kept since the last one that
+    /// was. The hold doubles with each, up to eight times.
+    size_t numFailedTrials{0};
     /// Whether readers go on while their copies run, instead of waiting for
     /// them.
     bool isCopyQueued{false};
@@ -159,7 +168,7 @@ class FetchScheduler {
     size_t numTrialsToCopyTrial{0};
     /// Trials of a number of readers between two trials of the other way of
     /// waiting for copies. Grows fourfold, up to kMaxCopyTrialInterval, with
-    /// every such trial that is not kept.
+    /// every such trial.
     size_t copyTrialInterval{1};
   };
 
@@ -211,6 +220,10 @@ class FetchScheduler {
     uint64_t numCopyModeChanges{0};
     /// Whether readers go on while their copies run now.
     bool isCopyQueued{false};
+    /// Time a staging buffer takes to copy to the device over the time it
+    /// takes to fill from memory, measured when the readers started with
+    /// CopyMode::kAuto. Zero when not measured.
+    double copyToFillRatio{0};
     /// Readers allowed now.
     size_t numReaders{0};
     /// Consumers blocked in wait() now.
@@ -247,6 +260,8 @@ class FetchScheduler {
     uint64_t bufferLimitedPercent{0};
     /// Readers allowed when the range completed.
     uint64_t numReaders{0};
+    /// The scheduler's Stats::copyToFillRatio, in percent.
+    uint64_t copyToFillPercent{0};
   };
 
   /// Reads 'size' bytes that start 'offset' bytes into a range into
@@ -270,37 +285,60 @@ class FetchScheduler {
   /// A submitted range.
   class Read;
 
+  /// Below this ratio of the time a staging buffer takes to copy to the
+  /// device to the time it takes to fill from memory, readers go on while
+  /// their copies run.
+  static constexpr double kMaxQueuedCopyToFillRatio{0.5};
+
+  /// Returns whether readers should go on while their copies run, given
+  /// 'copyToFillRatio': the time a staging buffer takes to copy to the
+  /// device over the time it takes to fill from memory. A link that is slow
+  /// for the machine's memory, a ratio near one as measured on a PCIe 4
+  /// workstation, is fed by two or three readers, and what the others fill
+  /// meanwhile takes memory bandwidth from the copies: there readers wait.
+  /// A fast link, a low ratio, needs many readers and leaves bandwidth to
+  /// spare, so a reader that waits is idle for nothing. Zero, for a ratio
+  /// that could not be measured, returns false.
+  static bool prefersQueuedCopies(double copyToFillRatio);
+
   /// Returns where the controller stands after measuring 'window' in
-  /// 'state'. While it holds a number of readers it averages the rate. What
-  /// it tries after the hold periods depends on what limits the rate. While
-  /// the readers spend half of their time or more waiting for copies, the
-  /// copies are the limit, and it tries an eighth fewer readers, at least
-  /// one fewer: they are kept when the rate falls by less than a quarter of
-  /// the share of the readers left out, and fewer still are tried while the
-  /// copies stay the limit. Otherwise the source is the limit, which more
-  /// readers can only help, and it tries a quarter more, at least one more:
-  /// they are kept when the rate rises by at least half of what the added
-  /// readers would bring if each brought as much as the others, and then
-  /// more are tried right away. A trial that is not kept goes back to the
-  /// held number. The number of readers never falls because a source did
-  /// not get slower with fewer of them in one measurement: how many
-  /// concurrent reads a drive needs shows over longer than a trial.
+  /// 'state'. While it holds a number of readers it averages the rate, and
+  /// after the hold periods it tries another number. What it tries depends
+  /// on what the readers wait for.
+  ///
+  /// While they spend less than half of their time waiting for copies, the
+  /// source is the limit, which fewer readers cannot help: it tries a
+  /// quarter more, at least one more. They are kept when the rate rises by
+  /// at least half of what the added readers would bring if each brought as
+  /// much as the others, and then more are tried right away. Readers are
+  /// never given up in this state: how many concurrent reads a drive needs
+  /// does not show in one measurement.
+  ///
+  /// While they wait for copies half of their time or more, the copies are
+  /// the limit: it tries an eighth fewer, at least one fewer. They are kept
+  /// when the rate falls by less than a quarter of the share of the readers
+  /// left out, and fewer still are tried while the readers keep waiting.
+  /// More readers are neither tried nor kept.
   ///
   /// While, half of the time or more, a reader is kept from its next piece
   /// because the staging buffers it may use are all being filled or copied,
-  /// more readers are not tried either.
+  /// more readers are not tried. A trial that is not kept goes back to the
+  /// held number. After a trial of more readers that is not kept, the hold
+  /// is twice as long with each such trial in a row, up to eight times.
   ///
   /// With CopyMode::kAuto, every 'copyTrialInterval' trials of a number of
   /// readers, the first time before any, the trial is of the other way of
   /// waiting for copies with the held number of readers. The rate of a scan
   /// drifts with what is being read, so the two ways are measured in turn,
   /// four measurements starting with the last one of the hold: the other
-  /// way is kept when each of its two delivered at least 3% more than the
-  /// measurement before it, and the way it came from 3% less in between.
+  /// way is kept when each of its two delivered at least 5% more than the
+  /// measurement before it, and the way it came from 5% less in between.
   /// The trial ends at the first measurement that does not fit, so one that
-  /// loses costs one period. When it is not kept the interval becomes four
-  /// times as long, so that a machine on which one way is clearly better
-  /// soon stops paying for trials of the other.
+  /// loses costs one period. A measurement in which nothing was delivered
+  /// starts no trial and decides none. The interval becomes four times as
+  /// long with every trial, so that a machine on which one way is clearly
+  /// better soon stops paying for trials of the other, and one on which
+  /// both deliver the same does not go back and forth.
   static ControlState nextControlState(
       const Options& options,
       const ControlState& state,
@@ -392,6 +430,14 @@ class FetchScheduler {
 
   // Staging buffers that may be in use at once.
   size_t depthLimit() const;
+
+  // Whether groups that asked later have been served ahead of 'group' for
+  // as long as they may.
+  bool isAged(const Group& group) const;
+
+  // Whether 'group' has so much less left to read than 'other' that it goes
+  // first: at most a quarter. Groups of about one size keep their order.
+  static bool isMuchSmaller(const Group& group, const Group& other);
 
   // Whether a reader may take a piece now.
   bool canDispatch() const;

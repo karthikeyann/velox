@@ -73,6 +73,12 @@ class BufferedInputDataSource : public cudf::io::datasource {
   /// for copies the scheduler used.
   static constexpr const char* kFetchCopyQueuedPercent =
       "cudfFetchCopyQueuedPercent";
+  /// Time a staging buffer takes to copy to the device over the time it
+  /// takes to fill from memory, in percent, as the scheduler measured it
+  /// when it started. Below 50 its readers start out going on while their
+  /// copies run.
+  static constexpr const char* kFetchCopyToFillPercent =
+      "cudfFetchCopyToFillPercent";
 
   /// 'stagingPool' supplies the page-locked buffers that device reads stage
   /// file bytes in. Device reads stage in pageable memory when it is null,

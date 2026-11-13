@@ -380,69 +380,86 @@ TEST_F(FetchSchedulerTest, ordering) {
   }
 }
 
-// Among the groups that consumers wait for, the one with the fewest bytes
-// left is served first, whichever asked first.
+// Among the groups that consumers wait for, one with far fewer bytes left
+// goes ahead of one that asked earlier, until the earlier one has been
+// overtaken by as many bytes as it may be.
 TEST_F(FetchSchedulerTest, shortestWaitedGroupFirst) {
   const auto content = makeContent(kBufferSize);
-  auto scheduler = makeScheduler(fixedReaders(1), 4);
-  Gate gate;
-  std::mutex mutex;
-  std::vector<std::string> order;
-  const auto fillAs = [&](const std::string& name) {
-    return [&, name](uint8_t* buffer, size_t offset, size_t size) {
-      {
-        std::lock_guard<std::mutex> lock(mutex);
-        order.push_back(name);
-      }
-      std::memcpy(buffer, content.data() + offset, size);
-    };
-  };
-  auto device = makeDeviceBuffer(8 * kBufferSize);
-  auto* dst = static_cast<uint8_t*>(device.data());
-  // Keeps the only reader busy while the other ranges queue up.
-  auto first = scheduler->submit(
-      scheduler->makeGroup(),
-      kBufferSize,
-      dst,
-      FillOrder::kAny,
-      [&](uint8_t* buffer, size_t offset, size_t size) {
-        gate.pass();
+  for (const bool isBounded : {false, true}) {
+    SCOPED_TRACE(isBounded);
+    auto options = fixedReaders(1);
+    if (isBounded) {
+      options.maxOvertakenBytes = 2 * kBufferSize;
+    }
+    auto scheduler = makeScheduler(options, 4);
+    Gate gate;
+    std::mutex mutex;
+    std::vector<std::string> order;
+    const auto fillAs = [&](const std::string& name) {
+      return [&, name](uint8_t* buffer, size_t offset, size_t size) {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          order.push_back(name);
+        }
         std::memcpy(buffer, content.data() + offset, size);
-      });
-  gate.waitForInside(1);
-
-  auto large = scheduler->makeGroup();
-  auto small = scheduler->makeGroup();
-  std::vector<std::shared_ptr<FetchScheduler::Read>> reads;
-  size_t next{1};
-  const auto submit = [&](const auto& group, const std::string& name) {
-    reads.push_back(scheduler->submit(
-        group,
+      };
+    };
+    auto device = makeDeviceBuffer(16 * kBufferSize);
+    auto* dst = static_cast<uint8_t*>(device.data());
+    // Keeps the only reader busy while the other ranges queue up.
+    auto first = scheduler->submit(
+        scheduler->makeGroup(),
         kBufferSize,
-        dst + next++ * kBufferSize,
+        dst,
         FillOrder::kAny,
-        fillAs(name)));
-  };
-  submit(large, "large1");
-  submit(large, "large2");
-  submit(large, "large3");
-  submit(small, "small1");
-  submit(small, "small2");
-  std::thread largeWaiter([&]() { scheduler->wait(*reads[2]); });
-  std::thread smallWaiter([&]() { scheduler->wait(*reads[4]); });
-  waitFor([&]() { return scheduler->stats().numWaiters == 2; });
-  gate.open();
-  largeWaiter.join();
-  smallWaiter.join();
-  scheduler->wait(*first);
-  for (auto& read : reads) {
-    scheduler->wait(*read);
+        [&](uint8_t* buffer, size_t offset, size_t size) {
+          gate.pass();
+          std::memcpy(buffer, content.data() + offset, size);
+        });
+    gate.waitForInside(1);
+
+    std::vector<std::shared_ptr<FetchScheduler::Read>> reads;
+    size_t next{1};
+    const auto submit = [&](const auto& group, const std::string& name) {
+      reads.push_back(scheduler->submit(
+          group,
+          kBufferSize,
+          dst + next++ * kBufferSize,
+          FillOrder::kAny,
+          fillAs(name)));
+    };
+    // A group of eight pieces, then four groups of one piece, each waited
+    // for.
+    auto large = scheduler->makeGroup();
+    for (int i = 0; i < 8; ++i) {
+      submit(large, "large");
+    }
+    for (int i = 0; i < 4; ++i) {
+      submit(scheduler->makeGroup(), "small");
+    }
+    std::vector<std::thread> waiters;
+    for (const size_t index : {7, 8, 9, 10, 11}) {
+      waiters.emplace_back([&, index]() { scheduler->wait(*reads[index]); });
+    }
+    waitFor([&]() { return scheduler->stats().numWaiters == 5; });
+    gate.open();
+    for (auto& waiter : waiters) {
+      waiter.join();
+    }
+    scheduler->wait(*first);
+    for (auto& read : reads) {
+      scheduler->wait(*read);
+    }
+    std::vector<std::string> expected(8, "large");
+    if (isBounded) {
+      // Two small groups go ahead; then the large one has waited enough.
+      expected.insert(expected.begin(), 2, "small");
+      expected.insert(expected.end(), 2, "small");
+    } else {
+      expected.insert(expected.begin(), 4, "small");
+    }
+    EXPECT_EQ(order, expected);
   }
-  // Once the small group is down to one piece the large one cannot overtake
-  // it; after it, the large group is served in order.
-  EXPECT_THAT(
-      order,
-      testing::ElementsAre("small1", "small2", "large1", "large2", "large3"));
 }
 
 TEST_F(FetchSchedulerTest, fillFailure) {
@@ -677,7 +694,6 @@ TEST_F(FetchSchedulerTest, nextControlState) {
         .phase = phase,
         .baseRate = 1'000e6};
   };
-
   // A measurement of 'bytesPerSecond' during which the readers waited for
   // copies half of their time.
   const auto copyLimited = [](double bytesPerSecond) {
@@ -685,6 +701,10 @@ TEST_F(FetchSchedulerTest, nextControlState) {
     window.readerBusyNanos = 1'000;
     window.copyWaitNanos = 500;
     return window;
+  };
+  const auto step = [&](const State& state, double bytesPerSecond) {
+    return FetchScheduler::nextControlState(
+        options, state, measured(bytesPerSecond));
   };
 
   // Nothing measured: nothing changes.
@@ -696,47 +716,54 @@ TEST_F(FetchSchedulerTest, nextControlState) {
   // While it holds, the controller averages the rate and counts down.
   auto state = holding(4, 1'000e6);
   state.numHoldsLeft = 2;
-  next = FetchScheduler::nextControlState(options, state, measured(2'000e6));
+  next = step(state, 2'000e6);
   EXPECT_EQ(next.numReaders, 4);
   EXPECT_EQ(next.phase, Phase::kHold);
   EXPECT_EQ(next.numHoldsLeft, 1);
   EXPECT_DOUBLE_EQ(next.baseRate, 1'250e6);
 
   // After the hold it tries a quarter more, at least one.
-  next = FetchScheduler::nextControlState(
-      options, holding(4, 1'000e6), measured(1'000e6));
+  next = step(holding(4, 1'000e6), 1'000e6);
   EXPECT_EQ(next.numReaders, 5);
   EXPECT_EQ(next.numHeldReaders, 4);
   EXPECT_EQ(next.phase, Phase::kTryMore);
-  next = FetchScheduler::nextControlState(
-      options, holding(12, 1'000e6), measured(1'000e6));
+  next = step(holding(12, 1'000e6), 1'000e6);
   EXPECT_EQ(next.numReaders, 15);
   EXPECT_EQ(next.numHeldReaders, 12);
 
   // Three more readers on top of twelve are kept when the rate rises by an
   // eighth, half of their share of a quarter, and more are tried right away.
   state = trying(Phase::kTryMore, 12, 15);
-  next = FetchScheduler::nextControlState(options, state, measured(1'130e6));
+  state.numFailedTrials = 2;
+  next = step(state, 1'130e6);
   EXPECT_EQ(next.numHeldReaders, 15);
   EXPECT_EQ(next.numReaders, 18);
   EXPECT_EQ(next.phase, Phase::kTryMore);
   EXPECT_DOUBLE_EQ(next.baseRate, 1'130e6);
-  // Otherwise the controller goes back to twelve and holds.
-  next = FetchScheduler::nextControlState(options, state, measured(1'120e6));
+  EXPECT_EQ(next.numFailedTrials, 0);
+  // Otherwise the controller goes back to twelve and holds, for twice as
+  // long with every such trial in a row that was not kept, up to eight
+  // times.
+  state.numFailedTrials = 0;
+  next = step(state, 1'120e6);
   EXPECT_EQ(next.numReaders, 12);
   EXPECT_EQ(next.numHeldReaders, 12);
   EXPECT_EQ(next.phase, Phase::kHold);
-  EXPECT_EQ(next.numHoldsLeft, 2);
+  EXPECT_EQ(next.numFailedTrials, 1);
+  EXPECT_EQ(next.numHoldsLeft, 4);
   EXPECT_DOUBLE_EQ(next.baseRate, 1'000e6);
+  state.numFailedTrials = 5;
+  EXPECT_EQ(step(state, 1'120e6).numHoldsLeft, 16);
 
-  // Fewer readers are tried only while the readers wait for copies half of
-  // their time: an eighth fewer, at least one. A rate that does not depend
-  // on the number of readers is no reason to give readers up.
-  state = next;
-  state.numHoldsLeft = 0;
-  next = FetchScheduler::nextControlState(options, state, measured(1'000e6));
+  // A rate that does not depend on the number of readers is no reason to
+  // give readers up: while the readers do not wait for copies, only more
+  // are tried.
+  state = holding(12, 1'000e6);
+  next = step(state, 1'000e6);
   EXPECT_EQ(next.numReaders, 15);
   EXPECT_EQ(next.phase, Phase::kTryMore);
+  // While they wait for copies half of their time, fewer are tried: an
+  // eighth fewer, at least one.
   next = FetchScheduler::nextControlState(options, state, copyLimited(1'000e6));
   EXPECT_EQ(next.numReaders, 11);
   EXPECT_EQ(next.numHeldReaders, 12);
@@ -747,38 +774,36 @@ TEST_F(FetchSchedulerTest, nextControlState) {
 
   // Fourteen of sixteen readers are kept when the rate falls by less than a
   // thirty-second, a quarter of the share of the two left out. Fewer still
-  // are tried right away while the copies stay the limit.
+  // are tried right away while the readers keep waiting for copies.
   state = trying(Phase::kTryFewer, 16, 14);
   next = FetchScheduler::nextControlState(options, state, copyLimited(970e6));
   EXPECT_EQ(next.numHeldReaders, 14);
   EXPECT_EQ(next.numReaders, 13);
   EXPECT_EQ(next.phase, Phase::kTryFewer);
   EXPECT_DOUBLE_EQ(next.baseRate, 970e6);
-  next = FetchScheduler::nextControlState(options, state, measured(970e6));
+  next = step(state, 970e6);
   EXPECT_EQ(next.numHeldReaders, 14);
   EXPECT_EQ(next.numReaders, 14);
   EXPECT_EQ(next.phase, Phase::kHold);
-  EXPECT_DOUBLE_EQ(next.baseRate, 970e6);
   // Otherwise the controller goes back to sixteen and holds.
   next = FetchScheduler::nextControlState(options, state, copyLimited(960e6));
   EXPECT_EQ(next.numReaders, 16);
   EXPECT_EQ(next.phase, Phase::kHold);
+  EXPECT_EQ(next.numHoldsLeft, 2);
 
   // The bounds end a run of kept trials and limit a trial.
-  next = FetchScheduler::nextControlState(
-      options, holding(18, 1'000e6), measured(1'000e6));
+  next = step(holding(18, 1'000e6), 1'000e6);
   EXPECT_EQ(next.numReaders, 20);
   state = trying(Phase::kTryMore, 18, 20);
-  next = FetchScheduler::nextControlState(options, state, measured(2'000e6));
+  next = step(state, 2'000e6);
   EXPECT_EQ(next.numReaders, 20);
   EXPECT_EQ(next.phase, Phase::kHold);
   state = trying(Phase::kTryFewer, 3, 2);
-  next = FetchScheduler::nextControlState(options, state, measured(1'000e6));
+  next = step(state, 1'000e6);
   EXPECT_EQ(next.numReaders, 2);
   EXPECT_EQ(next.phase, Phase::kHold);
   // At a bound nothing is tried in its direction.
-  next = FetchScheduler::nextControlState(
-      options, holding(20, 1'000e6), measured(1'000e6));
+  next = step(holding(20, 1'000e6), 1'000e6);
   EXPECT_EQ(next.numReaders, 20);
   EXPECT_EQ(next.phase, Phase::kHold);
   next = FetchScheduler::nextControlState(
@@ -817,7 +842,7 @@ TEST_F(FetchSchedulerTest, nextControlState) {
   // With nothing delivered at all, fewer readers are never kept.
   state = trying(Phase::kTryFewer, 4, 3);
   state.baseRate = 0;
-  next = FetchScheduler::nextControlState(options, state, measured(0));
+  next = step(state, 0);
   EXPECT_EQ(next.numReaders, 4);
   EXPECT_EQ(next.phase, Phase::kHold);
 
@@ -884,9 +909,43 @@ TEST_F(FetchSchedulerTest, nextControlStateConverges) {
   EXPECT_EQ(settle(8, 4e9, 300e9), 32);
 }
 
+// The way of waiting for copies follows the measured ratio of a buffer's
+// copy to its fill: readers wait where the link is slow for the memory, and
+// go on where it is fast.
+TEST_F(FetchSchedulerTest, prefersQueuedCopies) {
+  // A PCIe 4 workstation measures 0.86 to 1.11.
+  EXPECT_FALSE(FetchScheduler::prefersQueuedCopies(0.86));
+  EXPECT_TRUE(FetchScheduler::prefersQueuedCopies(0.3));
+  EXPECT_TRUE(FetchScheduler::prefersQueuedCopies(0.05));
+  EXPECT_FALSE(
+      FetchScheduler::prefersQueuedCopies(
+          FetchScheduler::kMaxQueuedCopyToFillRatio));
+  // Not measured.
+  EXPECT_FALSE(FetchScheduler::prefersQueuedCopies(0));
+
+  // A scheduler that is not told starts the way its measurement says.
+  const auto content = makeContent(kBufferSize);
+  auto scheduler = makeScheduler(Options{}, 4);
+  auto device = makeDeviceBuffer(kBufferSize);
+  auto read = scheduler->submit(
+      scheduler->makeGroup(),
+      kBufferSize,
+      static_cast<uint8_t*>(device.data()),
+      FillOrder::kAny,
+      fillFrom(content, 0));
+  scheduler->wait(*read);
+  const auto stats = scheduler->stats();
+  EXPECT_GT(stats.copyToFillRatio, 0);
+  EXPECT_EQ(
+      stats.isCopyQueued,
+      FetchScheduler::prefersQueuedCopies(stats.copyToFillRatio));
+  EXPECT_EQ(toHost(device), content);
+}
+
 // With nothing pinned, the controller measures the other way of waiting for
 // copies and the way it came from in turn, keeps the other way when it
-// delivered more each time, and otherwise tries it a quarter as often.
+// delivered more each time, and tries it a quarter as often after each
+// trial.
 TEST_F(FetchSchedulerTest, nextControlStateCopyMode) {
   using State = FetchScheduler::ControlState;
   using Phase = State::Phase;
@@ -926,7 +985,7 @@ TEST_F(FetchSchedulerTest, nextControlStateCopyMode) {
     EXPECT_EQ(trial.numHeldReaders, 8);
 
     // A trial that does not deliver more ends there.
-    auto next = step(trial, 1'020e6);
+    auto next = step(trial, 1'040e6);
     expectNotKept(next);
     // Until the next one, the trials are of numbers of readers.
     next.numHoldsLeft = 0;
@@ -937,28 +996,45 @@ TEST_F(FetchSchedulerTest, nextControlStateCopyMode) {
 
     // A trial that delivers more is followed by a second measurement of the
     // way it came from.
-    const auto check = step(trial, 1'040e6);
+    const auto check = step(trial, 1'060e6);
     EXPECT_EQ(check.phase, Phase::kCheckCopyTrial);
     EXPECT_EQ(check.isCopyQueued, isCopyQueued);
     EXPECT_EQ(check.numReaders, 8);
     // The trial is over when that delivers as much: the scan got faster.
-    expectNotKept(step(check, 1'020e6));
+    expectNotKept(step(check, 1'040e6));
 
     // Otherwise the other way is measured once more.
     const auto confirm = step(check, 1'000e6);
     EXPECT_EQ(confirm.phase, Phase::kConfirmOtherCopy);
     EXPECT_EQ(confirm.isCopyQueued, !isCopyQueued);
     EXPECT_EQ(confirm.numReaders, 8);
-    expectNotKept(step(confirm, 1'020e6));
-    // It is kept when it delivers more again.
-    next = step(confirm, 1'050e6);
+    expectNotKept(step(confirm, 1'040e6));
+    // It is kept when it delivers more again. The next trial is as far
+    // away as after one that was not kept, so that two ways that deliver
+    // the same do not take turns.
+    next = step(confirm, 1'060e6);
     EXPECT_EQ(next.phase, Phase::kHold);
     EXPECT_EQ(next.isCopyQueued, !isCopyQueued);
     EXPECT_EQ(next.numReaders, 8);
     EXPECT_EQ(next.numHoldsLeft, 2);
-    EXPECT_DOUBLE_EQ(next.baseRate, 1'050e6);
-    EXPECT_EQ(next.copyTrialInterval, 1);
-    EXPECT_EQ(next.numTrialsToCopyTrial, 1);
+    EXPECT_DOUBLE_EQ(next.baseRate, 1'060e6);
+    EXPECT_EQ(next.copyTrialInterval, 4);
+    EXPECT_EQ(next.numTrialsToCopyTrial, 4);
+
+    // Measurements in which nothing was delivered start no trial and
+    // decide none.
+    next = step(held, 0);
+    EXPECT_EQ(next.phase, Phase::kTryMore);
+    EXPECT_EQ(next.isCopyQueued, isCopyQueued);
+    auto stalled = trial;
+    stalled.copyTrialRate = 0;
+    expectNotKept(step(stalled, 0));
+    stalled = check;
+    stalled.copyTrialRate = 0;
+    expectNotKept(step(stalled, 0));
+    stalled = confirm;
+    stalled.copyTrialRate = 0;
+    expectNotKept(step(stalled, 0));
 
     // The distance between such trials is bounded.
     auto longest = trial;

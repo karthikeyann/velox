@@ -167,9 +167,9 @@ class CudfHiveConfig {
   static constexpr uint32_t kMaxFetchSchedulerReaders = 256;
 
   // How a connector's fetch scheduler waits for the copy of a filled staging
-  // buffer: "auto" measures and chooses, "wait" makes the reader wait before
-  // it fills another buffer, "queue" lets it go on. Anything but "auto" is
-  // meant for measurements.
+  // buffer: "auto" chooses by a measurement of the machine, "wait" makes the
+  // reader wait before it fills another buffer, "queue" lets it go on.
+  // Anything but "auto" is meant for measurements.
   static constexpr const char* kFetchSchedulerCopyMode =
       "cudf.hive.fetch-scheduler-copy-mode";
 

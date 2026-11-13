@@ -276,9 +276,6 @@ class CudfSplitReader : public NvtxHelper {
     bool isAhead{false};
   };
 
-  // The offer of the first pass's fetch to the fetch-ahead budget.
-  class FetchAhead;
-
   // Start the reads of 'byteRanges', the column chunks of the current pass.
   // 'isHeld' says whether the fetch-ahead budget already counts 'numBytes'
   // for them.
@@ -330,7 +327,7 @@ class CudfSplitReader : public NvtxHelper {
   // Row group passes and byte fetch states.
   std::unique_ptr<RowGroupPassState> passState_;
   // Set while the first pass's fetch is on offer to the fetch-ahead budget.
-  std::shared_ptr<FetchAhead> fetchAhead_;
+  std::shared_ptr<PostedFetchStart> fetchAhead_;
   bool serializeIoRequests_{false};
   // Whether the data source's reads go through the fetch scheduler. Its
   // futures then drop the reads that have not started when destroyed, and

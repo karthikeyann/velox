@@ -262,6 +262,9 @@ class ScheduledRead {
     add(BufferedInputDataSource::kFetchCopyQueuedPercent,
         cost.copyQueuedPercent,
         Unit::kNone);
+    add(BufferedInputDataSource::kFetchCopyToFillPercent,
+        cost.copyToFillPercent,
+        Unit::kNone);
   }
 
  private:

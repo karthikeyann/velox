@@ -29,8 +29,10 @@
 #include <sched.h>
 
 #include <algorithm>
+#include <cstring>
 #include <deque>
 #include <exception>
+#include <limits>
 #include <unordered_map>
 #include <utility>
 
@@ -109,6 +111,58 @@ void copyPageableToDevice(const uint8_t* src, size_t size, uint8_t* dst) {
   CUDF_CUDA_TRY(syncStatus);
 }
 
+// Returns the time a staging buffer of 'pool' takes to copy to the device
+// over the time it takes to fill from memory, or zero when that cannot be
+// measured.
+double measureCopyToFillRatio(PinnedBufferPool& pool) {
+  using Clock = std::chrono::steady_clock;
+  try {
+    ensureCudaContextForThread();
+    auto buffer = pool.acquire();
+    if (buffer == nullptr) {
+      return 0;
+    }
+    const auto size = pool.bufferSize();
+    // Several buffers long, so that a fill reads memory and not what the
+    // fill before it left in the processor's cache.
+    constexpr size_t kNumFills{4};
+    const std::vector<uint8_t> source(kNumFills * size, 1);
+    const auto fillStart = Clock::now();
+    for (size_t i = 0; i < kNumFills; ++i) {
+      std::memcpy(buffer->data, source.data() + i * size, size);
+    }
+    const auto fillNanos = nanosBetween(fillStart, Clock::now()) / kNumFills;
+
+    void* device{nullptr};
+    if (cudaMalloc(&device, size) != cudaSuccess) {
+      // Clear the error so that an unrelated CUDA call does not report it.
+      cudaGetLastError();
+      return 0;
+    }
+    constexpr size_t kNumCopies{4};
+    uint64_t copyNanos{std::numeric_limits<uint64_t>::max()};
+    auto status = cudaSuccess;
+    for (size_t i = 0; i < kNumCopies && status == cudaSuccess; ++i) {
+      const auto copyStart = Clock::now();
+      status = cudaMemcpyAsync(
+          device, buffer->data, size, cudaMemcpyHostToDevice, buffer->stream);
+      const auto syncStatus = cudaStreamSynchronize(buffer->stream);
+      status = status == cudaSuccess ? syncStatus : status;
+      copyNanos = std::min(copyNanos, nanosBetween(copyStart, Clock::now()));
+    }
+    cudaFree(device);
+    if (status != cudaSuccess) {
+      cudaGetLastError();
+      return 0;
+    }
+    return fillNanos == 0 ? 0 : static_cast<double>(copyNanos) / fillNanos;
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "Failed to measure the copy of a staging buffer: "
+                 << e.what();
+    return 0;
+  }
+}
+
 // Returns the fetch-ahead budget that the schedulers of the process share
 // for the device cuDF is registered on, creating it on first use.
 std::shared_ptr<FetchAheadBudget> sharedFetchAheadBudget() {
@@ -159,6 +213,9 @@ struct FetchScheduler::Group {
   size_t numWaiters{0};
   // Bytes of the group's ranges that no reader has been given.
   uint64_t queuedBytes{0};
+  // Bytes of groups that asked later served since this one, while a consumer
+  // waited for it. Reset when the group queues.
+  uint64_t overtakenBytes{0};
   // Ranges with pieces no reader has started, in submission order.
   std::deque<std::shared_ptr<Read>> pending;
 };
@@ -217,6 +274,11 @@ class FetchScheduler::Read {
 };
 
 // static
+bool FetchScheduler::prefersQueuedCopies(double copyToFillRatio) {
+  return copyToFillRatio > 0 && copyToFillRatio < kMaxQueuedCopyToFillRatio;
+}
+
+// static
 FetchScheduler::ControlState FetchScheduler::nextControlState(
     const Options& options,
     const ControlState& state,
@@ -241,7 +303,11 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
     next.phase = Phase::kHold;
     next.numReaders = numReaders;
     next.numHeldReaders = numReaders;
-    next.numHoldsLeft = options.numHoldPeriods;
+    // Trials of more readers that were not kept one after the other say
+    // that the number is enough: the hold gets twice as long with each, up
+    // to eight times.
+    next.numHoldsLeft = options.numHoldPeriods
+        << std::min<size_t>(next.numFailedTrials, 3);
   };
   // Starts a trial of more readers than 'numHeld', or holds at the bound.
   const auto tryMore = [&](size_t numHeld) {
@@ -278,7 +344,7 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
         --next.numHoldsLeft;
         break;
       }
-      if (options.copyMode == CopyMode::kAuto) {
+      if (options.copyMode == CopyMode::kAuto && rate > 0) {
         if (state.numTrialsToCopyTrial == 0) {
           next.phase = Phase::kTryOtherCopy;
           next.isCopyQueued = !state.isCopyQueued;
@@ -304,8 +370,10 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
           state.numHeldReaders;
       if (rate >= state.baseRate * (1 + share / 2) && !isCopyLimited) {
         next.baseRate = rate;
+        next.numFailedTrials = 0;
         tryMore(state.numReaders);
       } else {
+        ++next.numFailedTrials;
         hold(state.numHeldReaders);
       }
       break;
@@ -331,13 +399,15 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
     case Phase::kCheckCopyTrial:
     case Phase::kConfirmOtherCopy: {
       // Small gains are within what two measurements differ by.
-      constexpr double kMinGain{1.03};
+      constexpr double kMinGain{1.05};
       // Whether the way the trial came from is the one measured.
       const bool isCheck = state.phase == Phase::kCheckCopyTrial;
       // The other way has to deliver more than the measurement before it;
       // the way the trial came from, less than the trial before it.
-      const bool inFavour = isCheck ? state.copyTrialRate >= rate * kMinGain
-                                    : rate >= state.copyTrialRate * kMinGain;
+      // A measurement in which nothing was delivered says nothing.
+      const bool inFavour = rate > 0 && state.copyTrialRate > 0 &&
+          (isCheck ? state.copyTrialRate >= rate * kMinGain
+                   : rate >= state.copyTrialRate * kMinGain);
       if (inFavour && state.phase != Phase::kConfirmOtherCopy) {
         next.phase =
             isCheck ? Phase::kConfirmOtherCopy : Phase::kCheckCopyTrial;
@@ -347,13 +417,13 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
       }
       if (inFavour) {
         next.baseRate = rate;
-      } else {
-        if (!isCheck) {
-          next.isCopyQueued = !state.isCopyQueued;
-        }
-        next.copyTrialInterval =
-            std::min(4 * state.copyTrialInterval, kMaxCopyTrialInterval);
+      } else if (!isCheck) {
+        next.isCopyQueued = !state.isCopyQueued;
       }
+      // Also after a switch: two ways that deliver about the same would
+      // otherwise take turns.
+      next.copyTrialInterval =
+          std::min(4 * state.copyTrialInterval, kMaxCopyTrialInterval);
       next.copyTrialRate = 0;
       next.numTrialsToCopyTrial = next.copyTrialInterval;
       hold(state.numHeldReaders);
@@ -461,6 +531,15 @@ void FetchScheduler::ensureStarted() {
     options_.copyMode = CopyMode::kWait;
     control_.isCopyQueued = false;
   }
+  if (options_.copyMode == CopyMode::kAuto) {
+    stats_.copyToFillRatio = measureCopyToFillRatio(*pool_);
+    control_.isCopyQueued = prefersQueuedCopies(stats_.copyToFillRatio);
+    LOG(INFO) << "Fetch scheduler: a staging buffer takes "
+              << stats_.copyToFillRatio
+              << " times as long to copy to the device as to fill, so "
+              << (control_.isCopyQueued ? "readers go on while their copies run"
+                                        : "readers wait for their copies");
+  }
   options_.maxReaders = readers_.size();
   options_.minReaders = std::min(options_.minReaders, options_.maxReaders);
   control_.numReaders = std::min(control_.numReaders, options_.maxReaders);
@@ -492,6 +571,7 @@ std::shared_ptr<FetchScheduler::Read> FetchScheduler::submit(
   }
   if (group->pending.empty()) {
     group->sequence = nextSequence_++;
+    group->overtakenBytes = 0;
     queuedGroups_.push_back(group.get());
   }
   group->pending.push_back(read);
@@ -569,6 +649,15 @@ size_t FetchScheduler::depthLimit() const {
   return std::max<size_t>(
       1,
       std::min(pool_->maxBuffers(), control_.numReaders * numBuffersPerReader));
+}
+
+// static
+bool FetchScheduler::isMuchSmaller(const Group& group, const Group& other) {
+  return group.queuedBytes * 4 <= other.queuedBytes;
+}
+
+bool FetchScheduler::isAged(const Group& group) const {
+  return group.overtakenBytes >= options_.maxOvertakenBytes;
 }
 
 bool FetchScheduler::canDispatch() const {
@@ -653,8 +742,12 @@ FetchScheduler::Job FetchScheduler::takeJob(Clock::time_point now) {
     bool better;
     if (waited != bestWaited) {
       better = waited;
-    } else if (waited && group->queuedBytes != bestGroup->queuedBytes) {
-      better = group->queuedBytes < bestGroup->queuedBytes;
+    } else if (waited && isAged(*group) != isAged(*bestGroup)) {
+      better = isAged(*group);
+    } else if (waited && !isAged(*group) && isMuchSmaller(*group, *bestGroup)) {
+      better = true;
+    } else if (waited && !isAged(*group) && isMuchSmaller(*bestGroup, *group)) {
+      better = false;
     } else {
       better = group->sequence < bestGroup->sequence;
     }
@@ -679,6 +772,13 @@ FetchScheduler::Job FetchScheduler::takeJob(Clock::time_point now) {
     }
   }
   ++read.numOutstanding;
+  // What the groups that asked earlier, and are waited for, were made to
+  // wait for.
+  for (auto* other : queuedGroups_) {
+    if (other->numWaiters > 0 && other->sequence < group->sequence) {
+      other->overtakenBytes += job.size;
+    }
+  }
   if (job.offset == 0) {
     const auto queuedNanos = nanosBetween(read.submittedAt, now);
     read.stats.queuedNanos += queuedNanos;
@@ -733,6 +833,8 @@ void FetchScheduler::completeIfDone(Read& read, Clock::time_point now) {
     read.stats.copyQueuedPercent = read.numQueuedCopies * 100 / read.numPieces;
   }
   read.stats.numReaders = control_.numReaders;
+  read.stats.copyToFillPercent =
+      static_cast<uint64_t>(stats_.copyToFillRatio * 100);
   completed_.notify_all();
 }
 
@@ -888,6 +990,7 @@ void FetchScheduler::copyWaiterLoop() {
   folly::setThreadName("CudfFetchCopy");
   QueuedCopy copy;
   std::unique_lock<std::mutex> lock(mutex_);
+
   while (true) {
     if (queuedCopies_.empty() && copy.job.read != nullptr) {
       // The range is let go without the lock, as the readers do.

@@ -266,73 +266,6 @@ uint64_t numBytesOf(
 
 } // namespace
 
-// The fetch of a prepared split's first pass, on offer to the fetch-ahead
-// budget. When the budget has room it has the fetch started on a thread of
-// the fetch scheduler, while the reader may at the same moment be taken over
-// by the driver that reads the split, so both sides go through 'mutex_'.
-class CudfSplitReader::FetchAhead
-    : public FetchAheadBudget::Candidate,
-      public std::enable_shared_from_this<FetchAhead> {
- public:
-  FetchAhead(
-      CudfSplitReader* reader,
-      std::vector<cudf::io::text::byte_range_info> byteRanges,
-      uint64_t numBytes)
-      : reader_(reader),
-        scheduler_(reader->fetchScheduler_.get()),
-        byteRanges_(std::move(byteRanges)),
-        numBytes_(numBytes) {}
-
-  // Hands the start of the fetch to the scheduler, since it allocates the
-  // device memory of the pass and the calling thread only made room.
-  bool start() override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (reader_ == nullptr) {
-      return false;
-    }
-    isStarting_ = true;
-    scheduler_->post([self = shared_from_this()]() { self->startFetch(); });
-    return true;
-  }
-
-  // Makes start() do nothing from now on. Returns once a start that was
-  // handed to the scheduler has run.
-  void withdraw() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    started_.wait(lock, [&]() { return !isStarting_; });
-    reader_ = nullptr;
-  }
-
- private:
-  void startFetch() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    try {
-      ensureCudaContextForThread();
-      reader_->startFetch(byteRanges_, numBytes_, /*isHeld=*/true);
-    } catch (const std::exception& e) {
-      // The budget counted a fetch that does not exist. The reader starts
-      // the fetch again when its driver gets to it, and fails then.
-      LOG(WARNING) << "Failed to start a fetch ahead: " << e.what();
-      auto& budget = scheduler_->fetchAhead();
-      budget.claim();
-      budget.release(numBytes_);
-    }
-    reader_ = nullptr;
-    isStarting_ = false;
-    started_.notify_all();
-  }
-
-  std::mutex mutex_;
-  std::condition_variable started_;
-  // Null once the fetch has started or the offer was withdrawn.
-  CudfSplitReader* reader_;
-  // Whether the start is with the scheduler and has not run yet.
-  bool isStarting_{false};
-  FetchScheduler* const scheduler_;
-  const std::vector<cudf::io::text::byte_range_info> byteRanges_;
-  const uint64_t numBytes_;
-};
-
 CudfSplitReader::~CudfSplitReader() {
   // A split abandoned before it is read, e.g. when the task is cancelled while
   // the preloader prepares it, can still have reads in flight or queued.
@@ -618,8 +551,19 @@ bool CudfSplitReader::offerColumnChunkFetch() {
               passState_->passes[passState_->currentPass], readerOptions_)
           .first;
   const auto numBytes = numBytesOf(byteRanges);
-  fetchAhead_ =
-      std::make_shared<FetchAhead>(this, std::move(byteRanges), numBytes);
+  // The start allocates the device memory of the pass, which is work for a
+  // thread of the scheduler: the thread that gives the offer room only made
+  // room.
+  fetchAhead_ = std::make_shared<PostedFetchStart>(
+      &fetchScheduler_->fetchAhead(),
+      numBytes,
+      [scheduler = fetchScheduler_.get()](std::function<void()> task) {
+        scheduler->post(std::move(task));
+      },
+      [this, byteRanges = std::move(byteRanges), numBytes]() {
+        ensureCudaContextForThread();
+        startFetch(byteRanges, numBytes, /*isHeld=*/true);
+      });
   fetchScheduler_->fetchAhead().offer(fetchAhead_, numBytes);
   return true;
 }
@@ -627,7 +571,8 @@ bool CudfSplitReader::offerColumnChunkFetch() {
 void CudfSplitReader::withdrawFetchOffer() {
   if (fetchAhead_ != nullptr) {
     fetchScheduler_->fetchAhead().withdraw(fetchAhead_.get());
-    // Waits for a start that is running.
+    // Waits for a start that is running, and takes back one that is only
+    // queued: the caller then starts the fetch itself.
     fetchAhead_->withdraw();
     fetchAhead_.reset();
   }

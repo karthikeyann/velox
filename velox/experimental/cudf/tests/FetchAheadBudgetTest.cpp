@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -185,6 +186,88 @@ TEST_F(FetchAheadBudgetTest, withdrawnOffer) {
   budget.release(80);
   EXPECT_THAT(log_.names(), testing::ElementsAre("a", "c"));
   EXPECT_EQ(budget.stats().heldBytes, 20);
+}
+
+// A posted start runs once on the thread it is posted to. Until it begins
+// the consumer can take it back, and a start that cannot be posted or that
+// fails leaves the offer and the budget as if it had not been made.
+TEST_F(FetchAheadBudgetTest, postedStart) {
+  std::vector<std::function<void()>> tasks;
+  bool postFails{false};
+  bool startFails{false};
+  int numStarts{0};
+  FetchAheadBudget budget(100);
+  const auto offer = [&]() {
+    auto start = std::make_shared<PostedFetchStart>(
+        &budget,
+        10,
+        [&](std::function<void()> task) {
+          VELOX_CHECK(!postFails, "Injected post failure");
+          tasks.push_back(std::move(task));
+        },
+        [&]() {
+          VELOX_CHECK(!startFails, "Injected start failure");
+          ++numStarts;
+        });
+    budget.offer(start, 10);
+    return start;
+  };
+  const auto expectNothingHeld = [&]() {
+    EXPECT_EQ(budget.stats().heldBytes, 0);
+    EXPECT_EQ(budget.stats().numAhead, 0);
+    EXPECT_EQ(budget.stats().numWaiting, 0);
+  };
+  {
+    // Posted, then run: the fetch is ahead until its consumer claims it.
+    auto start = offer();
+    ASSERT_EQ(tasks.size(), 1);
+    EXPECT_EQ(numStarts, 0);
+    EXPECT_EQ(budget.stats().heldBytes, 10);
+    tasks[0]();
+    EXPECT_EQ(numStarts, 1);
+    start->withdraw();
+    EXPECT_EQ(budget.stats().heldBytes, 10);
+    EXPECT_EQ(budget.stats().numAhead, 1);
+    budget.claim();
+    budget.release(10);
+    tasks.clear();
+  }
+  {
+    // Taken back before it begins: it never runs, and holds nothing.
+    auto start = offer();
+    ASSERT_EQ(tasks.size(), 1);
+    EXPECT_EQ(budget.stats().heldBytes, 10);
+    start->withdraw();
+    expectNothingHeld();
+    tasks[0]();
+    EXPECT_EQ(numStarts, 1);
+    expectNothingHeld();
+    tasks.clear();
+  }
+  {
+    // A start that cannot be posted leaves the offer free to be taken back.
+    postFails = true;
+    auto start = offer();
+    postFails = false;
+    EXPECT_TRUE(tasks.empty());
+    expectNothingHeld();
+    start->withdraw();
+    expectNothingHeld();
+    EXPECT_EQ(numStarts, 1);
+  }
+  {
+    // A start that fails gives its bytes back.
+    startFails = true;
+    auto start = offer();
+    ASSERT_EQ(tasks.size(), 1);
+    tasks[0]();
+    startFails = false;
+    expectNothingHeld();
+    start->withdraw();
+    expectNothingHeld();
+    EXPECT_EQ(numStarts, 1);
+    tasks.clear();
+  }
 }
 
 // A fetch that has nothing to start holds no bytes and does not keep the

@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 
@@ -119,6 +120,54 @@ class FetchAheadBudget {
   // which keeps the order of the offers.
   bool starting_{false};
   Stats stats_;
+};
+
+/// A fetch on offer to a FetchAheadBudget that another thread starts. When
+/// the budget has room the start is posted to that thread. Until the posted
+/// start begins, the consumer can take the offer back and start the fetch
+/// itself, so a fetch somebody needs never waits behind work that is only
+/// queued.
+///
+/// Thread-safe.
+class PostedFetchStart final
+    : public FetchAheadBudget::Candidate,
+      public std::enable_shared_from_this<PostedFetchStart> {
+ public:
+  /// Runs a task on another thread, later. Throws when it cannot.
+  using Post = std::function<void(std::function<void()>)>;
+
+  /// 'startFetch' starts a fetch of 'numBytes' and runs at most once, on the
+  /// thread that 'post' hands its task to. A start that throws gives the
+  /// bytes back to 'budget', which must outlive the offer.
+  PostedFetchStart(
+      FetchAheadBudget* budget,
+      uint64_t numBytes,
+      Post post,
+      std::function<void()> startFetch);
+
+  /// Posts the start. Returns false when the offer was taken back. Throws
+  /// what the post throws, and can then be called again.
+  bool start() override;
+
+  /// Takes the offer back: a start that has not begun never runs, and its
+  /// bytes go back to the budget. Waits for a start that is running.
+  void withdraw();
+
+ private:
+  // Body of the posted task.
+  void run();
+
+  FetchAheadBudget* const budget_;
+  const uint64_t numBytes_;
+  const Post post_;
+  const std::function<void()> startFetch_;
+
+  // Held while the fetch is being started, so that withdraw() waits for it.
+  std::mutex mutex_;
+  // Whether the start is posted and has not begun.
+  bool isPosted_{false};
+  // Whether the start has begun or the offer was taken back.
+  bool isClosed_{false};
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

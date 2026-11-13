@@ -18,6 +18,8 @@
 
 #include "velox/common/base/Exceptions.h"
 
+#include <glog/logging.h>
+
 #include <algorithm>
 #include <utility>
 
@@ -120,6 +122,65 @@ void FetchAheadBudget::startWaiting() {
 FetchAheadBudget::Stats FetchAheadBudget::stats() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return stats_;
+}
+
+PostedFetchStart::PostedFetchStart(
+    FetchAheadBudget* budget,
+    uint64_t numBytes,
+    Post post,
+    std::function<void()> startFetch)
+    : budget_(budget),
+      numBytes_(numBytes),
+      post_(std::move(post)),
+      startFetch_(std::move(startFetch)) {
+  VELOX_CHECK_NOT_NULL(budget_);
+}
+
+bool PostedFetchStart::start() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (isClosed_ || isPosted_) {
+    return false;
+  }
+  post_([self = shared_from_this()]() { self->run(); });
+  // Only now: a post that throws leaves the offer as it was.
+  isPosted_ = true;
+  return true;
+}
+
+void PostedFetchStart::withdraw() {
+  bool tookBack{false};
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tookBack = isPosted_;
+    isPosted_ = false;
+    isClosed_ = true;
+  }
+  if (tookBack) {
+    // The budget counted a fetch that will not start.
+    budget_->claim();
+    budget_->release(numBytes_);
+  }
+}
+
+void PostedFetchStart::run() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!isPosted_) {
+    return;
+  }
+  isPosted_ = false;
+  isClosed_ = true;
+  try {
+    startFetch_();
+    return;
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "Failed to start a fetch ahead: " << e.what();
+  } catch (...) {
+    LOG(WARNING) << "Failed to start a fetch ahead";
+  }
+  // The budget counted a fetch that does not exist. The consumer starts the
+  // fetch again when it gets to it, and meets the failure then.
+  budget_->claim();
+  budget_->release(numBytes_);
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive
