@@ -930,19 +930,29 @@ TEST_F(FetchSchedulerTest, nextControlStateConverges) {
 // copy to its fill: readers wait where the link is slow for the memory, and
 // go on where it is fast.
 TEST_F(FetchSchedulerTest, prefersQueuedCopies) {
-  // A PCIe 4 workstation measures 1.3 to 1.9.
-  EXPECT_FALSE(FetchScheduler::prefersQueuedCopies(1.3));
+  // A PCIe 4 workstation measures 0.8 to 1.9, NVLink 0.12 to 0.14.
+  EXPECT_FALSE(FetchScheduler::prefersQueuedCopies(0.8));
   EXPECT_TRUE(FetchScheduler::prefersQueuedCopies(0.3));
-  EXPECT_TRUE(FetchScheduler::prefersQueuedCopies(0.05));
+  EXPECT_TRUE(FetchScheduler::prefersQueuedCopies(0.14));
   EXPECT_FALSE(
       FetchScheduler::prefersQueuedCopies(
           FetchScheduler::kMaxQueuedCopyToFillRatio));
   // Not measured.
   EXPECT_FALSE(FetchScheduler::prefersQueuedCopies(0));
 
+  // The number of readers to start with follows the same ratio.
+  EXPECT_EQ(FetchScheduler::initialReadersFor(1.92), 5);
+  EXPECT_EQ(FetchScheduler::initialReadersFor(1.14), 8);
+  EXPECT_EQ(FetchScheduler::initialReadersFor(0.4), 24);
+  EXPECT_EQ(FetchScheduler::initialReadersFor(0.13), 24);
+  EXPECT_EQ(FetchScheduler::initialReadersFor(10), 4);
+  EXPECT_EQ(FetchScheduler::initialReadersFor(0), 16);
+
   // A scheduler that is not told starts the way its measurement says.
   const auto content = makeContent(kBufferSize);
-  auto scheduler = makeScheduler(Options{}, 4);
+  Options options;
+  options.maxReaders = 64;
+  auto scheduler = makeScheduler(options, 4);
   auto device = makeDeviceBuffer(kBufferSize);
   auto read = scheduler->submit(
       scheduler->makeGroup(),
@@ -956,6 +966,9 @@ TEST_F(FetchSchedulerTest, prefersQueuedCopies) {
   EXPECT_EQ(
       stats.isCopyQueued,
       FetchScheduler::prefersQueuedCopies(stats.copyToFillRatio));
+  EXPECT_EQ(
+      stats.numReaders,
+      FetchScheduler::initialReadersFor(stats.copyToFillRatio));
   EXPECT_EQ(toHost(device), content);
 }
 

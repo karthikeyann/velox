@@ -127,8 +127,9 @@ double measureCopyToFillRatio(PinnedBufferPool& pool) {
       return 0;
     }
     const auto size = pool.bufferSize();
-    // Two buffers long, so that a fill reads memory and not what the fill
-    // before it left in the processor's cache.
+    // Two buffers, filled from in turn. The processor may still hold them in
+    // its cache, so this is the fastest fill the machine does, and the ratio
+    // reads higher than one taken from files would.
     const std::vector<uint8_t> source(2 * size, 1);
     uint64_t fillNanos{std::numeric_limits<uint64_t>::max()};
     for (size_t i = 0; i < kNumSamples; ++i) {
@@ -276,6 +277,14 @@ bool FetchScheduler::prefersQueuedCopies(double copyToFillRatio) {
 }
 
 // static
+size_t FetchScheduler::initialReadersFor(double copyToFillRatio) {
+  if (copyToFillRatio <= 0) {
+    return 16;
+  }
+  return static_cast<size_t>(std::clamp(10 / copyToFillRatio, 4.0, 24.0));
+}
+
+// static
 FetchScheduler::ControlState FetchScheduler::nextControlState(
     const Options& options,
     const ControlState& state,
@@ -408,7 +417,10 @@ FetchScheduler::FetchScheduler(
   }
   VELOX_CHECK_LE(options_.minReaders, options_.maxReaders);
   control_.numReaders = std::clamp(
-      options_.initialReaders, options_.minReaders, options_.maxReaders);
+      options_.initialReaders == 0 ? initialReadersFor(0)
+                                   : options_.initialReaders,
+      options_.minReaders,
+      options_.maxReaders);
   control_.numHeldReaders = control_.numReaders;
   isCopyQueued_ = options_.copyMode == CopyMode::kQueue;
 }
@@ -495,17 +507,27 @@ void FetchScheduler::ensureStarted() {
     options_.copyMode = CopyMode::kWait;
     isCopyQueued_ = false;
   }
-  if (options_.copyMode == CopyMode::kAuto) {
-    stats_.copyToFillRatio = measureCopyToFillRatio(*pool_);
-    isCopyQueued_ = prefersQueuedCopies(stats_.copyToFillRatio);
-    LOG(INFO) << "Fetch scheduler: a staging buffer takes "
-              << stats_.copyToFillRatio
-              << " times as long to copy to the device as to fill, so "
-              << (isCopyQueued_ ? "readers go on while their copies run"
-                                : "readers wait for their copies");
-  }
   options_.maxReaders = readers_.size();
   options_.minReaders = std::min(options_.minReaders, options_.maxReaders);
+  if (options_.copyMode == CopyMode::kAuto || options_.initialReaders == 0) {
+    stats_.copyToFillRatio = measureCopyToFillRatio(*pool_);
+    if (options_.copyMode == CopyMode::kAuto) {
+      isCopyQueued_ = prefersQueuedCopies(stats_.copyToFillRatio);
+    }
+    if (options_.initialReaders == 0) {
+      control_.numReaders = std::clamp(
+          initialReadersFor(stats_.copyToFillRatio),
+          options_.minReaders,
+          options_.maxReaders);
+      control_.numHeldReaders = control_.numReaders;
+    }
+    LOG(INFO) << "Fetch scheduler: a staging buffer takes "
+              << stats_.copyToFillRatio
+              << " times as long to copy to the device as to fill: "
+              << control_.numReaders << " readers that "
+              << (isCopyQueued_ ? "go on while their copies run"
+                                : "wait for their copies");
+  }
   control_.numReaders = std::min(control_.numReaders, options_.maxReaders);
   control_.numHeldReaders =
       std::min(control_.numHeldReaders, options_.maxReaders);

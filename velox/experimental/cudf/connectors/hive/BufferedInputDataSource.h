@@ -75,7 +75,7 @@ class BufferedInputDataSource : public cudf::io::datasource {
       "cudfFetchCopyQueuedPercent";
   /// Time a staging buffer takes to copy to the device over the time it
   /// takes to fill from memory, in percent, as the scheduler measured it
-  /// when it started. Below 70 its readers go on while their copies run.
+  /// when it started. Below 60 its readers go on while their copies run.
   static constexpr const char* kFetchCopyToFillPercent =
       "cudfFetchCopyToFillPercent";
 

@@ -83,8 +83,9 @@ class FetchScheduler {
     /// reader threads. Zero stands for half of the CPUs the process may run
     /// on, divided by the number of devices it sees, between 4 and 64.
     size_t maxReaders{0};
-    /// Readers at work before the first measurement.
-    size_t initialReaders{16};
+    /// Readers at work before the first measurement. Zero takes
+    /// initialReadersFor() of the ratio measured when the readers start.
+    size_t initialReaders{0};
     /// Time with ranges waiting for a reader that one measurement of the
     /// controller covers. The measurement of a trial of a number of readers
     /// covers twice as much.
@@ -190,8 +191,9 @@ class FetchScheduler {
     /// Whether readers go on while their copies run.
     bool isCopyQueued{false};
     /// Time a staging buffer takes to copy to the device over the time it
-    /// takes to fill from memory, measured when the readers started with
-    /// CopyMode::kAuto. Zero when not measured.
+    /// takes to fill from memory, measured when the readers started. Zero
+    /// when not measured: with the way of waiting and the first number of
+    /// readers both given, or when the measurement failed.
     double copyToFillRatio{0};
     /// Readers allowed now.
     size_t numReaders{0};
@@ -257,18 +259,27 @@ class FetchScheduler {
   /// Below this ratio of the time a staging buffer takes to copy to the
   /// device to the time it takes to fill from memory, readers go on while
   /// their copies run.
-  static constexpr double kMaxQueuedCopyToFillRatio{0.7};
+  static constexpr double kMaxQueuedCopyToFillRatio{0.6};
 
   /// Returns whether readers should go on while their copies run, given
   /// 'copyToFillRatio': the time a staging buffer takes to copy to the
   /// device over the time it takes to fill from memory. A link that is slow
-  /// for the machine's memory, a ratio above one as measured on a PCIe 4
+  /// for the machine's memory, a ratio of 0.8 to 1.9 as measured on a PCIe 4
   /// workstation, is fed by two or three readers, and what the others fill
   /// meanwhile takes memory bandwidth from the copies: there readers wait.
-  /// A fast link, a low ratio, needs many readers and leaves bandwidth to
-  /// spare, so a reader that waits is idle for nothing. Zero, for a ratio
-  /// that could not be measured, returns false.
+  /// A fast link, 0.12 to 0.14 as measured on NVLink, needs many readers
+  /// and leaves bandwidth to spare, so a reader that waits is idle for
+  /// nothing. Zero, for a ratio that could not be measured, returns false.
   static bool prefersQueuedCopies(double copyToFillRatio);
+
+  /// Returns the number of readers to start with, given 'copyToFillRatio' as
+  /// for prefersQueuedCopies(): ten divided by the ratio, between 4 and 24.
+  /// The ratio says how many fills the link takes at a time, and the numbers
+  /// are what three machines settled at when left to try: 5 to 8 readers at
+  /// a ratio of 1.1 to 1.9, 16 to 32 at 0.1 to 0.4. Starting there saves the
+  /// first scans the way from a number that suits another machine. Zero,
+  /// for a ratio that could not be measured, returns 16.
+  static size_t initialReadersFor(double copyToFillRatio);
 
   /// Returns where the controller stands after measuring 'window' in
   /// 'state'. While it holds a number of readers it averages the rate, and
