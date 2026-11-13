@@ -536,6 +536,13 @@ void CudfConfig::initialize(
   if (config.find(kCudfTopNBatchSize) != config.end()) {
     topNBatchSize = folly::to<int32_t>(config[kCudfTopNBatchSize]);
   }
+  if (config.find(kCudfDynamicFilterEnabled) != config.end()) {
+    dynamicFilterEnabled = folly::to<bool>(config[kCudfDynamicFilterEnabled]);
+  }
+  if (config.find(kCudfDynamicFilterRowFilterEnabled) != config.end()) {
+    dynamicFilterRowFilterEnabled =
+        folly::to<bool>(config[kCudfDynamicFilterRowFilterEnabled]);
+  }
   if (config.find(kCudfTimestampUnit) != config.end()) {
     const auto& unit = config[kCudfTimestampUnit];
     if (unit == "s") {

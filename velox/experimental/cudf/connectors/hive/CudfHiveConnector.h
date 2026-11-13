@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/FetchAheadBudget.h"
 
@@ -45,7 +46,7 @@ class CudfHiveConnector final
       ConnectorQueryCtx* connectorQueryCtx) override final;
 
   bool canAddDynamicFilter() const override {
-    return true;
+    return CudfConfig::getInstance().dynamicFilterEnabled;
   }
 
   bool supportsSplitPreload() const override {

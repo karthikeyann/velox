@@ -77,8 +77,9 @@ class CudfSplitReader : public NvtxHelper {
   /// row group pass to be on the device, one sample per pass.
   static constexpr const char* kFetchWaitWallNanos = "cudfFetchWaitWallNanos";
 
-  /// Snapshots dynamicFilters for reader pruning. Later filters remain in the
-  /// data source for post-read filtering.
+  /// 'dynamicFilters' are the dynamic filters on integer columns at this
+  /// time, by read column. The reader skips the row groups whose statistics
+  /// they exclude; the caller filters the rows.
   CudfSplitReader(
       std::shared_ptr<CudfHiveConnectorSplit> split,
       std::shared_ptr<const ::facebook::velox::connector::hive::HiveTableHandle>
@@ -306,8 +307,9 @@ class CudfSplitReader : public NvtxHelper {
   // Setup the cuDF reader options
   void setupReaderOptions();
 
-  // Use the parsed integer statistics to prune groups and prove redundant
-  // ranges.
+  // Decides from the footer's integer statistics which row groups can hold a
+  // row that passes the captured dynamic filters, and whether every row of
+  // those does.
   void filterDynamicRowGroups();
 
   // Setup Parquet column and offset indexes for the cudf split reader.
@@ -360,16 +362,19 @@ class CudfSplitReader : public NvtxHelper {
 
   std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
   memory::MemoryPool* pool_;
-  // The immutable integer bounds supplied when this reader was created.
-  std::vector<std::tuple<
-      std::string,
-      cudf::data_type,
-      std::shared_ptr<const common::Filter>>>
+  // The dynamic filters supplied when this reader was created: read column
+  // name, the column's type and the filter.
+  std::vector<std::tuple<std::string, cudf::data_type, common::FilterPtr>>
       readerDynamicFilters_;
-  // One entry per row group; empty if dynamic statistics cannot be used.
+  // One entry per row group of the file, false if the dynamic filters exclude
+  // it; empty without dynamic filters.
   std::vector<bool> dynamicRowGroups_;
-  // Every row in a retained group satisfies the captured dynamic bounds.
+  // Every row in a retained group satisfies the captured dynamic filters.
   bool dynamicFiltersSatisfied_{false};
+  // Row groups of the split the captured dynamic filters skipped.
+  int64_t numDynamicFilterSkippedRowGroups_{0};
+  // Row groups of the split left to read after every kind of pruning.
+  int64_t numSelectedRowGroups_{0};
 
   // The connector's fetch-ahead state. Null when the connector has no
   // fetch-ahead budget. Declared before the pass state, whose buffers can be

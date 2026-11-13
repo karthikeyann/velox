@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
+#include "velox/experimental/cudf/connectors/hive/CudfDynamicFilter.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -428,6 +429,8 @@ void CudfSplitReader::prepareSplit(dwio::common::RuntimeStats& runtimeStats) {
   } else {
     runtimeStats.processedSplits++;
   }
+  runtimeStats.skippedStrides += numDynamicFilterSkippedRowGroups_;
+  runtimeStats.processedStrides += numSelectedRowGroups_;
 }
 
 std::optional<CudfSplitReader::TableChunk> CudfSplitReader::next(
@@ -774,6 +777,8 @@ void CudfSplitReader::resetSplit() {
   pushdownFilterExpr_ = subfieldFilterAst_;
   dynamicRowGroups_.clear();
   dynamicFiltersSatisfied_ = false;
+  numDynamicFilterSkippedRowGroups_ = 0;
+  numSelectedRowGroups_ = 0;
   hasSplitSpecificPushdownFilter_ = false;
   emptySplit_ = false;
   fileColumnNames_.clear();
@@ -1042,42 +1047,98 @@ CudfSplitReader::fileMetaDatas() {
   return fileMetaDatas_;
 }
 
+namespace {
+
+// Whether Filter::testInt64Range() of a filter of 'kind' decides if a range of
+// integers can hold a passing value.
+bool testsIntegerRange(common::FilterKind kind) {
+  switch (kind) {
+    case common::FilterKind::kAlwaysFalse:
+    case common::FilterKind::kAlwaysTrue:
+    case common::FilterKind::kIsNull:
+    case common::FilterKind::kIsNotNull:
+    case common::FilterKind::kBigintRange:
+    case common::FilterKind::kNegatedBigintRange:
+    case common::FilterKind::kBigintValuesUsingHashTable:
+    case common::FilterKind::kBigintValuesUsingBitmask:
+    case common::FilterKind::kNegatedBigintValuesUsingHashTable:
+    case common::FilterKind::kNegatedBigintValuesUsingBitmask:
+    case common::FilterKind::kBigintMultiRange:
+    case common::FilterKind::kBigintValuesUsingBloomFilter:
+      return true;
+    default:
+      return false;
+  }
+}
+
+} // namespace
+
 void CudfSplitReader::filterDynamicRowGroups() {
   if (readerDynamicFilters_.empty()) {
     return;
   }
+  using ParquetType = cudf::io::parquet::Type;
   const auto& metadata = fileMetaDatas_.front();
   const auto& schema = metadata.schema;
   const auto& columns = schema.front().children_idx;
+  const auto fileName = [&](const std::string& name) {
+    return caseInsensitiveColumnNames_
+        ? ::facebook::velox::functions::stringImpl::utf8StrToLowerCopy(name)
+        : name;
+  };
   dynamicRowGroups_.assign(metadata.row_groups.size(), true);
   std::vector<bool> allRowsMatch(metadata.row_groups.size(), true);
   for (const auto& [name, type, filter] : readerDynamicFilters_) {
+    if (filter->kind() == common::FilterKind::kAlwaysFalse) {
+      dynamicRowGroups_.assign(dynamicRowGroups_.size(), false);
+      continue;
+    }
+    // The column the reader decodes for 'name': the first one of that name.
+    const auto requestedName = fileName(name);
     const auto column =
         std::find_if(columns.begin(), columns.end(), [&](auto index) {
-          return schema[index].name == name;
+          return fileName(schema[index].name) == requestedName;
         });
-    const auto matches = [&] {
-      if (column == columns.end() || !cudf::is_integral(type) ||
-          !cudf::is_signed(type)) {
+    // The statistics are comparable with the filter's 64-bit integers only if
+    // the file stores the column as the signed integer of the table's type.
+    const auto comparable = [&] {
+      if (column == columns.end() || !testsIntegerRange(filter->kind())) {
         return false;
       }
       const auto& field = schema[*column];
       if (field.max_repetition_level != 0 || !field.children_idx.empty()) {
         return false;
       }
+      if (type.id() == cudf::type_id::TIMESTAMP_DAYS) {
+        return field.type == ParquetType::INT32 &&
+            ((field.logical_type.has_value() &&
+              field.logical_type->type ==
+                  cudf::io::parquet::LogicalType::DATE) ||
+             field.converted_type == cudf::io::parquet::ConvertedType::DATE);
+      }
+      if (!cudf::is_integral(type) || !cudf::is_signed(type)) {
+        return false;
+      }
       const auto width = cudf::size_of(type) * 8;
       if (field.logical_type.has_value()) {
-        return field.logical_type->is_signed() &&
+        return field.logical_type->type ==
+            cudf::io::parquet::LogicalType::INTEGER &&
+            field.logical_type->is_signed() &&
             field.logical_type->bit_width() == width;
       }
-      using ParquetType = cudf::io::parquet::Type;
+      if (field.converted_type.has_value()) {
+        return false;
+      }
       return (field.type == ParquetType::INT32 && width == 32) ||
           (field.type == ParquetType::INT64 && width == 64);
     }();
-    if (!matches) {
-      dynamicRowGroups_.clear();
-      return;
+    if (!comparable) {
+      // Nothing is known about this filter: keep every row group and leave
+      // the filter to the rows.
+      allRowsMatch.assign(allRowsMatch.size(), false);
+      continue;
     }
+    const auto& columnName = schema[*column].name;
     for (size_t groupIndex = 0; groupIndex < metadata.row_groups.size();
          ++groupIndex) {
       if (!dynamicRowGroups_[groupIndex]) {
@@ -1091,10 +1152,9 @@ void CudfSplitReader::filterDynamicRowGroups() {
       const auto chunk = std::find_if(
           group.columns.begin(), group.columns.end(), [&](const auto& c) {
             return c.meta_data.path_in_schema.size() == 1 &&
-                c.meta_data.path_in_schema.front() == name;
+                c.meta_data.path_in_schema.front() == columnName;
           });
-      if (chunk == group.columns.end() ||
-          filter->kind() != common::FilterKind::kBigintRange) {
+      if (chunk == group.columns.end()) {
         allRowsMatch[groupIndex] = false;
         continue;
       }
@@ -1107,7 +1167,6 @@ void CudfSplitReader::filterDynamicRowGroups() {
           stats.min_value.has_value() ? stats.min_value : stats.min;
       const auto& upper =
           stats.max_value.has_value() ? stats.max_value : stats.max;
-      using ParquetType = cudf::io::parquet::Type;
       const auto width = chunk->meta_data.type == ParquetType::INT32 ? 4
           : chunk->meta_data.type == ParquetType::INT64              ? 8
                                                                      : 0;
@@ -1128,13 +1187,18 @@ void CudfSplitReader::filterDynamicRowGroups() {
         allRowsMatch[groupIndex] = false;
         continue;
       }
-      const auto& range = static_cast<const common::BigintRange&>(*filter);
       const bool hasNulls = stats.null_count.value_or(1) != 0;
       dynamicRowGroups_[groupIndex] =
-          range.testInt64Range(minimum, maximum, hasNulls);
-      allRowsMatch[groupIndex] = allRowsMatch[groupIndex] &&
-          range.lower() <= minimum && range.upper() >= maximum &&
-          (!hasNulls || range.testNull());
+          filter->testInt64Range(minimum, maximum, hasNulls);
+      if (filter->kind() == common::FilterKind::kBigintRange &&
+          advisoryFilterBitmap(filter) == nullptr) {
+        const auto& range = static_cast<const common::BigintRange&>(*filter);
+        allRowsMatch[groupIndex] = allRowsMatch[groupIndex] &&
+            range.lower() <= minimum && range.upper() >= maximum &&
+            (!hasNulls || range.testNull());
+      } else {
+        allRowsMatch[groupIndex] = false;
+      }
     }
   }
   dynamicFiltersSatisfied_ = true;
@@ -1219,8 +1283,10 @@ CudfSplitReader::RowGroupPasses CudfSplitReader::selectRowGroupPasses() {
 
   if (!dynamicRowGroups_.empty()) {
     for (auto& groups : rowGroupIndices) {
+      const auto numGroups = groups.size();
       std::erase_if(
           groups, [&](auto group) { return !dynamicRowGroups_[group]; });
+      numDynamicFilterSkippedRowGroups_ += numGroups - groups.size();
     }
   }
 
@@ -1231,6 +1297,7 @@ CudfSplitReader::RowGroupPasses CudfSplitReader::selectRowGroupPasses() {
       [](auto sum, const auto& sourceRowGroups) {
         return sum + sourceRowGroups.size();
       });
+  numSelectedRowGroups_ += numRowGroups;
   auto selectedRowGroups = numRowGroups;
   common::testutil::TestValue::adjust(
       "facebook::velox::cudf_velox::connector::hive::CudfSplitReader::selectedRowGroups",

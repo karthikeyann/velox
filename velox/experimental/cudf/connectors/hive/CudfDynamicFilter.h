@@ -18,16 +18,29 @@
 
 #include "velox/type/Filter.h"
 
+#include <cudf/column/column.hpp>
+
 #include <memory>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
-/// Marks bounds for row-group pruning only. The producing join must remain.
-/// Shared copies preserve this mode; clones and merges require full filtering.
-common::FilterPtr makeRowGroupOnlyFilter(
-    std::unique_ptr<common::Filter> filter);
+/// Marks 'filter' as advisory: the operator that produced it still drops
+/// every row the filter rejects, so a scan may keep any of those rows. A scan
+/// uses an advisory filter to prune row groups and, when that pays, rows.
+/// Shared copies stay advisory. A clone or a merge with another filter is not
+/// advisory, and a scan applies it to every row.
+///
+/// 'deviceBitmap', if given, narrows an advisory BigintRange for a scan that
+/// filters rows on the device: UINT32 words with bit 'value - lower()' set for
+/// each value the producer has. Other readers of the filter see the range.
+common::FilterPtr makeAdvisoryFilter(
+    std::unique_ptr<common::Filter> filter,
+    std::shared_ptr<const cudf::column> deviceBitmap = nullptr);
 
-/// Whether the filter can be used for statistics pruning without a row mask.
-bool isRowGroupOnlyFilter(const common::FilterPtr& filter);
+/// Whether a scan may keep rows that 'filter' rejects.
+bool isAdvisoryFilter(const common::FilterPtr& filter);
+
+/// Returns the device bitmap of an advisory filter, or null if it has none.
+const cudf::column* advisoryFilterBitmap(const common::FilterPtr& filter);
 
 } // namespace facebook::velox::cudf_velox::connector::hive

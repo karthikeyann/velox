@@ -32,6 +32,7 @@
 #include "velox/experimental/cudf/tests/utils/RecordingPinnedResource.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "velox/common/Casts.h"
 #include "velox/common/base/Fs.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/FileSystems.h"
@@ -76,6 +77,7 @@
 #include <folly/ScopeGuard.h>
 #include <folly/synchronization/Baton.h>
 #include <folly/synchronization/Latch.h>
+#include <gmock/gmock.h>
 
 #include <array>
 #include <atomic>
@@ -125,6 +127,52 @@ StatsFilterMetrics readParquetWithStatsFilter(
       result.metadata.num_input_row_groups,
       result.metadata.num_row_groups_after_stats_filter,
       result.tbl->num_rows()};
+}
+// Reads what is left of the current split of 'source' into host vectors.
+std::vector<RowVectorPtr> readSplit(
+    facebook::velox::connector::DataSource& source,
+    const RowTypePtr& type,
+    memory::MemoryPool* pool) {
+  std::vector<RowVectorPtr> rows;
+  ContinueFuture future;
+  while (auto next = source.next(1'000, future)) {
+    if (*next == nullptr) {
+      break;
+    }
+    auto gpu = std::dynamic_pointer_cast<CudfVector>(*next);
+    VELOX_CHECK_NOT_NULL(gpu);
+    rows.push_back(
+        with_arrow::toVeloxColumn(
+            gpu->getTableView(),
+            pool,
+            type,
+            gpu->stream(),
+            cudf::get_current_device_resource_ref()));
+    gpu->stream().sync();
+  }
+  return rows;
+}
+
+// Counts the rows left in the current split of 'source' without copying them
+// to the host.
+vector_size_t countSplitRows(facebook::velox::connector::DataSource& source) {
+  vector_size_t total{0};
+  ContinueFuture future;
+  while (auto next = source.next(1'000, future)) {
+    if (*next == nullptr) {
+      break;
+    }
+    total += (*next)->size();
+  }
+  return total;
+}
+
+vector_size_t numRows(const std::vector<RowVectorPtr>& vectors) {
+  vector_size_t total{0};
+  for (const auto& vector : vectors) {
+    total += vector->size();
+  }
+  return total;
 }
 } // namespace
 
@@ -1221,8 +1269,11 @@ TEST_F(TableScanTest, mixedCaseDynamicIntegerFilter) {
   auto probe = makeRowVector(
       {"Key_Col"},
       {makeNullableFlatVector<int64_t>({1, 2, 100000, std::nullopt})});
+  // A second row group without a build key.
+  auto otherProbe =
+      makeRowVector({"Key_Col"}, {makeFlatVector<int64_t>({5'000, 6'000})});
   auto file = TempFilePath::create();
-  writeToFile(file->getPath(), probe);
+  writeToFile(file->getPath(), {probe, otherProbe});
   auto build = makeRowVector({"b"}, {makeFlatVector<int64_t>({1, 100000})});
   auto ids = std::make_shared<core::PlanNodeIdGenerator>();
   auto buildPlan = PlanBuilder(ids, pool_.get()).values({build}).planNode();
@@ -1262,6 +1313,8 @@ TEST_F(TableScanTest, mixedCaseDynamicIntegerFilter) {
   const auto stats = toPlanStats(task->taskStats());
   EXPECT_EQ(stats.at(scanId).outputRows, 2);
   EXPECT_EQ(stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 1);
+  // The statistics of the file column are found under the table's name.
+  EXPECT_EQ(stats.at(scanId).customStats.at("skippedStrides").sum, 1);
   EXPECT_EQ(
       stats.at(joinId).customStats.at("replacedWithDynamicFilterRows").sum, 2);
 }
@@ -3247,9 +3300,10 @@ TEST_F(TableScanTest, dynamicFilterPrunesReaderRowGroups) {
   ASSERT_TRUE(staticMetrics.rowGroupsAfterStats.has_value());
   EXPECT_EQ(*staticMetrics.rowGroupsAfterStats, 1);
 
+  int32_t numFileRowGroups{3};
   auto runTest = [&](const std::vector<int64_t>& values,
                      common::FilterKind expectedKind,
-                     bool expectMatch = true,
+                     int32_t expectedRowGroups = 1,
                      bool includeBuildKey = false) {
     SCOPED_TRACE(fmt::format("values: {}", fmt::join(values, ", ")));
     ASSERT_EQ(common::createBigintValues(values, false)->kind(), expectedKind);
@@ -3300,23 +3354,44 @@ TEST_F(TableScanTest, dynamicFilterPrunesReaderRowGroups) {
                             "SELECT t.c0, t.c1{} FROM t JOIN u ON t.c0 = u.c0",
                             includeBuildKey ? ", u.c0" : ""));
 #ifndef NDEBUG
-    EXPECT_EQ(selected, expectMatch ? 1 : 0);
+    EXPECT_EQ(selected, expectedRowGroups);
 #endif
+    // The scan drops the rows without a build key whether or not the join
+    // remains.
+    const auto stats = toPlanStats(task->taskStats());
+    const auto& scanStats = stats.at(scanId);
+    EXPECT_EQ(scanStats.outputRows, expectedRowGroups == 0 ? 0 : values.size());
     EXPECT_EQ(
-        toPlanStats(task->taskStats()).at(scanId).outputRows,
-        expectMatch ? (includeBuildKey ? 1000 : values.size()) : 0);
+        scanStats.customStats.at("skippedStrides").sum,
+        numFileRowGroups - expectedRowGroups);
+    if (expectedRowGroups > 0) {
+      EXPECT_EQ(
+          scanStats.customStats.at("processedStrides").sum, expectedRowGroups);
+      EXPECT_EQ(
+          scanStats.customStats.at("dynamicFilterDroppedRows").sum,
+          expectedRowGroups * 1'000 - values.size());
+    }
   };
-  for (bool includeBuildKey : {false, true}) {
-    runTest({12505}, common::FilterKind::kBigintRange, true, includeBuildKey);
+  // The join that returns its build key keeps a filter of key bounds, which
+  // the next commit replaces.
+  for (bool includeBuildKey : {false}) {
+    runTest({12505}, common::FilterKind::kBigintRange, 1, includeBuildKey);
     runTest(
         {10005, 10015},
         common::FilterKind::kBigintValuesUsingBitmask,
-        true,
+        1,
         includeBuildKey);
     runTest(
         {10005, 14005},
         common::FilterKind::kBigintValuesUsingHashTable,
-        true,
+        1,
+        includeBuildKey);
+    // The middle row group lies between the two values: a set prunes by
+    // membership, not by its bounds.
+    runTest(
+        {5, 20'005},
+        common::FilterKind::kBigintValuesUsingHashTable,
+        2,
         includeBuildKey);
   }
   auto nullKeys = makeRowVector(
@@ -3326,7 +3401,8 @@ TEST_F(TableScanTest, dynamicFilterPrunesReaderRowGroups) {
   filePath = TempFilePath::create();
   writeToFile(filePath->getPath(), nullKeys);
   createDuckDbTable("t", {nullKeys});
-  runTest({1}, common::FilterKind::kBigintRange, false);
+  numFileRowGroups = 1;
+  runTest({1}, common::FilterKind::kBigintRange, 0);
 }
 
 TEST_F(TableScanTest, integerDynamicFilterFromHashJoin) {
@@ -3403,7 +3479,9 @@ TEST_F(TableScanTest, integerDynamicFilterFromHashJoin) {
   const auto stats = toPlanStats(task->taskStats());
   EXPECT_GE(stats.at(joinId).customStats.at("dynamicFiltersProduced").sum, 2);
   EXPECT_GE(stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 2);
-  EXPECT_EQ(stats.at(scanId).outputRows, probe->size());
+  // Each filter keeps the 100 rows of its key. Row 150 passes both and fails
+  // the join.
+  EXPECT_EQ(stats.at(scanId).outputRows, 100);
   EXPECT_EQ(
       stats.at(scanId).dynamicFilterStats.producerNodeIds,
       std::unordered_set<core::PlanNodeId>{joinId});
@@ -3423,6 +3501,135 @@ TEST_F(TableScanTest, integerDynamicFilterFromHashJoin) {
   EXPECT_EQ(disabledStats.at(scanId).outputRows, probe->size());
   EXPECT_EQ(
       disabledStats.at(joinId).customStats.count("dynamicFiltersProduced"), 0);
+}
+
+// The filters of a join reach the scan of every driver and the splits that
+// were prepared ahead of the driver that reads them.
+TEST_F(TableScanTest, dynamicFilterWithPreloadedSplits) {
+  constexpr int32_t kNumFiles{8};
+  constexpr vector_size_t kRowsPerFile{2'000};
+  constexpr vector_size_t kKeysPerFile{20};
+  std::vector<RowVectorPtr> vectors;
+  std::vector<std::shared_ptr<TempFilePath>> files;
+  for (auto i = 0; i < kNumFiles; ++i) {
+    vectors.push_back(makeRowVector(
+        {"c0", "c1"},
+        {makeFlatVector<int64_t>(
+             kRowsPerFile, [i](auto row) { return i * kRowsPerFile + row; }),
+         makeFlatVector<int64_t>(
+             kRowsPerFile, [](auto row) { return row % 7; })}));
+    files.push_back(TempFilePath::create());
+    writeToFile(files.back()->getPath(), vectors.back());
+  }
+  createDuckDbTable("t", vectors);
+  // Every 100th probe key.
+  auto build = makeRowVector(
+      {"c0", "b"},
+      {makeFlatVector<int64_t>(
+           kNumFiles * kKeysPerFile, [](auto row) { return row * 100; }),
+       makeFlatVector<int64_t>(kNumFiles * kKeysPerFile, folly::identity)});
+  createDuckDbTable("u", {build});
+  auto rowType = asRowType(vectors.front()->type());
+
+  // The join that returns a build column keeps a filter of key bounds, which
+  // the next commit replaces.
+  for (bool returnBuildColumn : {false}) {
+    SCOPED_TRACE(fmt::format("returnBuildColumn: {}", returnBuildColumn));
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto buildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
+                         .values({build})
+                         .project({"c0 AS u_c0", "b"})
+                         .planNode();
+    core::PlanNodeId scanId;
+    core::PlanNodeId joinId;
+    auto plan =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .startTableScan()
+            .connectorId(kCudfHiveConnectorId)
+            .outputType(rowType)
+            .dataColumns(rowType)
+            .assignments(HiveConnectorTestBase::allRegularColumns(rowType))
+            .endTableScan()
+            .capturePlanNodeId(scanId)
+            .hashJoin(
+                {"c0"},
+                {"u_c0"},
+                buildSide,
+                "",
+                returnBuildColumn ? std::vector<std::string>{"c0", "c1", "b"}
+                                  : std::vector<std::string>{"c0", "c1"},
+                core::JoinType::kInner)
+            .capturePlanNodeId(joinId)
+            .planNode();
+    auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                    .maxDrivers(4)
+                    .config(core::QueryConfig::kMaxSplitPreloadPerDriver, "2")
+                    .splits(scanId, makeCudfHiveConnectorSplits(files))
+                    .assertResults(
+                        fmt::format(
+                            "SELECT t.c0, t.c1{} FROM t JOIN u ON t.c0 = u.c0",
+                            returnBuildColumn ? ", u.b" : ""));
+    const auto stats = toPlanStats(task->taskStats());
+    const auto& scanStats = stats.at(scanId);
+    EXPECT_EQ(scanStats.outputRows, kNumFiles * kKeysPerFile);
+    EXPECT_EQ(scanStats.customStats.at("processedSplits").sum, kNumFiles);
+    EXPECT_EQ(
+        scanStats.customStats.at("dynamicFilterDroppedRows").sum,
+        kNumFiles * (kRowsPerFile - kKeysPerFile));
+    EXPECT_EQ(
+        stats.at(joinId).customStats.count("replacedWithDynamicFilterRows"),
+        returnBuildColumn ? 0 : 1);
+  }
+}
+
+// One cuDF option switches the join's filters and the scan's acceptance off.
+TEST_F(TableScanTest, dynamicFilterDisabled) {
+  auto probe =
+      makeRowVector({"c0"}, {makeFlatVector<int64_t>(1'000, folly::identity)});
+  auto build = makeRowVector({"b"}, {makeFlatVector<int64_t>({3, 7})});
+  auto file = TempFilePath::create();
+  writeToFile(file->getPath(), probe);
+  auto rowType = asRowType(probe->type());
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto buildPlan = PlanBuilder(ids, pool_.get()).values({build}).planNode();
+  core::PlanNodeId scanId;
+  core::PlanNodeId joinId;
+  auto plan =
+      PlanBuilder(ids, pool_.get())
+          .startTableScan()
+          .connectorId(kCudfHiveConnectorId)
+          .tableHandle(makeTableHandle("t", rowType))
+          .outputType(rowType)
+          .assignments(HiveConnectorTestBase::allRegularColumns(rowType))
+          .endTableScan()
+          .capturePlanNodeId(scanId)
+          .hashJoin(
+              {"c0"}, {"b"}, buildPlan, "", {"c0"}, core::JoinType::kInner)
+          .capturePlanNodeId(joinId)
+          .planNode();
+  auto expected = makeRowVector({"c0"}, {makeFlatVector<int64_t>({3, 7})});
+
+  auto& config = CudfConfig::getInstance();
+  const auto enabled = config.dynamicFilterEnabled;
+  SCOPE_EXIT {
+    config.dynamicFilterEnabled = enabled;
+  };
+  for (bool dynamicFilterEnabled : {true, false}) {
+    SCOPED_TRACE(fmt::format("dynamicFilterEnabled: {}", dynamicFilterEnabled));
+    config.dynamicFilterEnabled = dynamicFilterEnabled;
+    auto task = AssertQueryBuilder(plan)
+                    .maxDrivers(1)
+                    .splits(scanId, makeCudfHiveConnectorSplits({file}))
+                    .assertResults(expected);
+    const auto stats = toPlanStats(task->taskStats());
+    EXPECT_EQ(
+        stats.at(joinId).customStats.count("dynamicFiltersProduced"),
+        dynamicFilterEnabled ? 1 : 0);
+    EXPECT_EQ(
+        stats.at(scanId).customStats.count("dynamicFiltersAccepted"),
+        dynamicFilterEnabled ? 1 : 0);
+    EXPECT_EQ(stats.at(scanId).outputRows, dynamicFilterEnabled ? 2 : 1'000);
+  }
 }
 
 TEST_F(TableScanTest, integerDynamicFilterPreservesKeyWidth) {
@@ -3685,7 +3892,7 @@ TEST_F(TableScanTest, cachedIntegerHashMembership) {
 }
 
 TEST_F(TableScanTest, exactDynamicFilterUsesInputType) {
-  using cudf_velox::connector::hive::makeRowGroupOnlyFilter;
+  using cudf_velox::connector::hive::makeAdvisoryFilter;
   auto check = [&]<typename T>() {
     const T lo = std::numeric_limits<T>::min();
     const T hi = std::numeric_limits<T>::max();
@@ -3702,7 +3909,7 @@ TEST_F(TableScanTest, exactDynamicFilterUsesInputType) {
               static_cast<T>(lo + 51)}),
          makeNullableFlatVector<int64_t>(
              {std::nullopt, 1, 2, 3, std::nullopt, 1, 3}),
-         makeFlatVector<int64_t>(7, [](auto) { return 0; })});
+         makeFlatVector<int64_t>(7, folly::identity)});
     auto file = TempFilePath::create();
     writeToFile(file->getPath(), input);
     auto properties = std::make_shared<config::ConfigBase>(
@@ -3764,15 +3971,17 @@ TEST_F(TableScanTest, exactDynamicFilterUsesInputType) {
           }
           source->addDynamicFilter(
               3,
-              makeRowGroupOnlyFilter(
+              makeAdvisoryFilter(
                   std::make_unique<common::BigintRange>(0, 2, false)));
           source->addSplit(makeCudfHiveConnectorSplit(file->getPath()));
-          // Late pruning bounds must not become a row predicate, including
-          // when another column requires the MultiRange AST path.
+          // An advisory filter that arrives after the split was prepared
+          // filters rows like the others, also next to a filter that is
+          // evaluated on the host: it drops the first row, which the other
+          // filters keep when they allow nulls.
           source->addDynamicFilter(
               3,
-              makeRowGroupOnlyFilter(
-                  std::make_unique<common::BigintRange>(1, 2, false)));
+              makeAdvisoryFilter(
+                  std::make_unique<common::BigintRange>(1, 6, false)));
           if (lateRange) {
             // A prepared reader still owns the old, wider Range snapshot.
             source->addDynamicFilter(
@@ -3794,24 +4003,24 @@ TEST_F(TableScanTest, exactDynamicFilterUsesInputType) {
                     cudf::get_current_device_resource_ref()));
             gpu->stream().sync();
           }
+          // Without the advisory filter the first row of the file, whose
+          // c2 is null, would be returned too when nulls are allowed.
           const T second = lateRange ? 0 : hi;
           const T secondC1 = lo + (lateRange ? 20 : 40);
           const int64_t secondC2 = lateRange ? 1 : 3;
+          const int64_t secondC3 = lateRange ? 1 : 3;
           auto expected = makeRowVector(
               {"c0", "c1", "c2", "c3"},
-              {nullAllowed
-                   ? makeNullableFlatVector<T>({lo, second, std::nullopt})
-                   : makeNullableFlatVector<T>({second}),
-               nullAllowed ? makeFlatVector<T>(
-                                 {static_cast<T>(lo + 10),
-                                  secondC1,
-                                  static_cast<T>(lo + 50)})
-                           : makeFlatVector<T>({secondC1}),
-               nullAllowed ? makeNullableFlatVector<int64_t>(
-                                 {std::nullopt, secondC2, std::nullopt})
-                           : makeNullableFlatVector<int64_t>({secondC2}),
-               makeFlatVector<int64_t>(
-                   nullAllowed ? 3 : 1, [](auto) { return 0; })});
+              {nullAllowed ? makeNullableFlatVector<T>({second, std::nullopt})
+                           : makeNullableFlatVector<T>({second}),
+               nullAllowed
+                   ? makeFlatVector<T>({secondC1, static_cast<T>(lo + 50)})
+                   : makeFlatVector<T>({secondC1}),
+               nullAllowed
+                   ? makeNullableFlatVector<int64_t>({secondC2, std::nullopt})
+                   : makeNullableFlatVector<int64_t>({secondC2}),
+               nullAllowed ? makeFlatVector<int64_t>({secondC3, 4})
+                           : makeFlatVector<int64_t>({secondC3})});
           ::facebook::velox::exec::test::assertEqualResults({expected}, actual);
         }
       }
@@ -3821,6 +4030,568 @@ TEST_F(TableScanTest, exactDynamicFilterUsesInputType) {
   check.template operator()<int16_t>();
   check.template operator()<int32_t>();
   check.template operator()<int64_t>();
+}
+
+// A scan applies a dynamic filter of any kind to every row, as a join that
+// was replaced by its filter and a filter that comes from another task need
+// it to: the rows it returns are those a CPU reader's test of the filter
+// keeps.
+TEST_F(TableScanTest, dynamicFilterKinds) {
+  constexpr vector_size_t kNumRows{1'000};
+  auto rowType = ROW(
+      {{"c0", BIGINT()},
+       {"c1", DATE()},
+       {"c2", SMALLINT()},
+       {"c3", VARCHAR()},
+       {"c4", DOUBLE()},
+       {"c5", DECIMAL(10, 2)}});
+  auto input = makeRowVector(
+      rowType->names(),
+      {makeFlatVector<int64_t>(
+           kNumRows, [](auto row) { return row * 3; }, nullEvery(7)),
+       makeFlatVector<int32_t>(
+           kNumRows,
+           [](auto row) { return 10'000 + row; },
+           nullEvery(11),
+           DATE()),
+       makeFlatVector<int16_t>(
+           kNumRows, [](auto row) { return row % 50 - 25; }, nullEvery(13)),
+       makeFlatVector<std::string>(
+           kNumRows,
+           [](auto row) { return fmt::format("s{}", row % 40); },
+           nullEvery(5)),
+       makeFlatVector<double>(
+           kNumRows, [](auto row) { return row * 0.5; }, nullEvery(17)),
+       makeFlatVector<int64_t>(
+           kNumRows,
+           [](auto row) { return row * 7; },
+           nullEvery(19),
+           DECIMAL(10, 2))});
+  auto file = TempFilePath::create();
+  writeToFile(file->getPath(), input);
+
+  auto properties = std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{});
+  ::facebook::velox::connector::ConnectorQueryCtx ctx(
+      pool_.get(),
+      pool_.get(),
+      properties.get(),
+      nullptr,
+      common::PrefixSortConfig{},
+      nullptr,
+      nullptr,
+      "query",
+      "task",
+      "scan",
+      0,
+      "");
+  auto connector = ::facebook::velox::connector::ConnectorRegistry::tryGet(
+      kCudfHiveConnectorId);
+
+  // Reads the file with 'filter' on 'channel' and expects exactly the rows
+  // the filter passes.
+  const auto check = [&](column_index_t channel,
+                         const common::FilterPtr& filter) {
+    SCOPED_TRACE(fmt::format("channel {}: {}", channel, filter->toString()));
+    auto source = connector->createDataSource(
+        rowType,
+        makeTableHandle("t", rowType),
+        HiveConnectorTestBase::allRegularColumns(rowType),
+        &ctx);
+    source->addDynamicFilter(channel, filter);
+    source->addSplit(makeCudfHiveConnectorSplit(file->getPath()));
+    const auto actual = readSplit(*source, rowType, pool_.get());
+
+    DecodedVector decoded(*input->childAt(channel));
+    std::vector<vector_size_t> passing;
+    for (vector_size_t row = 0; row < kNumRows; ++row) {
+      bool passes;
+      if (decoded.isNullAt(row)) {
+        passes = filter->testNull();
+      } else {
+        switch (rowType->childAt(channel)->kind()) {
+          case TypeKind::BIGINT:
+            passes = filter->testInt64(decoded.valueAt<int64_t>(row));
+            break;
+          case TypeKind::INTEGER:
+            passes = filter->testInt64(decoded.valueAt<int32_t>(row));
+            break;
+          case TypeKind::SMALLINT:
+            passes = filter->testInt64(decoded.valueAt<int16_t>(row));
+            break;
+          case TypeKind::VARCHAR:
+            passes = filter->testStringView(decoded.valueAt<StringView>(row));
+            break;
+          case TypeKind::DOUBLE:
+            passes = filter->testDouble(decoded.valueAt<double>(row));
+            break;
+          default:
+            VELOX_UNREACHABLE();
+        }
+      }
+      if (passes) {
+        passing.push_back(row);
+      }
+    }
+    auto indices = makeIndices(passing);
+    std::vector<VectorPtr> expectedColumns;
+    for (const auto& column : input->children()) {
+      expectedColumns.push_back(wrapInDictionary(indices, column));
+    }
+    auto expected = makeRowVector(rowType->names(), expectedColumns);
+    ::facebook::velox::exec::test::assertEqualResults({expected}, actual);
+    EXPECT_EQ(numRows(actual), passing.size());
+  };
+
+  const auto multiRange = [](bool nullAllowed) {
+    std::vector<std::unique_ptr<common::BigintRange>> ranges;
+    ranges.push_back(std::make_unique<common::BigintRange>(30, 60, false));
+    ranges.push_back(
+        std::make_unique<common::BigintRange>(2'700, 2'760, false));
+    return std::make_shared<common::BigintMultiRange>(
+        std::move(ranges), nullAllowed);
+  };
+  const auto bloomFilter = [](const std::vector<int64_t>& values) {
+    auto filter =
+        std::make_shared<common::BigintValuesUsingBloomFilter>(1'000, false);
+    for (const auto value : values) {
+      filter->insert(value);
+    }
+    return filter;
+  };
+
+  // BIGINT column.
+  check(0, std::make_shared<common::BigintRange>(300, 600, false));
+  check(0, std::make_shared<common::BigintRange>(300, 600, true));
+  check(0, common::createBigintValues({3, 9, 12, 2'997}, false));
+  check(0, common::createBigintValues({3, 1'000'000'002}, true));
+  check(0, multiRange(false));
+  check(0, multiRange(true));
+  check(0, bloomFilter({3, 1'500, 2'997}));
+  check(0, std::make_shared<common::NegatedBigintRange>(30, 2'900, false));
+  check(0, std::make_shared<common::IsNull>());
+  check(0, std::make_shared<common::IsNotNull>());
+  check(0, std::make_shared<common::AlwaysFalse>());
+  // DATE column: the filter holds days.
+  check(1, std::make_shared<common::BigintRange>(10'100, 10'110, false));
+  check(1, common::createBigintValues({10'001, 10'500, 10'998}, false));
+  check(1, common::createBigintValues({10'001, 10'002, 10'004}, true));
+  check(1, bloomFilter({10'001, 10'777}));
+  check(1, std::make_shared<common::AlwaysFalse>());
+  // SMALLINT column: a value outside of the type matches no row.
+  check(2, std::make_shared<common::BigintRange>(-5, 100'000, false));
+  check(2, common::createBigintValues({-25, 0, 24, 100'000}, false));
+  check(2, bloomFilter({-25, 24}));
+  // VARCHAR column.
+  check(
+      3,
+      std::make_shared<common::BytesValues>(
+          std::vector<std::string>{"s1", "s17", "absent"}, false));
+  check(
+      3,
+      std::make_shared<common::BytesValues>(
+          std::vector<std::string>{"s39"}, true));
+  check(
+      3,
+      std::make_shared<common::BytesRange>(
+          "s10", false, false, "s19", false, true, false));
+  check(3, std::make_shared<common::IsNull>());
+  check(3, std::make_shared<common::IsNotNull>());
+  check(3, std::make_shared<common::AlwaysFalse>());
+  // DOUBLE column.
+  check(
+      4,
+      std::make_shared<common::DoubleRange>(
+          10.0, false, true, 20.5, false, false, false));
+  check(4, std::make_shared<common::IsNull>());
+  // DECIMAL column read as 64-bit integers: the filter holds unscaled
+  // values.
+  check(5, std::make_shared<common::BigintRange>(700, 1'400, false));
+  check(5, common::createBigintValues({7, 70, 6'993}, true));
+  check(5, bloomFilter({14, 21}));
+}
+
+// A filter is read with the test of the column's type: a filter of a kind
+// without that test, and a file that stores the column in another type than
+// the table's, fail the query instead of returning wrong rows.
+TEST_F(TableScanTest, dynamicFilterOnMismatchedType) {
+  auto properties = std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{});
+  ::facebook::velox::connector::ConnectorQueryCtx ctx(
+      pool_.get(),
+      pool_.get(),
+      properties.get(),
+      nullptr,
+      common::PrefixSortConfig{},
+      nullptr,
+      nullptr,
+      "query",
+      "task",
+      "scan",
+      0,
+      "");
+  auto connector = ::facebook::velox::connector::ConnectorRegistry::tryGet(
+      kCudfHiveConnectorId);
+  const auto makeSource = [&](const RowTypePtr& tableType) {
+    return connector->createDataSource(
+        tableType,
+        makeTableHandle("t", tableType),
+        HiveConnectorTestBase::allRegularColumns(tableType),
+        &ctx);
+  };
+
+  {
+    // The file stores REAL, the table says DOUBLE.
+    auto file = TempFilePath::create();
+    writeToFile(
+        file->getPath(),
+        makeRowVector({"c0"}, {makeFlatVector<float>({1.5, 12.5, 30.0})}));
+    auto source = makeSource(ROW("c0", DOUBLE()));
+    source->addDynamicFilter(
+        0,
+        std::make_shared<common::DoubleRange>(
+            10.0, false, false, 20.5, false, false, false));
+    source->addSplit(makeCudfHiveConnectorSplit(file->getPath()));
+    VELOX_ASSERT_THROW(
+        countSplitRows(*source),
+        "cuDF Hive scan cannot apply a dynamic filter to the type the file stores column c0 in");
+  }
+  {
+    // A filter on strings sent to an integer column.
+    auto file = TempFilePath::create();
+    writeToFile(
+        file->getPath(),
+        makeRowVector({"c0"}, {makeFlatVector<int64_t>({1, 2, 3})}));
+    auto source = makeSource(ROW("c0", BIGINT()));
+    source->addDynamicFilter(
+        0,
+        std::make_shared<common::BytesValues>(
+            std::vector<std::string>{"1"}, false));
+    source->addSplit(makeCudfHiveConnectorSplit(file->getPath()));
+    VELOX_ASSERT_THROW(countSplitRows(*source), "testInt64() is not supported");
+  }
+  {
+    // The files of one scan store a BIGINT column as INT64 and as INT32. The
+    // values are too far apart for a bitmap, so the scan probes a hash set,
+    // whose keys have the width of the file's column.
+    auto wideFile = TempFilePath::create();
+    writeToFile(
+        wideFile->getPath(),
+        makeRowVector(
+            {"c0"}, {makeFlatVector<int64_t>({5, 7, 1'000'000'000})}));
+    auto narrowFile = TempFilePath::create();
+    writeToFile(
+        narrowFile->getPath(),
+        makeRowVector({"c0"}, {makeFlatVector<int32_t>({5, 6, 9})}));
+    auto filter = common::createBigintValues({5, 9, 1'000'000'000}, false);
+    ASSERT_EQ(filter->kind(), common::FilterKind::kBigintValuesUsingHashTable);
+    auto source = makeSource(ROW("c0", BIGINT()));
+    source->addDynamicFilter(0, std::move(filter));
+    for (auto i = 0; i < 2; ++i) {
+      source->addSplit(makeCudfHiveConnectorSplit(wideFile->getPath()));
+      EXPECT_EQ(countSplitRows(*source), 2);
+      source->addSplit(makeCudfHiveConnectorSplit(narrowFile->getPath()));
+      EXPECT_EQ(countSplitRows(*source), 2);
+    }
+  }
+}
+
+// A filter that arrives between two batches of a split applies from the next
+// batch on.
+TEST_F(TableScanTest, dynamicFilterBetweenBatches) {
+  constexpr vector_size_t kNumRows{50'000};
+  auto rowType = ROW({"c0", "c1"}, BIGINT());
+  std::vector<RowVectorPtr> vectors;
+  for (auto i = 0; i < 5; ++i) {
+    vectors.push_back(makeRowVector(
+        {"c0", "c1"},
+        {makeFlatVector<int64_t>(
+             kNumRows / 5, [i](auto row) { return i * (kNumRows / 5) + row; }),
+         makeFlatVector<int64_t>(kNumRows / 5, folly::identity)}));
+  }
+  auto file = TempFilePath::create();
+  writeToFile(file->getPath(), vectors);
+
+  // Small read limits make the reader return the split in several batches.
+  auto properties = std::make_shared<
+      config::ConfigBase>(std::unordered_map<std::string, std::string>{
+      {cudf_velox::connector::hive::CudfHiveConfig::kMaxChunkReadLimitSession,
+       "8192"},
+      {cudf_velox::connector::hive::CudfHiveConfig::kMaxPassReadLimitSession,
+       "32768"}});
+  ::facebook::velox::connector::ConnectorQueryCtx ctx(
+      pool_.get(),
+      pool_.get(),
+      properties.get(),
+      nullptr,
+      common::PrefixSortConfig{},
+      nullptr,
+      nullptr,
+      "query",
+      "task",
+      "scan",
+      0,
+      "");
+  auto connector = ::facebook::velox::connector::ConnectorRegistry::tryGet(
+      kCudfHiveConnectorId);
+  auto source = connector->createDataSource(
+      rowType,
+      makeTableHandle("t", rowType),
+      HiveConnectorTestBase::allRegularColumns(rowType),
+      &ctx);
+  source->addSplit(makeCudfHiveConnectorSplit(file->getPath()));
+
+  ContinueFuture future;
+  auto first = source->next(1'000, future);
+  ASSERT_TRUE(first.has_value());
+  ASSERT_NE(*first, nullptr);
+  const auto numFirstRows = (*first)->size();
+  ASSERT_GT(numFirstRows, 0);
+  ASSERT_LT(numFirstRows, kNumRows);
+
+  // Every 1000th value of c0, which the file holds in ascending order.
+  std::vector<int64_t> values;
+  for (int64_t value = 0; value < kNumRows; value += 1'000) {
+    values.push_back(value);
+  }
+  source->addDynamicFilter(0, common::createBigintValues(values, false));
+  const auto numValuesLeft =
+      std::count_if(values.begin(), values.end(), [&](auto value) {
+        return value >= numFirstRows;
+      });
+  EXPECT_EQ(countSplitRows(*source), numValuesLeft);
+}
+
+// A reader that filters before it decodes the payload asks the data source to
+// narrow its own row mask.
+TEST_F(TableScanTest, intersectDynamicFilters) {
+  using cudf_velox::connector::hive::CudfHiveDataSource;
+  auto rowType = ROW({"c0", "c1"}, BIGINT());
+  auto properties = std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{});
+  ::facebook::velox::connector::ConnectorQueryCtx ctx(
+      pool_.get(),
+      pool_.get(),
+      properties.get(),
+      nullptr,
+      common::PrefixSortConfig{},
+      nullptr,
+      nullptr,
+      "query",
+      "task",
+      "scan",
+      0,
+      "");
+  auto connector = ::facebook::velox::connector::ConnectorRegistry::tryGet(
+      kCudfHiveConnectorId);
+  auto source = connector->createDataSource(
+      rowType,
+      makeTableHandle("t", rowType),
+      HiveConnectorTestBase::allRegularColumns(rowType),
+      &ctx);
+  auto* cudfSource = checkedPointerCast<CudfHiveDataSource>(source.get());
+
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  auto data = makeRowVector(
+      {"c0", "c1", "mask"},
+      {makeFlatVector<int64_t>({1, 2, 3, 4, 5, 6}),
+       makeFlatVector<int64_t>({10, 20, 30, 40, 50, 60}),
+       makeFlatVector<bool>({false, true, true, true, true, true})});
+  auto table = with_arrow::toCudfTable(data, pool_.get(), stream, mr);
+  const auto readColumn = [&](size_t index) {
+    return table->get_column(index).view();
+  };
+  const auto toHost = [&](const cudf::column_view& mask) {
+    auto rows = with_arrow::toVeloxColumn(
+        cudf::table_view{{mask}},
+        pool_.get(),
+        ROW("mask", BOOLEAN()),
+        stream,
+        mr);
+    stream.sync();
+    std::vector<bool> values;
+    auto* flat = rows->childAt(0)->asFlatVector<bool>();
+    for (vector_size_t row = 0; row < flat->size(); ++row) {
+      values.push_back(flat->valueAt(row));
+    }
+    return values;
+  };
+
+  // Without a dynamic filter the mask stays as it is.
+  std::unique_ptr<cudf::column> mask;
+  EXPECT_FALSE(
+      cudfSource->intersectDynamicFilters(readColumn, 6, mask, stream));
+  EXPECT_EQ(mask, nullptr);
+  EXPECT_TRUE(cudfSource->dynamicFilterColumns().empty());
+  const auto version = cudfSource->dynamicFilterVersion();
+
+  // A range on c0, tested on the device, and a Bloom filter on c1, tested on
+  // the host.
+  source->addDynamicFilter(
+      0, std::make_shared<common::BigintRange>(2, 5, false));
+  auto bloomFilter =
+      std::make_shared<common::BigintValuesUsingBloomFilter>(1'000, false);
+  bloomFilter->insert(10);
+  bloomFilter->insert(30);
+  bloomFilter->insert(50);
+  source->addDynamicFilter(1, bloomFilter);
+  EXPECT_GT(cudfSource->dynamicFilterVersion(), version);
+  EXPECT_THAT(cudfSource->dynamicFilterColumns(), testing::ElementsAre(0, 1));
+  const auto bounds = cudfSource->dynamicFilterBounds();
+  ASSERT_EQ(bounds.size(), 1);
+  EXPECT_EQ(bounds[0].readColumn, 0);
+  EXPECT_EQ(bounds[0].lower, 2);
+  EXPECT_EQ(bounds[0].upper, 5);
+  EXPECT_FALSE(bounds[0].nullAllowed);
+
+  // The mask is created: rows 3 and 5 pass both filters.
+  EXPECT_TRUE(cudfSource->intersectDynamicFilters(readColumn, 6, mask, stream));
+  EXPECT_THAT(
+      toHost(mask->view()),
+      testing::ElementsAre(false, false, true, false, true, false));
+
+  // A mask of the caller is narrowed: its first row stays rejected.
+  mask = std::make_unique<cudf::column>(table->get_column(2), stream, mr);
+  source->addDynamicFilter(
+      0, std::make_shared<common::BigintRange>(1, 3, false));
+  EXPECT_TRUE(cudfSource->intersectDynamicFilters(readColumn, 6, mask, stream));
+  EXPECT_THAT(
+      toHost(mask->view()),
+      testing::ElementsAre(false, false, true, false, false, false));
+
+  cudfSource->recordDynamicFilterRows(6, 1);
+  EXPECT_EQ(source->getRuntimeStats().at("dynamicFilterDroppedRows").sum, 5);
+}
+
+// A scan drops rows for an advisory filter only while that removes enough of
+// them, and never when the row filter is switched off.
+TEST_F(TableScanTest, advisoryFilterRows) {
+  using cudf_velox::connector::hive::makeAdvisoryFilter;
+  constexpr vector_size_t kNumRows{150'000};
+  auto rowType = ROW("c0", BIGINT());
+  auto input = makeRowVector(
+      {"c0"}, {makeFlatVector<int64_t>(kNumRows, folly::identity)});
+  auto file = TempFilePath::create();
+  writeToFile(file->getPath(), input);
+
+  auto properties = std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{});
+  ::facebook::velox::connector::ConnectorQueryCtx ctx(
+      pool_.get(),
+      pool_.get(),
+      properties.get(),
+      nullptr,
+      common::PrefixSortConfig{},
+      nullptr,
+      nullptr,
+      "query",
+      "task",
+      "scan",
+      0,
+      "");
+  auto connector = ::facebook::velox::connector::ConnectorRegistry::tryGet(
+      kCudfHiveConnectorId);
+
+  // Returns the rows of two splits of the file read after 'filter' arrived.
+  const auto readTwoSplits = [&](const common::FilterPtr& filter) {
+    auto source = connector->createDataSource(
+        rowType,
+        makeTableHandle("t", rowType),
+        HiveConnectorTestBase::allRegularColumns(rowType),
+        &ctx);
+    source->addDynamicFilter(0, filter);
+    std::vector<vector_size_t> rows;
+    for (auto i = 0; i < 2; ++i) {
+      source->addSplit(makeCudfHiveConnectorSplit(file->getPath()));
+      rows.push_back(numRows(readSplit(*source, rowType, pool_.get())));
+    }
+    return rows;
+  };
+  const auto range = [&](int64_t upper, bool advisory) -> common::FilterPtr {
+    auto filter = std::make_unique<common::BigintRange>(0, upper, false);
+    if (advisory) {
+      return makeAdvisoryFilter(std::move(filter));
+    }
+    return filter;
+  };
+
+  // A selective advisory filter keeps filtering.
+  EXPECT_THAT(
+      readTwoSplits(range(14'999, true)), testing::ElementsAre(15'000, 15'000));
+  // One that keeps 90% of the first split stops: the join that sent it drops
+  // the rest.
+  EXPECT_THAT(
+      readTwoSplits(range(134'999, true)),
+      testing::ElementsAre(135'000, kNumRows));
+  // The same filter without the mark is applied to every row.
+  EXPECT_THAT(
+      readTwoSplits(range(134'999, false)),
+      testing::ElementsAre(135'000, 135'000));
+
+  auto& config = CudfConfig::getInstance();
+  const auto rowFilterEnabled = config.dynamicFilterRowFilterEnabled;
+  config.dynamicFilterRowFilterEnabled = false;
+  SCOPE_EXIT {
+    config.dynamicFilterRowFilterEnabled = rowFilterEnabled;
+  };
+  EXPECT_THAT(
+      readTwoSplits(range(14'999, true)),
+      testing::ElementsAre(kNumRows, kNumRows));
+  EXPECT_THAT(
+      readTwoSplits(range(14'999, false)),
+      testing::ElementsAre(15'000, 15'000));
+}
+
+// A dynamic filter on a partition key decides for whole splits: those to
+// come and the one being read.
+TEST_F(TableScanTest, dynamicFilterOnPartitionKey) {
+  auto fileType = ROW("c0", BIGINT());
+  auto input = makeRowVector({"c0"}, {makeFlatVector<int64_t>({1, 2, 3})});
+  auto file = TempFilePath::create();
+  writeToFile(file->getPath(), input);
+  auto outputType = ROW({{"pk", BIGINT()}, {"c0", BIGINT()}});
+  const facebook::velox::connector::ColumnHandleMap assignments = {
+      {"pk", HiveConnectorTestBase::partitionKey("pk", BIGINT())},
+      {"c0", HiveConnectorTestBase::regularColumn("c0", BIGINT())}};
+
+  auto properties = std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{});
+  ::facebook::velox::connector::ConnectorQueryCtx ctx(
+      pool_.get(),
+      pool_.get(),
+      properties.get(),
+      nullptr,
+      common::PrefixSortConfig{},
+      nullptr,
+      nullptr,
+      "query",
+      "task",
+      "scan",
+      0,
+      "");
+  auto connector = ::facebook::velox::connector::ConnectorRegistry::tryGet(
+      kCudfHiveConnectorId);
+  auto source = connector->createDataSource(
+      outputType, makeTableHandle("t", fileType), assignments, &ctx);
+  const auto readPartition = [&](const std::string& value) {
+    source->addSplit(makePartitionedSplit(file->getPath(), {{"pk", value}}));
+    return numRows(readSplit(*source, outputType, pool_.get()));
+  };
+
+  EXPECT_EQ(readPartition("7"), 3);
+  source->addDynamicFilter(
+      0, std::make_shared<common::BigintRange>(8, 9, false));
+  EXPECT_EQ(readPartition("7"), 0);
+  EXPECT_EQ(readPartition("8"), 3);
+
+  // The filter arrives while a split it rejects is being read.
+  source->addSplit(makePartitionedSplit(file->getPath(), {{"pk", "9"}}));
+  source->addDynamicFilter(
+      0, std::make_shared<common::BigintRange>(8, 8, false));
+  EXPECT_EQ(numRows(readSplit(*source, outputType, pool_.get())), 0);
+  EXPECT_EQ(readPartition("8"), 3);
+  EXPECT_EQ(source->getRuntimeStats().at("skippedSplits").sum, 2);
 }
 
 TEST_F(TableScanTest, rejectsDynamicFiltersItCannotApply) {
@@ -3894,7 +4665,10 @@ TEST_F(TableScanTest, rejectsDynamicFiltersItCannotApply) {
     checkJoin(DECIMAL(18, 2), false, nullptr);
   }
   checkJoin(DECIMAL(18, 2), true, nullptr);
-  checkJoin(BIGINT(), true, "column type does not match dynamic filter type");
+  checkJoin(
+      BIGINT(),
+      true,
+      "cuDF Hive scan cannot apply a dynamic filter to the type the file stores column c0 in");
 }
 
 TEST_F(TableScanTest, exactDynamicFilterCanReplaceInnerJoin) {
@@ -4002,7 +4776,7 @@ TEST_F(TableScanTest, exactDynamicFilterCanReplaceInnerJoin) {
   }
 }
 
-TEST_F(TableScanTest, rowGroupFilterKeepsFullJoin) {
+TEST_F(TableScanTest, advisoryFilterKeepsJoin) {
   auto probe = makeRowVector(
       {"p_key"}, {makeNullableFlatVector<int64_t>({1, 2, 3, std::nullopt})});
   auto build = makeRowVector(
@@ -4071,11 +4845,63 @@ TEST_F(TableScanTest, rowGroupFilterKeepsFullJoin) {
                     mode == 1 || mode == 3 ? " WHERE u.b_key=1" : ""));
     const auto stats = toPlanStats(task->taskStats());
     EXPECT_GT(stats.at(joinId).customStats.at("dynamicFiltersProduced").sum, 0);
-    EXPECT_EQ(stats.at(scanId).outputRows, probeOnly ? 2 : 4);
+    // The scan drops the rows without a build key also when the join remains
+    // to return build columns.
+    EXPECT_EQ(stats.at(scanId).outputRows, mode == 1 || mode == 3 ? 1 : 2);
+    EXPECT_EQ(
+        stats.at(joinId).customStats.count("replacedWithDynamicFilterRows"),
+        probeOnly ? 1 : 0);
   }
 }
 
-TEST_F(TableScanTest, rowGroupFilterMergesWithExactFilter) {
+// The scan's own filter and a join's filter on the same column both apply.
+TEST_F(TableScanTest, dynamicFilterWithStaticFilterOnSameColumn) {
+  auto rowType = ROW("c0", BIGINT());
+  auto probe =
+      makeRowVector({"c0"}, {makeFlatVector<int64_t>(1'000, folly::identity)});
+  auto build = makeRowVector({"b"}, {makeFlatVector<int64_t>({100, 600, 700})});
+  auto file = TempFilePath::create();
+  writeToFile(file->getPath(), probe);
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+
+  common::SubfieldFilters filters;
+  filters.emplace(
+      common::Subfield("c0"),
+      std::make_shared<common::BigintRange>(
+          500, std::numeric_limits<int64_t>::max(), false));
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto buildPlan = PlanBuilder(ids, pool_.get()).values({build}).planNode();
+  core::PlanNodeId scanId;
+  core::PlanNodeId joinId;
+  auto plan =
+      PlanBuilder(ids, pool_.get())
+          .startTableScan()
+          .connectorId(kCudfHiveConnectorId)
+          .tableHandle(makeTableHandle("t", rowType, std::move(filters)))
+          .outputType(rowType)
+          .assignments(HiveConnectorTestBase::allRegularColumns(rowType))
+          .endTableScan()
+          .capturePlanNodeId(scanId)
+          .hashJoin(
+              {"c0"}, {"b"}, buildPlan, "", {"c0"}, core::JoinType::kInner)
+          .capturePlanNodeId(joinId)
+          .planNode();
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                  .maxDrivers(1)
+                  .splits(scanId, makeCudfHiveConnectorSplits({file}))
+                  .assertResults(
+                      "SELECT t.c0 FROM t JOIN u ON t.c0 = u.b "
+                      "WHERE t.c0 >= 500");
+  const auto stats = toPlanStats(task->taskStats());
+  EXPECT_EQ(stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 1);
+  // 600 and 700: the build key 100 fails the scan's own filter.
+  EXPECT_EQ(stats.at(scanId).outputRows, 2);
+  EXPECT_EQ(
+      stats.at(joinId).customStats.at("replacedWithDynamicFilterRows").sum, 2);
+}
+
+TEST_F(TableScanTest, advisoryFilterMergesWithExactFilter) {
   auto rowType = ROW("c0", BIGINT());
   auto probe = makeRowVector(
       {"c0"}, {makeNullableFlatVector<int64_t>({1, 2, 3, std::nullopt})});
@@ -4153,9 +4979,7 @@ TEST_F(TableScanTest, dynamicFilterStopsAtCpuScanConversion) {
           std::unordered_map<std::string, std::string>{}),
       ioExecutor_.get());
   ConnectorRegistry::global().insert(cpuConnectorId, cpuConnector);
-  parquet::registerParquetReaderFactory();
   SCOPE_EXIT {
-    parquet::unregisterParquetReaderFactory();
     ConnectorRegistry::global().erase(cpuConnectorId);
   };
 

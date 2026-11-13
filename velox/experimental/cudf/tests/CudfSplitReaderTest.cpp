@@ -284,6 +284,7 @@ TEST_F(CudfSplitReaderTest, timestampTypeFollowsSession) {
             /*fetchAheadContext=*/nullptr,
             std::make_shared<io::IoStatistics>(),
             std::make_shared<IoStats>(),
+            nullptr,
             nullptr);
         dwio::common::RuntimeStats runtimeStats;
         reader.prepareSplit(runtimeStats);

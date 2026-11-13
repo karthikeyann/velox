@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfDynamicFilter.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
@@ -45,12 +46,19 @@
 #include "velox/expression/ExprOptimizer.h"
 #include "velox/functions/lib/string/StringImpl.h"
 #include "velox/type/Filter.h"
+#include "velox/vector/DecodedVector.h"
 
+#include <cudf/aggregation.hpp>
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <algorithm>
@@ -381,22 +389,185 @@ std::optional<std::string> unsupportedFiltersReason(
   return std::nullopt;
 }
 
-// Carry the mode through Driver's shared ownership. A cloned or merged Filter
-// gets an ordinary owner, which conservatively restores full row filtering.
-struct RowGroupOnlyDeleter {
+// Carries the advisory mark in the owner of the filter, so that it follows
+// shared copies and is absent from a clone or a merge.
+struct AdvisoryFilterDeleter {
+  // See makeAdvisoryFilter().
+  std::shared_ptr<const cudf::column> deviceBitmap;
+
   void operator()(common::Filter* filter) const {
     delete filter;
   }
 };
-} // namespace
 
-common::FilterPtr makeRowGroupOnlyFilter(
-    std::unique_ptr<common::Filter> filter) {
-  return {filter.release(), RowGroupOnlyDeleter{}};
+// Whether the scan reads a column of 'type' as signed integers a dynamic
+// filter tests as 64-bit values: the integer types and DATE.
+bool hasIntegerStorage(const TypePtr& type) {
+  return type == TINYINT() || type == SMALLINT() || type == INTEGER() ||
+      type == BIGINT() || type->isDate();
 }
 
-bool isRowGroupOnlyFilter(const common::FilterPtr& filter) {
-  return std::get_deleter<RowGroupOnlyDeleter>(filter) != nullptr;
+// Views a DATE column as the INT32 days it stores.
+cudf::column_view integerStorageView(const cudf::column_view& column) {
+  if (column.type().id() != cudf::type_id::TIMESTAMP_DAYS) {
+    return column;
+  }
+  return cudf::column_view{
+      cudf::data_type{cudf::type_id::INT32},
+      column.size(),
+      column.head(),
+      column.null_mask(),
+      column.null_count(),
+      column.offset()};
+}
+
+// Clears the entries of 'pass' for the rows of the signed integer 'input'
+// that 'filter' rejects. Evaluates on the host, for the filters without a
+// device path.
+void intersectOnHost(
+    const cudf::column_view& input,
+    const common::Filter& filter,
+    std::vector<uint8_t>& pass,
+    cuda::stream_ref stream) {
+  std::vector<uint8_t> valid;
+  if (input.has_nulls()) {
+    const auto validColumn = cudf::is_valid(input, stream, get_temp_mr());
+    valid.resize(input.size());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        valid.data(),
+        validColumn->view().data<uint8_t>(),
+        valid.size(),
+        cudaMemcpyDeviceToHost,
+        stream.get()));
+    stream.sync();
+  }
+  cudf::type_dispatcher(input.type(), [&]<typename T>() {
+    if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
+      std::vector<T> values(input.size());
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          values.data(),
+          input.template data<T>(),
+          values.size() * sizeof(T),
+          cudaMemcpyDeviceToHost,
+          stream.get()));
+      stream.sync();
+      const bool nullAllowed = filter.testNull();
+      for (size_t i = 0; i < values.size(); ++i) {
+        if (pass[i] == 0) {
+          continue;
+        }
+        pass[i] = (!valid.empty() && valid[i] == 0)
+            ? nullAllowed
+            : filter.testInt64(values[i]);
+      }
+    } else {
+      VELOX_UNSUPPORTED("Dynamic filter requires a signed integer column");
+    }
+  });
+}
+
+// Tests the value of 'decoded' at 'row' with 'filter' the way a CPU reader
+// tests a value of that type.
+template <TypeKind kind>
+bool testValue(
+    const common::Filter& filter,
+    const DecodedVector& decoded,
+    vector_size_t row) {
+  return common::applyFilter(
+      filter, decoded.valueAt<typename TypeTraits<kind>::NativeType>(row));
+}
+
+// Clears the entries of 'pass' for the rows of 'column', of Velox type 'type',
+// that 'filter' rejects. Evaluates on the host over a copy of the column, for
+// the column types without a device path.
+void intersectOnHost(
+    const cudf::column_view& column,
+    const std::string& name,
+    const TypePtr& type,
+    const common::Filter& filter,
+    std::vector<uint8_t>& pass,
+    memory::MemoryPool* pool,
+    cuda::stream_ref stream) {
+  // The values are read below as the table's type, so the file has to store
+  // that type. A timestamp may be stored in any unit.
+  const auto tableType = veloxToCudfDataType(type);
+  VELOX_USER_CHECK(
+      column.type().id() == tableType.id() ||
+          (type->isTimestamp() && cudf::is_timestamp(column.type())),
+      "cuDF Hive scan cannot apply a dynamic filter to the type the file stores column {} in",
+      name);
+  const auto rows = with_arrow::toVeloxColumn(
+      cudf::table_view{{column}}, pool, ROW("c0", type), stream, get_temp_mr());
+  VELOX_CHECK(
+      rows->childAt(0)->type()->kindEquals(type),
+      "Unexpected type of the host copy of column {}: {}",
+      name,
+      rows->childAt(0)->type()->toString());
+  DecodedVector decoded(*rows->childAt(0));
+  const bool nullAllowed = filter.testNull();
+  for (vector_size_t row = 0; row < decoded.size(); ++row) {
+    if (pass[row] == 0) {
+      continue;
+    }
+    if (decoded.isNullAt(row)) {
+      pass[row] = nullAllowed;
+    } else if (type->isPrimitiveType()) {
+      pass[row] = VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
+          testValue, type->kind(), filter, decoded, row);
+    } else {
+      // Only the null tests are defined on a value that is not a scalar.
+      VELOX_USER_CHECK(
+          filter.kind() == common::FilterKind::kIsNull ||
+              filter.kind() == common::FilterKind::kIsNotNull ||
+              filter.kind() == common::FilterKind::kAlwaysTrue,
+          "Dynamic filter cannot be applied to a column of type {}: {}",
+          type->toString(),
+          filter.toString());
+      pass[row] = filter.kind() != common::FilterKind::kIsNull;
+    }
+  }
+}
+
+// Number of true rows of the non-nullable BOOL8 'mask'.
+int64_t countRetainedRows(
+    const cudf::column_view& mask,
+    cuda::stream_ref stream) {
+  const auto sum = cudf::reduce(
+      mask,
+      *cudf::make_sum_aggregation<cudf::reduce_aggregation>(),
+      cudf::data_type{cudf::type_id::INT64},
+      stream,
+      get_temp_mr());
+  return static_cast<const cudf::numeric_scalar<int64_t>&>(*sum).value(stream);
+}
+
+// Advisory filters stop filtering rows once they have kept more than this
+// share of at least 'kAdvisoryFilterMinRows' rows.
+constexpr double kAdvisoryFilterMaxKeptRatio{0.8};
+constexpr uint64_t kAdvisoryFilterMinRows{100'000};
+
+// Widest range of values, in 32-bit words, a value set is tested with a
+// bitmap for. A wider set is tested with a hash set.
+constexpr uint64_t kMaxBitmapWords{8'388'608};
+} // namespace
+
+common::FilterPtr makeAdvisoryFilter(
+    std::unique_ptr<common::Filter> filter,
+    std::shared_ptr<const cudf::column> deviceBitmap) {
+  VELOX_CHECK(
+      deviceBitmap == nullptr ||
+          filter->kind() == common::FilterKind::kBigintRange,
+      "Only a range carries a device bitmap");
+  return {filter.release(), AdvisoryFilterDeleter{std::move(deviceBitmap)}};
+}
+
+bool isAdvisoryFilter(const common::FilterPtr& filter) {
+  return std::get_deleter<AdvisoryFilterDeleter>(filter) != nullptr;
+}
+
+const cudf::column* advisoryFilterBitmap(const common::FilterPtr& filter) {
+  const auto* deleter = std::get_deleter<AdvisoryFilterDeleter>(filter);
+  return deleter != nullptr ? deleter->deviceBitmap.get() : nullptr;
 }
 
 bool CudfHiveDataSource::isSupported(
@@ -653,16 +824,15 @@ CudfHiveDataSource::CudfHiveDataSource(
 
 std::unique_ptr<CudfSplitReader> CudfHiveDataSource::createCudfSplitReader() {
   readerFiltersCurrent_ = true;
+  // The reader prunes row groups with the filters on integer columns as they
+  // are now.
   common::SubfieldFilters readerFilters;
-  for (const auto& [field, filter] : dynamicFilters_) {
-    readerFilters.emplace(field.clone(), filter);
-  }
-  // Exact set bounds provide a conservative filter for row-group statistics.
-  for (const auto& [channel, filter] : dynamicIntegerFilters_) {
-    readerFilters.emplace(
-        common::Subfield(readColumnNames_[channel]),
-        std::make_unique<common::BigintRange>(
-            filter.values.front(), filter.values.back(), filter.nullAllowed));
+  for (const auto& [index, dynamicFilter] : dynamicFilters_) {
+    if (hasIntegerStorage(columnType(readColumnNames_[index]))) {
+      readerFilters.emplace(
+          common::Subfield::create(readColumnNames_[index])->clone(),
+          dynamicFilter.filter);
+    }
   }
   return std::make_unique<CudfSplitReader>(
       split_,
@@ -730,6 +900,7 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   // Virtual method for class-specific conversion of the split
   convertSplit(split);
   partitionKeyScalars_.clear();
+  splitExhausted_ = false;
 
   // A partition key filter the split fails rejects every row of it, so open
   // nothing.
@@ -824,11 +995,15 @@ void CudfHiveDataSource::setFromDataSource(std::unique_ptr<DataSource> source) {
 
   split_ = std::move(preparedSource->split_);
   splitSkipped_ = preparedSource->splitSkipped_;
+  splitExhausted_ = false;
   runtimeStats_.skippedSplits += preparedSource->runtimeStats_.skippedSplits;
   runtimeStats_.processedSplits +=
       preparedSource->runtimeStats_.processedSplits;
   runtimeStats_.skippedSplitBytes +=
       preparedSource->runtimeStats_.skippedSplitBytes;
+  runtimeStats_.skippedStrides += preparedSource->runtimeStats_.skippedStrides;
+  runtimeStats_.processedStrides +=
+      preparedSource->runtimeStats_.processedStrides;
   completedBytes_ += preparedSource->completedBytes_;
   completedRows_ += preparedSource->completedRows_;
 
@@ -848,7 +1023,11 @@ void CudfHiveDataSource::setFromDataSource(std::unique_ptr<DataSource> source) {
 
   cudfSplitReader_ = std::move(preparedSource->cudfSplitReader_);
   partitionKeyScalars_ = std::move(preparedSource->partitionKeyScalars_);
+  // The split was prepared with the dynamic filters of that time.
   readerFiltersCurrent_ = false;
+  if (!splitSkipped_ && !partitionKeyFiltersAcceptSplit()) {
+    skipCurrentSplit();
+  }
 
   // A split a partition key filter rejected has no reader.
   if (!splitSkipped_) {
@@ -874,73 +1053,413 @@ void CudfHiveDataSource::addDynamicFilter(
     column_index_t outputChannel,
     const std::shared_ptr<common::Filter>& filter) {
   VELOX_CHECK_NOT_NULL(filter);
-  VELOX_CHECK_LT(outputChannel, outputType_->size());
+  VELOX_CHECK_LT(outputChannel, outputSourceNames_.size());
+  const auto& name = outputSourceNames_[outputChannel];
 
-  const auto& columnType = outputType_->childAt(outputChannel);
-  const bool isSupportedInteger = columnType == TINYINT() ||
-      columnType == SMALLINT() || columnType == INTEGER() ||
-      columnType == BIGINT();
-  const auto kind = filter->kind();
-  const bool isIntegerValues =
-      kind == common::FilterKind::kBigintValuesUsingHashTable ||
-      kind == common::FilterKind::kBigintValuesUsingBitmask;
-  auto field = common::Subfield::create(readColumnNames_[outputChannel]);
-
-  if (!isSupportedInteger) {
-    VELOX_UNSUPPORTED(
-        "cuDF Hive scan cannot apply a dynamic filter to column: {}",
-        readColumnNames_[outputChannel]);
-  }
-  if (isIntegerValues) {
-    std::vector<int64_t> values;
-    if (kind == common::FilterKind::kBigintValuesUsingHashTable) {
-      values =
-          static_cast<const common::BigintValuesUsingHashTable*>(filter.get())
-              ->values();
-    } else {
-      values =
-          static_cast<const common::BigintValuesUsingBitmask*>(filter.get())
-              ->values();
+  // The filter replaces the one the column had: the sender merges every
+  // filter of the column before sending.
+  if (partitionKeys_.contains(name)) {
+    dynamicPartitionKeyFilters_.insert_or_assign(
+        common::Subfield::create(name)->clone(), filter);
+    if (split_ != nullptr && !splitSkipped_ && !splitExhausted_ &&
+        !partitionKeyFiltersAcceptSplit()) {
+      skipCurrentSplit();
     }
-    dynamicIntegerFilters_.insert_or_assign(
-        outputChannel,
-        DynamicIntegerFilter{std::move(values), filter->testNull(), nullptr});
-    if (kind == common::FilterKind::kBigintValuesUsingBitmask) {
-      const auto& bitmask =
-          static_cast<const common::BigintValuesUsingBitmask&>(*filter);
-      auto& dynamicFilter = dynamicIntegerFilters_.at(outputChannel);
-      dynamicFilter.bitmapMinimum = bitmask.min();
-      const auto span = static_cast<uint64_t>(bitmask.max()) -
-          static_cast<uint64_t>(bitmask.min());
-      dynamicFilter.bitmap.resize(span / 32 + 1, 0);
-      for (auto value : dynamicFilter.values) {
-        const auto index =
-            static_cast<uint64_t>(value) - static_cast<uint64_t>(bitmask.min());
-        dynamicFilter.bitmap[index / 32] |= uint32_t{1} << (index % 32);
+    return;
+  }
+
+  const auto readIndex = static_cast<size_t>(std::distance(
+      readColumnNames_.begin(),
+      std::find(readColumnNames_.begin(), readColumnNames_.end(), name)));
+  VELOX_CHECK_LT(
+      readIndex,
+      readColumnNames_.size(),
+      "Dynamic filter is on a column the scan does not read: {}",
+      name);
+  // The sender repeats the filters that did not change when another column
+  // gets one.
+  if (const auto it = dynamicFilters_.find(readIndex);
+      it != dynamicFilters_.end() && it->second.filter == filter) {
+    return;
+  }
+  dynamicFilters_.insert_or_assign(readIndex, makeDynamicFilter(name, filter));
+  ++dynamicFilterVersion_;
+  readerFiltersCurrent_ = false;
+  // What the advisory filters kept so far says nothing about the new set.
+  advisoryFilterInputRows_ = 0;
+  advisoryFilterOutputRows_ = 0;
+  advisoryRowFilterDisabled_ = false;
+}
+
+CudfHiveDataSource::DynamicFilter CudfHiveDataSource::makeDynamicFilter(
+    const std::string& name,
+    const common::FilterPtr& filter) const {
+  DynamicFilter dynamicFilter;
+  dynamicFilter.filter = filter;
+  dynamicFilter.advisory = isAdvisoryFilter(filter);
+  if (filter->kind() == common::FilterKind::kAlwaysFalse) {
+    dynamicFilter.evaluation = DynamicFilterEvaluation::kAlwaysFalse;
+    return dynamicFilter;
+  }
+  if (!hasIntegerStorage(columnType(name))) {
+    dynamicFilter.evaluation = DynamicFilterEvaluation::kHost;
+    return dynamicFilter;
+  }
+  switch (filter->kind()) {
+    case common::FilterKind::kBigintRange:
+      dynamicFilter.evaluation = advisoryFilterBitmap(filter) != nullptr
+          ? DynamicFilterEvaluation::kDeviceBitmap
+          : DynamicFilterEvaluation::kRange;
+      break;
+    case common::FilterKind::kBigintValuesUsingHashTable:
+      dynamicFilter.evaluation = DynamicFilterEvaluation::kValues;
+      dynamicFilter.values =
+          static_cast<const common::BigintValuesUsingHashTable&>(*filter)
+              .values();
+      break;
+    case common::FilterKind::kBigintValuesUsingBitmask:
+      dynamicFilter.evaluation = DynamicFilterEvaluation::kValues;
+      dynamicFilter.values =
+          static_cast<const common::BigintValuesUsingBitmask&>(*filter)
+              .values();
+      break;
+    default:
+      dynamicFilter.evaluation = DynamicFilterEvaluation::kHost;
+      break;
+  }
+  if (dynamicFilter.evaluation == DynamicFilterEvaluation::kValues) {
+    std::sort(dynamicFilter.values.begin(), dynamicFilter.values.end());
+    if (dynamicFilter.values.empty()) {
+      dynamicFilter.evaluation = DynamicFilterEvaluation::kHost;
+    }
+  }
+  return dynamicFilter;
+}
+
+void CudfHiveDataSource::skipCurrentSplit() {
+  splitSkipped_ = true;
+  cudfSplitReader_.reset();
+  recordSkippedSplit();
+}
+
+void CudfHiveDataSource::uploadDynamicFilterValues(
+    DynamicFilter& dynamicFilter,
+    const cudf::column_view& input,
+    cuda::stream_ref stream) const {
+  dynamicFilter.hashSet.reset();
+  const auto& values = dynamicFilter.values;
+  const auto span = static_cast<uint64_t>(values.back()) -
+      static_cast<uint64_t>(values.front());
+  if (span / 32 < kMaxBitmapWords) {
+    std::vector<uint32_t> bitmap(span / 32 + 1, 0);
+    for (const auto value : values) {
+      const auto index =
+          static_cast<uint64_t>(value) - static_cast<uint64_t>(values.front());
+      bitmap[index / 32] |= uint32_t{1} << (index % 32);
+    }
+    dynamicFilter.bitmapMinimum = values.front();
+    dynamicFilter.deviceValues = cudf::make_fixed_width_column(
+        cudf::data_type{cudf::type_id::UINT32},
+        bitmap.size(),
+        cudf::mask_state::UNALLOCATED,
+        stream,
+        get_temp_mr());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        dynamicFilter.deviceValues->mutable_view().data<uint32_t>(),
+        bitmap.data(),
+        bitmap.size() * sizeof(uint32_t),
+        cudaMemcpyHostToDevice,
+        stream.get()));
+    // 'bitmap' has to outlive the copy.
+    stream.sync();
+    return;
+  }
+
+  dynamicFilter.deviceValues = cudf::type_dispatcher(
+      input.type(), [&]<typename T>() -> std::unique_ptr<cudf::column> {
+        if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
+          // A value outside of the column's type matches no row.
+          std::vector<T> typedValues;
+          typedValues.reserve(values.size());
+          for (const auto value : values) {
+            if (value >= std::numeric_limits<T>::min() &&
+                value <= std::numeric_limits<T>::max()) {
+              typedValues.push_back(static_cast<T>(value));
+            }
+          }
+          auto column = cudf::make_fixed_width_column(
+              input.type(),
+              typedValues.size(),
+              cudf::mask_state::UNALLOCATED,
+              stream,
+              get_temp_mr());
+          if (!typedValues.empty()) {
+            CUDF_CUDA_TRY(cudaMemcpyAsync(
+                column->mutable_view().template data<T>(),
+                typedValues.data(),
+                typedValues.size() * sizeof(T),
+                cudaMemcpyHostToDevice,
+                stream.get()));
+            // 'typedValues' has to outlive the copy.
+            stream.sync();
+          }
+          using Key =
+              std::conditional_t<(sizeof(T) < sizeof(int32_t)), int32_t, T>;
+          // The hash set needs a key that is not in it, also when the
+          // smallest key of the type is a value.
+          int64_t emptyKey = std::numeric_limits<Key>::min();
+          for (const auto value : typedValues) {
+            if (value < emptyKey) {
+              continue;
+            }
+            if (value != emptyKey) {
+              break;
+            }
+            ++emptyKey;
+          }
+          dynamicFilter.hashSet = std::make_unique<CudfIntegerHashSet>(
+              column->view(), emptyKey, stream, get_temp_mr());
+          dynamicFilter.hashSetType = input.type().id();
+          return column;
+        } else {
+          VELOX_UNSUPPORTED("Dynamic filter requires a signed integer column");
+        }
+      });
+}
+
+std::vector<CudfHiveDataSource::DynamicFilterBounds>
+CudfHiveDataSource::dynamicFilterBounds() const {
+  std::vector<DynamicFilterBounds> bounds;
+  for (const auto& [index, dynamicFilter] : dynamicFilters_) {
+    switch (dynamicFilter.evaluation) {
+      case DynamicFilterEvaluation::kRange:
+      case DynamicFilterEvaluation::kDeviceBitmap: {
+        const auto& range =
+            static_cast<const common::BigintRange&>(*dynamicFilter.filter);
+        bounds.push_back(
+            {index, range.lower(), range.upper(), range.testNull()});
+        break;
+      }
+      case DynamicFilterEvaluation::kValues:
+        bounds.push_back(
+            {index,
+             dynamicFilter.values.front(),
+             dynamicFilter.values.back(),
+             dynamicFilter.filter->testNull()});
+        break;
+      default:
+        break;
+    }
+  }
+  return bounds;
+}
+
+bool CudfHiveDataSource::appliesDynamicFilter(
+    const DynamicFilter& dynamicFilter) const {
+  return !dynamicFilter.advisory ||
+      (!advisoryRowFilterDisabled_ &&
+       CudfConfig::getInstance().dynamicFilterRowFilterEnabled);
+}
+
+std::vector<size_t> CudfHiveDataSource::dynamicFilterColumns() const {
+  std::vector<size_t> columns;
+  for (const auto& [index, dynamicFilter] : dynamicFilters_) {
+    if (appliesDynamicFilter(dynamicFilter)) {
+      columns.push_back(index);
+    }
+  }
+  return columns;
+}
+
+bool CudfHiveDataSource::intersectDynamicFilters(
+    const std::function<cudf::column_view(size_t)>& readColumn,
+    cudf::size_type numRows,
+    std::unique_ptr<cudf::column>& mask,
+    cuda::stream_ref stream) {
+  if (std::ranges::none_of(dynamicFilters_, [&](const auto& entry) {
+        return appliesDynamicFilter(entry.second);
+      })) {
+    return false;
+  }
+  const auto integerColumn = [&](size_t index) {
+    const auto column = integerStorageView(readColumn(index));
+    VELOX_USER_CHECK(
+        cudf::is_integral(column.type()) && cudf::is_signed(column.type()),
+        "cuDF Hive scan cannot apply a dynamic filter to the type the file stores column {} in",
+        readColumnNames_[index]);
+    return column;
+  };
+
+  if (std::ranges::any_of(dynamicFilters_, [&](const auto& entry) {
+        return entry.second.evaluation ==
+            DynamicFilterEvaluation::kAlwaysFalse &&
+            appliesDynamicFilter(entry.second);
+      })) {
+    const cudf::numeric_scalar<bool> none(false, true, stream, get_temp_mr());
+    mask = cudf::make_column_from_scalar(none, numRows, stream, get_temp_mr());
+    return true;
+  }
+
+  // Host-evaluated filters first: a mask made of them is what the device
+  // filters narrow.
+  std::vector<uint8_t> hostPass;
+  for (const auto& [index, dynamicFilter] : dynamicFilters_) {
+    if (dynamicFilter.evaluation != DynamicFilterEvaluation::kHost ||
+        !appliesDynamicFilter(dynamicFilter)) {
+      continue;
+    }
+    if (hostPass.empty()) {
+      hostPass.assign(numRows, 1);
+    }
+    if (const auto& type = columnType(readColumnNames_[index]);
+        hasIntegerStorage(type)) {
+      intersectOnHost(
+          integerColumn(index), *dynamicFilter.filter, hostPass, stream);
+    } else {
+      intersectOnHost(
+          readColumn(index),
+          readColumnNames_[index],
+          type,
+          *dynamicFilter.filter,
+          hostPass,
+          pool_,
+          stream);
+    }
+  }
+  if (!hostPass.empty()) {
+    auto hostMask = cudf::make_fixed_width_column(
+        cudf::data_type{cudf::type_id::BOOL8},
+        numRows,
+        cudf::mask_state::UNALLOCATED,
+        stream,
+        get_temp_mr());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        hostMask->mutable_view().data<uint8_t>(),
+        hostPass.data(),
+        hostPass.size(),
+        cudaMemcpyHostToDevice,
+        stream.get()));
+    // 'hostPass' has to outlive the copy.
+    stream.sync();
+    mask = mask == nullptr ? std::move(hostMask)
+                           : cudf::binary_operation(
+                                 mask->view(),
+                                 hostMask->view(),
+                                 cudf::binary_operator::LOGICAL_AND,
+                                 cudf::data_type{cudf::type_id::BOOL8},
+                                 stream,
+                                 get_temp_mr());
+  }
+
+  for (auto& [index, dynamicFilter] : dynamicFilters_) {
+    if (!appliesDynamicFilter(dynamicFilter)) {
+      continue;
+    }
+    if (dynamicFilter.evaluation == DynamicFilterEvaluation::kRange) {
+      const auto& range =
+          static_cast<const common::BigintRange&>(*dynamicFilter.filter);
+      applyIntegerRangeToMask(
+          integerColumn(index),
+          range.lower(),
+          range.upper(),
+          range.testNull(),
+          mask,
+          stream,
+          get_temp_mr());
+    } else if (
+        dynamicFilter.evaluation == DynamicFilterEvaluation::kDeviceBitmap) {
+      const auto& range =
+          static_cast<const common::BigintRange&>(*dynamicFilter.filter);
+      applyIntegerBitmapToMask(
+          integerColumn(index),
+          advisoryFilterBitmap(dynamicFilter.filter)->view(),
+          range.lower(),
+          range.testNull(),
+          mask,
+          stream,
+          get_temp_mr());
+    } else if (dynamicFilter.evaluation == DynamicFilterEvaluation::kValues) {
+      const auto input = integerColumn(index);
+      // A hash set holds keys of one integer width; another file of the
+      // scan may store the column in another.
+      if (dynamicFilter.deviceValues == nullptr ||
+          (dynamicFilter.hashSet != nullptr &&
+           dynamicFilter.hashSetType != input.type().id())) {
+        uploadDynamicFilterValues(dynamicFilter, input, stream);
+      }
+      if (dynamicFilter.hashSet != nullptr) {
+        dynamicFilter.hashSet->apply(
+            input,
+            dynamicFilter.filter->testNull(),
+            mask,
+            stream,
+            get_temp_mr());
+      } else {
+        applyIntegerBitmapToMask(
+            input,
+            dynamicFilter.deviceValues->view(),
+            dynamicFilter.bitmapMinimum,
+            dynamicFilter.filter->testNull(),
+            mask,
+            stream,
+            get_temp_mr());
       }
     }
-    dynamicFilters_.erase(*field);
-  } else if (
-      kind == common::FilterKind::kBigintRange ||
-      kind == common::FilterKind::kBigintMultiRange ||
-      kind == common::FilterKind::kMultiRange ||
-      kind == common::FilterKind::kIsNull ||
-      kind == common::FilterKind::kIsNotNull ||
-      kind == common::FilterKind::kAlwaysFalse) {
-    dynamicIntegerFilters_.erase(outputChannel);
-    dynamicFilters_.insert_or_assign(field->clone(), filter);
-  } else {
-    VELOX_UNSUPPORTED(
-        "cuDF Hive scan cannot apply dynamic filter: kind {}, column {}",
-        static_cast<int>(kind),
-        readColumnNames_[outputChannel]);
+  }
+  return true;
+}
+
+void CudfHiveDataSource::recordDynamicFilterRows(
+    uint64_t numInputRows,
+    uint64_t numRetainedRows) {
+  dynamicFilterDroppedRows_ += numInputRows - numRetainedRows;
+  const bool hasRequired = std::ranges::any_of(
+      dynamicFilters_,
+      [](const auto& entry) { return !entry.second.advisory; });
+  if (hasRequired) {
+    return;
+  }
+  advisoryFilterInputRows_ += numInputRows;
+  advisoryFilterOutputRows_ += numRetainedRows;
+  if (advisoryFilterInputRows_ >= kAdvisoryFilterMinRows &&
+      advisoryFilterOutputRows_ >
+          kAdvisoryFilterMaxKeptRatio * advisoryFilterInputRows_) {
+    advisoryRowFilterDisabled_ = true;
+  }
+}
+
+void CudfHiveDataSource::applyDynamicFilters(
+    std::unique_ptr<cudf::table>& table,
+    cuda::stream_ref stream) {
+  // The footer statistics of the row groups the reader kept already prove
+  // that every row passes. They say nothing about a column that is not read
+  // as integers.
+  const bool allIntegerColumns =
+      std::ranges::all_of(dynamicFilters_, [&](const auto& entry) {
+        return hasIntegerStorage(columnType(readColumnNames_[entry.first]));
+      });
+  if (readerFiltersCurrent_ && allIntegerColumns &&
+      cudfSplitReader_->dynamicFiltersSatisfied()) {
+    return;
   }
 
-  dynamicFilterChannels_.insert(outputChannel);
-  readerFiltersCurrent_ = false;
-  dynamicFilterExpr_ = nullptr;
-  dynamicFilterTree_.reset();
-  dynamicFilterScalars_.clear();
+  const auto numInputRows = table->num_rows();
+  std::unique_ptr<cudf::column> retentionMask;
+  if (!intersectDynamicFilters(
+          [&](size_t index) { return table->get_column(index).view(); },
+          numInputRows,
+          retentionMask,
+          stream)) {
+    return;
+  }
+  const auto numRetained = countRetainedRows(retentionMask->view(), stream);
+  if (numRetained == 0) {
+    table = cudf::empty_like(table->view());
+  } else if (numRetained < numInputRows) {
+    table = cudf::apply_retention_mask(
+        *table, retentionMask->view(), stream, get_output_mr());
+  }
+  recordDynamicFilterRows(numInputRows, numRetained);
 }
 
 std::optional<RowVectorPtr> CudfHiveDataSource::next(
@@ -959,177 +1478,14 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   auto chunkOpt = cudfSplitReader_->next(size);
   if (!chunkOpt.has_value()) {
     cudfSplitReader_->resetSplit();
+    splitExhausted_ = true;
     return nullptr;
   }
   auto nRows = chunkOpt.value().numRows;
   auto cudfTable = std::move(chunkOpt.value().table);
   auto stream = cudfSplitReader_->stream();
-  if (cudfTable->num_rows() > 0) {
-    for (auto channel : dynamicFilterChannels_) {
-      VELOX_CHECK_LT(channel, cudfTable->num_columns());
-      if (cudfTable->get_column(channel).type() !=
-          veloxToCudfDataType(outputType_->childAt(channel))) {
-        VELOX_UNSUPPORTED(
-            "cuDF Hive scan column type does not match dynamic filter type: {}",
-            readColumnNames_[channel]);
-      }
-    }
-
-    std::unique_ptr<cudf::column> retentionMask;
-    const bool needsRangeFilter = !dynamicFilters_.empty() &&
-        (!readerFiltersCurrent_ ||
-         !cudfSplitReader_->dynamicFiltersSatisfied());
-    const bool simpleRanges = needsRangeFilter &&
-        std::all_of(dynamicFilters_.begin(),
-                    dynamicFilters_.end(),
-                    [](const auto& entry) {
-                      return entry.second->kind() ==
-                          common::FilterKind::kBigintRange;
-                    });
-    if (simpleRanges) {
-      for (const auto& [field, filter] : dynamicFilters_) {
-        if (isRowGroupOnlyFilter(filter)) {
-          continue;
-        }
-        const auto channel = std::distance(
-            readColumnNames_.begin(),
-            std::find(
-                readColumnNames_.begin(),
-                readColumnNames_.end(),
-                field.toString()));
-        const auto& range = static_cast<const common::BigintRange&>(*filter);
-        applyIntegerRangeToMask(
-            cudfTable->get_column(channel).view(),
-            range.lower(),
-            range.upper(),
-            range.testNull(),
-            retentionMask,
-            stream,
-            get_temp_mr());
-      }
-    }
-    for (auto& [channel, dynamicFilter] : dynamicIntegerFilters_) {
-      if (cudfTable->num_rows() == 0) {
-        break;
-      }
-      auto inputColumn = cudfTable->get_column(channel).view();
-      if (!dynamicFilter.bitmap.empty()) {
-        if (!dynamicFilter.deviceValues) {
-          dynamicFilter.deviceValues = cudf::make_fixed_width_column(
-              cudf::data_type{cudf::type_id::UINT32},
-              dynamicFilter.bitmap.size(),
-              cudf::mask_state::UNALLOCATED,
-              stream,
-              get_temp_mr());
-          CUDF_CUDA_TRY(cudaMemcpyAsync(
-              dynamicFilter.deviceValues->mutable_view().data<uint32_t>(),
-              dynamicFilter.bitmap.data(),
-              dynamicFilter.bitmap.size() * sizeof(uint32_t),
-              cudaMemcpyHostToDevice,
-              stream.get()));
-          stream.sync();
-        }
-      } else if (!dynamicFilter.deviceValues) {
-        dynamicFilter.deviceValues = cudf::type_dispatcher(
-            inputColumn.type(),
-            [&]<typename T>() -> std::unique_ptr<cudf::column> {
-              if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
-                std::vector<T> values;
-                values.reserve(dynamicFilter.values.size());
-                for (auto value : dynamicFilter.values) {
-                  if (value >= std::numeric_limits<T>::min() &&
-                      value <= std::numeric_limits<T>::max()) {
-                    values.push_back(static_cast<T>(value));
-                  }
-                }
-                auto column = cudf::make_fixed_width_column(
-                    inputColumn.type(),
-                    values.size(),
-                    cudf::mask_state::UNALLOCATED,
-                    stream,
-                    get_temp_mr());
-                if (!values.empty()) {
-                  CUDF_CUDA_TRY(cudaMemcpyAsync(
-                      column->mutable_view().template data<T>(),
-                      values.data(),
-                      values.size() * sizeof(T),
-                      cudaMemcpyHostToDevice,
-                      stream.get()));
-                  // Keep the temporary host values alive until the copy
-                  // completes.
-                  stream.sync();
-                }
-                using Key = std::
-                    conditional_t<(sizeof(T) < sizeof(int32_t)), int32_t, T>;
-                int64_t emptyKey = std::numeric_limits<Key>::min();
-                // Find an absent key, including when INT_MIN is a real key.
-                for (auto value : values) {
-                  if (value < emptyKey) {
-                    continue;
-                  }
-                  if (value != emptyKey) {
-                    break;
-                  }
-                  ++emptyKey;
-                }
-                dynamicFilter.hashSet = std::make_unique<CudfIntegerHashSet>(
-                    column->view(), emptyKey, stream, get_temp_mr());
-                return column;
-              } else {
-                VELOX_UNSUPPORTED(
-                    "Dynamic integer filter requires an integer column");
-              }
-            });
-      }
-
-      if (dynamicFilter.hashSet) {
-        dynamicFilter.hashSet->apply(
-            inputColumn,
-            dynamicFilter.nullAllowed,
-            retentionMask,
-            stream,
-            get_temp_mr());
-      } else {
-        applyIntegerBitmapToMask(
-            inputColumn,
-            dynamicFilter.deviceValues->view(),
-            dynamicFilter.bitmapMinimum,
-            dynamicFilter.nullAllowed,
-            retentionMask,
-            stream,
-            get_temp_mr());
-      }
-    }
-    // Compact once for integer ranges and exact sets.
-    if (retentionMask) {
-      cudfTable = cudf::apply_retention_mask(
-          *cudfTable, retentionMask->view(), stream, get_output_mr());
-    }
-    if (cudfTable->num_rows() > 0 && needsRangeFilter && !simpleRanges) {
-      if (!dynamicFilterTree_) {
-        dynamicFilterTree_ = std::make_unique<cudf::ast::tree>();
-        auto dynamicFilterType = tableHandle_->dataColumns()
-            ? getTableRowType()
-            : ROW(readColumnNames_, outputType_->children());
-        common::SubfieldFilters rowFilters;
-        for (const auto& [field, filter] : dynamicFilters_) {
-          if (!isRowGroupOnlyFilter(filter)) {
-            rowFilters.emplace(field.clone(), filter);
-          }
-        }
-        dynamicFilterExpr_ = &createAstFromSubfieldFilters(
-            rowFilters,
-            *dynamicFilterTree_,
-            dynamicFilterScalars_,
-            dynamicFilterType);
-      }
-      auto mask = cudf::compute_column(
-          cudfTable->view(), *dynamicFilterExpr_, stream, get_temp_mr());
-      cudfTable = cudf::apply_retention_mask(
-          *cudfTable, mask->view(), stream, get_output_mr());
-    }
-    // Preserve footer-only counts, but report the compacted size when reading
-    // columns and applying dynamic row filters.
+  if (!dynamicFilters_.empty() && cudfTable->num_rows() > 0) {
+    applyDynamicFilters(cudfTable, stream);
     nRows = cudfTable->num_rows();
   }
 
@@ -1264,6 +1620,10 @@ CudfHiveDataSource::getRuntimeStats() {
            totalRemainingFilterTime_.load(std::memory_order_relaxed),
            RuntimeCounter::Unit::kNanos)},
   });
+  if (dynamicFilterDroppedRows_ > 0) {
+    result.emplace(
+        kDynamicFilterDroppedRows, RuntimeMetric(dynamicFilterDroppedRows_));
+  }
   const auto& ioStats = ioStats_->stats();
   for (const auto& [key, value] : ioStats) {
     // Keep the ReadFile-layer value under the established key.
@@ -1301,24 +1661,27 @@ bool CudfHiveDataSource::readTimestampPartitionValueAsLocalTime() const {
 }
 
 bool CudfHiveDataSource::partitionKeyFiltersAcceptSplit() const {
-  if (partitionKeyFilters_.empty()) {
+  if (partitionKeyFilters_.empty() && dynamicPartitionKeyFilters_.empty()) {
     return true;
   }
   const bool timestampValueAsLocalTime =
       readTimestampPartitionValueAsLocalTime();
-  for (const auto& [subfield, filter] : partitionKeyFilters_) {
-    const auto& name = subfield.baseName();
-    const auto& partitionKey = partitionKeys_.at(name);
-    if (!testPartitionKeyFilter(
-            *filter,
-            partitionKey.type,
-            partitionKeyValue(name),
-            partitionKey.dateValueDaysSinceEpoch,
-            timestampValueAsLocalTime)) {
-      VLOG(1) << "Skipping split " << split_->toString()
-              << " because the filter on partition key " << name
-              << " rejects its value";
-      return false;
+  for (const auto* filters :
+       {&partitionKeyFilters_, &dynamicPartitionKeyFilters_}) {
+    for (const auto& [subfield, filter] : *filters) {
+      const auto& name = subfield.baseName();
+      const auto& partitionKey = partitionKeys_.at(name);
+      if (!testPartitionKeyFilter(
+              *filter,
+              partitionKey.type,
+              partitionKeyValue(name),
+              partitionKey.dateValueDaysSinceEpoch,
+              timestampValueAsLocalTime)) {
+        VLOG(1) << "Skipping split " << split_->toString()
+                << " because the filter on partition key " << name
+                << " rejects its value";
+        return false;
+      }
     }
   }
   return true;

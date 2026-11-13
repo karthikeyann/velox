@@ -564,7 +564,7 @@ std::shared_ptr<common::Filter> CudfHashJoinProbe::makeIntegerDynamicFilter(
           if (!canReplaceJoinWithUniqueKeys()) {
             const auto [lower, upper] =
                 std::minmax_element(hostValues.begin(), hostValues.end());
-            return connector::hive::makeRowGroupOnlyFilter(
+            return connector::hive::makeAdvisoryFilter(
                 std::make_unique<common::BigintRange>(*lower, *upper, false));
           }
           const auto numNonNullValues = hostValues.size();
@@ -579,7 +579,7 @@ std::shared_ptr<common::Filter> CudfHashJoinProbe::makeIntegerDynamicFilter(
           dynamicFilterHasUniqueKeys_ = values.size() == numNonNullValues;
           if (!dynamicFilterHasUniqueKeys_) {
             // The retained join checks individual keys. Only prune row groups.
-            return connector::hive::makeRowGroupOnlyFilter(
+            return connector::hive::makeAdvisoryFilter(
                 std::make_unique<common::BigintRange>(
                     values.front(), values.back(), false));
           }

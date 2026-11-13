@@ -35,6 +35,8 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>
 
+#include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -51,6 +53,11 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   /// DWIO bytes read, preserved separately from ReadFile bytes.
   static constexpr std::string_view kDwioStorageReadBytes{
       "dwio.storageReadBytes"};
+
+  /// Runtime statistic: rows the scan dropped because a dynamic filter
+  /// rejected them.
+  static constexpr std::string_view kDynamicFilterDroppedRows{
+      "dynamicFilterDroppedRows"};
 
   /// Returns whether this data source can scan 'tableHandle' on the GPU:
   ///  - 'tableHandle' is a Hive table handle,
@@ -89,9 +96,61 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
 
   void setFromDataSource(std::unique_ptr<DataSource> source) override;
 
+  /// Applies 'filter' to the rows of 'outputChannel' from the next batch on,
+  /// and to the row groups of the splits opened from now on. Every row the
+  /// filter rejects is dropped, unless the filter is marked advisory (see
+  /// CudfDynamicFilter.h). May be called before, between and during splits.
+  ///
+  /// The filter has to be of a kind that tests the column's type, e.g. a
+  /// Bigint* filter on an integer, DATE or short DECIMAL column and a Bytes*
+  /// filter on a VARCHAR column. Any other filter, and a file that stores the
+  /// column in another type than the table's, fails the query at the next
+  /// batch.
   void addDynamicFilter(
       column_index_t outputChannel,
       const std::shared_ptr<facebook::velox::common::Filter>& filter) override;
+
+  /// The values a dynamic filter on an integer or DATE read column lets
+  /// through lie in ['lower', 'upper'].
+  struct DynamicFilterBounds {
+    /// Index of the column among the read columns.
+    size_t readColumn;
+    int64_t lower;
+    int64_t upper;
+    /// Whether the filter passes null.
+    bool nullAllowed;
+  };
+
+  /// Changes whenever the dynamic filters on the read columns change, for a
+  /// caller that remembers what it did with them.
+  uint64_t dynamicFilterVersion() const {
+    return dynamicFilterVersion_;
+  }
+
+  /// Returns the bounds of the dynamic filters that have them, for a reader
+  /// that prunes with a filter expression of its own.
+  std::vector<DynamicFilterBounds> dynamicFilterBounds() const;
+
+  /// Returns the read columns intersectDynamicFilters() would test now, in
+  /// ascending order.
+  std::vector<size_t> dynamicFilterColumns() const;
+
+  /// Clears in 'mask' the rows that fail a dynamic filter. 'readColumn'
+  /// returns the decoded read column of an index from dynamicFilterColumns(),
+  /// holding 'numRows' rows. 'mask' is a BOOL8 column without nulls of
+  /// 'numRows' rows; if null, it is created. Returns false, leaving 'mask'
+  /// as it is, if no dynamic filter is to be tested on rows now. Runs on
+  /// 'stream'.
+  bool intersectDynamicFilters(
+      const std::function<cudf::column_view(size_t)>& readColumn,
+      cudf::size_type numRows,
+      std::unique_ptr<cudf::column>& mask,
+      cuda::stream_ref stream);
+
+  /// Tells the data source that a mask from intersectDynamicFilters() kept
+  /// 'numRetainedRows' of 'numInputRows' rows. Feeds the statistics and the
+  /// decision to stop testing advisory filters on rows.
+  void recordDynamicFilterRows(uint64_t numInputRows, uint64_t numRetainedRows);
 
   std::optional<RowVectorPtr> next(
       uint64_t size,
@@ -298,48 +357,102 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   // Whether a partition key filter rejected the current split, which then has
   // no split reader.
   bool splitSkipped_{false};
-  // Holds an exact integer filter and its lazily copied device values.
-  struct DynamicIntegerFilter {
-    // Sorted host values for reader bounds and device representation.
-    std::vector<int64_t> values;
-
-    // Preserves SQL filter semantics for null probe values.
-    bool nullAllowed;
-
-    // Avoids repeated uploads; stores input-width values or UINT32 bitmap
-    // words.
-    std::unique_ptr<cudf::column> deviceValues;
-
-    // The CPU bitmask filter's exact representation, copied once to
-    // deviceValues.
-    std::vector<uint32_t> bitmap{};
-    int64_t bitmapMinimum{0};
-
-    // Sparse filters retain one hash table across decoded batches.
-    std::unique_ptr<CudfIntegerHashSet> hashSet{};
+  // How next() evaluates a dynamic filter.
+  enum class DynamicFilterEvaluation {
+    // Rejects every row.
+    kAlwaysFalse,
+    // An inclusive range of an integer column, tested on the device.
+    kRange,
+    // A set of values of an integer column, tested on the device.
+    kValues,
+    // A range of an integer column narrowed by the device bitmap its
+    // producer attached.
+    kDeviceBitmap,
+    // Any other filter, and any filter on a column that is not read as
+    // integers, tested on the host over a copy of the column.
+    kHost,
   };
 
-  // Tracks columns whose storage types must match accepted dynamic filters.
-  std::unordered_set<column_index_t> dynamicFilterChannels_;
+  // A dynamic filter on one read column and what next() needs to apply it.
+  struct DynamicFilter {
+    // The filter as the operator upstream sent it.
+    common::FilterPtr filter;
 
-  // Keeps ranges and other merged filters by physical subfield.
-  common::SubfieldFilters dynamicFilters_;
+    // Whether the scan may keep rows 'filter' rejects.
+    bool advisory{false};
 
-  // Keeps exact integer filters indexed by their output channel.
-  std::unordered_map<column_index_t, DynamicIntegerFilter>
-      dynamicIntegerFilters_;
+    DynamicFilterEvaluation evaluation{DynamicFilterEvaluation::kHost};
 
-  // Owns all AST nodes referenced by 'dynamicFilterExpr_'.
-  std::unique_ptr<cudf::ast::tree> dynamicFilterTree_;
+    // The sorted values of a kValues filter.
+    std::vector<int64_t> values;
 
-  // Owns all scalars referenced by 'dynamicFilterExpr_'.
-  std::vector<std::unique_ptr<cudf::scalar>> dynamicFilterScalars_;
+    // The device copy of 'values', made at the first batch: UINT32 words of a
+    // bitmap based at 'bitmapMinimum', or the values in the column's type
+    // for 'hashSet'.
+    std::unique_ptr<cudf::column> deviceValues;
 
-  // Points to the AST used for filter kinds without a direct integer path.
-  const cudf::ast::expression* dynamicFilterExpr_{nullptr};
+    // The value bit 0 of the bitmap stands for.
+    int64_t bitmapMinimum{0};
+
+    // Set when the values span too wide a range for a bitmap.
+    std::unique_ptr<CudfIntegerHashSet> hashSet;
+
+    // The integer type 'hashSet' holds its keys in: that of the column it
+    // was built for.
+    cudf::type_id hashSetType{cudf::type_id::EMPTY};
+  };
+
+  // Makes the DynamicFilter for 'filter' on the read column 'name'.
+  DynamicFilter makeDynamicFilter(
+      const std::string& name,
+      const common::FilterPtr& filter) const;
+
+  // Whether 'dynamicFilter' is tested on rows now: always, unless it is
+  // advisory and advisory filters have stopped paying or are switched off.
+  bool appliesDynamicFilter(const DynamicFilter& dynamicFilter) const;
+
+  // Drops the rows of 'table', which holds the read columns, that fail the
+  // dynamic filters.
+  void applyDynamicFilters(
+      std::unique_ptr<cudf::table>& table,
+      cuda::stream_ref stream);
+
+  // Copies the values of a kValues filter to the device in the form that fits
+  // the type of 'input'.
+  void uploadDynamicFilterValues(
+      DynamicFilter& dynamicFilter,
+      const cudf::column_view& input,
+      cuda::stream_ref stream) const;
+
+  // Ends the current split without reading the rest of it.
+  void skipCurrentSplit();
+
+  // Counts the changes of 'dynamicFilters_'.
+  uint64_t dynamicFilterVersion_{0};
+
+  // Whether next() has returned the last rows of the current split.
+  bool splitExhausted_{false};
+
+  // Dynamic filters by index in 'readColumnNames_'.
+  std::map<size_t, DynamicFilter> dynamicFilters_;
+
+  // Dynamic filters on partition keys. Each decides for a whole split.
+  common::SubfieldFilters dynamicPartitionKeyFilters_;
 
   // No dynamic filter has changed since this data source created its reader.
   bool readerFiltersCurrent_{false};
+
+  // Rows the advisory filters have seen and kept while no other dynamic
+  // filter was in place.
+  uint64_t advisoryFilterInputRows_{0};
+  uint64_t advisoryFilterOutputRows_{0};
+
+  // Set once the advisory filters have proven to keep almost every row, so
+  // that masking and compacting each batch costs more than it saves.
+  bool advisoryRowFilterDisabled_{false};
+
+  // Rows the dynamic filters dropped.
+  uint64_t dynamicFilterDroppedRows_{0};
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

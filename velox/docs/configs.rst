@@ -1669,6 +1669,14 @@ Note: These configurations are experimental and subject to change.
      - bool
      - true
      - If true, log a reason for falling back to Velox CPU execution, when an operation is not supported in cuDF execution.
+   * - cudf.dynamic_filter_enabled
+     - bool
+     - true
+     - If true, a cuDF Hive scan accepts dynamic filters, whoever sends them. If false, no dynamic filter reaches a cuDF Hive scan.
+   * - cudf.dynamic_filter_row_filter_enabled
+     - bool
+     - true
+     - If true, a cuDF scan drops the rows that fail a dynamic filter whose join still checks every key, for as long as the filter drops enough rows to pay for it. If false, such a filter only prunes row groups. A filter that replaces its join always drops rows.
    * - cudf.function_engine
      - string
      - presto

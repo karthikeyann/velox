@@ -65,6 +65,10 @@ struct CudfConfig {
   static constexpr const char* kUcxExchangeLogLevel{"cudf.exchange_log_level"};
   static constexpr const char* kUcxPartitionedOutputBatchRows{
       "cudf.partitioned_output_batch_rows"};
+  static constexpr const char* kCudfDynamicFilterEnabled{
+      "cudf.dynamic_filter_enabled"};
+  static constexpr const char* kCudfDynamicFilterRowFilterEnabled{
+      "cudf.dynamic_filter_row_filter_enabled"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
 
@@ -198,6 +202,14 @@ struct CudfConfig {
   std::optional<int32_t> batchSizeMaxThreshold;
   // Query config key for the TopN batch size in the cuDF TopN operator.
   int32_t topNBatchSize{5};
+
+  /// Whether a cuDF Hive scan accepts dynamic filters.
+  bool dynamicFilterEnabled{true};
+
+  /// Whether a cuDF scan drops the rows that fail a dynamic filter whose join
+  /// still checks every key. Such a filter always prunes row groups. A filter
+  /// that replaces its join always drops rows.
+  bool dynamicFilterRowFilterEnabled{true};
 
   /// Timestamp unit for cuDF timestamp types.
   /// Can be configured via kCudfTimestampUnit with string values:
