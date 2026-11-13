@@ -156,6 +156,7 @@ set(
   CursorTest.cpp
   SplitLifecycleTest.cpp
   TaskDynamicFilterTest.cpp
+  DynamicFilterCollectorTest.cpp
 )
 
 set(

@@ -18,19 +18,24 @@
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/Cursor.h"
+#include "velox/exec/DynamicFilterCollector.h"
+#include "velox/exec/Exchange.h"
 #include "velox/exec/HashProbe.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/TableScan.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
+#include "velox/exec/tests/utils/LocalExchangeSource.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
 namespace facebook::velox::exec::test {
 namespace {
 
+using BuildDistribution = DynamicFilterCollector::BuildDistribution;
+
 // Tests dynamic filters that travel outside of a pipeline: from a hash join
-// to a table scan behind a local exchange in the same task, and from outside
-// of the task, delivered by the test.
+// to a table scan behind a local exchange in the same task, and to table scans
+// in other tasks, with the test delivering the filters between the tasks.
 class TaskDynamicFilterTest : public HiveConnectorTestBase {
  protected:
   static constexpr int32_t kNumFiles = 4;
@@ -40,6 +45,8 @@ class TaskDynamicFilterTest : public HiveConnectorTestBase {
 
   void SetUp() override {
     HiveConnectorTestBase::SetUp();
+    exec::ExchangeSource::factories().clear();
+    exec::ExchangeSource::registerFactory(createLocalExchangeSource);
 
     // File i has the keys [i * 1'000, (i + 1) * 1'000) in 'k' and twice the
     // key in 'v'.
@@ -227,6 +234,143 @@ class TaskDynamicFilterTest : public HiveConnectorTestBase {
 
   static std::string makeTaskId(const std::string& prefix, int32_t num) {
     return fmt::format("local://{}-{}", prefix, num);
+  }
+
+  static exec::Split remoteSplit(const std::string& taskId) {
+    return exec::Split(std::make_shared<RemoteConnectorSplit>(taskId));
+  }
+
+  // A query of three stages: 'kNumScanTasks' tasks scan the probe table and
+  // partition it on the join key, 'kNumJoinTasks' tasks join it with the
+  // build side, and the test reads the result of the join tasks. The test
+  // plays the part of whoever runs the tasks: it collects the filters of the
+  // join tasks and delivers their combination to the scan tasks.
+  struct MultiTaskQuery {
+    std::vector<std::shared_ptr<Task>> scanTasks;
+    std::vector<std::shared_ptr<Task>> joinTasks;
+    core::PlanNodeId scanId;
+    RowTypePtr joinOutputType;
+  };
+
+  static constexpr int32_t kNumScanTasks = 2;
+  static constexpr int32_t kNumJoinTasks = 2;
+
+  // Starts the scan and join tasks. With a partitioned build, one more task
+  // partitions 'build' on its key for the join tasks; with a broadcast build
+  // every join task builds from all of 'build'.
+  MultiTaskQuery startQuery(
+      const RowVectorPtr& build,
+      BuildDistribution distribution,
+      int32_t numJoinDrivers = 2) {
+    MultiTaskQuery query;
+    for (int32_t i = 0; i < kNumScanTasks; ++i) {
+      core::PlanFragment fragment{PlanBuilder()
+                                      .tableScan(probeType_)
+                                      .capturePlanNodeId(query.scanId)
+                                      .partitionedOutput({"k"}, kNumJoinTasks)
+                                      .planNode()};
+      fragment.dynamicFilterTargets = {
+          {.filterId = "df", .scanNodeId = query.scanId, .outputChannel = 0}};
+      auto task = makeTask(makeTaskId("scan", i), std::move(fragment), 0);
+      const auto filesPerTask = kNumFiles / kNumScanTasks;
+      for (auto& split : probeSplits(i * filesPerTask, filesPerTask)) {
+        task->addSplit(query.scanId, exec::Split(std::move(split)));
+      }
+      task->noMoreSplits(query.scanId);
+      task->start(2);
+      query.scanTasks.push_back(std::move(task));
+    }
+
+    std::shared_ptr<Task> buildTask;
+    if (distribution == BuildDistribution::kPartitioned) {
+      core::PlanFragment fragment{PlanBuilder()
+                                      .values({build})
+                                      .partitionedOutput({"bk"}, kNumJoinTasks)
+                                      .planNode()};
+      buildTask = makeTask(makeTaskId("build", 0), std::move(fragment), 0);
+      buildTask->start(1);
+    }
+
+    for (int32_t i = 0; i < kNumJoinTasks; ++i) {
+      auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+      core::PlanNodeId probeExchangeId;
+      core::PlanNodeId buildExchangeId;
+      core::PlanNodeId joinId;
+      auto buildSide = PlanBuilder(planNodeIdGenerator);
+      if (buildTask != nullptr) {
+        buildSide.exchange(asRowType(build->type()), "Presto")
+            .capturePlanNodeId(buildExchangeId);
+      } else {
+        buildSide.values({build});
+      }
+      core::PlanFragment fragment{
+          PlanBuilder(planNodeIdGenerator)
+              .exchange(probeType_, "Presto")
+              .capturePlanNodeId(probeExchangeId)
+              .hashJoin({"k"}, {"bk"}, buildSide.planNode(), "", {"k", "v"})
+              .capturePlanNodeId(joinId)
+              .partitionedOutput({}, 1)
+              .planNode()};
+      query.joinOutputType = fragment.planNode->outputType();
+      fragment.dynamicFilterSources = {
+          {.filterId = "df", .joinNodeId = joinId, .keyIndex = 0}};
+      auto task = makeTask(makeTaskId("join", i), std::move(fragment), i);
+      for (const auto& scanTask : query.scanTasks) {
+        task->addSplit(probeExchangeId, remoteSplit(scanTask->taskId()));
+      }
+      task->noMoreSplits(probeExchangeId);
+      if (buildTask != nullptr) {
+        task->addSplit(buildExchangeId, remoteSplit(buildTask->taskId()));
+        task->noMoreSplits(buildExchangeId);
+      }
+      task->start(numJoinDrivers);
+      query.joinTasks.push_back(std::move(task));
+    }
+    return query;
+  }
+
+  // Collects the filters of the join tasks, combines them and delivers the
+  // result to the scan tasks. Returns the delivered filter.
+  static common::FilterPtr deliverFilters(
+      const MultiTaskQuery& query,
+      BuildDistribution distribution) {
+    DynamicFilterCollector collector(distribution, query.joinTasks.size(), {});
+    for (const auto& task : query.joinTasks) {
+      if (collector.add(
+              task->dynamicFilterFuture("df").get(std::chrono::seconds(60)))) {
+        break;
+      }
+    }
+    for (const auto& task : query.scanTasks) {
+      task->addDynamicFilter("df", collector.result());
+    }
+    return collector.result();
+  }
+
+  // Checks the result of the join tasks and returns the number of rows the
+  // scans of the scan tasks produced.
+  uint64_t finishQuery(
+      const MultiTaskQuery& query,
+      const std::string& duckDbSql) {
+    std::vector<exec::Split> splits;
+    for (const auto& task : query.joinTasks) {
+      splits.push_back(remoteSplit(task->taskId()));
+    }
+    AssertQueryBuilder(
+        PlanBuilder().exchange(query.joinOutputType, "Presto").planNode(),
+        duckDbQueryRunner_)
+        .splits(std::move(splits))
+        .assertResults(duckDbSql);
+
+    uint64_t numScanRows{0};
+    for (const auto& task : query.scanTasks) {
+      EXPECT_TRUE(waitForTaskCompletion(task.get(), 60'000'000));
+      numScanRows += toPlanStats(task->taskStats()).at(query.scanId).outputRows;
+    }
+    for (const auto& task : query.joinTasks) {
+      EXPECT_TRUE(waitForTaskCompletion(task.get(), 60'000'000));
+    }
+    return numScanRows;
   }
 
   const RowTypePtr probeType_{ROW({"k", "v"}, BIGINT())};
@@ -1103,6 +1247,51 @@ TEST_F(TaskDynamicFilterTest, invalidDeclarations) {
   VELOX_ASSERT_THROW(
       task->dynamicFilterFuture("other"),
       "Task has no source or target for the dynamic filter");
+}
+
+TEST_F(TaskDynamicFilterTest, partitionedBuildAcrossTasks) {
+  auto query = startQuery(
+      makeBuild({5, 77, 1'500, 1'501, 3'999, 10'000}),
+      BuildDistribution::kPartitioned);
+  const auto filter = deliverFilters(query, BuildDistribution::kPartitioned);
+  ASSERT_NE(filter, nullptr);
+  EXPECT_TRUE(filter->testInt64(77));
+  EXPECT_FALSE(filter->testInt64(78));
+  EXPECT_EQ(finishQuery(query, joinSql_), 5);
+}
+
+TEST_F(TaskDynamicFilterTest, emptyBuildPartitionAcrossTasks) {
+  // One of the join tasks gets no build rows. Its always-false filter must
+  // not narrow or disable the filter of the other task.
+  auto query = startQuery(makeBuild({1'500}), BuildDistribution::kPartitioned);
+  const auto filter = deliverFilters(query, BuildDistribution::kPartitioned);
+  ASSERT_NE(filter, nullptr);
+  EXPECT_TRUE(filter->testInt64(1'500));
+  EXPECT_EQ(finishQuery(query, joinSql_), 1);
+}
+
+TEST_F(TaskDynamicFilterTest, broadcastBuildAcrossTasks) {
+  auto query = startQuery(
+      makeBuild({5, 77, 1'500, 1'501, 3'999, 10'000}),
+      BuildDistribution::kBroadcast);
+  const auto filter = deliverFilters(query, BuildDistribution::kBroadcast);
+  ASSERT_NE(filter, nullptr);
+  EXPECT_EQ(finishQuery(query, joinSql_), 5);
+}
+
+TEST_F(TaskDynamicFilterTest, optOutAcrossTasks) {
+  // Each join task gets more distinct keys than a set of values holds, so the
+  // tasks opt out. The disabled filter releases the scans. With one build
+  // driver per task, that driver sees all the keys of the task.
+  constexpr int32_t kNumKeys = 250'000;
+  auto build =
+      makeRowVector({"bk"}, {makeFlatVector<int64_t>(kNumKeys, [](auto row) {
+                      return row * 1'000LL;
+                    })});
+  createDuckDbTable("build", {build});
+  auto query = startQuery(build, BuildDistribution::kPartitioned, 1);
+  EXPECT_EQ(deliverFilters(query, BuildDistribution::kPartitioned), nullptr);
+  EXPECT_EQ(finishQuery(query, joinSql_), kNumRows);
 }
 
 } // namespace
