@@ -83,6 +83,12 @@ DEFINE_uint64(
     "Device memory in bytes that column chunks fetched ahead of the drivers "
     "may hold; 0 fetches nothing ahead");
 
+DEFINE_bool(
+    cudf_parquet_filter_first,
+    false,
+    "Read the filter columns of a split first and the other columns only for "
+    "the rows the filters keep");
+
 DEFINE_string(
     cudf_properties,
     "",
@@ -157,6 +163,9 @@ CudfTpcdsBenchmark::makeConnectorProperties() {
   cfg->set(
       CudfHiveCfg::kFetchAheadBytes,
       std::to_string(FLAGS_cudf_hive_fetch_ahead_bytes));
+  cfg->set(
+      CudfHiveCfg::kFilterFirst,
+      std::to_string(FLAGS_cudf_parquet_filter_first));
   cfg->set(CudfHiveCfg::kAllowMismatchedCudfHiveSchemas, "true");
   cfg->set(
       CudfHiveCfg::kUseTileDecode,

@@ -89,6 +89,12 @@ DEFINE_uint64(
     "may hold; 0 fetches nothing ahead");
 
 DEFINE_bool(
+    cudf_parquet_filter_first,
+    false,
+    "Read the filter columns of a split first and the other columns only for "
+    "the rows the filters keep");
+
+DEFINE_bool(
     cudf_hive_serialize_io_requests,
     false,
     "Serialize I/O submissions to prevent interleaving between concurrent splits");
@@ -145,6 +151,9 @@ void CudfTpchBenchmark::initialize() {
     cudfHiveConfigurationValues
         [cudf_velox::connector::hive::CudfHiveConfig::kSerializeIoRequests] =
             std::to_string(FLAGS_cudf_hive_serialize_io_requests);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kFilterFirst] =
+            std::to_string(FLAGS_cudf_parquet_filter_first);
     auto cudfHiveProperties = std::make_shared<const config::ConfigBase>(
         std::move(cudfHiveConfigurationValues));
 
@@ -197,6 +206,9 @@ CudfTpchBenchmark::makeConnectorProperties() {
   cfg->set(
       CudfHiveCfg::kSerializeIoRequests,
       std::to_string(FLAGS_cudf_hive_serialize_io_requests));
+  cfg->set(
+      CudfHiveCfg::kFilterFirst,
+      std::to_string(FLAGS_cudf_parquet_filter_first));
   cfg->set(CudfHiveCfg::kAllowMismatchedCudfHiveSchemas, "true");
 
   return cfg;

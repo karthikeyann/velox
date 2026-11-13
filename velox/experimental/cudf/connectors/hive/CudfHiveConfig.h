@@ -119,6 +119,13 @@ class CudfHiveConfig {
   static constexpr const char* kSerializeIoRequestsSession =
       "cudf.hive.serialize_io_requests";
 
+  // Whether a split with a filter is read in two steps: the filter columns
+  // first, then the other columns for the rows the filters keep. Results do
+  // not depend on it.
+  static constexpr const char* kFilterFirst = "parquet.reader.filter-first";
+  static constexpr const char* kFilterFirstSession =
+      "parquet.reader.filter_first";
+
   // Writer config options
 
   /// Whether new data can be inserted into a CudfHive file
@@ -202,6 +209,9 @@ class CudfHiveConfig {
 
   bool serializeIoRequests() const;
   bool serializeIoRequestsSession(const config::ConfigBase* session) const;
+
+  bool isFilterFirst() const;
+  bool isFilterFirstSession(const config::ConfigBase* session) const;
 
   bool immutableFiles() const;
 

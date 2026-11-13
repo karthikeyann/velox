@@ -1735,6 +1735,11 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      - bool
      - false
      - Whether to serialize I/O submission batches to prevent requests from concurrent splits from interleaving.
+   * - parquet.reader.filter-first
+     - parquet.reader.filter_first
+     - bool
+     - false
+     - Whether a split that has a filter is read in two steps: the columns of the pushed-down filters and of the dynamic filters that have integer bounds first, then the other columns for the rows those filters keep. A split is read in one step when it has no such filter, when every column it reads is a filter column, when a filter column is missing from the file or stored in another type than the table's, and when it is an Iceberg split. The filter columns of a row group pass are decoded in one piece, so ``parquet.reader.chunk-read-limit`` bounds the other columns of a chunk only, and with no pass read limit a pass is the whole split. A row group takes about ``2F + 1`` read requests where it took one (``F`` is the number of filter columns), which matters on remote storage. The scan reports ``filterFirstPasses``, ``filterFirstOneStepPasses``, ``filterFirstRows`` and ``filterFirstKeptRows``. Results do not depend on this setting.
    * - parquet.reader.use-pandas-metadata
      - parquet.reader.use_pandas_metadata
      - bool

@@ -172,6 +172,16 @@ bool CudfHiveConfig::serializeIoRequestsSession(
       config_->get<bool>(kSerializeIoRequests, false));
 }
 
+bool CudfHiveConfig::isFilterFirst() const {
+  return config_->get<bool>(kFilterFirst, false);
+}
+
+bool CudfHiveConfig::isFilterFirstSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kFilterFirstSession, config_->get<bool>(kFilterFirst, false));
+}
+
 bool CudfHiveConfig::immutableFiles() const {
   return config_->get<bool>(kImmutableFiles, false);
 }
