@@ -93,6 +93,11 @@ DEFINE_bool(
     false,
     "Serialize I/O submissions to prevent interleaving between concurrent splits");
 
+DEFINE_uint32(
+    cudf_num_splits_per_file,
+    1,
+    "Number of splits each data file is cut into for the cuDF table scan");
+
 DEFINE_string(
     cudf_properties,
     "",
@@ -209,8 +214,12 @@ CudfTpchBenchmark::listSplits(
     // makeHiveConnectorSplits(vector<shared_ptr<TempFilePath>>&
     // filePaths)
     std::vector<std::shared_ptr<connector::ConnectorSplit>> result;
+    VELOX_USER_CHECK_GT(
+        FLAGS_cudf_num_splits_per_file,
+        0,
+        "A file must be cut into at least one split: cudf_num_splits_per_file");
     auto temp = HiveConnectorTestBase::makeHiveConnectorSplits(
-        path, 1, plan.dataFileFormat);
+        path, FLAGS_cudf_num_splits_per_file, plan.dataFileFormat);
     for (auto& i : temp) {
       result.push_back(i);
     }
