@@ -19,6 +19,8 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/dwio/common/CachedBufferedInput.h"
+#include "velox/dwio/common/SeekableInputStream.h"
 
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
@@ -124,7 +126,11 @@ BufferedInputDataSource::BufferedInputDataSource(
     uint64_t pinnedPieceBytes)
     : input_(std::move(input)),
       fileSize_(input_->getReadFile()->size()),
-      pinnedPieceBytes_(pinnedPieceBytes) {}
+      pinnedPieceBytes_(pinnedPieceBytes),
+      inputHasCache_(
+          dynamic_cast<
+              const facebook::velox::dwio::common::CachedBufferedInput*>(
+              input_.get()) != nullptr) {}
 
 size_t BufferedInputDataSource::size() const {
   return fileSize_;
@@ -201,10 +207,16 @@ size_t BufferedInputDataSource::readToDeviceInPieces(
   if (offset >= fileSize_) {
     return 0;
   }
+  using facebook::velox::dwio::common::LogType;
   const size_t readSize = std::min(size, fileSize_ - offset);
-  auto input = input_->read(
-      offset, readSize, facebook::velox::dwio::common::LogType::FILE);
-  VELOX_CHECK_NOT_NULL(input, "read() returned null stream");
+  // A stream of the input reads the file into memory of the input's and
+  // copies from there. That is wanted when the input has the bytes already
+  // or keeps them in a cache; otherwise the file is read into the pieces.
+  std::unique_ptr<facebook::velox::dwio::common::SeekableInputStream> input;
+  if (inputHasCache_ || input_->isBuffered(offset, readSize)) {
+    input = input_->read(offset, readSize, LogType::FILE);
+    VELOX_CHECK_NOT_NULL(input, "read() returned null stream");
+  }
 
   const size_t pieceSize = std::min<size_t>(readSize, pinnedPieceBytes_);
   std::array<std::optional<PinnedPiece>, 2> pieces;
@@ -217,7 +229,12 @@ size_t BufferedInputDataSource::readToDeviceInPieces(
       piece.emplace(pieceSize);
     }
     const size_t numBytes = std::min(pieceSize, readSize - numCopied);
-    input->readFully(reinterpret_cast<char*>(piece->data()), numBytes);
+    if (input != nullptr) {
+      input->readFully(reinterpret_cast<char*>(piece->data()), numBytes);
+    } else {
+      input_->getInputStream()->read(
+          piece->data(), numBytes, offset + numCopied, LogType::FILE);
+    }
     piece->copyToDevice(dst + numCopied, numBytes, stream);
     numCopied += numBytes;
   }

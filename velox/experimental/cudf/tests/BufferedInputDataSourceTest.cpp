@@ -158,7 +158,8 @@ class BufferedInputDataSourceTest : public ::facebook::velox::cudf_velox::exec::
 
 // A device read through page-locked pieces delivers the bytes of the range
 // with at most two pieces of the configured size allocated, however long the
-// range; with a piece size of zero it allocates no page-locked memory.
+// range, and reads the file once for every piece; with a piece size of zero
+// it allocates no page-locked memory.
 TEST_F(BufferedInputDataSourceTest, pinnedPieces) {
   constexpr size_t kOffset{100};
   constexpr size_t kPieceBytes{4'096};
@@ -200,6 +201,12 @@ TEST_F(BufferedInputDataSourceTest, pinnedPieces) {
     EXPECT_EQ(pinned.numAllocations(), testCase.expectedNumPieces);
     EXPECT_EQ(pinned.maxBytesInUse(), testCase.expectedMaxPinnedBytes);
     EXPECT_EQ(pinned.bytesInUse(), 0);
+    if (testCase.pinnedPieceBytes > 0) {
+      // The file is read into the pieces: one read for each.
+      EXPECT_EQ(
+          file_->numReads(),
+          (testCase.expectedSize + kPieceBytes - 1) / kPieceBytes);
+    }
   }
 }
 

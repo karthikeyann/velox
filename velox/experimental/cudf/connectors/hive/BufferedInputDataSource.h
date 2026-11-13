@@ -36,7 +36,9 @@ class BufferedInputDataSource : public cudf::io::datasource {
  public:
   /// @param pinnedPieceBytes Size of the page-locked pieces a device read
   /// copies through, taken from cuDF's pinned memory resource: at most two per
-  /// read in progress. Zero reads each byte range into one pageable buffer.
+  /// read in progress. An input without a data cache is then read from the
+  /// file into the pieces. Zero reads each byte range into one pageable
+  /// buffer.
   BufferedInputDataSource(
       std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input,
       uint64_t pinnedPieceBytes);
@@ -74,7 +76,9 @@ class BufferedInputDataSource : public cudf::io::datasource {
 
   // Reads up to 'size' bytes at 'offset' and copies them to 'dst' on 'stream'
   // through page-locked pieces, reading a piece while the one before it is
-  // copied. Returns the number of bytes copied, after the last copy completed.
+  // copied. The file is read into the pieces unless the input has the bytes
+  // in memory or in a data cache. Returns the number of bytes copied, after
+  // the last copy completed.
   size_t readToDeviceInPieces(
       size_t offset,
       size_t size,
@@ -84,6 +88,8 @@ class BufferedInputDataSource : public cudf::io::datasource {
   std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input_;
   const size_t fileSize_;
   const uint64_t pinnedPieceBytes_;
+  // Whether 'input_' serves byte ranges from a data cache.
+  const bool inputHasCache_;
   // Set by abandonDeviceReads().
   std::atomic_bool deviceReadsAbandoned_{false};
 };
