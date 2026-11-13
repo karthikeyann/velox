@@ -1709,6 +1709,11 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      - bool
      - false
      - Whether to serialize I/O submission batches to prevent requests from concurrent splits from interleaving.
+   * - parquet.reader.use-tile-decode
+     - parquet.reader.use_tile_decode
+     - bool
+     - false
+     - Whether pages of flat fixed-width columns (PLAIN and dictionary encoded INT32, INT64, FLOAT and DOUBLE, with at most one level of nulls) are decoded by libcudf's tile decode kernels, which split a page into tiles decoded by one warp each. All other pages are decoded as usual. Results do not depend on this option. Maps to ``enable_use_tile_decode`` in `libcudf parquet_reader_options <https://docs.rapids.ai/api/libcudf/stable/classcudf_1_1io_1_1parquet__reader__options>`_.
    * - parquet.reader.use-pandas-metadata
      - parquet.reader.use_pandas_metadata
      - bool

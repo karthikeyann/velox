@@ -66,6 +66,12 @@ DEFINE_bool(
     "Use BufferedInputDataSource instead of KvikIO for cuDF Hive reads");
 
 DEFINE_bool(
+    cudf_parquet_use_tile_decode,
+    false,
+    "Decode pages of flat fixed-width columns with libcudf's tile decode "
+    "kernels");
+
+DEFINE_bool(
     cudf_hive_preload_column_chunks,
     false,
     "Load column chunks while preloading cuDF Hive splits");
@@ -107,6 +113,9 @@ void CudfTpchBenchmark::initialize() {
     cudfHiveConfigurationValues
         [cudf_velox::connector::hive::CudfHiveConfig::kUseBufferedInput] =
             std::to_string(FLAGS_cudf_hive_use_buffered_input);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kUseTileDecode] =
+            std::to_string(FLAGS_cudf_parquet_use_tile_decode);
     cudfHiveConfigurationValues
         [cudf_velox::connector::hive::CudfHiveConfig::kPreloadColumnChunks] =
             std::to_string(FLAGS_cudf_hive_preload_column_chunks);
@@ -150,6 +159,9 @@ CudfTpchBenchmark::makeConnectorProperties() {
   cfg->set(
       CudfHiveCfg::kUseBufferedInput,
       std::to_string(FLAGS_cudf_hive_use_buffered_input));
+  cfg->set(
+      CudfHiveCfg::kUseTileDecode,
+      std::to_string(FLAGS_cudf_parquet_use_tile_decode));
   cfg->set(
       CudfHiveCfg::kPreloadColumnChunks,
       std::to_string(FLAGS_cudf_hive_preload_column_chunks));

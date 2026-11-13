@@ -713,6 +713,8 @@ void CudfSplitReader::setupReaderOptions() {
                   sessionProperties))
           .timestamp_type(
               cudfHiveConfig_->timestampTypeSession(sessionProperties))
+          .use_tile_decode(
+              cudfHiveConfig_->isUseTileDecodeSession(sessionProperties))
           // cuDF currently only folds ASCII letters, unlike the CPU reader's
           // UTF-8 folding, so non-ASCII names (rare case) that differ in case
           // do not match.

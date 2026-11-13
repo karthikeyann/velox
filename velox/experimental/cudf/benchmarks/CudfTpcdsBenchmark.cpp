@@ -65,6 +65,12 @@ DEFINE_bool(
     false,
     "Load column chunks while preloading cuDF Hive splits");
 
+DEFINE_bool(
+    cudf_parquet_use_tile_decode,
+    false,
+    "Decode pages of flat fixed-width columns with libcudf's tile decode "
+    "kernels");
+
 DEFINE_string(
     cudf_properties,
     "",
@@ -134,6 +140,9 @@ CudfTpcdsBenchmark::makeConnectorProperties() {
       CudfHiveCfg::kPreloadColumnChunks,
       std::to_string(FLAGS_cudf_hive_preload_column_chunks));
   cfg->set(CudfHiveCfg::kAllowMismatchedCudfHiveSchemas, "true");
+  cfg->set(
+      CudfHiveCfg::kUseTileDecode,
+      std::to_string(FLAGS_cudf_parquet_use_tile_decode));
 
   return cfg;
 }
