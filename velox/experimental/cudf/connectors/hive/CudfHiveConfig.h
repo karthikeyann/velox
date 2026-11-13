@@ -166,6 +166,13 @@ class CudfHiveConfig {
   // Largest accepted bound on the reader threads of a fetch scheduler.
   static constexpr uint32_t kMaxFetchSchedulerReaders = 256;
 
+  // How a connector's fetch scheduler waits for the copy of a filled staging
+  // buffer: "auto" measures and chooses, "wait" makes the reader wait before
+  // it fills another buffer, "queue" lets it go on. Anything but "auto" is
+  // meant for measurements.
+  static constexpr const char* kFetchSchedulerCopyMode =
+      "cudf.hive.fetch-scheduler-copy-mode";
+
   // Whether the column chunks of splits prepared ahead of the drivers are
   // fetched ahead too, while the device memory held by fetched and not yet
   // decoded column chunks stays within the fetch-ahead budget. Applies to
@@ -178,9 +185,7 @@ class CudfHiveConfig {
 
   // Capacity in bytes of a fetch-ahead budget of the connector's own. Zero
   // makes the connector use the budget all connectors of the process share:
-  // one sixteenth of the device's memory, and, unless cuDF allocates from a
-  // pool or an arena, no more than a quarter of what is free when it is
-  // created.
+  // one sixteenth of the device's memory.
   static constexpr const char* kFetchAheadBytes = "cudf.hive.fetch-ahead-bytes";
 
   // Smallest accepted staging buffer size. A range takes one queued read per
@@ -287,6 +292,10 @@ class CudfHiveConfig {
   /// Returns the fewest readers the connector's fetch scheduler keeps at
   /// work.
   uint32_t fetchSchedulerMinReaders() const;
+
+  /// Returns how the connector's fetch scheduler waits for copies: "auto",
+  /// "wait" or "queue".
+  std::string fetchSchedulerCopyMode() const;
 
   /// Returns whether the column chunks of splits prepared ahead are fetched
   /// ahead within the fetch-ahead budget.

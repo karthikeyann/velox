@@ -52,8 +52,10 @@
 #include <folly/ScopeGuard.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <ranges>
 #include <span>
@@ -265,41 +267,68 @@ uint64_t numBytesOf(
 } // namespace
 
 // The fetch of a prepared split's first pass, on offer to the fetch-ahead
-// budget. The budget starts it from whichever thread makes room, while the
-// reader may at the same moment be taken over by the driver that reads the
-// split, so both sides go through 'mutex'.
-class CudfSplitReader::FetchAhead : public FetchAheadBudget::Candidate {
+// budget. When the budget has room it has the fetch started on a thread of
+// the fetch scheduler, while the reader may at the same moment be taken over
+// by the driver that reads the split, so both sides go through 'mutex_'.
+class CudfSplitReader::FetchAhead
+    : public FetchAheadBudget::Candidate,
+      public std::enable_shared_from_this<FetchAhead> {
  public:
   FetchAhead(
       CudfSplitReader* reader,
       std::vector<cudf::io::text::byte_range_info> byteRanges,
       uint64_t numBytes)
       : reader_(reader),
+        scheduler_(reader->fetchScheduler_.get()),
         byteRanges_(std::move(byteRanges)),
         numBytes_(numBytes) {}
 
+  // Hands the start of the fetch to the scheduler, since it allocates the
+  // device memory of the pass and the calling thread only made room.
   bool start() override {
     std::lock_guard<std::mutex> lock(mutex_);
     if (reader_ == nullptr) {
       return false;
     }
-    auto* reader = std::exchange(reader_, nullptr);
-    ensureCudaContextForThread();
-    reader->startFetch(byteRanges_, numBytes_, /*isHeld=*/true);
+    isStarting_ = true;
+    scheduler_->post([self = shared_from_this()]() { self->startFetch(); });
     return true;
   }
 
-  // Makes start() do nothing from now on. Returns once no start() is
-  // running.
+  // Makes start() do nothing from now on. Returns once a start that was
+  // handed to the scheduler has run.
   void withdraw() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    started_.wait(lock, [&]() { return !isStarting_; });
     reader_ = nullptr;
   }
 
  private:
+  void startFetch() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    try {
+      ensureCudaContextForThread();
+      reader_->startFetch(byteRanges_, numBytes_, /*isHeld=*/true);
+    } catch (const std::exception& e) {
+      // The budget counted a fetch that does not exist. The reader starts
+      // the fetch again when its driver gets to it, and fails then.
+      LOG(WARNING) << "Failed to start a fetch ahead: " << e.what();
+      auto& budget = scheduler_->fetchAhead();
+      budget.claim();
+      budget.release(numBytes_);
+    }
+    reader_ = nullptr;
+    isStarting_ = false;
+    started_.notify_all();
+  }
+
   std::mutex mutex_;
+  std::condition_variable started_;
   // Null once the fetch has started or the offer was withdrawn.
   CudfSplitReader* reader_;
+  // Whether the start is with the scheduler and has not run yet.
+  bool isStarting_{false};
+  FetchScheduler* const scheduler_;
   const std::vector<cudf::io::text::byte_range_info> byteRanges_;
   const uint64_t numBytes_;
 };
@@ -645,19 +674,37 @@ void CudfSplitReader::releaseHeldBytes() {
 }
 
 void CudfSplitReader::releaseCurrentPassData() {
-  SCOPE_EXIT {
-    releaseHeldBytes();
-  };
   // Queued or active reads can still write into the buffers being released.
-  passState_->fetch.wait();
-  passState_->fetch = {};
+  std::exception_ptr failure;
+  try {
+    passState_->fetch.wait();
+    passState_->fetch = {};
+  } catch (...) {
+    failure = std::current_exception();
+  }
+  releaseHeldBytes();
+  if (failure != nullptr) {
+    std::rethrow_exception(failure);
+  }
 }
 
 void CudfSplitReader::abandonCurrentPassData() {
-  SCOPE_EXIT {
-    releaseHeldBytes();
-  };
-  passState_->fetch.abandon(isScheduled_);
+  std::exception_ptr failure;
+  try {
+    if (isScheduled_) {
+      // Every range of the fetch at once, so that no reader starts on a later
+      // range while an earlier one is given up.
+      static_cast<BufferedInputDataSource*>(dataSource_.get())
+          ->dropQueuedDeviceReads();
+    }
+    passState_->fetch.abandon(isScheduled_);
+  } catch (...) {
+    failure = std::current_exception();
+  }
+  releaseHeldBytes();
+  if (failure != nullptr) {
+    std::rethrow_exception(failure);
+  }
 }
 
 void CudfSplitReader::resetSplit() {

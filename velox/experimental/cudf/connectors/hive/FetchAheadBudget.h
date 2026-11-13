@@ -93,8 +93,9 @@ class FetchAheadBudget {
   /// release().
   void offer(std::shared_ptr<Candidate> candidate, uint64_t bytes);
 
-  /// Takes back an offer that has not started. Does nothing when the fetch
-  /// has started or is being started.
+  /// Takes back an offer that has not started, and starts the offers behind
+  /// it that now have room. Does nothing when the fetch has started or is
+  /// being started.
   void withdraw(const Candidate* candidate);
 
   /// Returns the counters.

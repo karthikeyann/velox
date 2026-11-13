@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/FetchScheduler.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
@@ -57,22 +56,40 @@ std::exception_ptr makeShutdownFailure() {
   }
 }
 
-// Copies the first 'size' bytes of 'buffer' to 'dst' and waits for the copy,
-// after which the buffer can be reused. The calling thread sleeps meanwhile:
-// a copy whose submitter keeps running was measured to take longer.
-void copyToDevice(
+// Starts the copy of the first 'size' bytes of 'buffer' to 'dst' on the
+// buffer's stream and marks its end with the buffer's event.
+void startCopy(
     const PinnedBufferPool::StagingBuffer& buffer,
     size_t size,
     uint8_t* dst) {
   CUDF_CUDA_TRY(cudaMemcpyAsync(
       dst, buffer.data, size, cudaMemcpyHostToDevice, buffer.stream));
-  auto status = cudaEventRecord(buffer.event, buffer.stream);
-  if (status == cudaSuccess) {
-    status = cudaEventSynchronize(buffer.event);
-  }
+  const auto status = cudaEventRecord(buffer.event, buffer.stream);
   if (status != cudaSuccess) {
     // The copy is queued and reads the buffer, so the buffer cannot go back
     // to its pool before the stream has drained.
+    cudaStreamSynchronize(buffer.stream);
+    CUDF_CUDA_TRY(status);
+  }
+}
+
+// Waits for the copy started from 'buffer', after which the buffer can be
+// reused.
+void waitForCopy(const PinnedBufferPool::StagingBuffer& buffer) {
+  // A copy of one buffer over a fast link is done sooner than a sleeping
+  // thread is woken, so the thread looks for about as long as such a copy
+  // takes before it sleeps.
+  constexpr std::chrono::microseconds kMaxLook{200};
+  const auto deadline = std::chrono::steady_clock::now() + kMaxLook;
+  auto status = cudaEventQuery(buffer.event);
+  while (status == cudaErrorNotReady &&
+         std::chrono::steady_clock::now() < deadline) {
+    status = cudaEventQuery(buffer.event);
+  }
+  if (status == cudaErrorNotReady) {
+    status = cudaEventSynchronize(buffer.event);
+  }
+  if (status != cudaSuccess) {
     cudaStreamSynchronize(buffer.stream);
     CUDF_CUDA_TRY(status);
   }
@@ -103,18 +120,13 @@ std::shared_ptr<FetchAheadBudget> sharedFetchAheadBudget() {
   std::lock_guard<std::mutex> lock(mutex);
   auto& budget = budgets[device];
   if (budget == nullptr) {
+    // From the device's size and not from what is free now: free memory
+    // depends on when the first scan runs and on how cuDF's memory resource
+    // keeps what it has released.
     size_t freeBytes{0};
     size_t totalBytes{0};
     CUDF_CUDA_TRY(cudaMemGetInfo(&freeBytes, &totalBytes));
-    auto capacity = totalBytes / 16;
-    // With a pool or an arena the device's free memory says how much the
-    // process has not reserved, which is unrelated to what it can use.
-    const auto& memoryResource = CudfConfig::getInstance().memoryResource;
-    const bool isPooled = memoryResource.find("pool") != std::string::npos ||
-        memoryResource.find("arena") != std::string::npos;
-    if (!isPooled) {
-      capacity = std::min(capacity, freeBytes / 4);
-    }
+    const auto capacity = totalBytes / 16;
     budget = std::make_shared<FetchAheadBudget>(capacity);
   }
   return budget;
@@ -145,6 +157,8 @@ struct FetchScheduler::Group {
   uint64_t sequence{0};
   // Consumers blocked in wait() on a range of the group.
   size_t numWaiters{0};
+  // Bytes of the group's ranges that no reader has been given.
+  uint64_t queuedBytes{0};
   // Ranges with pieces no reader has started, in submission order.
   std::deque<std::shared_ptr<Read>> pending;
 };
@@ -191,6 +205,10 @@ class FetchScheduler::Read {
   size_t nextOffset{0};
   // Pieces given to a reader whose bytes are not on the device yet.
   size_t numOutstanding{0};
+  // Pieces on the device, and those of them whose reader did not wait for
+  // the copy.
+  size_t numPieces{0};
+  size_t numQueuedCopies{0};
   // Set once done() holds and the waiters have been told.
   bool completed{false};
   // First failure of a fill or a copy.
@@ -213,6 +231,11 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
   // front of them.
   const bool isCopyLimited = window.readerBusyNanos > 0 &&
       window.copyWaitNanos * 2 >= window.readerBusyNanos;
+  // Readers kept from their next piece for lack of a staging buffer have
+  // more copies queued than the device takes: more readers cannot help, and
+  // the ones there do no harm.
+  const bool isBufferLimited =
+      window.bufferLimitedNanos * 2 >= window.saturatedNanos;
   using Phase = ControlState::Phase;
   const auto hold = [&](size_t numReaders) {
     next.phase = Phase::kHold;
@@ -255,12 +278,21 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
         --next.numHoldsLeft;
         break;
       }
-      const bool canTryMore = state.numReaders < options.maxReaders;
-      const bool canTryFewer = state.numReaders > options.minReaders;
-      if (canTryMore && !isCopyLimited && (state.tryMoreNext || !canTryFewer)) {
+      if (options.copyMode == CopyMode::kAuto) {
+        if (state.numTrialsToCopyTrial == 0) {
+          next.phase = Phase::kTryOtherCopy;
+          next.isCopyQueued = !state.isCopyQueued;
+          next.copyTrialRate = rate;
+          break;
+        }
+        --next.numTrialsToCopyTrial;
+      }
+      if (isCopyLimited) {
+        if (state.numReaders > options.minReaders) {
+          tryFewer(state.numReaders);
+        }
+      } else if (!isBufferLimited && state.numReaders < options.maxReaders) {
         tryMore(state.numReaders);
-      } else if (canTryFewer) {
-        tryFewer(state.numReaders);
       }
       break;
     }
@@ -274,7 +306,6 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
         next.baseRate = rate;
         tryMore(state.numReaders);
       } else {
-        next.tryMoreNext = false;
         hold(state.numHeldReaders);
       }
       break;
@@ -286,11 +317,46 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
       // Nothing delivered says nothing in favour of fewer readers.
       if (rate > 0 && rate >= state.baseRate * (1 - share / 4)) {
         next.baseRate = rate;
-        tryFewer(state.numReaders);
+        if (isCopyLimited) {
+          tryFewer(state.numReaders);
+        } else {
+          hold(state.numReaders);
+        }
       } else {
-        next.tryMoreNext = true;
         hold(state.numHeldReaders);
       }
+      break;
+    }
+    case Phase::kTryOtherCopy:
+    case Phase::kCheckCopyTrial:
+    case Phase::kConfirmOtherCopy: {
+      // Small gains are within what two measurements differ by.
+      constexpr double kMinGain{1.03};
+      // Whether the way the trial came from is the one measured.
+      const bool isCheck = state.phase == Phase::kCheckCopyTrial;
+      // The other way has to deliver more than the measurement before it;
+      // the way the trial came from, less than the trial before it.
+      const bool inFavour = isCheck ? state.copyTrialRate >= rate * kMinGain
+                                    : rate >= state.copyTrialRate * kMinGain;
+      if (inFavour && state.phase != Phase::kConfirmOtherCopy) {
+        next.phase =
+            isCheck ? Phase::kConfirmOtherCopy : Phase::kCheckCopyTrial;
+        next.isCopyQueued = !state.isCopyQueued;
+        next.copyTrialRate = rate;
+        break;
+      }
+      if (inFavour) {
+        next.baseRate = rate;
+      } else {
+        if (!isCheck) {
+          next.isCopyQueued = !state.isCopyQueued;
+        }
+        next.copyTrialInterval =
+            std::min(4 * state.copyTrialInterval, kMaxCopyTrialInterval);
+      }
+      next.copyTrialRate = 0;
+      next.numTrialsToCopyTrial = next.copyTrialInterval;
+      hold(state.numHeldReaders);
       break;
     }
   }
@@ -310,6 +376,7 @@ FetchScheduler::FetchScheduler(
   control_.numReaders = std::clamp(
       options_.initialReaders, options_.minReaders, options_.maxReaders);
   control_.numHeldReaders = control_.numReaders;
+  control_.isCopyQueued = options_.copyMode == CopyMode::kQueue;
 }
 
 FetchScheduler::~FetchScheduler() {
@@ -331,6 +398,26 @@ FetchScheduler::~FetchScheduler() {
   for (auto& reader : readers_) {
     reader.join();
   }
+  if (copyWaiter_.joinable()) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      readersStopped_ = true;
+    }
+    copyQueued_.notify_all();
+    copyWaiter_.join();
+  }
+}
+
+void FetchScheduler::dropQueued(Group& group) noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto now = Clock::now();
+  advance(now);
+  while (!group.pending.empty()) {
+    const auto read = group.pending.front();
+    dropRemaining(*read);
+    completeIfDone(*read, now);
+  }
+  bufferFreed_.notify_all();
 }
 
 FetchAheadBudget& FetchScheduler::fetchAhead() {
@@ -366,6 +453,14 @@ void FetchScheduler::ensureStarted() {
       break;
     }
   }
+  try {
+    copyWaiter_ = std::thread([this]() { copyWaiterLoop(); });
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "Fetch scheduler readers wait for their own copies: "
+                 << e.what();
+    options_.copyMode = CopyMode::kWait;
+    control_.isCopyQueued = false;
+  }
   options_.maxReaders = readers_.size();
   options_.minReaders = std::min(options_.minReaders, options_.maxReaders);
   control_.numReaders = std::min(control_.numReaders, options_.maxReaders);
@@ -400,6 +495,7 @@ std::shared_ptr<FetchScheduler::Read> FetchScheduler::submit(
     queuedGroups_.push_back(group.get());
   }
   group->pending.push_back(read);
+  group->queuedBytes += size;
   workAvailable_.notify_one();
   return read;
 }
@@ -448,18 +544,31 @@ void FetchScheduler::cancel(Read& read) noexcept {
   }
 }
 
+void FetchScheduler::post(std::function<void()> task) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  VELOX_CHECK(!stopping_, "Fetch scheduler is stopping");
+  ensureStarted();
+  tasks_.push_back(std::move(task));
+  workAvailable_.notify_one();
+}
+
 FetchScheduler::Stats FetchScheduler::stats() {
   std::lock_guard<std::mutex> lock(mutex_);
   advance(Clock::now());
   auto stats = stats_;
   stats.numReaders = control_.numReaders;
+  stats.isCopyQueued = control_.isCopyQueued;
   stats.numWaiters = numWaiters_;
   return stats;
 }
 
 size_t FetchScheduler::depthLimit() const {
+  // A reader that goes on while its copy runs has one buffer being copied
+  // and one being filled.
+  const auto numBuffersPerReader = control_.isCopyQueued ? 2 : 1;
   return std::max<size_t>(
-      1, std::min(pool_->maxBuffers(), control_.numReaders));
+      1,
+      std::min(pool_->maxBuffers(), control_.numReaders * numBuffersPerReader));
 }
 
 bool FetchScheduler::canDispatch() const {
@@ -471,19 +580,20 @@ void FetchScheduler::advance(Clock::time_point now) {
   const auto elapsed = nanosBetween(lastAdvance_, now);
   lastAdvance_ = std::max(lastAdvance_, now);
   const bool hasQueued = !queuedGroups_.empty();
-  if (!hasQueued && numRunning_ == 0) {
+  if (!hasQueued && numRunning_ == 0 && numCopies_ == 0) {
     return;
   }
   stats_.activeNanos += elapsed;
   stats_.readerNanos += elapsed * control_.numReaders;
   stats_.readerBusyNanos += elapsed * numRunning_;
-  stats_.copyWaitNanos += elapsed * numCopies_;
+  stats_.copyWaitNanos += elapsed * numCopyWaiters_;
   if (numCopies_ > 0) {
     stats_.copyBusyNanos += elapsed;
   }
-  if (numBufferWaiters_ > 0 ||
+  const bool isBufferLimited = numBufferWaiters_ > 0 ||
       (hasQueued && numRunning_ < control_.numReaders &&
-       numBuffersInUse_ >= depthLimit())) {
+       numBuffersInUse_ >= depthLimit());
+  if (isBufferLimited) {
     stats_.bufferLimitedNanos += elapsed;
   } else if (hasQueued && numRunning_ >= control_.numReaders) {
     stats_.readerLimitedNanos += elapsed;
@@ -496,21 +606,33 @@ void FetchScheduler::advance(Clock::time_point now) {
   stats_.saturatedNanos += elapsed;
   window_.saturatedNanos += elapsed;
   window_.readerBusyNanos += elapsed * numRunning_;
-  window_.copyWaitNanos += elapsed * numCopies_;
+  window_.copyWaitNanos += elapsed * numCopyWaiters_;
+  if (isBufferLimited) {
+    window_.bufferLimitedNanos += elapsed;
+  }
   uint64_t periodNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              options_.controlPeriod)
                              .count();
-  // The rate of one period depends on what is being read. A trial is
-  // measured for twice as long, since a wrong verdict stays for a hold.
-  if (control_.phase != ControlState::Phase::kHold) {
+  // The rate of one period depends on what is being read. A trial of a
+  // number of readers is measured for twice as long, since a wrong verdict
+  // stays for a hold. A trial of the other way of waiting for copies is
+  // measured twice instead, so that one that loses ends after one period.
+  if (control_.phase == ControlState::Phase::kTryMore ||
+      control_.phase == ControlState::Phase::kTryFewer) {
     periodNanos *= 2;
   }
   if (window_.saturatedNanos < periodNanos) {
     return;
   }
   const auto numReaders = control_.numReaders;
+  const auto wasCopyQueued = control_.isCopyQueued;
   control_ = nextControlState(options_, control_, window_);
   window_ = {};
+  if (control_.isCopyQueued != wasCopyQueued) {
+    ++stats_.numCopyModeChanges;
+    workAvailable_.notify_all();
+    bufferFreed_.notify_all();
+  }
   if (control_.numReaders > numReaders) {
     ++stats_.numRaises;
     workAvailable_.notify_one();
@@ -528,7 +650,15 @@ FetchScheduler::Job FetchScheduler::takeJob(Clock::time_point now) {
     const auto* bestGroup = queuedGroups_[best];
     const bool waited = group->numWaiters > 0;
     const bool bestWaited = bestGroup->numWaiters > 0;
-    if (waited != bestWaited ? waited : group->sequence < bestGroup->sequence) {
+    bool better;
+    if (waited != bestWaited) {
+      better = waited;
+    } else if (waited && group->queuedBytes != bestGroup->queuedBytes) {
+      better = group->queuedBytes < bestGroup->queuedBytes;
+    } else {
+      better = group->sequence < bestGroup->sequence;
+    }
+    if (better) {
       best = i;
     }
   }
@@ -540,6 +670,8 @@ FetchScheduler::Job FetchScheduler::takeJob(Clock::time_point now) {
   job.size = std::min(pool_->bufferSize(), read.size - read.nextOffset);
   read.nextOffset += job.size;
   // A sequential range stays with the reader that starts it.
+  group->queuedBytes -=
+      read.order == FillOrder::kSequential ? read.size : job.size;
   if (read.order == FillOrder::kSequential || read.nextOffset >= read.size) {
     group->pending.pop_front();
     if (group->pending.empty()) {
@@ -569,6 +701,7 @@ void FetchScheduler::dropRemaining(Read& read) {
         return queued.get() == &read;
       });
   if (it != pending.end()) {
+    read.group->queuedBytes -= read.size - read.nextOffset;
     pending.erase(it);
     if (pending.empty()) {
       queuedGroups_.erase(
@@ -596,6 +729,9 @@ void FetchScheduler::completeIfDone(Read& read, Clock::time_point now) {
     read.stats.bufferLimitedPercent =
         percent(stats_.bufferLimitedNanos - read.bufferLimitedAtSubmit);
   }
+  if (read.numPieces > 0) {
+    read.stats.copyQueuedPercent = read.numQueuedCopies * 100 / read.numPieces;
+  }
   read.stats.numReaders = control_.numReaders;
   completed_.notify_all();
 }
@@ -604,7 +740,13 @@ void FetchScheduler::recordPiece(
     Read& read,
     size_t size,
     uint64_t readNanos,
-    uint64_t copyNanos) {
+    uint64_t copyNanos,
+    bool isCopyQueued) {
+  ++read.numPieces;
+  if (isCopyQueued) {
+    ++read.numQueuedCopies;
+    ++stats_.numQueuedCopies;
+  }
   read.stats.bytes += size;
   read.stats.readNanos += readNanos;
   read.stats.copyNanos += copyNanos;
@@ -638,7 +780,17 @@ void FetchScheduler::readerLoop() {
   folly::setThreadName("CudfFetchRead");
   std::unique_lock<std::mutex> lock(mutex_);
   while (true) {
-    workAvailable_.wait(lock, [&]() { return stopping_ || canDispatch(); });
+    workAvailable_.wait(
+        lock, [&]() { return stopping_ || !tasks_.empty() || canDispatch(); });
+    if (!tasks_.empty()) {
+      auto task = std::move(tasks_.front());
+      tasks_.pop_front();
+      lock.unlock();
+      task();
+      task = nullptr;
+      lock.lock();
+      continue;
+    }
     if (stopping_) {
       return;
     }
@@ -666,6 +818,7 @@ bool FetchScheduler::fillAndCopy(const Job& job) {
   uint64_t readNanos{0};
   uint64_t copyNanos{0};
   bool isCopying{false};
+  bool isWaiting{false};
   try {
     ensureCudaContextForThread();
     auto buffer = pool_->acquire();
@@ -687,11 +840,26 @@ bool FetchScheduler::fillAndCopy(const Job& job) {
       advance(copyStart);
       ++numCopies_;
       isCopying = true;
+      // The reader of a sequential range starts its next piece itself, so it
+      // gains nothing from going on.
+      isWaiting = !control_.isCopyQueued || buffer == nullptr ||
+          read.order == FillOrder::kSequential;
+      if (isWaiting) {
+        ++numCopyWaiters_;
+      }
     }
-    if (buffer != nullptr) {
-      copyToDevice(*buffer, job.size, dst);
-    } else {
+    if (buffer == nullptr) {
       copyPageableToDevice(pageable.get(), job.size, dst);
+    } else {
+      startCopy(*buffer, job.size, dst);
+      if (!isWaiting) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queuedCopies_.push_back(
+            QueuedCopy{job, std::move(buffer), copyStart, readNanos});
+        copyQueued_.notify_one();
+        return true;
+      }
+      waitForCopy(*buffer);
     }
     copyNanos = nanosBetween(copyStart, Clock::now());
   } catch (...) {
@@ -705,12 +873,61 @@ bool FetchScheduler::fillAndCopy(const Job& job) {
   if (isCopying) {
     --numCopies_;
   }
+  if (isWaiting) {
+    --numCopyWaiters_;
+  }
   if (failure == nullptr) {
-    recordPiece(read, job.size, readNanos, copyNanos);
+    recordPiece(read, job.size, readNanos, copyNanos, false);
   }
   const bool succeeded = failure == nullptr;
   finishPiece(read, now, std::move(failure));
   return succeeded;
+}
+
+void FetchScheduler::copyWaiterLoop() {
+  folly::setThreadName("CudfFetchCopy");
+  QueuedCopy copy;
+  std::unique_lock<std::mutex> lock(mutex_);
+  while (true) {
+    if (queuedCopies_.empty() && copy.job.read != nullptr) {
+      // The range is let go without the lock, as the readers do.
+      lock.unlock();
+      copy = {};
+      lock.lock();
+    }
+    copyQueued_.wait(
+        lock, [&]() { return !queuedCopies_.empty() || readersStopped_; });
+    if (queuedCopies_.empty()) {
+      return;
+    }
+    auto next = std::move(queuedCopies_.front());
+    queuedCopies_.pop_front();
+    lock.unlock();
+    copy = std::move(next);
+    std::exception_ptr failure;
+    try {
+      ensureCudaContextForThread();
+      waitForCopy(*copy.buffer);
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    const auto now = Clock::now();
+    // Back in the pool before its reservation is given up.
+    copy.buffer.reset();
+    lock.lock();
+    advance(now);
+    --numCopies_;
+    auto& read = *copy.job.read;
+    if (failure == nullptr) {
+      recordPiece(
+          read,
+          copy.job.size,
+          copy.readNanos,
+          nanosBetween(copy.start, now),
+          true);
+    }
+    finishPiece(read, now, std::move(failure));
+  }
 }
 
 void FetchScheduler::runSequential(Job job) {

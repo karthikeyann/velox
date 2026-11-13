@@ -75,6 +75,19 @@ std::shared_ptr<FetchScheduler> createFetchScheduler(
   }
   options.minReaders = minReaders;
   options.maxReaders = maxReaders;
+  const auto copyMode = config.fetchSchedulerCopyMode();
+  if (copyMode == "auto") {
+    options.copyMode = FetchScheduler::CopyMode::kAuto;
+  } else if (copyMode == "wait") {
+    options.copyMode = FetchScheduler::CopyMode::kWait;
+  } else if (copyMode == "queue") {
+    options.copyMode = FetchScheduler::CopyMode::kQueue;
+  } else {
+    VELOX_USER_FAIL(
+        "{} must be auto, wait or queue: {}",
+        CudfHiveConfig::kFetchSchedulerCopyMode,
+        copyMode);
+  }
   options.fetchAheadBytes = config.fetchAheadBytes();
   return std::make_shared<FetchScheduler>(
       std::make_shared<PinnedBufferPool>(bufferSize, poolSize), options);

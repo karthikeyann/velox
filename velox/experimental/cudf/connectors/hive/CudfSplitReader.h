@@ -131,13 +131,13 @@ class CudfSplitReader : public NvtxHelper {
   void startColumnChunkFetch();
 
   /// Offers the reads of the column chunks of the first pass to the
-  /// connector's fetch-ahead budget, which starts them when the device memory
-  /// it bounds has room for them, possibly on another thread. For a split
-  /// prepared ahead of the driver that will read it; the offer must be the
-  /// last use of the reader by the thread that prepares the split. Returns
-  /// false when the split's reads do not go through the fetch scheduler,
-  /// whose ordering is what keeps a fetch started ahead from delaying one a
-  /// driver waits for.
+  /// connector's fetch-ahead budget, which has them started when the device
+  /// memory it bounds has room for them, on a thread of the fetch scheduler.
+  /// For a split prepared ahead of the driver that will read it; the offer must
+  /// be the last use of the reader by the thread that prepares the split.
+  /// Returns false when the split's reads do not go through the fetch
+  /// scheduler, whose ordering is what keeps a fetch started ahead from
+  /// delaying one a driver waits for.
   bool offerColumnChunkFetch();
 
   /// Get the stream.

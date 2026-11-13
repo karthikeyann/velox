@@ -124,6 +124,12 @@ DEFINE_uint32(
     "Fewest readers the fetch scheduler keeps at work; equal to the upper "
     "bound it pins the reader count");
 
+DEFINE_string(
+    cudf_hive_fetch_scheduler_copy_mode,
+    "auto",
+    "How the fetch scheduler waits for a copy to the device: auto measures "
+    "and chooses, wait makes the reader wait, queue lets it go on");
+
 DEFINE_bool(
     cudf_hive_fetch_ahead_enabled,
     true,
@@ -204,6 +210,9 @@ void CudfTpchBenchmark::initialize() {
                                     kFetchSchedulerMinReaders] =
         std::to_string(FLAGS_cudf_hive_fetch_scheduler_min_readers);
     cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kFetchSchedulerCopyMode] =
+            FLAGS_cudf_hive_fetch_scheduler_copy_mode;
+    cudfHiveConfigurationValues
         [cudf_velox::connector::hive::CudfHiveConfig::kFetchAheadEnabled] =
             std::to_string(FLAGS_cudf_hive_fetch_ahead_enabled);
     cudfHiveConfigurationValues
@@ -277,6 +286,9 @@ CudfTpchBenchmark::makeConnectorProperties() {
       CudfHiveCfg::kFetchSchedulerMinReaders,
       std::to_string(FLAGS_cudf_hive_fetch_scheduler_min_readers));
   cfg->set(
+      CudfHiveCfg::kFetchSchedulerCopyMode,
+      FLAGS_cudf_hive_fetch_scheduler_copy_mode);
+  cfg->set(
       CudfHiveCfg::kFetchAheadEnabled,
       std::to_string(FLAGS_cudf_hive_fetch_ahead_enabled));
   cfg->set(
@@ -299,6 +311,10 @@ CudfTpchBenchmark::listSplits(
     // makeHiveConnectorSplits(vector<shared_ptr<TempFilePath>>&
     // filePaths)
     std::vector<std::shared_ptr<connector::ConnectorSplit>> result;
+    VELOX_USER_CHECK_GT(
+        FLAGS_cudf_num_splits_per_file,
+        0,
+        "A file must be cut into at least one split: cudf_num_splits_per_file");
     auto temp = HiveConnectorTestBase::makeHiveConnectorSplits(
         path, FLAGS_cudf_num_splits_per_file, plan.dataFileFormat);
     for (auto& i : temp) {

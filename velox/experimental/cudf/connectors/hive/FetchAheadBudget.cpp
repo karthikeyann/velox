@@ -41,15 +41,20 @@ void FetchAheadBudget::claim() {
 }
 
 void FetchAheadBudget::withdraw(const Candidate* candidate) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  const auto it =
-      std::find_if(waiting_.begin(), waiting_.end(), [&](const Offer& offer) {
-        return offer.candidate.get() == candidate;
-      });
-  if (it != waiting_.end()) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it =
+        std::find_if(waiting_.begin(), waiting_.end(), [&](const Offer& offer) {
+          return offer.candidate.get() == candidate;
+        });
+    if (it == waiting_.end()) {
+      return;
+    }
     waiting_.erase(it);
     stats_.numWaiting = waiting_.size();
   }
+  // The offers behind it may fit where it did not.
+  startWaiting();
 }
 
 void FetchAheadBudget::release(uint64_t bytes) {

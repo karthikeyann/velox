@@ -1717,7 +1717,7 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      - cudf.hive.fetch_scheduler_enabled
      - bool
      - true
-     - Whether the column chunks staged in page-locked buffers are moved to the device by the connector's fetch scheduler, which all scans of the connector share. The scheduler reads with its own threads and chooses how many of them read at a time, so a scan behaves the same whichever thread starts it and however many threads the IO executor has. It serves the column chunks of a split that a driver is waiting for before those fetched ahead. When false, each read runs on a thread of the IO executor. Has no effect when ``cudf.hive.pinned-staging-enabled`` is false or the staging pool size is 0. A scan that uses the scheduler reports ``cudfFetch*`` runtime statistics.
+     - Whether the column chunks staged in page-locked buffers are moved to the device by the connector's fetch scheduler, which all scans of the connector share. The scheduler reads with its own threads and chooses how many of them read at a time and whether a reader waits for its copy to the device, so a scan behaves the same whichever thread starts it and however many threads the IO executor has. It serves the column chunks of a split that a driver is waiting for before those fetched ahead. When false, each read runs on a thread of the IO executor. Has no effect when ``cudf.hive.pinned-staging-enabled`` is false or the staging pool size is 0. A scan that uses the scheduler reports ``cudfFetch*`` runtime statistics.
    * - cudf.hive.fetch-scheduler-max-readers
      -
      - integer
@@ -1728,6 +1728,11 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      - integer
      - 1
      - Fewest readers a connector's fetch scheduler keeps at work while column chunks wait. Set equal to ``cudf.hive.fetch-scheduler-max-readers`` it pins the reader count, which is meant for measurements.
+   * - cudf.hive.fetch-scheduler-copy-mode
+     -
+     - string
+     - auto
+     - How a connector's fetch scheduler waits for the copy of a filled staging buffer to the device. With ``wait`` the reader waits for its copy before it fills another buffer; with ``queue`` it goes on and one thread of the scheduler waits for the copies. Which delivers more depends on the machine: where filling buffers slows the copies that run meanwhile, ``wait`` does. ``auto`` measures the bytes per second that reach the device both ways and stays with the better one, trying the other less and less often. Anything but ``auto`` is meant for measurements. The mean of the ``cudfFetchCopyQueuedPercent`` runtime statistic shows which way a scan's column chunks were copied.
    * - cudf.hive.fetch-ahead-enabled
      - cudf.hive.fetch_ahead_enabled
      - bool
@@ -1737,7 +1742,7 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      -
      - integer
      - 0
-     - Capacity in bytes of a fetch-ahead budget of the connector's own: the device memory that column chunks fetched ahead may bring the total held by the connector's scans to. A fetch that a driver is waiting for is not held back by it. 0 makes the connector use the budget that all cuDF connectors of the process share, which is one sixteenth of the device's memory and, unless ``cudf.memory_resource`` is a pool or an arena, no more than a quarter of what is free when the first scan creates it.
+     - Capacity in bytes of a fetch-ahead budget of the connector's own: the device memory that column chunks fetched ahead may bring the total held by the connector's scans to. A fetch that a driver is waiting for is not held back by it. 0 makes the connector use the budget that all cuDF connectors of the process share, which is one sixteenth of the device's memory.
    * - parquet.reader.use-tile-decode
      - parquet.reader.use_tile_decode
      - bool

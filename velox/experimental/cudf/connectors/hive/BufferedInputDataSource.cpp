@@ -259,6 +259,9 @@ class ScheduledRead {
         cost.bufferLimitedPercent,
         Unit::kNone);
     add(BufferedInputDataSource::kFetchReaders, cost.numReaders, Unit::kNone);
+    add(BufferedInputDataSource::kFetchCopyQueuedPercent,
+        cost.copyQueuedPercent,
+        Unit::kNone);
   }
 
  private:
@@ -373,6 +376,12 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
         tasks.join();
         return readSize;
       });
+}
+
+void BufferedInputDataSource::dropQueuedDeviceReads() {
+  if (fetchScheduler_ != nullptr) {
+    fetchScheduler_->dropQueued(*fetchGroup_);
+  }
 }
 
 std::future<size_t> BufferedInputDataSource::scheduleDeviceRead(

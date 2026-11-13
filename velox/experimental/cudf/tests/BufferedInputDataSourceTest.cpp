@@ -497,15 +497,24 @@ TEST_F(BufferedInputDataSourceTest, abandonedDeviceReadInProgress) {
 }
 
 // A fetch of several ranges that is given up waits for the reads in progress.
-// With a data source whose futures drop the reads that have not started it
-// reads nothing more; otherwise it reads everything first.
+// With a data source whose queued reads are dropped first it reads nothing
+// more, in none of its ranges; otherwise it reads everything first.
 TEST_F(BufferedInputDataSourceTest, abandonedFetch) {
-  const auto content = makeContent(1 << 20);
-  const auto numPieces = content.size() / kBufferSize;
+  // Three ranges with gaps between them, so that each is a read of its own.
+  const int64_t rangeSize = 16 * kBufferSize;
+  const std::vector<cudf::io::text::byte_range_info> byteRanges{
+      {0, rangeSize},
+      {2 * rangeSize, rangeSize},
+      {4 * rangeSize, rangeSize},
+  };
+  const auto content = makeContent(5 * rangeSize);
+  const auto numPieces = 3 * rangeSize / kBufferSize;
   for (const bool dropsUnstartedReads : {true, false}) {
     SCOPED_TRACE(dropsUnstartedReads);
-    std::shared_ptr<cudf::io::datasource> dataSource =
+    auto scheduled =
         makeDataSource(content, {.pinned = true, .scheduled = true});
+    auto* bufferedInput = scheduled.get();
+    std::shared_ptr<cudf::io::datasource> dataSource = std::move(scheduled);
     std::promise<void> started;
     std::promise<void> resume;
     auto resumed = resume.get_future().share();
@@ -515,17 +524,16 @@ TEST_F(BufferedInputDataSourceTest, abandonedFetch) {
       resumed.wait();
     });
     auto stream = cudfGlobalStreamPool().get_stream();
-    const std::vector<cudf::io::text::byte_range_info> byteRanges{
-        {0, static_cast<int64_t>(content.size() / 2)},
-        {static_cast<int64_t>(content.size() / 2),
-         static_cast<int64_t>(content.size() / 2)},
-    };
     auto fetch = fetchByteRangesAsync(
         dataSource, byteRanges, false, stream, {get_temp_mr(), get_temp_mr()});
     started.get_future().wait();
 
-    auto abandoned = std::async(
-        std::launch::async, [&]() { fetch.abandon(dropsUnstartedReads); });
+    auto abandoned = std::async(std::launch::async, [&]() {
+      if (dropsUnstartedReads) {
+        bufferedInput->dropQueuedDeviceReads();
+      }
+      fetch.abandon(dropsUnstartedReads);
+    });
     EXPECT_EQ(
         abandoned.wait_for(std::chrono::milliseconds(100)),
         std::future_status::timeout);

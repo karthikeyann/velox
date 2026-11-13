@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -34,24 +35,45 @@ namespace facebook::velox::cudf_velox::connector::hive {
 
 /// Moves file bytes to the device for every scan that shares it. Ranges are
 /// cut into pieces of one staging buffer. A reader thread owned by the
-/// scheduler fills a page-locked buffer with a piece, copies it to the device
-/// on the buffer's stream and sleeps until that copy has run.
+/// scheduler fills a page-locked buffer with a piece and copies it to the
+/// device on the buffer's stream. Either the reader then waits until that
+/// copy has run, or it goes on to its next piece and one thread of the
+/// scheduler waits for the copies in the order they were started.
 ///
-/// The number of readers at work is not configured. A controller measures
-/// the bytes per second that reach the device while ranges wait for a
-/// reader, and tries one reader more or one fewer from time to time: it
-/// keeps an added reader that raises the rate and gives up one whose absence
-/// does not lower it. The result does not depend on the thread that submits
-/// a range.
+/// Neither the number of readers at work nor the way copies are waited for
+/// is configured. A controller measures the bytes per second that reach the
+/// device while ranges wait for a reader, and from time to time tries more
+/// readers, fewer readers or the other way of waiting: it keeps what raises
+/// the rate, and gives up readers whose absence does not lower it. Which way
+/// of waiting delivers more depends on the machine: where filling buffers
+/// slows the copies that run meanwhile, a reader that waits delivers more;
+/// where it does not, a reader that waits is idle for nothing. The result
+/// does not depend on the thread that submits a range.
 ///
 /// Ranges belong to groups. The ranges of a group that a consumer is waiting
-/// for are served before those nobody waits for yet, and within each class
-/// the group that asked first is served first, so the ranges of one consumer
-/// arrive together.
+/// for are served before those nobody waits for yet. Among the groups waited
+/// for, the one with the fewest bytes left to read goes first, so that a
+/// small scan, such as the build side of a join, is not held up behind a
+/// large one; groups of one size are served one after the other in the order
+/// they asked, as are the groups nobody waits for, so the ranges of one
+/// consumer arrive together.
 ///
 /// Thread-safe.
 class FetchScheduler {
  public:
+  /// How the copy of a filled staging buffer is waited for.
+  enum class CopyMode {
+    /// The controller measures both ways and stays with the one that
+    /// delivers more.
+    kAuto,
+    /// The reader that filled the buffer waits for its copy before it fills
+    /// another.
+    kWait,
+    /// The reader goes on to its next piece, and a thread of the scheduler
+    /// waits for the copies.
+    kQueue,
+  };
+
   /// Bounds the scheduler works within.
   struct Options {
     /// Fewest readers the controller settles on. At least one.
@@ -63,17 +85,18 @@ class FetchScheduler {
     /// Readers at work before the first measurement.
     size_t initialReaders{16};
     /// Time with ranges waiting for a reader that one measurement of the
-    /// controller covers while it holds a number of readers. The measurement
-    /// of a trial covers twice as much.
+    /// controller covers. The measurement of a trial of a number of readers
+    /// covers twice as much.
     std::chrono::microseconds controlPeriod{10'000};
     /// Measurements the controller stays with a number of readers before it
     /// tries another.
     size_t numHoldPeriods{3};
+    /// How copies are waited for. Anything but kAuto pins it, which is
+    /// meant for measurements.
+    CopyMode copyMode{CopyMode::kAuto};
     /// Capacity in bytes of a fetch-ahead budget of the scheduler's own.
     /// Zero makes the scheduler use the budget that all schedulers of the
-    /// process share for the device: one sixteenth of the device's memory,
-    /// and, unless cuDF allocates from a pool or an arena, no more than a
-    /// quarter of what is free when the budget is created.
+    /// process share for the device: one sixteenth of the device's memory.
     uint64_t fetchAheadBytes{0};
   };
 
@@ -88,6 +111,9 @@ class FetchScheduler {
     uint64_t readerBusyNanos{0};
     /// Part of 'readerBusyNanos' spent waiting for copies.
     uint64_t copyWaitNanos{0};
+    /// Part of 'saturatedNanos' with a reader kept from its next piece
+    /// because every staging buffer it may use was being filled or copied.
+    uint64_t bufferLimitedNanos{0};
   };
 
   /// Where the controller stands between two measurements.
@@ -100,6 +126,14 @@ class FetchScheduler {
       kTryMore,
       /// Fewer than that number, on trial.
       kTryFewer,
+      /// That number with the other way of waiting for copies, on trial.
+      kTryOtherCopy,
+      /// Back to the way of waiting for copies it came from, to measure it
+      /// again after a trial of the other way that delivered more.
+      kCheckCopyTrial,
+      /// The other way once more, after the way it came from delivered less
+      /// again.
+      kConfirmOtherCopy,
     };
 
     /// Readers allowed now.
@@ -111,11 +145,27 @@ class FetchScheduler {
     /// Bytes per second measured with the number the controller stays
     /// with. Zero before the first measurement.
     double baseRate{0};
+    /// Bytes per second of the previous measurement during a trial of the
+    /// other way of waiting for copies, which the next one is compared
+    /// with.
+    double copyTrialRate{0};
     /// Measurements left before the next trial.
     size_t numHoldsLeft{0};
-    /// Whether the next trial adds a reader. Trials alternate.
-    bool tryMoreNext{true};
+    /// Whether readers go on while their copies run, instead of waiting for
+    /// them.
+    bool isCopyQueued{false};
+    /// Trials of a number of readers left before the next trial of the
+    /// other way of waiting for copies.
+    size_t numTrialsToCopyTrial{0};
+    /// Trials of a number of readers between two trials of the other way of
+    /// waiting for copies. Grows fourfold, up to kMaxCopyTrialInterval, with
+    /// every such trial that is not kept.
+    size_t copyTrialInterval{1};
   };
+
+  /// Most trials of a number of readers between two trials of the other way
+  /// of waiting for copies.
+  static constexpr size_t kMaxCopyTrialInterval{64};
 
   /// Counters since the scheduler was created.
   struct Stats {
@@ -154,6 +204,13 @@ class FetchScheduler {
     uint64_t numRaises{0};
     /// Times the controller lowered the number of readers.
     uint64_t numLowers{0};
+    /// Pieces whose reader went on while the copy ran.
+    uint64_t numQueuedCopies{0};
+    /// Times the controller changed how copies are waited for, trials
+    /// included.
+    uint64_t numCopyModeChanges{0};
+    /// Whether readers go on while their copies run now.
+    bool isCopyQueued{false};
     /// Readers allowed now.
     size_t numReaders{0};
     /// Consumers blocked in wait() now.
@@ -173,8 +230,12 @@ class FetchScheduler {
     /// Time the range waited for its first reader, and that reader for the
     /// staging buffers of later pieces when one reader fills them in turn.
     uint64_t queuedNanos{0};
-    /// Time readers waited for the copies of the range's pieces.
+    /// Time from the start of the copies of the range's pieces until each
+    /// was seen to have run, summed over pieces.
     uint64_t copyNanos{0};
+    /// Share of the range's pieces whose reader went on while the copy ran,
+    /// in percent.
+    uint64_t copyQueuedPercent{0};
     /// Share of the time between submission and completion during which a
     /// copy of any range was queued or running, in percent.
     uint64_t copyBusyPercent{0};
@@ -210,16 +271,36 @@ class FetchScheduler {
   class Read;
 
   /// Returns where the controller stands after measuring 'window' in
-  /// 'state'. While it holds a number of readers it averages the rate, and
-  /// after the hold periods it tries more readers or fewer, in turn: a
-  /// quarter more, an eighth fewer, at least one. More are kept when the
-  /// rate rises by at least half of what the added readers would bring if
-  /// each brought as much as the others, and then more are tried right
-  /// away. Fewer are kept when the rate falls by less than a quarter of the
-  /// share of the readers left out, and then fewer still are tried. A trial
-  /// that is not kept goes back to the held number. While the readers spend
-  /// half of their time or more waiting for copies, the copies are the
-  /// limit: more readers are neither tried nor kept, and fewer are tried.
+  /// 'state'. While it holds a number of readers it averages the rate. What
+  /// it tries after the hold periods depends on what limits the rate. While
+  /// the readers spend half of their time or more waiting for copies, the
+  /// copies are the limit, and it tries an eighth fewer readers, at least
+  /// one fewer: they are kept when the rate falls by less than a quarter of
+  /// the share of the readers left out, and fewer still are tried while the
+  /// copies stay the limit. Otherwise the source is the limit, which more
+  /// readers can only help, and it tries a quarter more, at least one more:
+  /// they are kept when the rate rises by at least half of what the added
+  /// readers would bring if each brought as much as the others, and then
+  /// more are tried right away. A trial that is not kept goes back to the
+  /// held number. The number of readers never falls because a source did
+  /// not get slower with fewer of them in one measurement: how many
+  /// concurrent reads a drive needs shows over longer than a trial.
+  ///
+  /// While, half of the time or more, a reader is kept from its next piece
+  /// because the staging buffers it may use are all being filled or copied,
+  /// more readers are not tried either.
+  ///
+  /// With CopyMode::kAuto, every 'copyTrialInterval' trials of a number of
+  /// readers, the first time before any, the trial is of the other way of
+  /// waiting for copies with the held number of readers. The rate of a scan
+  /// drifts with what is being read, so the two ways are measured in turn,
+  /// four measurements starting with the last one of the hold: the other
+  /// way is kept when each of its two delivered at least 3% more than the
+  /// measurement before it, and the way it came from 3% less in between.
+  /// The trial ends at the first measurement that does not fit, so one that
+  /// loses costs one period. When it is not kept the interval becomes four
+  /// times as long, so that a machine on which one way is clearly better
+  /// soon stops paying for trials of the other.
   static ControlState nextControlState(
       const Options& options,
       const ControlState& state,
@@ -273,6 +354,17 @@ class FetchScheduler {
   /// rest, after which nothing refers to the range's destination or fill.
   void cancel(Read& read) noexcept;
 
+  /// Drops the pieces no reader has started of every range of 'group', at
+  /// once. The ranges still have to be cancelled or waited for; a wait
+  /// returns as for a cancelled range.
+  void dropQueued(Group& group) noexcept;
+
+  /// Runs 'task' on one of the scheduler's reader threads, ahead of the
+  /// ranges that wait. For short work that belongs to the fetch and should
+  /// not be done by the thread that noticed it was due, such as starting a
+  /// fetch ahead. The destructor runs the tasks still waiting.
+  void post(std::function<void()> task);
+
   /// Returns the counters, brought up to now.
   Stats stats();
 
@@ -308,9 +400,25 @@ class FetchScheduler {
   // a staging buffer for it. Requires canDispatch().
   Job takeJob(Clock::time_point now);
 
-  // Fills a staging buffer with the piece 'job', copies it to the device and
-  // waits for the copy, then gives up the buffer reserved for the job.
-  // Returns false when the piece failed.
+  // A copy that its reader did not wait for.
+  struct QueuedCopy {
+    Job job;
+    PinnedBufferPool::Buffer buffer{
+        nullptr,
+        PinnedBufferPool::Releaser(nullptr)};
+    // When the copy was started.
+    Clock::time_point start;
+    // Time the reader took to fill the buffer.
+    uint64_t readNanos{0};
+  };
+
+  // Body of the thread that waits for the copies readers did not wait for.
+  void copyWaiterLoop();
+
+  // Fills a staging buffer with the piece 'job' and copies it to the device.
+  // Either waits for the copy and gives up the buffer reserved for the job,
+  // or leaves both to the thread that waits for queued copies. Returns false
+  // when the piece failed.
   bool fillAndCopy(const Job& job);
 
   // Fills the pieces of a sequential range one after the other, starting
@@ -318,8 +426,12 @@ class FetchScheduler {
   void runSequential(Job job);
 
   // Adds a piece that reached the device to the counters. Requires 'mutex_'.
-  void
-  recordPiece(Read& read, size_t size, uint64_t readNanos, uint64_t copyNanos);
+  void recordPiece(
+      Read& read,
+      size_t size,
+      uint64_t readNanos,
+      uint64_t copyNanos,
+      bool isCopyQueued);
 
   // Accounts for a piece that is on the device or has failed: gives up its
   // staging buffer reservation and wakes whoever waits for that or for the
@@ -349,11 +461,22 @@ class FetchScheduler {
   std::condition_variable bufferFreed_;
   // Signalled when a range completes.
   std::condition_variable completed_;
+  // Signalled when a copy is queued and when the readers have stopped.
+  std::condition_variable copyQueued_;
 
   bool started_{false};
   bool stopping_{false};
   std::vector<std::thread> readers_;
+  // Waits for the copies in 'queuedCopies_'. Not joinable when it could not
+  // be started, in which case every reader waits for its own copy.
+  std::thread copyWaiter_;
+  // Set by the destructor once no reader can queue another copy.
+  bool readersStopped_{false};
+  // Copies their readers did not wait for, in the order started.
+  std::deque<QueuedCopy> queuedCopies_;
 
+  // Tasks handed to post() that no reader thread has taken.
+  std::deque<std::function<void()>> tasks_;
   // Groups with ranges that have pieces no reader has started.
   std::vector<Group*> queuedGroups_;
   // Arrival number given to the next group that queues.
@@ -366,8 +489,10 @@ class FetchScheduler {
   size_t numRunning_{0};
   // Staging buffers reserved: being filled or being copied.
   size_t numBuffersInUse_{0};
-  // Readers waiting for the copy of their buffer.
+  // Copies started and not yet seen to have run.
   size_t numCopies_{0};
+  // Readers waiting for the copy of their buffer.
+  size_t numCopyWaiters_{0};
   // Readers of sequential ranges waiting for a staging buffer.
   size_t numBufferWaiters_{0};
   // Consumers blocked in wait().

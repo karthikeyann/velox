@@ -213,6 +213,10 @@ uint32_t CudfHiveConfig::fetchSchedulerMinReaders() const {
   return config_->get<uint32_t>(kFetchSchedulerMinReaders, 1);
 }
 
+std::string CudfHiveConfig::fetchSchedulerCopyMode() const {
+  return config_->get<std::string>(kFetchSchedulerCopyMode, "auto");
+}
+
 bool CudfHiveConfig::fetchAheadEnabled() const {
   return config_->get<bool>(kFetchAheadEnabled, true);
 }

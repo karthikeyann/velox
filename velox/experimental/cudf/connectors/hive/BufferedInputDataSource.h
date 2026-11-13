@@ -68,6 +68,11 @@ class BufferedInputDataSource : public cudf::io::datasource {
   /// Readers the scheduler allowed when a read completed. Minimum, maximum
   /// and mean over reads show how the reader count moved.
   static constexpr const char* kFetchReaders = "cudfFetchReaders";
+  /// Share of a read's pieces whose reader went on while the copy to the
+  /// device ran, in percent. The mean over reads shows which way of waiting
+  /// for copies the scheduler used.
+  static constexpr const char* kFetchCopyQueuedPercent =
+      "cudfFetchCopyQueuedPercent";
 
   /// 'stagingPool' supplies the page-locked buffers that device reads stage
   /// file bytes in. Device reads stage in pageable memory when it is null,
@@ -110,6 +115,12 @@ class BufferedInputDataSource : public cudf::io::datasource {
       size_t size,
       uint8_t* dst,
       cuda::stream_ref stream) override;
+
+  /// Drops, at once, the parts that no reader has started of every device
+  /// read handed to the fetch scheduler and not yet collected. For a
+  /// consumer that gives all of them up; the futures must still be waited
+  /// for or destroyed. Does nothing without a fetch scheduler.
+  void dropQueuedDeviceReads();
 
  private:
   void readContiguous(size_t offset, size_t size, uint8_t* dst);

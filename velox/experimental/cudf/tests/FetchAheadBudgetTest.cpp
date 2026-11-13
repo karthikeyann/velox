@@ -167,18 +167,22 @@ TEST_F(FetchAheadBudgetTest, oneFetchAlwaysAhead) {
 // An offer taken back does not start and does not keep later offers waiting.
 TEST_F(FetchAheadBudgetTest, withdrawnOffer) {
   FetchAheadBudget budget(100);
-  budget.hold(90);
+  budget.hold(80);
   budget.offer(fetch("a"), 10);
   auto large = fetch("b");
   budget.offer(large, 80);
+  // Fits, and waits behind the offer that does not.
   budget.offer(fetch("c"), 10);
   EXPECT_THAT(log_.names(), testing::ElementsAre("a"));
   EXPECT_EQ(budget.stats().numWaiting, 2);
+  // With the large offer gone the one behind it starts at once.
   budget.withdraw(large.get());
-  EXPECT_EQ(budget.stats().numWaiting, 1);
+  EXPECT_EQ(budget.stats().numWaiting, 0);
+  EXPECT_THAT(log_.names(), testing::ElementsAre("a", "c"));
+  EXPECT_EQ(budget.stats().heldBytes, 100);
   // Taking back an offer that is not waiting does nothing.
   budget.withdraw(large.get());
-  budget.release(90);
+  budget.release(80);
   EXPECT_THAT(log_.names(), testing::ElementsAre("a", "c"));
   EXPECT_EQ(budget.stats().heldBytes, 20);
 }
