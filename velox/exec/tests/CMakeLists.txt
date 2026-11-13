@@ -157,6 +157,7 @@ set(
   SplitLifecycleTest.cpp
   TaskDynamicFilterTest.cpp
   DynamicFilterCollectorTest.cpp
+  DynamicFilterPlannerTest.cpp
 )
 
 set(

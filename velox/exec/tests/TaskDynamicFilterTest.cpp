@@ -1249,6 +1249,240 @@ TEST_F(TaskDynamicFilterTest, invalidDeclarations) {
       "Task has no source or target for the dynamic filter");
 }
 
+TEST_F(TaskDynamicFilterTest, derivedFromPlan) {
+  // Without declared filters, a task derives them from its plan if enabled.
+  // Each plan has one of the nodes a filter is placed across between the join
+  // and the scan of the probe table. 'numScanRows' is what the scan returns
+  // with the filter.
+  struct TestPlan {
+    std::string name;
+    core::PlanNodePtr plan;
+    core::PlanNodeId scanId;
+    std::string duckDbSql;
+    uint64_t numScanRows;
+  };
+  auto build = makeBuild({5, 1'500, 1'501, 3'999, 10'000});
+  std::vector<TestPlan> plans;
+  {
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    TestPlan plan{.name = "project, filter and local exchange"};
+    plan.plan =
+        PlanBuilder(planNodeIdGenerator)
+            .tableScan(probeType_)
+            .capturePlanNodeId(plan.scanId)
+            .project({"v AS payload", "k AS key"})
+            .filter("payload >= 0")
+            .localPartition({"key"})
+            .hashJoin(
+                {"key"},
+                {"bk"},
+                PlanBuilder(planNodeIdGenerator).values({build}).planNode(),
+                "",
+                {"key", "payload"})
+            .planNode();
+    plan.duckDbSql = joinSql_;
+    plan.numScanRows = 4;
+    plans.push_back(std::move(plan));
+  }
+  {
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    TestPlan plan{.name = "aggregation on the key"};
+    plan.plan =
+        PlanBuilder(planNodeIdGenerator)
+            .tableScan(probeType_)
+            .capturePlanNodeId(plan.scanId)
+            .partialAggregation({"k"}, {"sum(v) AS total"})
+            .localPartition({"k"})
+            .finalAggregation()
+            .hashJoin(
+                {"k"},
+                {"bk"},
+                PlanBuilder(planNodeIdGenerator).values({build}).planNode(),
+                "",
+                {"k", "total"})
+            .planNode();
+    plan.duckDbSql = joinSql_;
+    plan.numScanRows = 4;
+    plans.push_back(std::move(plan));
+  }
+  {
+    // The upper join's key 'v' comes through the probe side of the lower
+    // join, whose own key 'k' matches everything.
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto all = makeRowVector(
+        {"ak"},
+        {makeFlatVector<int64_t>(kNumRows, [](auto row) { return row; })});
+    auto doubled =
+        makeRowVector({"dk"}, {makeFlatVector<int64_t>({10, 3'000, 7'998, 9})});
+    TestPlan plan{.name = "probe side of a lower join"};
+    plan.plan =
+        PlanBuilder(planNodeIdGenerator)
+            .tableScan(probeType_)
+            .capturePlanNodeId(plan.scanId)
+            .localPartition({"k"})
+            .hashJoin(
+                {"k"},
+                {"ak"},
+                PlanBuilder(planNodeIdGenerator).values({all}).planNode(),
+                "",
+                {"k", "v"})
+            .hashJoin(
+                {"v"},
+                {"dk"},
+                PlanBuilder(planNodeIdGenerator).values({doubled}).planNode(),
+                "",
+                {"k", "v"})
+            .planNode();
+    plan.duckDbSql = "SELECT k, v FROM probe WHERE v IN (10, 3000, 7998)";
+    plan.numScanRows = 3;
+    plans.push_back(std::move(plan));
+  }
+  {
+    // The upper join's key 'v' comes from the build side of the lower join,
+    // which is the scan of the probe table.
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto all = makeRowVector(
+        {"ak"},
+        {makeFlatVector<int64_t>(kNumRows, [](auto row) { return row; })});
+    auto doubled =
+        makeRowVector({"dk"}, {makeFlatVector<int64_t>({10, 3'000, 7'998, 9})});
+    TestPlan plan{.name = "build side of a lower join"};
+    plan.plan =
+        PlanBuilder(planNodeIdGenerator)
+            .values({all})
+            .hashJoin(
+                {"ak"},
+                {"k"},
+                PlanBuilder(planNodeIdGenerator)
+                    .tableScan(probeType_)
+                    .capturePlanNodeId(plan.scanId)
+                    .planNode(),
+                "",
+                {"k", "v"})
+            .hashJoin(
+                {"v"},
+                {"dk"},
+                PlanBuilder(planNodeIdGenerator).values({doubled}).planNode(),
+                "",
+                {"k", "v"})
+            .planNode();
+    plan.duckDbSql = "SELECT k, v FROM probe WHERE v IN (10, 3000, 7998)";
+    plan.numScanRows = 3;
+    plans.push_back(std::move(plan));
+  }
+
+  // The upper join's key 'v' comes through a lower join of each kind that
+  // keeps the rows of the side with the scan as they are.
+  struct LowerJoin {
+    std::string name;
+    core::JoinType joinType;
+    bool nullAware;
+    // True if the build side of the lower join has every key of the probe
+    // table, false if it has none of them.
+    bool buildMatches;
+  };
+  const std::vector<LowerJoin> lowerJoins = {
+      {"left", core::JoinType::kLeft, false, true},
+      {"left semi filter", core::JoinType::kLeftSemiFilter, false, true},
+      {"left semi project", core::JoinType::kLeftSemiProject, false, true},
+      {"anti", core::JoinType::kAnti, false, false},
+      {"null-aware anti", core::JoinType::kAnti, true, false},
+  };
+  auto doubled =
+      makeRowVector({"dk"}, {makeFlatVector<int64_t>({10, 3'000, 7'998, 9})});
+  for (const auto& lowerJoin : lowerJoins) {
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto lowerBuild =
+        makeRowVector({"ak"}, {makeFlatVector<int64_t>(kNumRows, [&](auto row) {
+                        return lowerJoin.buildMatches ? row : row + 100'000;
+                      })});
+    std::vector<std::string> lowerOutput{"k", "v"};
+    if (isLeftSemiProjectJoin(lowerJoin.joinType)) {
+      lowerOutput.push_back("match");
+    }
+    TestPlan plan{.name = "probe side of a lower " + lowerJoin.name + " join"};
+    plan.plan =
+        PlanBuilder(planNodeIdGenerator)
+            .tableScan(probeType_)
+            .capturePlanNodeId(plan.scanId)
+            .localPartition({"k"})
+            .hashJoin(
+                {"k"},
+                {"ak"},
+                PlanBuilder(planNodeIdGenerator)
+                    .values({lowerBuild})
+                    .planNode(),
+                "",
+                lowerOutput,
+                lowerJoin.joinType,
+                lowerJoin.nullAware)
+            .hashJoin(
+                {"v"},
+                {"dk"},
+                PlanBuilder(planNodeIdGenerator).values({doubled}).planNode(),
+                "",
+                {"k", "v"})
+            .planNode();
+    plan.duckDbSql = "SELECT k, v FROM probe WHERE v IN (10, 3000, 7998)";
+    plan.numScanRows = 3;
+    plans.push_back(std::move(plan));
+  }
+  {
+    // The scan is the build side of a lower right join.
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto all = makeRowVector(
+        {"ak"},
+        {makeFlatVector<int64_t>(kNumRows, [](auto row) { return row; })});
+    TestPlan plan{.name = "build side of a lower right join"};
+    plan.plan =
+        PlanBuilder(planNodeIdGenerator)
+            .values({all})
+            .hashJoin(
+                {"ak"},
+                {"k"},
+                PlanBuilder(planNodeIdGenerator)
+                    .tableScan(probeType_)
+                    .capturePlanNodeId(plan.scanId)
+                    .planNode(),
+                "",
+                {"k", "v"},
+                core::JoinType::kRight)
+            .hashJoin(
+                {"v"},
+                {"dk"},
+                PlanBuilder(planNodeIdGenerator).values({doubled}).planNode(),
+                "",
+                {"k", "v"})
+            .planNode();
+    plan.duckDbSql = "SELECT k, v FROM probe WHERE v IN (10, 3000, 7998)";
+    plan.numScanRows = 3;
+    plans.push_back(std::move(plan));
+  }
+
+  for (const auto& plan : plans) {
+    for (const bool enabled : {false, true}) {
+      SCOPED_TRACE(fmt::format("{}, enabled {}", plan.name, enabled));
+      auto task = AssertQueryBuilder(plan.plan, duckDbQueryRunner_)
+                      .maxDrivers(4)
+                      .config(
+                          core::QueryConfig::kCrossPipelineDynamicFilterEnabled,
+                          enabled ? "true" : "false")
+                      .config(
+                          core::QueryConfig::kTableScanDynamicFilterMaxWaitMs,
+                          std::string(kWaitForever))
+                      .splits(plan.scanId, probeSplits())
+                      .assertResults(plan.duckDbSql);
+      const auto stats = toPlanStats(task->taskStats());
+      EXPECT_EQ(
+          stats.at(plan.scanId).outputRows,
+          enabled ? plan.numScanRows : kNumRows);
+      EXPECT_EQ(
+          statSum(stats.at(plan.scanId), TableScan::kDynamicFiltersTimedOut),
+          0);
+    }
+  }
+}
+
 TEST_F(TaskDynamicFilterTest, partitionedBuildAcrossTasks) {
   auto query = startQuery(
       makeBuild({5, 77, 1'500, 1'501, 3'999, 10'000}),

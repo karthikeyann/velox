@@ -1301,6 +1301,20 @@ class QueryConfig {
       false,
       "Enable scaled table scan processing based on memory usage.")
 
+  /// If true, a task whose plan fragment declares no dynamic filters derives
+  /// them from its plan: a hash join sends the build-side values of its keys
+  /// to the table scans of its probe side that are in the same task and not
+  /// in the join's pipeline, for example behind a local exchange. See
+  /// core::DynamicFilterSource.
+  VELOX_QUERY_CONFIG(
+      kCrossPipelineDynamicFilterEnabled,
+      crossPipelineDynamicFilterEnabled,
+      "cross_pipeline_dynamic_filter_enabled",
+      bool,
+      false,
+      "Derive dynamic filters from hash joins for table scans of the same "
+      "task that are outside of the join's pipeline.")
+
   /// The longest time, in milliseconds, a table scan waits before reading for
   /// the dynamic filters that the plan fragment declares for it
   /// (core::DynamicFilterTarget). After that it reads without the missing

@@ -50,6 +50,10 @@ class FileTableHandle : public ConnectorTableHandle {
     return remainingFilter_;
   }
 
+  bool hasFilters() const override {
+    return !subfieldFilters().empty() || remainingFilter() != nullptr;
+  }
+
   /// Sampling rate between 0 and 1 (excluding 0). 0.1 means 10% sampling.
   /// 1.0 means no sampling.
   virtual double sampleRate() const {
