@@ -97,6 +97,15 @@ class CudfHiveConfig {
   static constexpr const char* kPreloadColumnChunksSession =
       "cudf.hive.preload_column_chunks";
 
+  // Device memory in bytes that column chunks fetched ahead of the drivers
+  // may bring the total held by scans to: the fetch-ahead budget. Zero, the
+  // default, fetches nothing ahead. With a budget, the row group passes a
+  // scan gets to next are fetched while a driver decodes, kPreloadColumnChunks
+  // no longer fetches without a bound, and every scan may have one fetch
+  // ahead whatever its size. Connectors of a process that set the same value
+  // share one budget per device.
+  static constexpr const char* kFetchAheadBytes = "cudf.hive.fetch-ahead-bytes";
+
   // Whether to serialize concurrent I/O request submission batches.
   static constexpr const char* kSerializeIoRequests =
       "cudf.hive.serialize-io-requests";
@@ -179,6 +188,8 @@ class CudfHiveConfig {
 
   bool preloadColumnChunks() const;
   bool preloadColumnChunksSession(const config::ConfigBase* session) const;
+
+  uint64_t fetchAheadBytes() const;
 
   bool serializeIoRequests() const;
   bool serializeIoRequestsSession(const config::ConfigBase* session) const;

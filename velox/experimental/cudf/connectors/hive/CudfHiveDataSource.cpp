@@ -742,10 +742,12 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   // them into columns on.
   partitionKeyScalars_ = makePartitionKeyScalars(cudfSplitReader_->stream());
 
-  // Check if preloaded splits should start pre-fetching the first pass of
-  // column chunks.
+  // A preloaded split offers the first pass of its column chunks to the
+  // fetch-ahead budget, or, without fetch-ahead, starts fetching them when
+  // asked to. The offer is the last use of the reader on this thread: from
+  // here on the budget may start the fetch on another one.
   const bool isPreloadedSplit = split->dataSource != nullptr;
-  if (isPreloadedSplit &&
+  if (isPreloadedSplit && !cudfSplitReader_->offerColumnChunkFetch() &&
       cudfHiveConfig_->preloadColumnChunksSession(
           connectorQueryCtx_->sessionProperties())) {
     cudfSplitReader_->startColumnChunkFetch();

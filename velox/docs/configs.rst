@@ -1704,6 +1704,11 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      - bool
      - false
      - Whether background split preparation starts fetching the first column-chunk pass. Active splits always start fetching when activated. Enabling this can overlap I/O with the previous split, but retains one pass of device buffers per preloaded split.
+   * - cudf.hive.fetch-ahead-bytes
+     -
+     - integer
+     - 0
+     - Device memory in bytes that column chunks fetched ahead of the drivers may bring the total held by scans to: the fetch-ahead budget. 0 fetches nothing ahead. With a budget, a scan fetches the row group passes it gets to next while its drivers decode: the next pass of a split being read, then the first pass of the splits Velox prepares ahead. This keeps the storage and the link to the device busy however few the drivers. A fetch that a driver is waiting for is not held back by the budget, and every scan may have one fetch ahead whatever its size. ``cudf.hive.preload-column-chunks`` has no further effect with a budget: prepared splits are fetched within it instead of without a bound. Connectors of a process that set the same value share one budget per device.
    * - cudf.hive.serialize-io-requests
      - cudf.hive.serialize_io_requests
      - bool

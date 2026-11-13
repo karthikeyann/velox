@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderByteFetch.h"
+#include "velox/experimental/cudf/connectors/hive/FetchAheadBudget.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 
 #include "velox/common/io/IoStatistics.h"
@@ -69,6 +70,10 @@ std::optional<cudf::type_id> constantTimestampType(
 
 class CudfSplitReader : public NvtxHelper {
  public:
+  /// Runtime statistic of the time a scan waited for the column chunks of a
+  /// row group pass to be on the device, one sample per pass.
+  static constexpr const char* kFetchWaitWallNanos = "cudfFetchWaitWallNanos";
+
   CudfSplitReader(
       std::shared_ptr<CudfHiveConnectorSplit> split,
       std::shared_ptr<const ::facebook::velox::connector::hive::HiveTableHandle>
@@ -122,6 +127,17 @@ class CudfSplitReader : public NvtxHelper {
   /// Start the reads of the column chunks of the current pass without waiting
   /// for them. Does nothing when they are already in flight or complete.
   void startColumnChunkFetch();
+
+  /// Offers the reads of the column chunks of the current pass to the
+  /// fetch-ahead budget, which starts them on a thread of the IO executor
+  /// when the device memory held by fetched and not yet decoded column
+  /// chunks leaves room. The reader must not be used by another thread until
+  /// startColumnChunkFetch() or resetSplit() is called or the reader is
+  /// destroyed. Returns false, having done nothing, when the connector has
+  /// no fetch-ahead budget or the reader has no executor. With a budget, the
+  /// reader makes the same offer for each later pass when the pass before it
+  /// starts decoding.
+  bool offerColumnChunkFetch();
 
   /// Get the stream.
   cuda::stream_ref stream() const {
@@ -241,6 +257,21 @@ class CudfSplitReader : public NvtxHelper {
   // Stores per-split row group indices by read pass.
   using RowGroupPasses = std::vector<RowGroupIndicesBySplit>;
 
+  // The fetch of one row group pass.
+  struct PassFetch {
+    // Owns the device data of the pass.
+    ByteRangeFetch fetch;
+    // Bytes of the fetch counted in the fetch-ahead budget.
+    uint64_t heldBytes{0};
+    // Where the fetch stands for the budget, while the budget counts it.
+    std::optional<FetchAheadBudget::Stage> stage;
+    // Whether the fetch was started on the fetch-ahead stream. The reader's
+    // stream, which decodes the pass, is not ordered against that stream:
+    // the reader synchronises the fetch-ahead stream before the pass is
+    // decoded, and its own stream before the pass's buffers are freed.
+    bool isOnFetchAheadStream{false};
+  };
+
   // Tracks how far the row group passes of the current split have been read.
   struct RowGroupPassState {
     // Row groups to read, indexed as passes[pass][split][rowGroup], in read
@@ -253,8 +284,10 @@ class CudfSplitReader : public NvtxHelper {
     // Whether the chunked read of the current pass has been set up.
     bool isChunkingSetup{false};
 
-    // Owns the device data of the current pass.
-    ByteRangeFetch fetch;
+    // The pass being materialized.
+    PassFetch current;
+    // The pass after it, when its fetch was started ahead.
+    PassFetch next;
   };
 
   // Setup the cuDF reader options
@@ -274,6 +307,40 @@ class CudfSplitReader : public NvtxHelper {
   // Wait for any reads of the current pass, then release its column chunk data.
   void releaseCurrentPassData();
 
+  // Wait for any reads of 'pass', then release its column chunk data and give
+  // its bytes back to the fetch-ahead budget. 'isDecoded' says whether the
+  // pass was given to decode.
+  void releasePassData(PassFetch& pass, bool isDecoded);
+
+  // Start the reads of 'byteRanges', the column chunks of a pass, into
+  // 'pass'. 'isHeld' says whether the fetch-ahead budget already counts
+  // 'numBytes' for them.
+  void startFetch(
+      PassFetch& pass,
+      cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
+      uint64_t numBytes,
+      bool isHeld,
+      cuda::stream_ref stream);
+
+  // Offers the fetch of 'pass', which is the current pass or the one after
+  // it, to the fetch-ahead budget.
+  void offerPassFetch(
+      size_t pass,
+      PassFetch& target,
+      cuda::stream_ref stream,
+      FetchAheadBudget::Distance distance);
+
+  // Takes back the reader's offer to the fetch-ahead budget. Returns once the
+  // budget is not starting the fetch.
+  void withdrawFetchOffer();
+
+  // Makes the pass after the one just read the current pass, with the fetch
+  // that was started ahead for it, if any.
+  void advancePass();
+
+  // Returns the stream that fetches are started ahead on.
+  cuda::stream_ref fetchAheadStream();
+
   std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
   memory::MemoryPool* pool_;
 
@@ -284,6 +351,18 @@ class CudfSplitReader : public NvtxHelper {
 
   // Row group passes and byte fetch states.
   std::unique_ptr<RowGroupPassState> passState_;
+  // Null when the connector has no fetch-ahead budget.
+  std::shared_ptr<FetchAheadBudget> fetchAheadBudget_;
+  // Names the scan to the fetch-ahead budget: the plan node of the query.
+  uint64_t fetchAheadScan_{0};
+  // Set while the fetch of a pass is on offer to the fetch-ahead budget.
+  std::shared_ptr<PostedFetchStart> fetchAhead_;
+  // Stream that fetches are started ahead on, created on first use and owned
+  // by the reader. Not the reader's stream, which decodes, and not a stream
+  // of cuDF's pool, which decode kernels of any reader run on: the data
+  // sources synchronise the stream a fetch is given, and would wait for
+  // those.
+  cudaStream_t fetchAheadStream_{nullptr};
   bool serializeIoRequests_{false};
 
   // Chunk and pass read limits resolved from the session when the reader is

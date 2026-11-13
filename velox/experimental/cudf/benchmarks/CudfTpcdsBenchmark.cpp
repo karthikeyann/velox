@@ -71,6 +71,12 @@ DEFINE_bool(
     "Decode pages of flat fixed-width columns with libcudf's tile decode "
     "kernels");
 
+DEFINE_uint64(
+    cudf_hive_fetch_ahead_bytes,
+    0,
+    "Device memory in bytes that column chunks fetched ahead of the drivers "
+    "may hold; 0 fetches nothing ahead");
+
 DEFINE_string(
     cudf_properties,
     "",
@@ -139,6 +145,9 @@ CudfTpcdsBenchmark::makeConnectorProperties() {
   cfg->set(
       CudfHiveCfg::kPreloadColumnChunks,
       std::to_string(FLAGS_cudf_hive_preload_column_chunks));
+  cfg->set(
+      CudfHiveCfg::kFetchAheadBytes,
+      std::to_string(FLAGS_cudf_hive_fetch_ahead_bytes));
   cfg->set(CudfHiveCfg::kAllowMismatchedCudfHiveSchemas, "true");
   cfg->set(
       CudfHiveCfg::kUseTileDecode,
