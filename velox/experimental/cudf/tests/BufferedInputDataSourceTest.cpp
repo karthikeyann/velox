@@ -18,21 +18,31 @@
 #include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
+#include "velox/experimental/cudf/tests/utils/RecordingPinnedResource.h"
 
 #include "velox/common/file/File.h"
 #include "velox/dwio/common/BufferedInput.h"
 
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
 
+#include <rmm/aligned.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
 
+#include <fmt/format.h>
 #include <folly/Executor.h>
+#include <folly/ScopeGuard.h>
 
+#include <algorithm>
 #include <atomic>
+#include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -51,6 +61,9 @@ class CountingReadFile : public InMemoryReadFile {
       void* buf,
       const FileIoContext& context = {}) const override {
     ++numReads_;
+    if (onRead_ != nullptr) {
+      onRead_();
+    }
     return InMemoryReadFile::pread(offset, length, buf, context);
   }
 
@@ -58,8 +71,14 @@ class CountingReadFile : public InMemoryReadFile {
     return numReads_;
   }
 
+  // Sets a function that every read calls before it reads.
+  void setOnRead(std::function<void()> onRead) {
+    onRead_ = std::move(onRead);
+  }
+
  private:
   mutable std::atomic_int32_t numReads_{0};
+  std::function<void()> onRead_;
 };
 
 // An executor that holds what it is given and never runs it, so that a read
@@ -103,10 +122,12 @@ class BufferedInputDataSourceTest : public ::facebook::velox::cudf_velox::exec::
   }
 
   std::unique_ptr<BufferedInputDataSource> makeDataSource(
-      const std::string& content) {
+      const std::string& content,
+      uint64_t pinnedPieceBytes) {
     file_ = std::make_shared<CountingReadFile>(content);
     return std::make_unique<BufferedInputDataSource>(
-        std::make_shared<TestBufferedInput>(file_, *pool_, &executor_));
+        std::make_shared<TestBufferedInput>(file_, *pool_, &executor_),
+        pinnedPieceBytes);
   }
 
   // Returns a device buffer of 'size' bytes that all have 'value'.
@@ -135,6 +156,98 @@ class BufferedInputDataSourceTest : public ::facebook::velox::cudf_velox::exec::
   std::shared_ptr<CountingReadFile> file_;
 };
 
+// A device read through page-locked pieces delivers the bytes of the range
+// with at most two pieces of the configured size allocated, however long the
+// range; with a piece size of zero it allocates no page-locked memory.
+TEST_F(BufferedInputDataSourceTest, pinnedPieces) {
+  constexpr size_t kOffset{100};
+  constexpr size_t kPieceBytes{4'096};
+  const auto content = makeContent(100'000);
+  auto stream = cudfGlobalStreamPool().get_stream();
+
+  struct TestCase {
+    uint64_t pinnedPieceBytes;
+    size_t size;
+    size_t expectedSize;
+    size_t expectedNumPieces;
+    size_t expectedMaxPinnedBytes;
+  };
+  const std::vector<TestCase> testCases = {
+      {0, 50'000, 50'000, 0, 0},
+      {kPieceBytes, 1'000, 1'000, 1, 1'000},
+      {kPieceBytes, kPieceBytes, kPieceBytes, 1, kPieceBytes},
+      {kPieceBytes, 6'000, 6'000, 2, 2 * kPieceBytes},
+      {kPieceBytes, 50'000, 50'000, 2, 2 * kPieceBytes},
+      // Past the end of the file.
+      {kPieceBytes, 200'000, 99'900, 2, 2 * kPieceBytes},
+  };
+  for (const auto& testCase : testCases) {
+    SCOPED_TRACE(
+        fmt::format(
+            "piece {} size {}", testCase.pinnedPieceBytes, testCase.size));
+    test::RecordingPinnedResource pinned{cudf::get_pinned_memory_resource()};
+    const auto previous = cudf::set_pinned_memory_resource(pinned);
+    SCOPE_EXIT {
+      cudf::set_pinned_memory_resource(previous);
+    };
+    auto dataSource = makeDataSource(content, testCase.pinnedPieceBytes);
+    auto device = makeDeviceBuffer(testCase.expectedSize, 7);
+    auto read = dataSource->device_read_async(
+        kOffset, testCase.size, static_cast<uint8_t*>(device.data()), stream);
+    EXPECT_EQ(read.get(), testCase.expectedSize);
+    stream.sync();
+    EXPECT_EQ(toHost(device), content.substr(kOffset, testCase.expectedSize));
+    EXPECT_EQ(pinned.numAllocations(), testCase.expectedNumPieces);
+    EXPECT_EQ(pinned.maxBytesInUse(), testCase.expectedMaxPinnedBytes);
+    EXPECT_EQ(pinned.bytesInUse(), 0);
+  }
+}
+
+// A read through pieces that is given up while it reads its first piece
+// copies that piece and stops.
+TEST_F(BufferedInputDataSourceTest, abandonedBetweenPieces) {
+  constexpr size_t kPieceBytes{4'096};
+  constexpr size_t kSize{50'000};
+  const auto content = makeContent(100'000);
+  auto stream = cudfGlobalStreamPool().get_stream();
+  auto dataSource = makeDataSource(content, kPieceBytes);
+  file_->setOnRead([&]() { dataSource->abandonDeviceReads(); });
+  auto device = makeDeviceBuffer(kSize, 7);
+  auto read = dataSource->device_read_async(
+      0, kSize, static_cast<uint8_t*>(device.data()), stream);
+  EXPECT_EQ(read.get(), kPieceBytes);
+  stream.sync();
+  EXPECT_EQ(
+      toHost(device),
+      content.substr(0, kPieceBytes) + std::string(kSize - kPieceBytes, 7));
+}
+
+// A read whose second piece cannot be allocated fails where the consumer
+// waits for it, after the copy of the first piece, and leaves no page-locked
+// memory in use.
+TEST_F(BufferedInputDataSourceTest, pinnedAllocationFailure) {
+  constexpr size_t kPieceBytes{4'096};
+  constexpr size_t kSize{50'000};
+  const auto content = makeContent(100'000);
+  auto stream = cudfGlobalStreamPool().get_stream();
+  test::RecordingPinnedResource pinned{
+      cudf::get_pinned_memory_resource(), /*failingAllocation=*/2};
+  const auto previous = cudf::set_pinned_memory_resource(pinned);
+  SCOPE_EXIT {
+    cudf::set_pinned_memory_resource(previous);
+  };
+  auto dataSource = makeDataSource(content, kPieceBytes);
+  auto device = makeDeviceBuffer(kSize, 7);
+  auto read = dataSource->device_read_async(
+      0, kSize, static_cast<uint8_t*>(device.data()), stream);
+  EXPECT_THROW(read.get(), std::bad_alloc);
+  stream.sync();
+  EXPECT_EQ(pinned.numAllocations(), 1);
+  EXPECT_EQ(pinned.bytesInUse(), 0);
+  EXPECT_EQ(
+      toHost(device).substr(0, kPieceBytes), content.substr(0, kPieceBytes));
+}
+
 // Device reads that have not begun when the consumer gives them up do not
 // read the file or write to the device, whether they were asked for before or
 // after; without that, waiting for them performs them.
@@ -144,7 +257,7 @@ TEST_F(BufferedInputDataSourceTest, abandonedDeviceReads) {
   auto stream = cudfGlobalStreamPool().get_stream();
   {
     SCOPED_TRACE("waited for");
-    auto dataSource = makeDataSource(content);
+    auto dataSource = makeDataSource(content, 0);
     auto device = makeDeviceBuffer(kSize, 7);
     auto read = dataSource->device_read_async(
         100, kSize, static_cast<uint8_t*>(device.data()), stream);
@@ -156,7 +269,7 @@ TEST_F(BufferedInputDataSourceTest, abandonedDeviceReads) {
   }
   {
     SCOPED_TRACE("abandoned");
-    auto dataSource = makeDataSource(content);
+    auto dataSource = makeDataSource(content, 0);
     auto device = makeDeviceBuffer(kSize, 7);
     auto before = dataSource->device_read_async(
         100, kSize, static_cast<uint8_t*>(device.data()), stream);

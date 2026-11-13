@@ -26,6 +26,7 @@
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
+#include "velox/experimental/cudf/tests/utils/RecordingPinnedResource.h"
 
 #include "velox/common/base/Fs.h"
 #include "velox/common/base/tests/GTestUtils.h"
@@ -57,6 +58,7 @@
 #include "velox/type/tests/SubfieldFiltersBuilder.h"
 
 #include <cudf/io/parquet.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -915,6 +917,50 @@ TEST_P(TableScanTestParameterized, fetchAheadClaimed) {
   resetCudfHiveConnector(
       std::make_shared<config::ConfigBase>(
           std::unordered_map<std::string, std::string>{}));
+}
+
+// A scan with the buffered-input reader copies its column chunks through
+// page-locked pieces far smaller than the chunks, on the threads of the IO
+// executor, and returns the same rows, alone and with fetch-ahead.
+TEST_F(TableScanTest, bufferedInputPinnedPieces) {
+  using cudf_velox::connector::hive::CudfHiveConfig;
+  // A size that nothing else allocates.
+  constexpr uint64_t kPieceBytes{2'500};
+  constexpr int32_t kNumFiles{4};
+  auto filePaths = makeFilePaths(kNumFiles);
+  auto vectors = makeVectors(kNumFiles, 5'000);
+  for (auto i = 0; i < vectors.size(); ++i) {
+    writeToFile(filePaths[i]->getPath(), vectors[i]);
+  }
+  createDuckDbTable(vectors);
+  for (const uint64_t fetchAheadBytes : {uint64_t{0}, uint64_t{1} << 30}) {
+    SCOPED_TRACE(fetchAheadBytes);
+    cudf_velox::test::RecordingPinnedResource pinned{
+        cudf::get_pinned_memory_resource()};
+    const auto previous = cudf::set_pinned_memory_resource(pinned);
+    SCOPE_EXIT {
+      cudf::set_pinned_memory_resource(previous);
+    };
+    resetCudfHiveConnector(
+        std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>{
+                {CudfHiveConfig::kUseBufferedInput, "true"},
+                {CudfHiveConfig::kBufferedInputPinnedPieceBytes,
+                 std::to_string(kPieceBytes)},
+                {CudfHiveConfig::kFetchAheadBytes,
+                 std::to_string(fetchAheadBytes)},
+            }));
+    AssertQueryBuilder(tableScanNode(), duckDbQueryRunner_)
+        .maxDrivers(2)
+        .splits(makeCudfHiveConnectorSplits(filePaths))
+        .assertResults("SELECT * FROM tmp");
+    waitForAllTasksToBeDeleted();
+    resetCudfHiveConnector(
+        std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>{}));
+    EXPECT_GT(pinned.numAllocationsOf(kPieceBytes), 0);
+    EXPECT_EQ(pinned.bytesInUse(), 0);
+  }
 }
 
 // Splits prepared in the background by the preloader must produce the same

@@ -153,6 +153,10 @@ bool CudfHiveConfig::preloadColumnChunksSession(
       config_->get<bool>(kPreloadColumnChunks, false));
 }
 
+uint64_t CudfHiveConfig::bufferedInputPinnedPieceBytes() const {
+  return config_->get<uint64_t>(kBufferedInputPinnedPieceBytes, 0);
+}
+
 uint64_t CudfHiveConfig::fetchAheadBytes() const {
   return config_->get<uint64_t>(kFetchAheadBytes, 0);
 }

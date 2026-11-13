@@ -90,6 +90,12 @@ class CudfHiveConfig {
   static constexpr const char* kUseBufferedInputSession =
       "cudf.hive.use_buffered_input";
 
+  // Size in bytes of the page-locked pieces through which the BufferedInput
+  // data source copies a byte range to the device. Zero, the default, reads
+  // each byte range into one pageable buffer and copies from that.
+  static constexpr const char* kBufferedInputPinnedPieceBytes =
+      "cudf.hive.buffered-input-pinned-piece-bytes";
+
   // Whether background split preparation starts reading the first column-chunk
   // pass. Disable to keep queued preloaded splits metadata-only.
   static constexpr const char* kPreloadColumnChunks =
@@ -189,6 +195,8 @@ class CudfHiveConfig {
 
   bool preloadColumnChunks() const;
   bool preloadColumnChunksSession(const config::ConfigBase* session) const;
+
+  uint64_t bufferedInputPinnedPieceBytes() const;
 
   uint64_t fetchAheadBytes() const;
 

@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/tests/GTestUtils.h"
@@ -76,6 +77,27 @@ TEST(ConfigTest, rejectsNonPositiveBatchConcatTargets) {
   VELOX_ASSERT_USER_THROW(
       initialize(CudfConfig::kCudfBatchSizeMinBytes, "-1"),
       "cuDF BatchConcat minimum byte target must be a positive integer: -1");
+}
+
+TEST(ConfigTest, hiveFetchOptions) {
+  using connector::hive::CudfHiveConfig;
+  {
+    CudfHiveConfig config(
+        std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>{}));
+    EXPECT_EQ(config.fetchAheadBytes(), 0);
+    EXPECT_EQ(config.bufferedInputPinnedPieceBytes(), 0);
+  }
+  {
+    CudfHiveConfig config(
+        std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>{
+                {CudfHiveConfig::kFetchAheadBytes, "2147483648"},
+                {CudfHiveConfig::kBufferedInputPinnedPieceBytes, "4194304"},
+            }));
+    EXPECT_EQ(config.fetchAheadBytes(), 2'147'483'648);
+    EXPECT_EQ(config.bufferedInputPinnedPieceBytes(), 4'194'304);
+  }
 }
 
 } // namespace facebook::velox::cudf_velox::test
