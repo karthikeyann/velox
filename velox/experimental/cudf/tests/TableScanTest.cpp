@@ -958,6 +958,38 @@ TEST_F(TableScanTest, bufferedInputPinnedPieces) {
   }
 }
 
+// With a fetch-ahead budget a scan keeps a number of splits prepared that
+// does not shrink with the drivers; without one, the number is Velox's.
+TEST_F(TableScanTest, fetchAheadPreloadedSplits) {
+  using cudf_velox::connector::hive::CudfHiveConfig;
+  using cudf_velox::connector::hive::CudfHiveConnector;
+  std::unordered_map<std::string, std::string> options;
+  const auto maxPreloadedSplits = [&](uint64_t fetchAheadBytes,
+                                      int32_t numDrivers,
+                                      int32_t maxSplitPreloadPerDriver) {
+    options[CudfHiveConfig::kFetchAheadBytes] = std::to_string(fetchAheadBytes);
+    resetCudfHiveConnector(
+        std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>(options)));
+    return facebook::velox::connector::ConnectorRegistry::tryGet(
+               kCudfHiveConnectorId)
+        ->maxPreloadedSplits(numDrivers, maxSplitPreloadPerDriver);
+  };
+  EXPECT_EQ(maxPreloadedSplits(0, 1, 2), 2);
+  EXPECT_EQ(maxPreloadedSplits(0, 8, 2), 16);
+  EXPECT_EQ(maxPreloadedSplits(0, 16, 4), 64);
+  EXPECT_EQ(maxPreloadedSplits(1 << 20, 1, 2), 16);
+  EXPECT_EQ(maxPreloadedSplits(1 << 20, 4, 2), 16);
+  EXPECT_EQ(maxPreloadedSplits(1 << 20, 16, 4), 64);
+  options[CudfHiveConfig::kFetchAheadMinPreloadedSplits] = "4";
+  EXPECT_EQ(maxPreloadedSplits(1 << 20, 1, 2), 4);
+  EXPECT_EQ(maxPreloadedSplits(1 << 20, 4, 2), 8);
+  EXPECT_EQ(maxPreloadedSplits(0, 1, 2), 2);
+  resetCudfHiveConnector(
+      std::make_shared<config::ConfigBase>(
+          std::unordered_map<std::string, std::string>{}));
+}
+
 // Splits prepared in the background by the preloader must produce the same
 // results as splits prepared on the driver thread.
 TEST_F(TableScanTest, preloadSplits) {

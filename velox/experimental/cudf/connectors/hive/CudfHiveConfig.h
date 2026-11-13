@@ -113,6 +113,13 @@ class CudfHiveConfig {
   // are not held back. Every connector has a budget of its own.
   static constexpr const char* kFetchAheadBytes = "cudf.hive.fetch-ahead-bytes";
 
+  // Fewest splits a table scan keeps prepared ahead of its drivers when the
+  // connector has a fetch-ahead budget, however few the drivers. The query's
+  // max_split_preload_per_driver still applies when it gives more, and zero
+  // there still disables preparing splits ahead.
+  static constexpr const char* kFetchAheadMinPreloadedSplits =
+      "cudf.hive.fetch-ahead-min-preloaded-splits";
+
   // Whether to serialize concurrent I/O request submission batches.
   static constexpr const char* kSerializeIoRequests =
       "cudf.hive.serialize-io-requests";
@@ -199,6 +206,8 @@ class CudfHiveConfig {
   uint64_t bufferedInputPinnedPieceBytes() const;
 
   uint64_t fetchAheadBytes() const;
+
+  int32_t fetchAheadMinPreloadedSplits() const;
 
   bool serializeIoRequests() const;
   bool serializeIoRequestsSession(const config::ConfigBase* session) const;

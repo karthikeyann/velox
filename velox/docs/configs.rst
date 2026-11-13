@@ -1714,6 +1714,11 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      - integer
      - 0
      - Bytes of compressed column chunks that fetches started ahead of the drivers may bring the total held on the device by the connector's scans to: the fetch-ahead budget. 0 fetches nothing ahead. With a budget, a scan fetches the row group passes it gets to next while its drivers are busy with what they have: the next pass of a split being read, then the first pass of the splits Velox prepares ahead. This keeps the storage and the link to the device busy however few the drivers. Fetches start ahead only while the drivers of the scan have received everything they asked for and no driver of any scan of the connector is blocked waiting for bytes, because the data sources serve fetches in the order they are started. The budget is not a bound on device memory: a fetch that a driver asks for is counted and never held back, every scan may have one fetch ahead whatever its size, and what decoding allocates is not counted. The memory is outside Velox's memory pools. ``cudf.hive.preload-column-chunks`` has no further effect with a budget: prepared splits are fetched within it instead of without a bound. Every connector has a budget, a thread that starts the fetches and a set of CUDA streams of its own.
+   * - cudf.hive.fetch-ahead-min-preloaded-splits
+     -
+     - integer
+     - 16
+     - Fewest splits a table scan keeps prepared ahead of its drivers when ``cudf.hive.fetch-ahead-bytes`` is set, however few the drivers, so that the look-ahead of a scan of small splits is bounded by the budget's bytes and not by a count of splits. A prepared split holds a parsed footer and a reader. The query's ``max_split_preload_per_driver`` times the number of drivers applies when it is larger, and a value of 0 there still disables preparing splits ahead.
    * - cudf.hive.serialize-io-requests
      - cudf.hive.serialize_io_requests
      - bool

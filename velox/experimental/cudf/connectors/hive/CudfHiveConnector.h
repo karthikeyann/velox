@@ -58,6 +58,15 @@ class CudfHiveConnector final
     return fetchAheadContext_;
   }
 
+  /// With a fetch-ahead budget, returns at least
+  /// cudf.hive.fetch-ahead-min-preloaded-splits whatever the number of
+  /// drivers, so that the look-ahead of a scan of small splits is bounded by
+  /// the budget's bytes and not by a count of splits. What is fetched for a
+  /// prepared split is bounded by the budget.
+  int32_t maxPreloadedSplits(
+      int32_t numDrivers,
+      int32_t maxSplitPreloadPerDriver) const override;
+
   // TODO (dm): Re-add data sink
 
  protected:

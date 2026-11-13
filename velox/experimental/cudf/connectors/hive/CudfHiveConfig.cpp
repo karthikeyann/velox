@@ -161,6 +161,10 @@ uint64_t CudfHiveConfig::fetchAheadBytes() const {
   return config_->get<uint64_t>(kFetchAheadBytes, 0);
 }
 
+int32_t CudfHiveConfig::fetchAheadMinPreloadedSplits() const {
+  return config_->get<int32_t>(kFetchAheadMinPreloadedSplits, 16);
+}
+
 bool CudfHiveConfig::serializeIoRequests() const {
   return config_->get<bool>(kSerializeIoRequests, false);
 }

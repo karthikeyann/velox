@@ -22,6 +22,8 @@
 
 #include "velox/connectors/hive/HiveDataSource.h"
 
+#include <algorithm>
+
 namespace facebook::velox::cudf_velox::connector::hive {
 
 using namespace facebook::velox::connector;
@@ -71,6 +73,15 @@ std::unique_ptr<DataSource> CudfHiveConnector::createDataSource(
       ioExecutor_,
       connectorQueryCtx,
       hiveConfig_);
+}
+
+int32_t CudfHiveConnector::maxPreloadedSplits(
+    int32_t numDrivers,
+    int32_t maxSplitPreloadPerDriver) const {
+  const auto numSplits = numDrivers * maxSplitPreloadPerDriver;
+  return cudfHiveConfig_->fetchAheadBytes() > 0
+      ? std::max(numSplits, cudfHiveConfig_->fetchAheadMinPreloadedSplits())
+      : numSplits;
 }
 
 // TODO (dm): Re-add data sink
