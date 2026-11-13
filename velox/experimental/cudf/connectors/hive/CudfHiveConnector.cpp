@@ -31,7 +31,12 @@ CudfHiveConnector::CudfHiveConnector(
     std::shared_ptr<const facebook::velox::config::ConfigBase> config,
     folly::Executor* executor)
     : ::facebook::velox::connector::hive::HiveConnector(id, config, executor),
-      cudfHiveConfig_(std::make_shared<CudfHiveConfig>(config)) {
+      cudfHiveConfig_(std::make_shared<CudfHiveConfig>(config)),
+      fetchAheadContext_(
+          cudfHiveConfig_->fetchAheadBytes() > 0
+              ? std::make_shared<FetchAheadContext>(
+                    cudfHiveConfig_->fetchAheadBytes())
+              : nullptr) {
   VLOG(1) << "cuDF Hive connector created";
 }
 
@@ -54,7 +59,8 @@ std::unique_ptr<DataSource> CudfHiveConnector::createDataSource(
         &fileHandleFactory_,
         ioExecutor_,
         connectorQueryCtx,
-        cudfHiveConfig_);
+        cudfHiveConfig_,
+        fetchAheadContext_);
   }
 
   return std::make_unique<::facebook::velox::connector::hive::HiveDataSource>(

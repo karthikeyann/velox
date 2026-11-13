@@ -410,7 +410,8 @@ CudfHiveDataSource::CudfHiveDataSource(
     facebook::velox::FileHandleFactory* fileHandleFactory,
     folly::Executor* executor,
     const ConnectorQueryCtx* connectorQueryCtx,
-    const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig)
+    const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
+    const std::shared_ptr<FetchAheadContext>& fetchAheadContext)
     : CudfHiveDataSource(
           outputType,
           tableHandle,
@@ -419,6 +420,7 @@ CudfHiveDataSource::CudfHiveDataSource(
           executor,
           connectorQueryCtx,
           cudfHiveConfig,
+          fetchAheadContext,
           PartitionKeySource::kDataSource) {}
 
 CudfHiveDataSource::CudfHiveDataSource(
@@ -429,12 +431,14 @@ CudfHiveDataSource::CudfHiveDataSource(
     folly::Executor* executor,
     const ConnectorQueryCtx* connectorQueryCtx,
     const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
+    const std::shared_ptr<FetchAheadContext>& fetchAheadContext,
     PartitionKeySource partitionKeySource)
     : NvtxHelper(
           nvtx3::rgb{80, 171, 241}, // CudfHive blue,
           std::nullopt,
           fmt::format("[{}]", tableHandle->name())),
       cudfHiveConfig_(cudfHiveConfig),
+      fetchAheadContext_(fetchAheadContext),
       fileHandleFactory_(fileHandleFactory),
       executor_(executor),
       connectorQueryCtx_(connectorQueryCtx),
@@ -635,6 +639,7 @@ std::unique_ptr<CudfSplitReader> CudfHiveDataSource::createCudfSplitReader() {
       executor_,
       connectorQueryCtx_,
       cudfHiveConfig_,
+      fetchAheadContext_,
       ioStatistics_,
       ioStats_,
       subfieldFilterAst_);

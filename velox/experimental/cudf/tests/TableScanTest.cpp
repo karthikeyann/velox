@@ -26,6 +26,7 @@
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
+#include "velox/experimental/cudf/tests/utils/RecordingPinnedResource.h"
 
 #include "velox/common/base/Fs.h"
 #include "velox/common/base/tests/GTestUtils.h"
@@ -36,12 +37,14 @@
 #include "velox/common/memory/MemoryArbitrator.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/connectors/ConnectorRegistry.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/dwio/common/FileSink.h"
 #include "velox/dwio/common/tests/utils/DataFiles.h"
 #include "velox/dwio/parquet/RegisterParquetReader.h"
 #include "velox/dwio/parquet/writer/Writer.h"
+#include "velox/exec/Cursor.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/TableScan.h"
@@ -55,6 +58,7 @@
 #include "velox/type/tests/SubfieldFiltersBuilder.h"
 
 #include <cudf/io/parquet.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -63,7 +67,9 @@
 #include <folly/synchronization/Baton.h>
 #include <folly/synchronization/Latch.h>
 
+#include <chrono>
 #include <functional>
+#include <thread>
 
 using namespace facebook::velox;
 using namespace facebook::velox::common::testutil;
@@ -391,6 +397,22 @@ class TableScanTest : public virtual CudfHiveConnectorTestBase {
 class TableScanTestParameterized : public TableScanTest,
                                    public testing::WithParamInterface<bool> {};
 
+// Returns the cuDF Hive connector that is registered.
+std::shared_ptr<cudf_velox::connector::hive::CudfHiveConnector>
+cudfHiveConnector() {
+  auto connector =
+      std::dynamic_pointer_cast<cudf_velox::connector::hive::CudfHiveConnector>(
+          facebook::velox::connector::ConnectorRegistry::tryGet(
+              kCudfHiveConnectorId));
+  VELOX_CHECK_NOT_NULL(connector);
+  return connector;
+}
+
+// Returns the counters of the registered connector's fetch-ahead budget.
+cudf_velox::connector::hive::FetchAheadBudget::Stats fetchAheadStats() {
+  return cudfHiveConnector()->fetchAheadContext()->budget().stats();
+}
+
 TEST_P(TableScanTestParameterized, ignoreMissingFiles) {
   using cudf_velox::connector::hive::CudfHiveConfig;
   using hive::HiveConfig;
@@ -610,10 +632,9 @@ TEST_P(TableScanTestParameterized, allColumnsWithRowGroupPasses) {
 // prepared ahead of it are fetched ahead too, within the fetch-ahead budget,
 // when the session asks for it; either way the scan returns the same rows and
 // gives back every byte it held.
-TEST_F(TableScanTest, fetchAhead) {
+TEST_P(TableScanTestParameterized, fetchAhead) {
   using cudf_velox::connector::hive::CudfHiveConfig;
   using cudf_velox::connector::hive::FetchAheadBudget;
-  using cudf_velox::connector::hive::sharedFetchAheadBudget;
   constexpr int32_t kNumFiles{12};
   auto filePaths = makeFilePaths(kNumFiles);
   auto vectors = makeVectors(kNumFiles, 5'000);
@@ -634,27 +655,26 @@ TEST_F(TableScanTest, fetchAhead) {
 
   // What a scan is run with.
   struct Scan {
-    // Capacity of the budget, or zero for none. Budgets are shared by
-    // capacity for the life of the process, so every case has a capacity of
-    // its own.
+    // Capacity of the budget, or zero for none.
     uint64_t capacity;
     bool preloadColumnChunks{false};
     int32_t numPreloadedSplits{4};
     // Rows to read, or zero for every row.
     int64_t limit{0};
   };
-  // Returns the counters of the budget of 'scan.capacity' after the scan,
-  // with the counts of offers and starts being those of this scan.
+  // Returns the counters of the connector's budget after the scan. Every
+  // scan has a connector, and so a budget, of its own.
   const auto run = [&](const Scan& scan) {
-    const auto before = scan.capacity > 0
-        ? sharedFetchAheadBudget(scan.capacity)->stats()
-        : FetchAheadBudget::Stats{};
     resetCudfHiveConnector(
         std::make_shared<config::ConfigBase>(
             std::unordered_map<std::string, std::string>{
                 {CudfHiveConfig::kFetchAheadBytes,
                  std::to_string(scan.capacity)},
+                {CudfHiveConfig::kUseBufferedInput,
+                 GetParam() ? "true" : "false"},
             }));
+    EXPECT_EQ(
+        cudfHiveConnector()->fetchAheadContext() != nullptr, scan.capacity > 0);
     AssertQueryBuilder builder(
         scan.limit > 0 ? limitPlan(scan.limit) : plan, duckDbQueryRunner_);
     builder.maxDrivers(1)
@@ -675,20 +695,9 @@ TEST_F(TableScanTest, fetchAhead) {
     }
     // The splits the scan did not get to are given up with their task.
     waitForAllTasksToBeDeleted();
-    if (scan.capacity == 0) {
-      return FetchAheadBudget::Stats{};
-    }
-    auto stats = sharedFetchAheadBudget(scan.capacity)->stats();
-    stats.numOffered -= before.numOffered;
-    stats.numStartedAhead -= before.numStartedAhead;
-    return stats;
+    return scan.capacity > 0 ? fetchAheadStats() : FetchAheadBudget::Stats{};
   };
   constexpr uint64_t kRoomy{1ULL << 30};
-
-  // Budgets are shared by capacity. Zero takes a share of the device.
-  EXPECT_EQ(sharedFetchAheadBudget(kRoomy), sharedFetchAheadBudget(kRoomy));
-  EXPECT_NE(sharedFetchAheadBudget(kRoomy), sharedFetchAheadBudget(kRoomy + 1));
-  EXPECT_EQ(sharedFetchAheadBudget(kRoomy)->capacity(), kRoomy);
 
   {
     // The default: no budget. The scan returns the same rows.
@@ -700,7 +709,7 @@ TEST_F(TableScanTest, fetchAhead) {
   uint64_t largestSplit{0};
   {
     SCOPED_TRACE("no split prepared ahead");
-    const auto stats = run({.capacity = kRoomy + 2, .numPreloadedSplits = 0});
+    const auto stats = run({.capacity = kRoomy, .numPreloadedSplits = 0});
     EXPECT_EQ(stats.numOffered, 0);
     EXPECT_EQ(stats.heldBytes, 0);
     EXPECT_GT(stats.maxHeldBytes, 0);
@@ -708,9 +717,8 @@ TEST_F(TableScanTest, fetchAhead) {
   }
   {
     SCOPED_TRACE("room for every split");
-    const auto stats = run({.capacity = kRoomy + 3});
+    const auto stats = run({.capacity = kRoomy});
     EXPECT_GT(stats.numOffered, 0);
-    EXPECT_GT(stats.numStartedAhead, 0);
     EXPECT_EQ(stats.numWaiting, 0);
     EXPECT_EQ(stats.numAhead, 0);
     EXPECT_EQ(stats.heldBytes, 0);
@@ -738,7 +746,7 @@ TEST_F(TableScanTest, fetchAhead) {
     SCOPED_TRACE("scan that stops early");
     // The scan ends after its first rows, with fetches offered and started
     // ahead that no driver asked for. Every byte comes back.
-    const auto stats = run({.capacity = kRoomy + 4, .limit = 10});
+    const auto stats = run({.capacity = kRoomy, .limit = 10});
     EXPECT_GT(stats.numOffered, 0);
     EXPECT_EQ(stats.heldBytes, 0);
     EXPECT_EQ(stats.numAhead, 0);
@@ -753,10 +761,9 @@ TEST_F(TableScanTest, fetchAhead) {
 // the pass after the one being decoded is offered to the budget, so the
 // reader holds at most two passes; the rows are the same and every byte is
 // given back, also when the scan stops early.
-TEST_F(TableScanTest, fetchAheadWithinSplit) {
+TEST_P(TableScanTestParameterized, fetchAheadWithinSplit) {
   using cudf_velox::connector::hive::CudfHiveConfig;
   using cudf_velox::connector::hive::FetchAheadBudget;
-  using cudf_velox::connector::hive::sharedFetchAheadBudget;
   constexpr int32_t kNumRowGroups{8};
   // One row group per vector.
   auto vectors = makeVectors(kNumRowGroups, 5'000);
@@ -772,16 +779,15 @@ TEST_F(TableScanTest, fetchAheadWithinSplit) {
                        .limit(0, 10, false)
                        .planNode();
 
-  // Returns the counters of the budget of 'capacity' after a scan that
-  // reads every row, or its first rows, with the counts of offers and starts
-  // being those of this scan.
+  // Returns the counters of the connector's budget after a scan that reads
+  // every row, or its first rows.
   const auto run = [&](uint64_t capacity, bool stopsEarly) {
-    const auto before = capacity > 0 ? sharedFetchAheadBudget(capacity)->stats()
-                                     : FetchAheadBudget::Stats{};
     resetCudfHiveConnector(
         std::make_shared<config::ConfigBase>(
             std::unordered_map<std::string, std::string>{
                 {CudfHiveConfig::kFetchAheadBytes, std::to_string(capacity)},
+                {CudfHiveConfig::kUseBufferedInput,
+                 GetParam() ? "true" : "false"},
             }));
     AssertQueryBuilder builder(
         stopsEarly ? limitPlan : plan, duckDbQueryRunner_);
@@ -799,15 +805,9 @@ TEST_F(TableScanTest, fetchAheadWithinSplit) {
       builder.assertResults("SELECT * FROM tmp");
     }
     waitForAllTasksToBeDeleted();
-    if (capacity == 0) {
-      return FetchAheadBudget::Stats{};
-    }
-    auto stats = sharedFetchAheadBudget(capacity)->stats();
-    stats.numOffered -= before.numOffered;
-    stats.numStartedAhead -= before.numStartedAhead;
-    return stats;
+    return capacity > 0 ? fetchAheadStats() : FetchAheadBudget::Stats{};
   };
-  constexpr uint64_t kRoomy{(1ULL << 30) + 100};
+  constexpr uint64_t kRoomy{1ULL << 30};
 
   {
     // The default: no budget. The scan returns the same rows.
@@ -818,7 +818,7 @@ TEST_F(TableScanTest, fetchAheadWithinSplit) {
   // so with or without room it holds the pass being decoded and the next:
   // two of the eight, which are of about one size.
   const auto fileSize = static_cast<uint64_t>(filePath->fileSize());
-  for (const uint64_t capacity : {uint64_t{3}, kRoomy + 1}) {
+  for (const uint64_t capacity : {uint64_t{3}, kRoomy}) {
     SCOPED_TRACE(capacity);
     const auto stats = run(capacity, false);
     // Every pass but the first is offered while the one before it is
@@ -832,7 +832,7 @@ TEST_F(TableScanTest, fetchAheadWithinSplit) {
   }
   {
     SCOPED_TRACE("scan that stops early");
-    const auto stats = run(kRoomy + 2, true);
+    const auto stats = run(kRoomy, true);
     EXPECT_GT(stats.numOffered, 0);
     EXPECT_EQ(stats.numWaiting, 0);
     EXPECT_EQ(stats.numAhead, 0);
@@ -841,6 +841,121 @@ TEST_F(TableScanTest, fetchAheadWithinSplit) {
   resetCudfHiveConnector(
       std::make_shared<config::ConfigBase>(
           std::unordered_map<std::string, std::string>{}));
+}
+
+// A driver that is held back after its first batch finds column chunks of
+// the splits prepared ahead on the device: their fetches start while the
+// driver is busy with what it has, and the driver claims them when it gets
+// to those splits. The scan reports how long the driver waited for bytes.
+TEST_P(TableScanTestParameterized, fetchAheadClaimed) {
+  using cudf_velox::connector::hive::CudfHiveConfig;
+  using cudf_velox::connector::hive::CudfSplitReader;
+  constexpr int32_t kNumFiles{4};
+  constexpr int32_t kNumRows{5'000};
+  auto filePaths = makeFilePaths(kNumFiles);
+  auto vectors = makeVectors(kNumFiles, kNumRows);
+  for (auto i = 0; i < vectors.size(); ++i) {
+    writeToFile(filePaths[i]->getPath(), vectors[i]);
+  }
+  resetCudfHiveConnector(
+      std::make_shared<config::ConfigBase>(
+          std::unordered_map<std::string, std::string>{
+              {CudfHiveConfig::kFetchAheadBytes, std::to_string(1ULL << 30)},
+              {CudfHiveConfig::kUseBufferedInput,
+               GetParam() ? "true" : "false"},
+          }));
+  auto plan = tableScanNode();
+  {
+    CursorParameters params;
+    params.planNode = plan;
+    params.maxDrivers = 1;
+    // The driver blocks after every batch until the batch is taken.
+    params.bufferedBytes = 2;
+    auto cursor = TaskCursor::create(params);
+    cursor->start();
+    for (auto& split : makeCudfHiveConnectorSplits(filePaths)) {
+      cursor->task()->addSplit(
+          plan->id(), facebook::velox::exec::Split(std::move(split)));
+    }
+    cursor->task()->noMoreSplits(plan->id());
+
+    // The driver has decoded the first split and waits for its batch to be
+    // taken. A split prepared ahead offers its fetch, which starts.
+    while (fetchAheadStats().numStartedAhead == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    // The start thread runs the starts in the order they were posted.
+    folly::Baton<> started;
+    cudfHiveConnector()->fetchAheadContext()->post([&]() { started.post(); });
+    started.wait();
+
+    int64_t numRows{0};
+    while (cursor->moveNext()) {
+      numRows += cursor->current()->size();
+    }
+    EXPECT_EQ(numRows, kNumFiles * kNumRows);
+
+    auto planStats = toPlanStats(cursor->task()->taskStats());
+    const auto& scanStats = planStats.at(plan->id());
+    const auto fetchWait = scanStats.customStats.find(
+        std::string(CudfSplitReader::kFetchWaitWallNanos));
+    ASSERT_TRUE(fetchWait != scanStats.customStats.end());
+    // One pass in every file.
+    EXPECT_EQ(fetchWait->second.count, kNumFiles);
+  }
+  waitForAllTasksToBeDeleted();
+  const auto stats = fetchAheadStats();
+  EXPECT_GE(stats.numClaimed, 1);
+  EXPECT_EQ(stats.numAhead, 0);
+  EXPECT_EQ(stats.numWaiting, 0);
+  EXPECT_EQ(stats.heldBytes, 0);
+  resetCudfHiveConnector(
+      std::make_shared<config::ConfigBase>(
+          std::unordered_map<std::string, std::string>{}));
+}
+
+// A scan with the buffered-input reader copies its column chunks through
+// page-locked pieces far smaller than the chunks, on the threads of the IO
+// executor, and returns the same rows, alone and with fetch-ahead.
+TEST_F(TableScanTest, bufferedInputPinnedPieces) {
+  using cudf_velox::connector::hive::CudfHiveConfig;
+  // A size that nothing else allocates.
+  constexpr uint64_t kPieceBytes{2'500};
+  constexpr int32_t kNumFiles{4};
+  auto filePaths = makeFilePaths(kNumFiles);
+  auto vectors = makeVectors(kNumFiles, 5'000);
+  for (auto i = 0; i < vectors.size(); ++i) {
+    writeToFile(filePaths[i]->getPath(), vectors[i]);
+  }
+  createDuckDbTable(vectors);
+  for (const uint64_t fetchAheadBytes : {uint64_t{0}, uint64_t{1} << 30}) {
+    SCOPED_TRACE(fetchAheadBytes);
+    cudf_velox::test::RecordingPinnedResource pinned{
+        cudf::get_pinned_memory_resource()};
+    const auto previous = cudf::set_pinned_memory_resource(pinned);
+    SCOPE_EXIT {
+      cudf::set_pinned_memory_resource(previous);
+    };
+    resetCudfHiveConnector(
+        std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>{
+                {CudfHiveConfig::kUseBufferedInput, "true"},
+                {CudfHiveConfig::kBufferedInputPinnedPieceBytes,
+                 std::to_string(kPieceBytes)},
+                {CudfHiveConfig::kFetchAheadBytes,
+                 std::to_string(fetchAheadBytes)},
+            }));
+    AssertQueryBuilder(tableScanNode(), duckDbQueryRunner_)
+        .maxDrivers(2)
+        .splits(makeCudfHiveConnectorSplits(filePaths))
+        .assertResults("SELECT * FROM tmp");
+    waitForAllTasksToBeDeleted();
+    resetCudfHiveConnector(
+        std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>{}));
+    EXPECT_GT(pinned.numAllocationsOf(kPieceBytes), 0);
+    EXPECT_EQ(pinned.bytesInUse(), 0);
+  }
 }
 
 // Splits prepared in the background by the preloader must produce the same

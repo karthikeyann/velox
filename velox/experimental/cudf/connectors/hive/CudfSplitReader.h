@@ -84,6 +84,7 @@ class CudfSplitReader : public NvtxHelper {
       folly::Executor* executor,
       const ConnectorQueryCtx* connectorQueryCtx,
       const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
+      const std::shared_ptr<FetchAheadContext>& fetchAheadContext,
       const std::shared_ptr<io::IoStatistics>& ioStatistics,
       const std::shared_ptr<IoStats>& ioStats,
       const cudf::ast::expression* subfieldFilterAst);
@@ -129,7 +130,7 @@ class CudfSplitReader : public NvtxHelper {
   void startColumnChunkFetch();
 
   /// Offers the reads of the column chunks of the current pass to the
-  /// fetch-ahead budget, which starts them on a thread of the IO executor
+  /// fetch-ahead budget, which starts them on the connector's start thread
   /// when the device memory held by fetched and not yet decoded column
   /// chunks leaves room. The reader must not be used by another thread until
   /// startColumnChunkFetch() or resetSplit() is called or the reader is
@@ -338,11 +339,18 @@ class CudfSplitReader : public NvtxHelper {
   // that was started ahead for it, if any.
   void advancePass();
 
-  // Returns the stream that fetches are started ahead on.
+  // Returns the stream that the reader's fetches are started ahead on.
   cuda::stream_ref fetchAheadStream();
 
   std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
   memory::MemoryPool* pool_;
+
+  // The connector's fetch-ahead state. Null when the connector has no
+  // fetch-ahead budget. Declared before the pass state, whose buffers can be
+  // allocated on its streams.
+  const std::shared_ptr<FetchAheadContext> fetchAheadContext_;
+  // The budget of 'fetchAheadContext_', or null.
+  FetchAheadBudget* const fetchAheadBudget_;
 
   // cuDF split reader stuff.
   std::shared_ptr<cudf::io::datasource> dataSource_;
@@ -351,18 +359,13 @@ class CudfSplitReader : public NvtxHelper {
 
   // Row group passes and byte fetch states.
   std::unique_ptr<RowGroupPassState> passState_;
-  // Null when the connector has no fetch-ahead budget.
-  std::shared_ptr<FetchAheadBudget> fetchAheadBudget_;
-  // Names the scan to the fetch-ahead budget: the plan node of the query.
+  // Names the scan to the fetch-ahead budget: the plan node of the task.
   uint64_t fetchAheadScan_{0};
   // Set while the fetch of a pass is on offer to the fetch-ahead budget.
   std::shared_ptr<PostedFetchStart> fetchAhead_;
-  // Stream that fetches are started ahead on, created on first use and owned
-  // by the reader. Not the reader's stream, which decodes, and not a stream
-  // of cuDF's pool, which decode kernels of any reader run on: the data
-  // sources synchronise the stream a fetch is given, and would wait for
-  // those.
-  cudaStream_t fetchAheadStream_{nullptr};
+  // One of the connector's fetch-ahead streams, taken on first use. Not the
+  // reader's stream, which decodes.
+  std::optional<cuda::stream_ref> fetchAheadStream_;
   bool serializeIoRequests_{false};
 
   // Chunk and pass read limits resolved from the session when the reader is

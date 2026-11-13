@@ -456,6 +456,10 @@ These stats are reported only by connector data or index sources.
    * - totalRemainingFilterCpuNanos
      - nanos
      - The total CPU time in nanoseconds that the data or index connector do the remaining filtering.
+   * - cudfFetchWaitWallNanos
+     - nanos
+     - The walltime in nanoseconds that a cuDF table scan waited for the column
+       chunks of a row group pass to be on the device, one sample per pass.
    * - numIndexReaderOutputRows
      -
      - The total number of output rows returned across all next() calls from the

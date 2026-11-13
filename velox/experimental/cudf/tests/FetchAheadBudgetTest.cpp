@@ -300,7 +300,6 @@ TEST_F(FetchAheadBudgetTest, consumersWaitingForBytes) {
   budget.waitEnd();
   EXPECT_THAT(log_.names(), testing::ElementsAre("a", "b"));
   EXPECT_EQ(budget.stats().numWaitingConsumers, 0);
-  VELOX_ASSERT_THROW(budget.waitEnd(), "(0 vs. 0)");
 }
 
 // No fetch of a scan starts ahead while a consumer of the scan awaits a
@@ -330,6 +329,48 @@ TEST_F(FetchAheadBudgetTest, awaitedFetches) {
   EXPECT_THAT(log_.names(), testing::ElementsAre("b", "a", "c", "d"));
 
   VELOX_ASSERT_THROW(budget.receive(2), "No fetch of the scan is awaited: 2");
+}
+
+// A scan whose consumers hold nothing between two fetches still starts what
+// it has on offer: they are busy with what they received.
+TEST_F(FetchAheadBudgetTest, betweenFetches) {
+  FetchAheadBudget budget(100);
+  holdReceived(budget, 10, 0);
+  budget.waitBegin();
+  budget.offer(fetch("a"), 10, kLater, 0);
+  budget.release(10, 0, kReceived);
+  EXPECT_TRUE(log_.names().empty());
+  budget.waitEnd();
+  EXPECT_THAT(log_.names(), testing::ElementsAre("a"));
+  // Once the scan holds and offers nothing, it starts over: an offer waits
+  // for a consumer to receive bytes again.
+  claimReceived(budget, 0);
+  budget.release(10, 0, kReceived);
+  budget.offer(fetch("b"), 10, kLater, 0);
+  EXPECT_THAT(log_.names(), testing::ElementsAre("a"));
+  holdReceived(budget, 10, 0);
+  EXPECT_THAT(log_.names(), testing::ElementsAre("a", "b"));
+
+  // While a reader of the scan exists, the scan does not start over.
+  budget.attach(1);
+  holdReceived(budget, 10, 1);
+  budget.release(10, 1, kReceived);
+  budget.offer(fetch("c"), 10, kLater, 1);
+  EXPECT_THAT(log_.names(), testing::ElementsAre("a", "b", "c"));
+  budget.detach(1);
+}
+
+// The offer for what a consumer gets to next, made before the consumer says
+// that it has its bytes, starts before the later offers that were waiting.
+TEST_F(FetchAheadBudgetTest, nextOfferedBeforeReceive) {
+  FetchAheadBudget budget(100);
+  budget.hold(60, 0);
+  budget.offer(fetch("later"), 50, kLater, 0);
+  budget.offer(fetch("next"), 30, kNext, 0);
+  EXPECT_TRUE(log_.names().empty());
+  budget.receive(0);
+  // 60 + 30 fit; 50 more do not, and a fetch of the scan is ahead.
+  EXPECT_THAT(log_.names(), testing::ElementsAre("next"));
 }
 
 // A fetch that has nothing to start holds no bytes and does not keep the
@@ -438,23 +479,70 @@ TEST_F(FetchAheadBudgetTest, postedStart) {
   }
 }
 
-// A start posted from a thread of an IO executor runs on the start
-// executor's own thread, not on the thread that posted it.
-TEST_F(FetchAheadBudgetTest, startExecutor) {
+// withdraw() of a posted start that is running returns after the start.
+TEST_F(FetchAheadBudgetTest, withdrawOfRunningStart) {
+  FetchAheadBudget budget(100);
+  holdReceived(budget, 0, 0);
+  folly::Baton<> began;
+  folly::Baton<> finish;
+  std::atomic_bool startDone{false};
+  std::thread startThread;
+  auto start = std::make_shared<PostedFetchStart>(
+      &budget,
+      10,
+      /*scan=*/0,
+      [&](std::function<void()> task) {
+        startThread = std::thread(std::move(task));
+      },
+      [&]() {
+        began.post();
+        finish.wait();
+        startDone = true;
+      });
+  budget.offer(start, 10, kLater, 0);
+  began.wait();
+  folly::Baton<> withdrawing;
+  bool sawStartDone{false};
+  std::thread withdrawThread([&]() {
+    withdrawing.post();
+    start->withdraw();
+    sawStartDone = startDone;
+  });
+  withdrawing.wait();
+  finish.post();
+  withdrawThread.join();
+  startThread.join();
+  EXPECT_TRUE(sawStartDone);
+  // The start ran: the fetch is ahead until its consumer claims it.
+  EXPECT_EQ(budget.stats().numAhead, 1);
+  EXPECT_EQ(budget.stats().numClaimed, 0);
+  budget.claim(0);
+  EXPECT_EQ(budget.stats().numClaimed, 1);
+  budget.release(10, 0, kAwaited);
+}
+
+// A task posted from a thread of an IO executor runs on the context's own
+// thread, after the tasks posted before it.
+TEST_F(FetchAheadBudgetTest, contextStartThread) {
+  FetchAheadContext context(100);
+  EXPECT_EQ(context.budget().capacity(), 100);
   folly::IOThreadPoolExecutor ioExecutor(2);
   std::thread::id ioThread;
-  std::thread::id startThread;
-  folly::Baton<> started;
+  std::vector<std::thread::id> startThreads;
+  folly::Baton<> done;
   ioExecutor.add([&]() {
     ioThread = std::this_thread::get_id();
-    fetchAheadStartExecutor()->add([&]() {
-      startThread = std::this_thread::get_id();
-      started.post();
+    context.post([&]() { startThreads.push_back(std::this_thread::get_id()); });
+    context.post([&]() {
+      startThreads.push_back(std::this_thread::get_id());
+      done.post();
     });
   });
-  started.wait();
-  EXPECT_NE(startThread, ioThread);
-  EXPECT_NE(startThread, std::this_thread::get_id());
+  done.wait();
+  ASSERT_EQ(startThreads.size(), 2);
+  EXPECT_EQ(startThreads[0], startThreads[1]);
+  EXPECT_NE(startThreads[0], ioThread);
+  EXPECT_NE(startThreads[0], std::this_thread::get_id());
 }
 
 // Threads that hold, offer and release at once leave nothing held and start

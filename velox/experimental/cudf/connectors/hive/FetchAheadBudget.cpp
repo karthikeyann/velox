@@ -19,17 +19,13 @@
 
 #include "velox/common/base/Exceptions.h"
 
-#include <cudf/utilities/error.hpp>
-
-#include <cuda_runtime.h>
-
+#include <folly/ScopeGuard.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
 #include <glog/logging.h>
 
 #include <algorithm>
 #include <array>
-#include <map>
 #include <string_view>
 #include <utility>
 
@@ -49,6 +45,21 @@ uint32_t& FetchAheadBudget::Scan::numAt(Stage stage) {
   VELOX_UNREACHABLE();
 }
 
+void FetchAheadBudget::attach(uint64_t scan) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ++scans_[scan].numReaders;
+}
+
+void FetchAheadBudget::detach(uint64_t scan) noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = scans_.find(scan);
+  if (it == scans_.end() || it->second.numReaders == 0) {
+    return;
+  }
+  --it->second.numReaders;
+  eraseIfIdle(scan);
+}
+
 void FetchAheadBudget::hold(uint64_t bytes, uint64_t scan) {
   std::lock_guard<std::mutex> lock(mutex_);
   stats_.heldBytes += bytes;
@@ -60,8 +71,10 @@ void FetchAheadBudget::leaveStage(uint64_t scan, Stage stage) {
   static constexpr std::array<std::string_view, 3> kStageNames = {
       "ahead", "awaited", "received"};
   const auto it = scans_.find(scan);
-  VELOX_CHECK(
-      it != scans_.end() && it->second.numAt(stage) > 0,
+  const auto numAtStage = it == scans_.end() ? 0 : it->second.numAt(stage);
+  VELOX_CHECK_GT(
+      numAtStage,
+      0,
       "No fetch of the scan is {}: {}",
       kStageNames[static_cast<size_t>(stage)],
       scan);
@@ -74,7 +87,8 @@ void FetchAheadBudget::leaveStage(uint64_t scan, Stage stage) {
 void FetchAheadBudget::eraseIfIdle(uint64_t scan) {
   const auto it = scans_.find(scan);
   if (it != scans_.end() && it->second.numAhead == 0 &&
-      it->second.numAwaited == 0 && it->second.numReceived == 0) {
+      it->second.numAwaited == 0 && it->second.numReceived == 0 &&
+      it->second.numOffersWaiting == 0 && it->second.numReaders == 0) {
     scans_.erase(it);
   }
 }
@@ -83,13 +97,16 @@ void FetchAheadBudget::claim(uint64_t scan) {
   std::lock_guard<std::mutex> lock(mutex_);
   leaveStage(scan, Stage::kAhead);
   ++scans_[scan].numAwaited;
+  ++stats_.numClaimed;
 }
 
 void FetchAheadBudget::receive(uint64_t scan) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     leaveStage(scan, Stage::kAwaited);
-    ++scans_[scan].numReceived;
+    auto& entry = scans_[scan];
+    ++entry.numReceived;
+    entry.hasReceived = true;
   }
   startWaiting();
 }
@@ -104,8 +121,11 @@ void FetchAheadBudget::withdraw(const Candidate* candidate) {
     if (it == waiting_.end()) {
       return;
     }
+    const auto scan = it->scan;
     waiting_.erase(it);
     stats_.numWaiting = waiting_.size();
+    --scans_[scan].numOffersWaiting;
+    eraseIfIdle(scan);
   }
   // The offers behind it may fit where it did not.
   startWaiting();
@@ -116,13 +136,20 @@ void FetchAheadBudget::waitBegin() {
   ++stats_.numWaitingConsumers;
 }
 
-void FetchAheadBudget::waitEnd() {
+void FetchAheadBudget::waitEnd() noexcept {
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    VELOX_CHECK_GT(stats_.numWaitingConsumers, 0);
-    --stats_.numWaitingConsumers;
+    VELOX_DCHECK_GT(stats_.numWaitingConsumers, 0);
+    if (stats_.numWaitingConsumers > 0) {
+      --stats_.numWaitingConsumers;
+    }
   }
-  startWaiting();
+  try {
+    startWaiting();
+  } catch (const std::exception& e) {
+    // The offers stay waiting and start at the next change.
+    LOG(WARNING) << "Failed to start the fetches ahead: " << e.what();
+  }
 }
 
 void FetchAheadBudget::release(uint64_t bytes, uint64_t scan, Stage stage) {
@@ -155,6 +182,7 @@ void FetchAheadBudget::offer(
     waiting_.insert(
         position, Offer{std::move(candidate), bytes, distance, scan});
     stats_.numWaiting = waiting_.size();
+    ++scans_[scan].numOffersWaiting;
   }
   startWaiting();
 }
@@ -165,19 +193,25 @@ void FetchAheadBudget::startWaiting() {
     return;
   }
   starting_ = true;
+  SCOPE_EXIT {
+    if (!lock.owns_lock()) {
+      lock.lock();
+    }
+    starting_ = false;
+  };
   // Not while a consumer waits for bytes: what it waits for goes first.
   while (stats_.numWaitingConsumers == 0) {
     // The first offer in order that has room, or, ahead of its turn, the
     // first of a scan that has nothing ahead. Offers behind one that waits
     // for room wait with it. Only offers of scans whose consumers have
-    // bytes and await none: what they await was asked for first, and the
-    // others have not received their first bytes yet.
+    // received bytes and await none: what they await was asked for first,
+    // and the others have not received their first bytes yet.
     auto next = waiting_.end();
     bool isBlocked{false};
     for (auto it = waiting_.begin(); it != waiting_.end(); ++it) {
       const auto scan = scans_.find(it->scan);
-      if (scan == scans_.end() || scan->second.numReceived == 0 ||
-          scan->second.numAwaited > 0) {
+      VELOX_CHECK(scan != scans_.end());
+      if (!scan->second.hasReceived || scan->second.numAwaited > 0) {
         continue;
       }
       const bool hasRoom =
@@ -201,7 +235,9 @@ void FetchAheadBudget::startWaiting() {
     stats_.heldBytes += bytes;
     stats_.maxHeldBytes = std::max(stats_.maxHeldBytes, stats_.heldBytes);
     ++stats_.numAhead;
-    ++scans_[scan].numAhead;
+    auto& entry = scans_[scan];
+    ++entry.numAhead;
+    --entry.numOffersWaiting;
     lock.unlock();
     bool started{false};
     try {
@@ -219,7 +255,6 @@ void FetchAheadBudget::startWaiting() {
       eraseIfIdle(scan);
     }
   }
-  starting_ = false;
 }
 
 FetchAheadBudget::Stats FetchAheadBudget::stats() const {
@@ -227,37 +262,33 @@ FetchAheadBudget::Stats FetchAheadBudget::stats() const {
   return stats_;
 }
 
-std::shared_ptr<FetchAheadBudget> sharedFetchAheadBudget(uint64_t capacity) {
-  static std::mutex mutex;
-  // By device and capacity.
-  static std::map<std::pair<int, uint64_t>, std::shared_ptr<FetchAheadBudget>>
-      budgets;
+FetchAheadContext::FetchAheadContext(uint64_t capacity)
+    : budget_(capacity),
+      startExecutor_(
+          std::make_unique<folly::CPUThreadPoolExecutor>(
+              1,
+              std::make_shared<folly::NamedThreadFactory>("CudfFetchAhead"))) {
   VELOX_CHECK_GT(capacity, 0);
-  ensureCudaContextForThread();
-  int device{0};
-  CUDF_CUDA_TRY(cudaGetDevice(&device));
-  std::lock_guard<std::mutex> lock(mutex);
-  auto& budget = budgets[{device, capacity}];
-  if (budget == nullptr) {
-    budget = std::make_shared<FetchAheadBudget>(capacity);
-    const auto numOnDevice =
-        std::count_if(budgets.begin(), budgets.end(), [&](const auto& entry) {
-          return entry.first.first == device;
-        });
-    LOG_IF(WARNING, numOnDevice > 1)
-        << "Fetch-ahead budgets of " << numOnDevice << " capacities on device "
-        << device
-        << ": scans of connectors that are configured differently are bounded "
-           "separately. Latest capacity: "
-        << capacity;
-  }
-  return budget;
 }
 
-folly::Executor* fetchAheadStartExecutor() {
-  static folly::CPUThreadPoolExecutor executor(
-      1, std::make_shared<folly::NamedThreadFactory>("CudfFetchAhead"));
-  return &executor;
+FetchAheadContext::~FetchAheadContext() {
+  startExecutor_->join();
+}
+
+void FetchAheadContext::post(std::function<void()> task) {
+  startExecutor_->add(std::move(task));
+}
+
+cuda::stream_ref FetchAheadContext::nextStream() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (streams_.empty()) {
+    ensureCudaContextForThread();
+    streams_.reserve(kNumStreams);
+    for (size_t i = 0; i < kNumStreams; ++i) {
+      streams_.emplace_back(rmm::cuda_stream::flags::non_blocking);
+    }
+  }
+  return streams_[nextStream_++ % kNumStreams];
 }
 
 PostedFetchStart::PostedFetchStart(
@@ -310,9 +341,9 @@ void PostedFetchStart::run() {
     startFetch_();
     return;
   } catch (const std::exception& e) {
-    LOG(WARNING) << "Failed to start a fetch ahead: " << e.what();
+    LOG_EVERY_N(WARNING, 100) << "Failed to start a fetch ahead: " << e.what();
   } catch (...) {
-    LOG(WARNING) << "Failed to start a fetch ahead";
+    LOG_EVERY_N(WARNING, 100) << "Failed to start a fetch ahead";
   }
   // The budget counted a fetch that does not exist. The consumer starts the
   // fetch again when it gets to it, and meets the failure then.

@@ -16,7 +16,9 @@
 
 #pragma once
 
-#include <folly/Executor.h>
+#include <rmm/cuda_stream.hpp>
+
+#include <cuda/stream>
 
 #include <cstdint>
 #include <deque>
@@ -24,6 +26,11 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
+
+namespace folly {
+class CPUThreadPoolExecutor;
+}
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -37,14 +44,19 @@ namespace facebook::velox::cudf_velox::connector::hive {
 /// that a scan whose units are larger than the capacity still reads ahead.
 ///
 /// A fetch starts ahead only while the consumers of its scan have received
-/// every fetch they asked for and hold at least one, and no consumer of any
-/// scan is blocked waiting for bytes. The readers below have no notion of
-/// priority: they serve fetches in the order they are started, so a fetch
+/// every fetch they asked for, the first one included, and no consumer of
+/// any scan is blocked waiting for bytes. The readers below have no notion
+/// of priority: they serve fetches in the order they are started, so a fetch
 /// started ahead while somebody needs bytes, or before the scan's consumers
 /// have their first bytes, would be served before the fetch that is needed
-/// first. Fetches ahead therefore start when consumers are busy decoding
-/// what they have, which is when the storage and the link would otherwise be
+/// first. Fetches ahead therefore start when consumers are busy with what
+/// they have, which is when the storage and the link would otherwise be
 /// idle.
+///
+/// The bytes counted are those of the fetches: compressed column chunks. The
+/// budget does not bound the device memory of a scan. Consumers' own fetches
+/// are counted and never held back, every scan may add one fetch beyond the
+/// capacity, and what decoding allocates is not counted.
 ///
 /// Thread-safe.
 class FetchAheadBudget {
@@ -74,6 +86,8 @@ class FetchAheadBudget {
     uint64_t numWaiting{0};
     /// Fetches started ahead that their consumers have not asked for yet.
     uint64_t numAhead{0};
+    /// Fetches started ahead that their consumers asked for afterwards.
+    uint64_t numClaimed{0};
     /// Consumers blocked waiting for bytes now.
     uint64_t numWaitingConsumers{0};
   };
@@ -98,6 +112,14 @@ class FetchAheadBudget {
     return capacity_;
   }
 
+  /// Tells the budget that a reader of 'scan' exists, until the matching
+  /// detach(). While a scan has readers the budget remembers that its
+  /// consumers have received bytes.
+  void attach(uint64_t scan);
+
+  /// Ends an attach().
+  void detach(uint64_t scan) noexcept;
+
   /// Counts 'bytes' as held by a fetch of 'scan' that its consumer started:
   /// an awaited fetch. Always succeeds, also beyond the capacity.
   void hold(uint64_t bytes, uint64_t scan);
@@ -119,7 +141,7 @@ class FetchAheadBudget {
   void waitBegin();
 
   /// Ends a waitBegin(), and starts the offered fetches that can start now.
-  void waitEnd();
+  void waitEnd() noexcept;
 
   /// How soon the consumer of an offered fetch gets to it.
   enum class Distance {
@@ -140,7 +162,9 @@ class FetchAheadBudget {
   /// waiting for bytes, and it has room: the bytes held stay within the
   /// capacity with it. A fetch of a scan that has none ahead needs no room,
   /// and does not wait for the offers before it. The bytes of a fetch
-  /// started this way are held, ahead, until claim().
+  /// started this way are held, ahead, until claim(). The budget forgets
+  /// that a scan received bytes when the scan has no reader attached, holds
+  /// nothing and has no offer waiting.
   void offer(
       std::shared_ptr<Candidate> candidate,
       uint64_t bytes,
@@ -181,6 +205,12 @@ class FetchAheadBudget {
     uint32_t numAhead{0};
     uint32_t numAwaited{0};
     uint32_t numReceived{0};
+    // Offers of the scan that have not started.
+    uint32_t numOffersWaiting{0};
+    // Readers attached.
+    uint32_t numReaders{0};
+    // Whether a consumer has received a fetch since the entry was made.
+    bool hasReceived{false};
 
     // Returns the number of fetches at 'stage'.
     uint32_t& numAt(Stage stage);
@@ -190,28 +220,60 @@ class FetchAheadBudget {
   // there.
   void leaveStage(uint64_t scan, Stage stage);
 
-  // Removes the entry of 'scan' when it holds no fetch.
+  // Removes the entry of 'scan' when it holds no fetch and has no offer
+  // waiting and no reader.
   void eraseIfIdle(uint64_t scan);
 
-  // Scans that hold fetches.
+  // Scans that hold fetches or have offers waiting or readers.
   std::unordered_map<uint64_t, Scan> scans_;
   Stats stats_;
 };
 
-/// Returns the fetch-ahead budget of 'capacity' bytes, which must be
-/// positive, for the device cuDF is registered on, creating it on first use.
-/// Callers that pass the same capacity share one budget for the life of the
-/// process, so that the scans of every connector configured alike are
-/// bounded together; a second capacity on a device gets a budget of its own
-/// and a warning. Requires cuDF to be registered.
-std::shared_ptr<FetchAheadBudget> sharedFetchAheadBudget(uint64_t capacity);
+/// What a connector with a fetch-ahead budget owns and hands to its readers:
+/// the budget, the thread that starts fetches ahead, and the CUDA streams
+/// those fetches run on. The scans of one connector are bounded together; a
+/// second connector has a budget, a thread and streams of its own.
+class FetchAheadContext {
+ public:
+  /// Number of streams the fetches ahead of a connector share.
+  static constexpr size_t kNumStreams{8};
 
-/// Returns the executor that starts fetches ahead: one thread of the process
-/// that belongs to no IO executor. A start submits the reads of a row group
-/// pass, and an IO executor that runs what one of its own threads adds on
-/// that same thread, as folly::IOThreadPoolExecutor does, would run all of
-/// them on the thread that started the fetch.
-folly::Executor* fetchAheadStartExecutor();
+  /// 'capacity' is the capacity of the budget in bytes and must be positive.
+  explicit FetchAheadContext(uint64_t capacity);
+
+  /// Runs the starts that were posted before returning.
+  ~FetchAheadContext();
+
+  /// Returns the budget.
+  FetchAheadBudget& budget() {
+    return budget_;
+  }
+
+  /// Runs 'task' on the thread that starts fetches ahead, after the tasks
+  /// posted before it. The thread belongs to no IO executor: a start submits
+  /// the reads of a row group pass, and an IO executor that runs what one of
+  /// its own threads adds on that same thread, as folly::IOThreadPoolExecutor
+  /// does, would run all of them on the thread that started the fetch.
+  void post(std::function<void()> task);
+
+  /// Returns a stream for the fetches ahead of one reader, taking the
+  /// connector's streams in turn, so that readers can share a stream. The
+  /// streams are created on first use and live as long as the context. They
+  /// are not streams of cuDF's pool, which decode kernels of any reader run
+  /// on: a data source synchronizes the stream a fetch is given, and would
+  /// wait for those.
+  cuda::stream_ref nextStream();
+
+ private:
+  FetchAheadBudget budget_;
+  // Guards the streams.
+  std::mutex mutex_;
+  std::vector<rmm::cuda_stream> streams_;
+  // Index of the stream nextStream() returns.
+  size_t nextStream_{0};
+  // One thread. Declared last: its tasks use the members above.
+  std::unique_ptr<folly::CPUThreadPoolExecutor> startExecutor_;
+};
 
 /// A fetch on offer to a FetchAheadBudget that another thread starts. When
 /// the budget has room the start is posted to that thread. Until the posted

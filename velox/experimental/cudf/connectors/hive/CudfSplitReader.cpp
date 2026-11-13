@@ -207,6 +207,7 @@ CudfSplitReader::CudfSplitReader(
     folly::Executor* executor,
     const ConnectorQueryCtx* connectorQueryCtx,
     const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
+    const std::shared_ptr<FetchAheadContext>& fetchAheadContext,
     const std::shared_ptr<io::IoStatistics>& ioStatistics,
     const std::shared_ptr<IoStats>& ioStats,
     const cudf::ast::expression* subfieldFilterAst)
@@ -226,6 +227,10 @@ CudfSplitReader::CudfSplitReader(
       ioStats_(ioStats),
       cudfHiveConfig_(cudfHiveConfig),
       pool_(connectorQueryCtx->memoryPool()),
+      fetchAheadContext_(fetchAheadContext),
+      fetchAheadBudget_(
+          fetchAheadContext_ != nullptr ? &fetchAheadContext_->budget()
+                                        : nullptr),
       baseReaderOpts_(pool_),
       subfieldFilterAst_(subfieldFilterAst),
       pushdownFilterExpr_(subfieldFilterAst) {
@@ -243,13 +248,13 @@ CudfSplitReader::CudfSplitReader(
     }
   }
   VELOX_DCHECK_EQ(readColumnNames_.size(), readColumnTypes_.size());
-  if (const auto fetchAheadBytes = cudfHiveConfig_->fetchAheadBytes();
-      fetchAheadBytes > 0) {
-    fetchAheadBudget_ = sharedFetchAheadBudget(fetchAheadBytes);
+  if (fetchAheadBudget_ != nullptr) {
     fetchAheadScan_ = std::hash<std::string>{}(fmt::format(
-        "{}/{}",
+        "{}/{}/{}",
         connectorQueryCtx_->queryId(),
+        connectorQueryCtx_->taskId(),
         connectorQueryCtx_->planNodeId()));
+    fetchAheadBudget_->attach(fetchAheadScan_);
   }
   baseReaderOpts_.setDataIoStats(ioStatistics_);
   baseReaderOpts_.setMetadataIoStats(ioStatistics_);
@@ -271,15 +276,18 @@ CudfSplitReader::CudfSplitReader(
 }
 
 CudfSplitReader::~CudfSplitReader() {
-  // After the fetches that use it are done.
   SCOPE_EXIT {
-    if (fetchAheadStream_ != nullptr) {
-      cudaStreamDestroy(fetchAheadStream_);
+    if (fetchAheadBudget_ != nullptr) {
+      fetchAheadBudget_->detach(fetchAheadScan_);
     }
   };
   // A split abandoned before it is read, e.g. when the task is cancelled while
   // the preloader prepares it, can still have reads in flight or queued.
-  withdrawFetchOffer();
+  try {
+    withdrawFetchOffer();
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Failed to take back a fetch offered ahead: " << e.what();
+  }
   if (passState_ == nullptr) {
     return;
   }
@@ -296,11 +304,10 @@ CudfSplitReader::~CudfSplitReader() {
 }
 
 cuda::stream_ref CudfSplitReader::fetchAheadStream() {
-  if (fetchAheadStream_ == nullptr) {
-    CUDF_CUDA_TRY(
-        cudaStreamCreateWithFlags(&fetchAheadStream_, cudaStreamNonBlocking));
+  if (!fetchAheadStream_.has_value()) {
+    fetchAheadStream_ = fetchAheadContext_->nextStream();
   }
-  return cuda::stream_ref{fetchAheadStream_};
+  return *fetchAheadStream_;
 }
 
 void CudfSplitReader::prepareSplitInternal(
@@ -433,6 +440,8 @@ std::optional<CudfSplitReader::TableChunk> CudfSplitReader::next(
 void CudfSplitReader::setConnectorQueryCtx(
     const ConnectorQueryCtx* connectorQueryCtx) {
   VELOX_CHECK_NOT_NULL(connectorQueryCtx);
+  // A fetch of the reader may be starting ahead on another thread.
+  withdrawFetchOffer();
   // A preloaded split can be adopted by a driver with a different memory pool.
   // Only the context pointer changes; 'pool_' and its buffers stay with the
   // pool that allocated them.
@@ -470,16 +479,6 @@ std::optional<CudfSplitReader::TableChunk> CudfSplitReader::readNextChunk() {
     VELOX_CHECK(
         splitReader_->has_next_table_chunk(),
         "cuDF row group pass did not produce a table chunk");
-    // The bytes of this pass are on the device and its decode begins: the
-    // time to fetch the next pass, within the fetch-ahead budget.
-    if (fetchAheadBudget_ != nullptr and executor_ != nullptr and
-        passState_->currentPass + 1 < passState_->passes.size()) {
-      offerPassFetch(
-          passState_->currentPass + 1,
-          passState_->next,
-          fetchAheadStream(),
-          FetchAheadBudget::Distance::kNext);
-    }
   }
 
   auto tableWithMetadata = splitReader_->materialize_all_columns_chunk();
@@ -564,7 +563,8 @@ void CudfSplitReader::startFetch(
     pass.stage = isHeld ? FetchAheadBudget::Stage::kAhead
                         : FetchAheadBudget::Stage::kAwaited;
   }
-  pass.isOnFetchAheadStream = stream.get() == fetchAheadStream_;
+  // Only fetches the budget counted already were started ahead.
+  pass.isOnFetchAheadStream = isHeld;
 }
 
 bool CudfSplitReader::offerColumnChunkFetch() {
@@ -601,11 +601,11 @@ void CudfSplitReader::offerPassFetch(
   // That is not work for the thread that gives the offer room, which only
   // released memory.
   fetchAhead_ = std::make_shared<PostedFetchStart>(
-      fetchAheadBudget_.get(),
+      fetchAheadBudget_,
       numBytes,
       fetchAheadScan_,
-      [](std::function<void()> task) {
-        fetchAheadStartExecutor()->add(std::move(task));
+      [context = fetchAheadContext_](std::function<void()> task) {
+        context->post(std::move(task));
       },
       [this, &target, stream, byteRanges = std::move(byteRanges), numBytes]() {
         ensureCudaContextForThread();
@@ -644,6 +644,18 @@ void CudfSplitReader::setupChunkingForCurrentPass(
     NanosecondWallTimer timer(&waitNanos);
     passState_->current.fetch.wait();
   }
+  // The bytes of this pass are on the device and its decode begins: the
+  // time to fetch the next pass, within the fetch-ahead budget. Offered
+  // before the budget learns that the bytes arrived, which starts what is on
+  // offer: the next pass goes before the splits prepared ahead.
+  if (fetchAheadBudget_ != nullptr and executor_ != nullptr and
+      passState_->currentPass + 1 < passState_->passes.size()) {
+    offerPassFetch(
+        passState_->currentPass + 1,
+        passState_->next,
+        fetchAheadStream(),
+        FetchAheadBudget::Distance::kNext);
+  }
   if (passState_->current.stage == FetchAheadBudget::Stage::kAwaited) {
     passState_->current.stage = FetchAheadBudget::Stage::kReceived;
     fetchAheadBudget_->receive(fetchAheadScan_);
@@ -657,7 +669,7 @@ void CudfSplitReader::setupChunkingForCurrentPass(
   // A data source may queue its copies on the stream of the fetch. Decode
   // runs on the reader's stream, so those of another stream must have run.
   if (passState_->current.isOnFetchAheadStream) {
-    CUDF_CUDA_TRY(cudaStreamSynchronize(fetchAheadStream_));
+    CUDF_CUDA_TRY(cudaStreamSynchronize(fetchAheadStream().get()));
   }
 
   splitReader_->setup_chunking_for_all_columns(
@@ -677,11 +689,15 @@ void CudfSplitReader::releasePassData(PassFetch& pass, bool isDecoded) {
   try {
     // Queued or active reads can still write into the buffers being released.
     pass.fetch.wait();
-    // Buffers of the fetch-ahead stream are freed on that stream, where the
-    // next fetch reuses them. Decode read them on the reader's stream, which
-    // has drained when decode returned but not after it failed.
-    if (isDecoded and pass.isOnFetchAheadStream) {
-      CUDF_CUDA_TRY(cudaStreamSynchronize(stream_.get()));
+    // Buffers of a fetch-ahead stream are freed on that stream, where the
+    // next fetch reuses them. A data source may have queued copies there.
+    // Decode read the buffers on the reader's stream, which has drained when
+    // decode returned but not after it failed.
+    if (pass.isOnFetchAheadStream) {
+      CUDF_CUDA_TRY(cudaStreamSynchronize(fetchAheadStream().get()));
+      if (isDecoded) {
+        CUDF_CUDA_TRY(cudaStreamSynchronize(stream_.get()));
+      }
     }
   } catch (...) {
     failure = std::current_exception();
