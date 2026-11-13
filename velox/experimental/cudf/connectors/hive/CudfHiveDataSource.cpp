@@ -1014,14 +1014,15 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
     cudfSplitReader_->setPushdownFilter(&filter);
     pushdownFilter = &filter;
   }
-  if (filterFirst_ and pushdownFilter != nullptr) {
-    std::vector<std::string> filterColumns;
-    filterColumns.reserve(subfieldFilters_.size());
-    for (const auto& [field, _] : subfieldFilters_) {
-      filterColumns.push_back(field.toString());
+  readerTestedFilters_.clear();
+  if (filterFirst_) {
+    if (pushdownFilter == subfieldFilterAst_) {
+      // No pushdown filter of this split is in the tree: start it over for
+      // the split's dynamic filter bounds.
+      pushdownFilterTree_ = cudf::ast::tree{};
+      pushdownFilterScalars_.clear();
     }
-    cudfSplitReader_->setFilterFirstFilter(
-        pushdownFilter, std::move(filterColumns));
+    setFilterFirstFilter(pushdownFilter);
   }
   cudfSplitReader_->prepareSplit(runtimeStats_);
 
@@ -1104,6 +1105,7 @@ void CudfHiveDataSource::setFromDataSource(std::unique_ptr<DataSource> source) {
 
   cudfSplitReader_ = std::move(preparedSource->cudfSplitReader_);
   partitionKeyScalars_ = std::move(preparedSource->partitionKeyScalars_);
+  readerTestedFilters_.clear();
   // The split was prepared with the dynamic filters of that time.
   readerFiltersCurrent_ = false;
   if (!splitSkipped_ && !partitionKeyFiltersAcceptSplit()) {
@@ -1213,6 +1215,106 @@ CudfHiveDataSource::DynamicFilter CudfHiveDataSource::makeDynamicFilter(
       break;
   }
   return dynamicFilter;
+}
+
+void CudfHiveDataSource::setFilterFirstFilter(
+    const cudf::ast::expression* pushdownFilter) {
+  std::vector<std::string> filterColumns;
+  filterColumns.reserve(subfieldFilters_.size());
+  for (const auto& [field, _] : subfieldFilters_) {
+    filterColumns.push_back(field.toString());
+  }
+
+  // The bounds of a dynamic filter make its column a filter column and let
+  // the reader prune with them. A column with a pushed-down filter is a
+  // filter column already. The reader's filter drops nulls, so a filter that
+  // passes them is left to the rows. A filter that is no longer tested on
+  // rows, because it keeps most of them, has no rows to save.
+  const auto tested = dynamicFilterColumns();
+  common::SubfieldFilters bounds;
+  for (const auto& bound : dynamicFilterBounds()) {
+    const auto& name = readColumnNames_[bound.readColumn];
+    if (bound.nullAllowed ||
+        std::ranges::find(tested, bound.readColumn) == tested.end() ||
+        std::ranges::find(filterColumns, name) != filterColumns.end()) {
+      continue;
+    }
+    // The bounds are literals of the table's type, which the reader can only
+    // compare with a column the file stores in that type.
+    if (!cudfSplitReader_->storesIntegersOfType(
+            name, veloxToCudfDataType(columnType(name)))) {
+      continue;
+    }
+    bounds.emplace(
+        common::Subfield::create(name)->clone(),
+        std::make_shared<common::BigintRange>(bound.lower, bound.upper, false));
+    filterColumns.push_back(name);
+  }
+  const auto* filter = pushdownFilter;
+  if (!bounds.empty()) {
+    // In the tree the reader's pushdown filter is in, which stays with the
+    // reader when another data source takes it over.
+    filter = &createAstFromSubfieldFilters(
+        bounds, pushdownFilterTree_, pushdownFilterScalars_, getTableRowType());
+    if (pushdownFilter != nullptr) {
+      filter = &pushdownFilterTree_.push(
+          cudf::ast::operation{
+              cudf::ast::ast_operator::NULL_LOGICAL_AND,
+              *pushdownFilter,
+              *filter});
+    }
+  }
+  if (filter != nullptr) {
+    cudfSplitReader_->setFilterFirstFilter(filter, std::move(filterColumns));
+  }
+}
+
+std::unique_ptr<cudf::column> CudfHiveDataSource::testDynamicFiltersInReader(
+    const cudf::table_view& filterColumns,
+    std::span<const size_t> readColumns,
+    cuda::stream_ref stream) {
+  readerTestedFilters_.clear();
+  // Either every dynamic filter is tested here, on the device, or all of them
+  // are left to the rows the reader returns.
+  const auto filtered = dynamicFilterColumns();
+  if (filtered.empty()) {
+    return nullptr;
+  }
+  std::vector<cudf::size_type> position(readColumnNames_.size(), -1);
+  for (size_t i = 0; i < readColumns.size(); ++i) {
+    position[readColumns[i]] = i;
+  }
+  for (const auto readColumn : filtered) {
+    if (position[readColumn] < 0 ||
+        !hasIntegerStorage(columnType(readColumnNames_[readColumn]))) {
+      return nullptr;
+    }
+  }
+  std::unique_ptr<cudf::column> mask;
+  if (!intersectDynamicFilters(
+          [&](size_t readColumn) {
+            return filterColumns.column(position[readColumn]);
+          },
+          filterColumns.num_rows(),
+          mask,
+          stream)) {
+    return nullptr;
+  }
+  for (const auto& [readColumn, dynamicFilter] : dynamicFilters_) {
+    readerTestedFilters_.emplace_back(readColumn, dynamicFilter.filter);
+  }
+  return mask;
+}
+
+bool CudfHiveDataSource::readerTestedDynamicFilters() const {
+  return readerTestedFilters_.size() == dynamicFilters_.size() &&
+      std::ranges::equal(
+             readerTestedFilters_,
+             dynamicFilters_,
+             [](const auto& tested, const auto& current) {
+               return tested.first == current.first &&
+                   tested.second == current.second.filter;
+             });
 }
 
 void CudfHiveDataSource::skipCurrentSplit() {
@@ -1545,8 +1647,28 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     return nullptr;
   }
   ensureCudaContextForThread();
-  auto chunkOpt = cudfSplitReader_->next(size, {});
+  const CudfSplitReader::RowFilter rowFilter =
+      [&](const cudf::table_view& filterColumns,
+          std::span<const size_t> readColumns,
+          cuda::stream_ref stream) {
+        return testDynamicFiltersInReader(filterColumns, readColumns, stream);
+      };
+  auto chunkOpt = cudfSplitReader_->next(
+      size, dynamicFilters_.empty() ? CudfSplitReader::RowFilter{} : rowFilter);
   const auto readStats = cudfSplitReader_->takeReadStats();
+  if (subfieldFilters_.empty()) {
+    // The reader's filter was the bounds of the dynamic filters, so every
+    // row the first step dropped is one a dynamic filter dropped.
+    if (readStats.numFilterFirstRows > 0) {
+      recordDynamicFilterRows(
+          readStats.numFilterFirstRows, readStats.numFilterFirstKeptRows);
+    }
+  } else if (readStats.numRowFilterRows > 0) {
+    // The rows that reached the dynamic filters had passed the pushed-down
+    // filter.
+    recordDynamicFilterRows(
+        readStats.numRowFilterRows, readStats.numRowFilterKeptRows);
+  }
   readStats_.numFilterFirstPasses += readStats.numFilterFirstPasses;
   readStats_.numOneStepPasses += readStats.numOneStepPasses;
   readStats_.numFilterFirstRows += readStats.numFilterFirstRows;
@@ -1559,7 +1681,12 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   auto nRows = chunkOpt.value().numRows;
   auto cudfTable = std::move(chunkOpt.value().table);
   auto stream = cudfSplitReader_->stream();
-  if (!dynamicFilters_.empty() && cudfTable->num_rows() > 0) {
+  // The rows of a chunk the reader tested the current filters on have passed
+  // them.
+  const bool testedInReader =
+      chunkOpt.value().rowFilterApplied && readerTestedDynamicFilters();
+  if (!dynamicFilters_.empty() && cudfTable->num_rows() > 0 &&
+      !testedInReader) {
     applyDynamicFilters(cudfTable, stream);
     nRows = cudfTable->num_rows();
   }

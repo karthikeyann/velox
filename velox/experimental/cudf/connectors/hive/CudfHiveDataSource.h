@@ -351,6 +351,12 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   // What the split readers of this data source read, by reading mode.
   CudfSplitReader::ReadStats readStats_;
 
+  // The dynamic filters, by read column, that the reader tested on the rows
+  // of the last pass it read filter columns first. Empty if it tested none.
+  // Holding the filters keeps a later filter from being taken for one of
+  // them.
+  std::vector<std::pair<size_t, common::FilterPtr>> readerTestedFilters_;
+
   // Table column name of each output column, in 'outputType_' order.
   std::vector<std::string> outputSourceNames_;
 
@@ -450,6 +456,22 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
       DynamicFilter& dynamicFilter,
       const cudf::column_view& input,
       cuda::stream_ref stream);
+
+  // Lets the reader about to be prepared read its split filter columns
+  // first, with 'pushdownFilter', which may be null, narrowed by the bounds
+  // of the dynamic filters.
+  void setFilterFirstFilter(const cudf::ast::expression* pushdownFilter);
+
+  // Tests the dynamic filters on the filter columns the reader decoded for a
+  // row group pass. A CudfSplitReader::RowFilter.
+  std::unique_ptr<cudf::column> testDynamicFiltersInReader(
+      const cudf::table_view& filterColumns,
+      std::span<const size_t> readColumns,
+      cuda::stream_ref stream);
+
+  // Whether the filters the reader last tested are the dynamic filters as
+  // they are now.
+  bool readerTestedDynamicFilters() const;
 
   // Ends the current split without reading the rest of it.
   void skipCurrentSplit();
