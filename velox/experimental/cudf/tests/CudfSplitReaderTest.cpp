@@ -54,6 +54,16 @@ class MetadataOnlySplitReader final : public CudfSplitReader {
       dwio::common::RuntimeStats& /*runtimeStats*/) override {}
 };
 
+// Exposes the cuDF reader options a prepared split reads with.
+class ReaderOptionsSplitReader final : public CudfSplitReader {
+ public:
+  using CudfSplitReader::CudfSplitReader;
+
+  bool useTileDecode() const {
+    return readerOptions().is_enabled_use_tile_decode();
+  }
+};
+
 class CudfSplitReaderTest : public ::facebook::velox::cudf_velox::exec::test::
                                 CudfHiveConnectorTestBase {};
 
@@ -195,6 +205,71 @@ TEST_F(CudfSplitReaderTest, timestampTypeFollowsSession) {
           {{CudfHiveConfig::kTimestampType, seconds}},
           {{CudfHiveConfig::kTimestampTypeSession, microseconds}}),
       cudf::type_id::TIMESTAMP_MICROSECONDS);
+}
+
+// The cuDF reader options take tile decode from the session's
+// parquet.reader.use_tile_decode when the session sets it, and from the
+// connector's parquet.reader.use-tile-decode otherwise.
+TEST_F(CudfSplitReaderTest, tileDecodeFollowsSession) {
+  auto rowType = ROW("c0", BIGINT());
+  auto dataFile = common::testutil::TempFilePath::create();
+  writeToFile(
+      dataFile->getPath(),
+      makeNamedRowVector("c0", makeFlatVector<int64_t>({1, 2, 3})));
+
+  // Prepares a split of the file with the connector config 'connectorConfig'
+  // under 'session' and returns whether its reader options use tile decode.
+  const auto useTileDecode =
+      [&](const std::unordered_map<std::string, std::string>& connectorConfig,
+          const std::unordered_map<std::string, std::string>& session) {
+        auto sessionProperties = std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>(session));
+        auto connectorQueryCtx =
+            ::facebook::velox::connector::ConnectorQueryCtx::Builder()
+                .operatorPool(pool_.get())
+                .connectorPool(pool_.get())
+                .sessionProperties(sessionProperties.get())
+                .queryId("query.CudfSplitReaderTest")
+                .taskId("task.CudfSplitReaderTest")
+                .planNodeId("plan.CudfSplitReaderTest")
+                .build();
+        FileHandleFactory fileHandleFactory(
+            std::make_unique<FileHandleCache>(1000),
+            std::make_unique<FileHandleGenerator>());
+        auto split = CudfHiveConnectorSplitBuilder(dataFile->getPath())
+                         .connectorId(
+                             ::facebook::velox::cudf_velox::exec::test::
+                                 kCudfHiveConnectorId)
+                         .build();
+        ReaderOptionsSplitReader reader(
+            std::move(split),
+            ::facebook::velox::cudf_velox::exec::test::
+                CudfHiveConnectorTestBase::makeTableHandle(
+                    "parquet_table", rowType),
+            rowType,
+            {"c0"},
+            &fileHandleFactory,
+            ioExecutor_.get(),
+            connectorQueryCtx.get(),
+            std::make_shared<CudfHiveConfig>(
+                std::make_shared<config::ConfigBase>(
+                    std::unordered_map<std::string, std::string>(
+                        connectorConfig))),
+            std::make_shared<io::IoStatistics>(),
+            std::make_shared<IoStats>(),
+            nullptr);
+        dwio::common::RuntimeStats runtimeStats;
+        reader.prepareSplit(runtimeStats);
+        return reader.useTileDecode();
+      };
+
+  EXPECT_FALSE(useTileDecode({}, {}));
+  EXPECT_TRUE(useTileDecode({{CudfHiveConfig::kUseTileDecode, "true"}}, {}));
+  EXPECT_TRUE(
+      useTileDecode({}, {{CudfHiveConfig::kUseTileDecodeSession, "true"}}));
+  EXPECT_FALSE(useTileDecode(
+      {{CudfHiveConfig::kUseTileDecode, "true"}},
+      {{CudfHiveConfig::kUseTileDecodeSession, "false"}}));
 }
 
 } // namespace

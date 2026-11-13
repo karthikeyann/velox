@@ -1714,7 +1714,7 @@ TEST_F(TableScanTest, filterPushdown) {
 // the same rows with it on and off.
 TEST_F(TableScanTest, tileDecode) {
   using cudf_velox::connector::hive::CudfHiveConfig;
-  auto rowType = ROW({"c0", "c1", "c2"}, {INTEGER(), BIGINT(), BIGINT()});
+  auto rowType = ROW({{"c0", INTEGER()}, {"c1", BIGINT()}, {"c2", BIGINT()}});
   auto filePaths = makeFilePaths(4);
   auto vectors = makeVectors(4, 1'000, rowType);
   for (int32_t i = 0; i < vectors.size(); i++) {
@@ -1741,7 +1741,7 @@ TEST_F(TableScanTest, tileDecode) {
           rowType);
   auto plan = PlanBuilder()
                   .startTableScan()
-                  .outputType(ROW({"c0", "c1"}, {INTEGER(), BIGINT()}))
+                  .outputType(ROW({{"c0", INTEGER()}, {"c1", BIGINT()}}))
                   .tableHandle(tableHandle)
                   .assignments(assignments)
                   .endTableScan()

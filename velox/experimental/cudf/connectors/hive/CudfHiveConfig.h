@@ -74,8 +74,8 @@ class CudfHiveConfig {
   static constexpr const char* kTimestampTypeSession =
       "parquet.reader.timestamp_type";
 
-  // Whether pages of flat fixed-width columns are decoded by libcudf's tile
-  // decode kernels. Results do not depend on it.
+  // Whether eligible pages of flat fixed-width columns take libcudf's tile
+  // decode path. Results do not depend on it.
   static constexpr const char* kUseTileDecode =
       "parquet.reader.use-tile-decode";
   static constexpr const char* kUseTileDecodeSession =
@@ -167,7 +167,11 @@ class CudfHiveConfig {
   cudf::data_type timestampType() const;
   cudf::data_type timestampTypeSession(const config::ConfigBase* session) const;
 
+  /// Returns the connector's 'parquet.reader.use-tile-decode'.
   bool isUseTileDecode() const;
+
+  /// Returns the session's 'parquet.reader.use_tile_decode' if set, and the
+  /// connector's 'parquet.reader.use-tile-decode' otherwise.
   bool isUseTileDecodeSession(const config::ConfigBase* session) const;
 
   bool useBufferedInput() const;

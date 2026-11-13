@@ -138,6 +138,12 @@ class CudfSplitReader : public NvtxHelper {
     return *cudfHiveConfig_;
   }
 
+  // Returns the cuDF reader options of the current split. Set while the split
+  // is prepared.
+  const cudf::io::parquet_reader_options& readerOptions() const {
+    return readerOptions_;
+  }
+
   // Performs split-specific setup after the Parquet footer is loaded.
   virtual void prepareSplitInternal(dwio::common::RuntimeStats& runtimeStats);
 
