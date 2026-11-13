@@ -33,13 +33,13 @@ namespace facebook::velox::cudf_velox {
 /// feed the probe side.
 struct BuildKeyFilter {
   /// Passes every non-null build key and rejects null: AlwaysFalse for a
-  /// build side without a non-null key. Null if the key type carries no
-  /// filter.
+  /// build side without a non-null key. Null if there is no filter: the key
+  /// type carries none, or building it failed.
   std::unique_ptr<common::Filter> filter;
 
   /// Whether 'filter' rejects every value that is not a build key. True for a
   /// build side of at most CudfConfig::dynamicFilterMaxValues distinct keys
-  /// in at most 64 times as many key rows. A larger build side gives the
+  /// in at most 64 times as many rows. A larger build side gives the
   /// range from its smallest to its largest key.
   bool exact{false};
 
@@ -58,7 +58,8 @@ struct BuildKeyFilter {
 /// Builds the filter for one join key from 'keyColumns', the column of that
 /// key in each table of the build side, of Velox type 'type'. Supports the
 /// integer types and DATE. Runs on 'stream' and returns after the device work
-/// has finished.
+/// has finished. Never throws: a dynamic filter is an optimization, and a
+/// build side it cannot be built for gives no filter.
 BuildKeyFilter makeBuildKeyFilter(
     const std::vector<cudf::column_view>& keyColumns,
     const TypePtr& type,

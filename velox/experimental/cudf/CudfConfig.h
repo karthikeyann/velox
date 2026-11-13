@@ -214,7 +214,7 @@ struct CudfConfig {
 
   /// Largest number of distinct build-side keys a cuDF hash join sends the
   /// scan as an exact set of values, its dynamic filter. A build side with
-  /// more keys, or with more than 64 times as many key rows, sends only the
+  /// more keys, or with more than 64 times as many rows, sends only the
   /// smallest and largest key. 0 sends bounds only.
   int64_t dynamicFilterMaxValues{100'000};
 

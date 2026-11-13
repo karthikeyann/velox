@@ -22,16 +22,18 @@
 
 #include "velox/common/base/Exceptions.h"
 
-#include <cudf/concatenate.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <cuda_runtime.h>
+
+#include <glog/logging.h>
 
 #include <algorithm>
 #include <optional>
@@ -145,44 +147,61 @@ std::vector<int64_t> copyIntegersToHost(
 constexpr uint64_t kMaxRowsPerDistinctValue{64};
 
 // Returns the distinct non-null values of the signed integer 'columns', or
-// std::nullopt if there are more than 'maxValues'.
+// std::nullopt if there are more than 'maxValues'. Works table by table, so
+// that the device holds one table's distinct keys at a time.
 std::optional<std::vector<int64_t>> copyDistinctIntegersToHost(
     const std::vector<cudf::column_view>& columns,
     uint64_t maxValues,
     cuda::stream_ref stream) {
-  const auto allKeys = cudf::concatenate(columns, stream, get_temp_mr());
-  const auto distinctKeys = cudf::distinct(
-      cudf::table_view{{allKeys->view()}},
-      std::vector<cudf::size_type>{0},
-      cudf::duplicate_keep_option::KEEP_ANY,
-      cudf::null_equality::EQUAL,
-      cudf::nan_equality::ALL_EQUAL,
-      stream,
-      get_temp_mr());
-  const auto distinct = distinctKeys->view().column(0);
-  const uint64_t numDistinct = distinct.size() - distinct.null_count();
-  if (numDistinct > maxValues) {
+  std::vector<int64_t> values;
+  for (const auto& column : columns) {
+    const auto distinctKeys = cudf::distinct(
+        cudf::table_view{{column}},
+        std::vector<cudf::size_type>{0},
+        cudf::duplicate_keep_option::KEEP_ANY,
+        cudf::null_equality::EQUAL,
+        cudf::nan_equality::ALL_EQUAL,
+        stream,
+        get_temp_mr());
+    const auto distinct = distinctKeys->view().column(0);
+    const uint64_t numDistinct = distinct.size() - distinct.null_count();
+    if (numDistinct > maxValues) {
+      return std::nullopt;
+    }
+    const auto tableValues =
+        copyIntegersToHost({distinct}, numDistinct, stream);
+    values.insert(values.end(), tableValues.begin(), tableValues.end());
+  }
+  std::sort(values.begin(), values.end());
+  values.erase(std::unique(values.begin(), values.end()), values.end());
+  if (values.size() > maxValues) {
     return std::nullopt;
   }
-  return copyIntegersToHost({distinct}, numDistinct, stream);
+  return values;
 }
 
-} // namespace
-
-BuildKeyFilter makeBuildKeyFilter(
+BuildKeyFilter makeBuildKeyFilterOrThrow(
     const std::vector<cudf::column_view>& keyColumns,
     const TypePtr& type,
     cuda::stream_ref stream) {
   BuildKeyFilter result;
-  if (!isDynamicFilterKeyType(type)) {
+  if (!isDynamicFilterKeyType(type) || keyColumns.empty()) {
     return result;
   }
   std::vector<cudf::column_view> keys;
   keys.reserve(keyColumns.size());
   uint64_t numValues{0};
+  uint64_t numRows{0};
   for (const auto& column : keyColumns) {
     keys.push_back(integerStorageView(column));
+    // The build side has to hold the key as the signed integer of its type.
+    if (!cudf::is_integral(keys.back().type()) ||
+        !cudf::is_signed(keys.back().type()) ||
+        keys.back().type() != keys.front().type()) {
+      return result;
+    }
     numValues += keys.back().size() - keys.back().null_count();
+    numRows += keys.back().size();
   }
   if (numValues == 0) {
     // No probe row has a matching build key.
@@ -197,7 +216,7 @@ BuildKeyFilter makeBuildKeyFilter(
   std::optional<std::vector<int64_t>> values;
   if (numValues <= maxValues) {
     values = copyIntegersToHost(keys, numValues, stream);
-  } else if (numValues <= kMaxRowsPerDistinctValue * maxValues) {
+  } else if (numRows <= kMaxRowsPerDistinctValue * maxValues) {
     values = copyDistinctIntegersToHost(keys, maxValues, stream);
   }
   if (values.has_value()) {
@@ -235,14 +254,38 @@ BuildKeyFilter makeBuildKeyFilter(
           0, CudfConfig::getInstance().dynamicFilterMaxBitmapBytes));
   if (span < maxBitmapBits &&
       numValues < kMaxDynamicFilterBitmapDensity * span) {
-    result.deviceBitmap = connector::hive::makeIntegerBitmap(
-        keys, bounds->first, bounds->second, stream, get_output_mr());
-    // Scans read the bitmap on their own streams.
-    stream.sync();
+    try {
+      result.deviceBitmap = connector::hive::makeIntegerBitmap(
+          keys, bounds->first, bounds->second, stream, get_output_mr());
+      // Scans read the bitmap on their own streams.
+      stream.sync();
+    } catch (const std::exception& e) {
+      // The bounds alone remain a valid filter.
+      LOG(WARNING) << "Failed to build the bitmap of a dynamic filter: "
+                   << e.what();
+      result.deviceBitmap = nullptr;
+    }
   }
   result.filter = std::make_unique<common::BigintRange>(
       bounds->first, bounds->second, false);
   return result;
+}
+
+} // namespace
+
+BuildKeyFilter makeBuildKeyFilter(
+    const std::vector<cudf::column_view>& keyColumns,
+    const TypePtr& type,
+    cuda::stream_ref stream) {
+  try {
+    return makeBuildKeyFilterOrThrow(keyColumns, type, stream);
+  } catch (const std::exception& e) {
+    // A dynamic filter is an optimization: a join whose build side cannot be
+    // described, for example for lack of device memory, runs without one.
+    LOG(WARNING) << "Failed to build a dynamic filter from join keys: "
+                 << e.what();
+    return {};
+  }
 }
 
 } // namespace facebook::velox::cudf_velox

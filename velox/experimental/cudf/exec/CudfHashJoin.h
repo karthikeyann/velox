@@ -186,13 +186,12 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   void doNoMoreInput() override;
   void doClose() override;
 
-  /// Returns a filter that passes the build side's values of the join key
-  /// at 'keyIndex' in the join keys. Call after the build side has arrived
-  /// (isBlocked() returned kNotBlocked once).
-  BuildKeyFilter buildKeyFilter(column_index_t keyIndex);
-
  private:
   void waitForBuildReady(cuda::stream_ref stream);
+
+  // Returns a filter that passes the build side's values of the join key at
+  // 'keyIndex' in the join keys.
+  BuildKeyFilter buildKeyFilter(column_index_t keyIndex);
 
   /// Registers a stream that is about to read hashObject_, rightMatchedFlags_,
   /// scalars_, tree_, or filterEvaluator_. Must be called before submitting

@@ -40,6 +40,8 @@
 
 #include <cuda.h>
 
+#include <algorithm>
+
 static const std::string kCudfAdapterName = "cuDF";
 
 namespace facebook::velox::cudf_velox {
@@ -540,12 +542,16 @@ void CudfConfig::initialize(
     dynamicFilterEnabled = folly::to<bool>(config[kCudfDynamicFilterEnabled]);
   }
   if (config.find(kCudfDynamicFilterMaxValues) != config.end()) {
-    dynamicFilterMaxValues =
-        folly::to<int64_t>(config[kCudfDynamicFilterMaxValues]);
+    // The values travel through the host.
+    dynamicFilterMaxValues = std::clamp<int64_t>(
+        folly::to<int64_t>(config[kCudfDynamicFilterMaxValues]), 0, 16'777'216);
   }
   if (config.find(kCudfDynamicFilterMaxBitmapBytes) != config.end()) {
-    dynamicFilterMaxBitmapBytes =
-        folly::to<int64_t>(config[kCudfDynamicFilterMaxBitmapBytes]);
+    // A bitmap is one cuDF column of 32-bit words.
+    dynamicFilterMaxBitmapBytes = std::clamp<int64_t>(
+        folly::to<int64_t>(config[kCudfDynamicFilterMaxBitmapBytes]),
+        0,
+        int64_t{4} << 30);
   }
   if (config.find(kCudfDynamicFilterRowFilterEnabled) != config.end()) {
     dynamicFilterRowFilterEnabled =
