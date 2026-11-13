@@ -896,6 +896,19 @@ class Connector {
     return false;
   }
 
+  /// Returns the number of splits that a table scan keeps prepared ahead of
+  /// its drivers, given the number of drivers of the scan and the query's
+  /// 'max_split_preload_per_driver', which is positive. Called when
+  /// supportsSplitPreload() returns true. The number is for the scan as a
+  /// whole. By default it grows with the drivers; a connector whose prepared
+  /// splits are cheap to hold can ask for a number that does not depend on
+  /// how many drivers read them.
+  virtual int32_t maxPreloadedSplits(
+      int32_t numDrivers,
+      int32_t maxSplitPreloadPerDriver) const {
+    return numDrivers * maxSplitPreloadPerDriver;
+  }
+
   /// Returns true if the connector supports index lookup, otherwise false.
   virtual bool supportsIndexLookup() const {
     return false;

@@ -690,7 +690,7 @@ Table Scan
    * - max_split_preload_per_driver
      - integer
      - 2
-     - Maximum number of splits to preload per driver. Set to 0 to disable preloading.
+     - Maximum number of splits to preload per driver. Set to 0 to disable preloading. A connector can keep a different number of splits preloaded for a scan than this value times the number of drivers.
    * - table_scan_scaled_processing_enabled
      - bool
      - false

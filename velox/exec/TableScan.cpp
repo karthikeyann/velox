@@ -503,8 +503,9 @@ void TableScan::checkPreload() {
       !connector_->supportsSplitPreload()) {
     return;
   }
-  maxPreloadedSplits_ = driverCtx_->task->numDrivers(driverCtx_->driver) *
-      maxSplitPreloadPerDriver_;
+  maxPreloadedSplits_ = connector_->maxPreloadedSplits(
+      driverCtx_->task->numDrivers(driverCtx_->driver),
+      maxSplitPreloadPerDriver_);
   if (!splitPreloader_) {
     splitPreloader_ =
         [ioExecutor,
