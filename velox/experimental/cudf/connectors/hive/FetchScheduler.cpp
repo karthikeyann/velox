@@ -22,6 +22,8 @@
 
 #include <cudf/utilities/error.hpp>
 
+#include <rmm/device_buffer.hpp>
+
 #include <cuda_runtime.h>
 
 #include <folly/system/ThreadName.h>
@@ -112,10 +114,12 @@ void copyPageableToDevice(const uint8_t* src, size_t size, uint8_t* dst) {
 }
 
 // Returns the time a staging buffer of 'pool' takes to copy to the device
-// over the time it takes to fill from memory, or zero when that cannot be
-// measured.
+// over the time it takes to fill from memory, each the best of a few, or
+// zero when that cannot be measured. The device memory comes from cuDF's
+// memory resource, like that of the scans.
 double measureCopyToFillRatio(PinnedBufferPool& pool) {
   using Clock = std::chrono::steady_clock;
+  constexpr size_t kNumSamples{4};
   try {
     ensureCudaContextForThread();
     auto buffer = pool.acquire();
@@ -123,37 +127,30 @@ double measureCopyToFillRatio(PinnedBufferPool& pool) {
       return 0;
     }
     const auto size = pool.bufferSize();
-    // Several buffers long, so that a fill reads memory and not what the
-    // fill before it left in the processor's cache.
-    constexpr size_t kNumFills{4};
-    const std::vector<uint8_t> source(kNumFills * size, 1);
-    const auto fillStart = Clock::now();
-    for (size_t i = 0; i < kNumFills; ++i) {
-      std::memcpy(buffer->data, source.data() + i * size, size);
+    // Two buffers long, so that a fill reads memory and not what the fill
+    // before it left in the processor's cache.
+    const std::vector<uint8_t> source(2 * size, 1);
+    uint64_t fillNanos{std::numeric_limits<uint64_t>::max()};
+    for (size_t i = 0; i < kNumSamples; ++i) {
+      const auto start = Clock::now();
+      std::memcpy(buffer->data, source.data() + (i % 2) * size, size);
+      fillNanos = std::min(fillNanos, nanosBetween(start, Clock::now()));
     }
-    const auto fillNanos = nanosBetween(fillStart, Clock::now()) / kNumFills;
 
-    void* device{nullptr};
-    if (cudaMalloc(&device, size) != cudaSuccess) {
-      // Clear the error so that an unrelated CUDA call does not report it.
-      cudaGetLastError();
-      return 0;
-    }
-    constexpr size_t kNumCopies{4};
+    auto stream = cudfGlobalStreamPool().get_stream();
+    rmm::device_buffer device(size, stream, get_temp_mr());
+    stream.sync();
     uint64_t copyNanos{std::numeric_limits<uint64_t>::max()};
-    auto status = cudaSuccess;
-    for (size_t i = 0; i < kNumCopies && status == cudaSuccess; ++i) {
-      const auto copyStart = Clock::now();
-      status = cudaMemcpyAsync(
-          device, buffer->data, size, cudaMemcpyHostToDevice, buffer->stream);
-      const auto syncStatus = cudaStreamSynchronize(buffer->stream);
-      status = status == cudaSuccess ? syncStatus : status;
-      copyNanos = std::min(copyNanos, nanosBetween(copyStart, Clock::now()));
-    }
-    cudaFree(device);
-    if (status != cudaSuccess) {
-      cudaGetLastError();
-      return 0;
+    for (size_t i = 0; i < kNumSamples; ++i) {
+      const auto start = Clock::now();
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          device.data(),
+          buffer->data,
+          size,
+          cudaMemcpyHostToDevice,
+          buffer->stream));
+      CUDF_CUDA_TRY(cudaStreamSynchronize(buffer->stream));
+      copyNanos = std::min(copyNanos, nanosBetween(start, Clock::now()));
     }
     return fillNanos == 0 ? 0 : static_cast<double>(copyNanos) / fillNanos;
   } catch (const std::exception& e) {
@@ -344,20 +341,19 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
         --next.numHoldsLeft;
         break;
       }
-      if (options.copyMode == CopyMode::kAuto && rate > 0) {
-        if (state.numTrialsToCopyTrial == 0) {
-          next.phase = Phase::kTryOtherCopy;
-          next.isCopyQueued = !state.isCopyQueued;
-          next.copyTrialRate = rate;
-          break;
-        }
-        --next.numTrialsToCopyTrial;
+      // Before anything was delivered there is no rate to compare a trial
+      // with.
+      if (next.baseRate <= 0) {
+        break;
       }
       if (isCopyLimited) {
         if (state.numReaders > options.minReaders) {
           tryFewer(state.numReaders);
         }
       } else if (!isBufferLimited && state.numReaders < options.maxReaders) {
+        // Against the latest rate when that is the higher one: a scan that
+        // is still getting faster must not pass for the trial's gain.
+        next.baseRate = std::max(next.baseRate, rate);
         tryMore(state.numReaders);
       }
       break;
@@ -368,7 +364,9 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
       const double share =
           static_cast<double>(state.numReaders - state.numHeldReaders) /
           state.numHeldReaders;
-      if (rate >= state.baseRate * (1 + share / 2) && !isCopyLimited) {
+      // Nothing delivered says nothing in favour of more readers either.
+      if (rate > 0 && state.baseRate > 0 &&
+          rate >= state.baseRate * (1 + share / 2) && !isCopyLimited) {
         next.baseRate = rate;
         next.numFailedTrials = 0;
         tryMore(state.numReaders);
@@ -395,40 +393,6 @@ FetchScheduler::ControlState FetchScheduler::nextControlState(
       }
       break;
     }
-    case Phase::kTryOtherCopy:
-    case Phase::kCheckCopyTrial:
-    case Phase::kConfirmOtherCopy: {
-      // Small gains are within what two measurements differ by.
-      constexpr double kMinGain{1.05};
-      // Whether the way the trial came from is the one measured.
-      const bool isCheck = state.phase == Phase::kCheckCopyTrial;
-      // The other way has to deliver more than the measurement before it;
-      // the way the trial came from, less than the trial before it.
-      // A measurement in which nothing was delivered says nothing.
-      const bool inFavour = rate > 0 && state.copyTrialRate > 0 &&
-          (isCheck ? state.copyTrialRate >= rate * kMinGain
-                   : rate >= state.copyTrialRate * kMinGain);
-      if (inFavour && state.phase != Phase::kConfirmOtherCopy) {
-        next.phase =
-            isCheck ? Phase::kConfirmOtherCopy : Phase::kCheckCopyTrial;
-        next.isCopyQueued = !state.isCopyQueued;
-        next.copyTrialRate = rate;
-        break;
-      }
-      if (inFavour) {
-        next.baseRate = rate;
-      } else if (!isCheck) {
-        next.isCopyQueued = !state.isCopyQueued;
-      }
-      // Also after a switch: two ways that deliver about the same would
-      // otherwise take turns.
-      next.copyTrialInterval =
-          std::min(4 * state.copyTrialInterval, kMaxCopyTrialInterval);
-      next.copyTrialRate = 0;
-      next.numTrialsToCopyTrial = next.copyTrialInterval;
-      hold(state.numHeldReaders);
-      break;
-    }
   }
   return next;
 }
@@ -446,7 +410,7 @@ FetchScheduler::FetchScheduler(
   control_.numReaders = std::clamp(
       options_.initialReaders, options_.minReaders, options_.maxReaders);
   control_.numHeldReaders = control_.numReaders;
-  control_.isCopyQueued = options_.copyMode == CopyMode::kQueue;
+  isCopyQueued_ = options_.copyMode == CopyMode::kQueue;
 }
 
 FetchScheduler::~FetchScheduler() {
@@ -529,16 +493,16 @@ void FetchScheduler::ensureStarted() {
     LOG(WARNING) << "Fetch scheduler readers wait for their own copies: "
                  << e.what();
     options_.copyMode = CopyMode::kWait;
-    control_.isCopyQueued = false;
+    isCopyQueued_ = false;
   }
   if (options_.copyMode == CopyMode::kAuto) {
     stats_.copyToFillRatio = measureCopyToFillRatio(*pool_);
-    control_.isCopyQueued = prefersQueuedCopies(stats_.copyToFillRatio);
+    isCopyQueued_ = prefersQueuedCopies(stats_.copyToFillRatio);
     LOG(INFO) << "Fetch scheduler: a staging buffer takes "
               << stats_.copyToFillRatio
               << " times as long to copy to the device as to fill, so "
-              << (control_.isCopyQueued ? "readers go on while their copies run"
-                                        : "readers wait for their copies");
+              << (isCopyQueued_ ? "readers go on while their copies run"
+                                : "readers wait for their copies");
   }
   options_.maxReaders = readers_.size();
   options_.minReaders = std::min(options_.minReaders, options_.maxReaders);
@@ -637,7 +601,7 @@ FetchScheduler::Stats FetchScheduler::stats() {
   advance(Clock::now());
   auto stats = stats_;
   stats.numReaders = control_.numReaders;
-  stats.isCopyQueued = control_.isCopyQueued;
+  stats.isCopyQueued = isCopyQueued_;
   stats.numWaiters = numWaiters_;
   return stats;
 }
@@ -645,7 +609,7 @@ FetchScheduler::Stats FetchScheduler::stats() {
 size_t FetchScheduler::depthLimit() const {
   // A reader that goes on while its copy runs has one buffer being copied
   // and one being filled.
-  const auto numBuffersPerReader = control_.isCopyQueued ? 2 : 1;
+  const auto numBuffersPerReader = isCopyQueued_ ? 2 : 1;
   return std::max<size_t>(
       1,
       std::min(pool_->maxBuffers(), control_.numReaders * numBuffersPerReader));
@@ -714,14 +678,8 @@ void FetchScheduler::advance(Clock::time_point now) {
     return;
   }
   const auto numReaders = control_.numReaders;
-  const auto wasCopyQueued = control_.isCopyQueued;
   control_ = nextControlState(options_, control_, window_);
   window_ = {};
-  if (control_.isCopyQueued != wasCopyQueued) {
-    ++stats_.numCopyModeChanges;
-    workAvailable_.notify_all();
-    bufferFreed_.notify_all();
-  }
   if (control_.numReaders > numReaders) {
     ++stats_.numRaises;
     workAvailable_.notify_one();
@@ -944,7 +902,7 @@ bool FetchScheduler::fillAndCopy(const Job& job) {
       isCopying = true;
       // The reader of a sequential range starts its next piece itself, so it
       // gains nothing from going on.
-      isWaiting = !control_.isCopyQueued || buffer == nullptr ||
+      isWaiting = !isCopyQueued_ || buffer == nullptr ||
           read.order == FillOrder::kSequential;
       if (isWaiting) {
         ++numCopyWaiters_;

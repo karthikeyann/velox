@@ -45,11 +45,10 @@ namespace facebook::velox::cudf_velox::connector::hive {
 /// where filling buffers slows the copies that run meanwhile, a reader that
 /// waits delivers more; where it does not, a reader that waits is idle for
 /// nothing. The scheduler measures a copy against a fill when its readers
-/// start and chooses by that. A controller then measures the bytes per
-/// second that reach the device while ranges wait for a reader, and from
-/// time to time tries more readers, fewer readers or the other way of
-/// waiting, and keeps what raises the rate. The result does not depend on
-/// the thread that submits a range.
+/// start and chooses by that, once. A controller then measures the bytes
+/// per second that reach the device while ranges wait for a reader, and
+/// from time to time tries more readers or fewer, and keeps what the rate
+/// supports. The result does not depend on the thread that submits a range.
 ///
 /// Ranges belong to groups. The ranges of a group that a consumer is waiting
 /// for are served before those nobody waits for yet. Among the groups waited
@@ -66,8 +65,7 @@ class FetchScheduler {
   /// How the copy of a filled staging buffer is waited for.
   enum class CopyMode {
     /// Chosen by prefersQueuedCopies() from a measurement made when the
-    /// readers start. From time to time the controller measures the other
-    /// way against it and changes when that delivers clearly more.
+    /// readers start, and kept from then on.
     kAuto,
     /// The reader that filled the buffer waits for its copy before it fills
     /// another.
@@ -132,14 +130,6 @@ class FetchScheduler {
       kTryMore,
       /// Fewer than that number, on trial.
       kTryFewer,
-      /// That number with the other way of waiting for copies, on trial.
-      kTryOtherCopy,
-      /// Back to the way of waiting for copies it came from, to measure it
-      /// again after a trial of the other way that delivered more.
-      kCheckCopyTrial,
-      /// The other way once more, after the way it came from delivered less
-      /// again.
-      kConfirmOtherCopy,
     };
 
     /// Readers allowed now.
@@ -151,30 +141,12 @@ class FetchScheduler {
     /// Bytes per second measured with the number the controller stays
     /// with. Zero before the first measurement.
     double baseRate{0};
-    /// Bytes per second of the previous measurement during a trial of the
-    /// other way of waiting for copies, which the next one is compared
-    /// with.
-    double copyTrialRate{0};
     /// Measurements left before the next trial.
     size_t numHoldsLeft{0};
     /// Trials of more readers that were not kept since the last one that
     /// was. The hold doubles with each, up to eight times.
     size_t numFailedTrials{0};
-    /// Whether readers go on while their copies run, instead of waiting for
-    /// them.
-    bool isCopyQueued{false};
-    /// Trials of a number of readers left before the next trial of the
-    /// other way of waiting for copies.
-    size_t numTrialsToCopyTrial{0};
-    /// Trials of a number of readers between two trials of the other way of
-    /// waiting for copies. Grows fourfold, up to kMaxCopyTrialInterval, with
-    /// every such trial.
-    size_t copyTrialInterval{1};
   };
-
-  /// Most trials of a number of readers between two trials of the other way
-  /// of waiting for copies.
-  static constexpr size_t kMaxCopyTrialInterval{64};
 
   /// Counters since the scheduler was created.
   struct Stats {
@@ -215,10 +187,7 @@ class FetchScheduler {
     uint64_t numLowers{0};
     /// Pieces whose reader went on while the copy ran.
     uint64_t numQueuedCopies{0};
-    /// Times the controller changed how copies are waited for, trials
-    /// included.
-    uint64_t numCopyModeChanges{0};
-    /// Whether readers go on while their copies run now.
+    /// Whether readers go on while their copies run.
     bool isCopyQueued{false};
     /// Time a staging buffer takes to copy to the device over the time it
     /// takes to fill from memory, measured when the readers started with
@@ -288,12 +257,12 @@ class FetchScheduler {
   /// Below this ratio of the time a staging buffer takes to copy to the
   /// device to the time it takes to fill from memory, readers go on while
   /// their copies run.
-  static constexpr double kMaxQueuedCopyToFillRatio{0.5};
+  static constexpr double kMaxQueuedCopyToFillRatio{0.7};
 
   /// Returns whether readers should go on while their copies run, given
   /// 'copyToFillRatio': the time a staging buffer takes to copy to the
   /// device over the time it takes to fill from memory. A link that is slow
-  /// for the machine's memory, a ratio near one as measured on a PCIe 4
+  /// for the machine's memory, a ratio above one as measured on a PCIe 4
   /// workstation, is fed by two or three readers, and what the others fill
   /// meanwhile takes memory bandwidth from the copies: there readers wait.
   /// A fast link, a low ratio, needs many readers and leaves bandwidth to
@@ -310,7 +279,11 @@ class FetchScheduler {
   /// source is the limit, which fewer readers cannot help: it tries a
   /// quarter more, at least one more. They are kept when the rate rises by
   /// at least half of what the added readers would bring if each brought as
-  /// much as the others, and then more are tried right away. Readers are
+  /// much as the others, and then more are tried right away. The rate they
+  /// are compared with is the higher of the average and the latest
+  /// measurement, so that a scan that is still getting faster does not pass
+  /// for their gain; a measurement in which nothing was delivered keeps
+  /// none, and before anything was delivered none are tried. Readers are
   /// never given up in this state: how many concurrent reads a drive needs
   /// does not show in one measurement.
   ///
@@ -325,20 +298,6 @@ class FetchScheduler {
   /// more readers are not tried. A trial that is not kept goes back to the
   /// held number. After a trial of more readers that is not kept, the hold
   /// is twice as long with each such trial in a row, up to eight times.
-  ///
-  /// With CopyMode::kAuto, every 'copyTrialInterval' trials of a number of
-  /// readers, the first time before any, the trial is of the other way of
-  /// waiting for copies with the held number of readers. The rate of a scan
-  /// drifts with what is being read, so the two ways are measured in turn,
-  /// four measurements starting with the last one of the hold: the other
-  /// way is kept when each of its two delivered at least 5% more than the
-  /// measurement before it, and the way it came from 5% less in between.
-  /// The trial ends at the first measurement that does not fit, so one that
-  /// loses costs one period. A measurement in which nothing was delivered
-  /// starts no trial and decides none. The interval becomes four times as
-  /// long with every trial, so that a machine on which one way is clearly
-  /// better soon stops paying for trials of the other, and one on which
-  /// both deliver the same does not go back and forth.
   static ControlState nextControlState(
       const Options& options,
       const ControlState& state,
@@ -512,6 +471,9 @@ class FetchScheduler {
 
   bool started_{false};
   bool stopping_{false};
+  // Whether readers go on while their copies run. Set before the readers
+  // take their first piece.
+  bool isCopyQueued_{false};
   std::vector<std::thread> readers_;
   // Waits for the copies in 'queuedCopies_'. Not joinable when it could not
   // be started, in which case every reader waits for its own copy.
