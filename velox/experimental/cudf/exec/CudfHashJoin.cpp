@@ -617,24 +617,16 @@ void CudfHashJoinProbe::pushdownDynamicFilters() {
   const auto numFilters = driver->pushdownFilters(
       this,
       probeKeyChannels_,
-      [&](column_index_t sourceChannel,
-          std::shared_ptr<common::Filter>& filter) {
-        // Driver passes the index in probeKeyChannels_, not an input channel.
-        if (dynamicFiltersProducedOnChannels_.contains(sourceChannel)) {
-          return true;
-        }
-        filter = makeIntegerDynamicFilter(sourceChannel);
-        if (!filter) {
-          return false;
-        }
-        dynamicFiltersProducedOnChannels_.insert(sourceChannel);
-        for (auto* peer : findPeerOperators()) {
-          peer->dynamicFiltersProducedOnChannels_.insert(sourceChannel);
-          if (dynamicFilterHasUniqueKeys_) {
+      [&](column_index_t keyIndex) -> common::FilterPtr {
+        auto filter = makeIntegerDynamicFilter(keyIndex);
+        if (filter != nullptr && dynamicFilterHasUniqueKeys_) {
+          // The Driver calls this for one driver of the pipeline only. The
+          // others learn here that the build keys are unique.
+          for (auto* peer : findPeerOperators()) {
             peer->dynamicFilterHasUniqueKeys_ = true;
           }
         }
-        return true;
+        return filter;
       });
   // An exact filter can replace a unique, single-key inner
   // join whose output contains no build columns and has no residual filter.

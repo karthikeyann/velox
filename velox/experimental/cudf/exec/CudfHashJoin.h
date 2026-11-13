@@ -239,8 +239,6 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   // Preserves the join key order expected by Driver::pushdownFilters().
   std::vector<column_index_t> probeKeyChannels_;
 
-  // Prevents peer probe operators from rebuilding the same filter.
-  std::unordered_set<column_index_t> dynamicFiltersProducedOnChannels_;
   // Learned while deduplicating a complete single-key build for an exact
   // filter.
   bool dynamicFilterHasUniqueKeys_{false};
