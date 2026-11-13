@@ -136,11 +136,26 @@ void FetchAheadBudget::waitBegin() {
   ++stats_.numWaitingConsumers;
 }
 
+FetchAheadBudget::ScopedStartSuspension::ScopedStartSuspension(
+    FetchAheadBudget* budget)
+    : budget_(budget) {
+  if (budget_ != nullptr) {
+    budget_->waitBegin();
+  }
+}
+
+FetchAheadBudget::ScopedStartSuspension::~ScopedStartSuspension() {
+  if (budget_ != nullptr) {
+    budget_->waitEnd();
+  }
+}
+
 void FetchAheadBudget::waitEnd() noexcept {
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    VELOX_DCHECK_GT(stats_.numWaitingConsumers, 0);
-    if (stats_.numWaitingConsumers > 0) {
+    if (stats_.numWaitingConsumers == 0) {
+      LOG(ERROR) << "waitEnd() without a waitBegin()";
+    } else {
       --stats_.numWaitingConsumers;
     }
   }
@@ -283,12 +298,15 @@ cuda::stream_ref FetchAheadContext::nextStream() {
   std::lock_guard<std::mutex> lock(mutex_);
   if (streams_.empty()) {
     ensureCudaContextForThread();
-    streams_.reserve(kNumStreams);
+    // All or none: a failure leaves no stream behind.
+    std::vector<rmm::cuda_stream> streams;
+    streams.reserve(kNumStreams);
     for (size_t i = 0; i < kNumStreams; ++i) {
-      streams_.emplace_back(rmm::cuda_stream::flags::non_blocking);
+      streams.emplace_back(rmm::cuda_stream::flags::non_blocking);
     }
+    streams_ = std::move(streams);
   }
-  return streams_[nextStream_++ % kNumStreams];
+  return streams_[nextStream_++ % streams_.size()];
 }
 
 PostedFetchStart::PostedFetchStart(
