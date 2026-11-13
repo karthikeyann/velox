@@ -700,6 +700,12 @@ void CudfSplitReader::releasePassData(PassFetch& pass, bool isDecoded) {
 }
 
 void CudfSplitReader::releaseCurrentPassData() {
+  // The split is done with or given up: reads that have not begun need not
+  // run. The KvikIO data source has no such switch.
+  if (auto* bufferedInput =
+          dynamic_cast<BufferedInputDataSource*>(dataSource_.get())) {
+    bufferedInput->abandonDeviceReads();
+  }
   // The fetch of the pass after it goes with it. Both are released even when
   // the first fails.
   SCOPE_EXIT {
