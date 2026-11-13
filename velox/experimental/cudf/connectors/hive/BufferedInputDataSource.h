@@ -22,6 +22,7 @@
 
 #include <cuda/stream>
 
+#include <atomic>
 #include <future>
 #include <memory>
 #include <vector>
@@ -57,11 +58,19 @@ class BufferedInputDataSource : public cudf::io::datasource {
       uint8_t* dst,
       cuda::stream_ref stream) override;
 
+  /// Makes the device reads that have not begun return zero without reading
+  /// or copying anything, including those submitted later. For a consumer
+  /// that gives up what it asked for: it still waits for the futures, and the
+  /// wait is then only for the reads in progress.
+  void abandonDeviceReads();
+
  private:
   void readContiguous(size_t offset, size_t size, uint8_t* dst);
 
   std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input_;
   const size_t fileSize_;
+  // Set by abandonDeviceReads().
+  std::atomic_bool deviceReadsAbandoned_{false};
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

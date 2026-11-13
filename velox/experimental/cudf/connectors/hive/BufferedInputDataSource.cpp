@@ -107,6 +107,9 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
   VELOX_CHECK(input_->executor() != nullptr, "IO executor is not initialized");
   return submitDeviceRead(
       input_->executor(), [this, offset, size, dst, stream]() {
+        if (deviceReadsAbandoned_) {
+          return size_t{0};
+        }
         auto hostBuffer = host_read(offset, size);
         ensureCudaContextForThread();
         CUDF_CUDA_TRY(cudaMemcpyAsync(
@@ -117,6 +120,10 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
             stream.get()));
         return hostBuffer->size();
       });
+}
+
+void BufferedInputDataSource::abandonDeviceReads() {
+  deviceReadsAbandoned_ = true;
 }
 
 bool BufferedInputDataSource::supports_device_read() const {
