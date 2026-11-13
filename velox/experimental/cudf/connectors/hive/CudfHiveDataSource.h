@@ -59,6 +59,12 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   static constexpr std::string_view kDynamicFilterDroppedRows{
       "dynamicFilterDroppedRows"};
 
+  /// Runtime statistic: times the scan listed the values of a value-set
+  /// dynamic filter and copied them to the device. The data sources of a
+  /// scan share the copy, so this counts once per filter, not per split.
+  static constexpr std::string_view kDynamicFilterValueUploads{
+      "dynamicFilterValueUploads"};
+
   /// Returns whether this data source can scan 'tableHandle' on the GPU:
   ///  - 'tableHandle' is a Hive table handle,
   ///  - no rows are sampled,
@@ -383,16 +389,17 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
 
     DynamicFilterEvaluation evaluation{DynamicFilterEvaluation::kHost};
 
-    // The sorted values of a kValues filter.
-    std::vector<int64_t> values;
+    // The smallest and largest value of a kValues filter.
+    int64_t lower{0};
+    int64_t upper{0};
 
-    // The device copy of 'values', made at the first batch: UINT32 words of a
-    // bitmap based at 'bitmapMinimum', or the values in the column's type
-    // for 'hashSet'.
+    // The values of a kValues filter as a bitmap on the device, made at the
+    // first batch and shared by the data sources of the scan: UINT32 words
+    // with bit 'value - lower' set. Null if the values span too wide a range.
+    std::shared_ptr<const cudf::column> bitmap;
+
+    // The values in the column's type, for 'hashSet'.
     std::unique_ptr<cudf::column> deviceValues;
-
-    // The value bit 0 of the bitmap stands for.
-    int64_t bitmapMinimum{0};
 
     // Set when the values span too wide a range for a bitmap.
     std::unique_ptr<CudfIntegerHashSet> hashSet;
@@ -422,7 +429,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   void uploadDynamicFilterValues(
       DynamicFilter& dynamicFilter,
       const cudf::column_view& input,
-      cuda::stream_ref stream) const;
+      cuda::stream_ref stream);
 
   // Ends the current split without reading the rest of it.
   void skipCurrentSplit();
@@ -453,6 +460,10 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
 
   // Rows the dynamic filters dropped.
   uint64_t dynamicFilterDroppedRows_{0};
+
+  // Times this data source listed the values of a value-set filter and
+  // copied them to the device.
+  uint64_t numDynamicFilterValueUploads_{0};
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

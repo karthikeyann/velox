@@ -5080,6 +5080,74 @@ TEST_F(TableScanTest, intersectDynamicFilters) {
   EXPECT_EQ(source->getRuntimeStats().at("dynamicFilterDroppedRows").sum, 5);
 }
 
+// The data sources of a scan, one per driver and per split prepared ahead,
+// get the same filter object: its values are listed and copied to the device
+// once, by the first data source that filters a batch.
+TEST_F(TableScanTest, dynamicFilterValuesSharedByDataSources) {
+  auto rowType = ROW("c0", BIGINT());
+  auto input =
+      makeRowVector({"c0"}, {makeFlatVector<int64_t>(1'000, folly::identity)});
+  auto file = TempFilePath::create();
+  writeToFile(file->getPath(), input);
+
+  auto properties = std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{});
+  ::facebook::velox::connector::ConnectorQueryCtx ctx(
+      pool_.get(),
+      pool_.get(),
+      properties.get(),
+      nullptr,
+      common::PrefixSortConfig{},
+      nullptr,
+      nullptr,
+      "query",
+      "task",
+      "scan",
+      0,
+      "");
+  auto connector = ::facebook::velox::connector::ConnectorRegistry::tryGet(
+      kCudfHiveConnectorId);
+  const auto numUploads =
+      [](facebook::velox::connector::DataSource& source) -> int64_t {
+    const auto stats = source.getRuntimeStats();
+    const auto it = stats.find("dynamicFilterValueUploads");
+    return it == stats.end() ? 0 : it->second.sum;
+  };
+
+  // A set kept in a hash table, of which the file holds 3 and 500, and one
+  // kept in a bitmask.
+  for (const auto& values :
+       {std::vector<int64_t>{3, 500, 100'000}, std::vector<int64_t>{3, 5}}) {
+    const common::FilterPtr filter = common::createBigintValues(values, false);
+    SCOPED_TRACE(filter->toString());
+    std::vector<std::unique_ptr<facebook::velox::connector::DataSource>>
+        sources;
+    for (auto i = 0; i < 4; ++i) {
+      sources.push_back(connector->createDataSource(
+          rowType,
+          makeTableHandle("t", rowType),
+          HiveConnectorTestBase::allRegularColumns(rowType),
+          &ctx));
+      sources.back()->addDynamicFilter(0, filter);
+    }
+    // Adding the filter lists nothing.
+    int64_t total{0};
+    for (auto& source : sources) {
+      total += numUploads(*source);
+    }
+    EXPECT_EQ(total, 0);
+
+    for (auto& source : sources) {
+      for (auto split = 0; split < 2; ++split) {
+        source->addSplit(makeCudfHiveConnectorSplit(file->getPath()));
+        EXPECT_EQ(countSplitRows(*source), 2);
+      }
+      total += numUploads(*source);
+    }
+    EXPECT_EQ(total, 1);
+  }
+}
+
 // A scan drops rows for an advisory filter only while that removes enough of
 // them, and never when the row filter is switched off.
 TEST_F(TableScanTest, advisoryFilterRows) {

@@ -541,6 +541,74 @@ int64_t countRetainedRows(
   return static_cast<const cudf::numeric_scalar<int64_t>&>(*sum).value(stream);
 }
 
+// Returns the values of a value-set filter in ascending order.
+std::vector<int64_t> sortedFilterValues(const common::Filter& filter) {
+  auto values = filter.kind() == common::FilterKind::kBigintValuesUsingHashTable
+      ? static_cast<const common::BigintValuesUsingHashTable&>(filter).values()
+      : static_cast<const common::BigintValuesUsingBitmask&>(filter).values();
+  std::sort(values.begin(), values.end());
+  return values;
+}
+
+// Returns the device bitmap of the value-set 'filter', whose values lie in
+// ['lower', 'upper']: UINT32 words with bit 'value - lower' set for each
+// value. The data sources of a scan, one per driver and per split prepared
+// ahead, receive the same filter object and share one bitmap, so that its
+// values are listed and copied to the device once. Sets 'built' if this call
+// made the bitmap.
+std::shared_ptr<const cudf::column> sharedValueBitmap(
+    const common::FilterPtr& filter,
+    int64_t lower,
+    int64_t upper,
+    cuda::stream_ref stream,
+    bool& built) {
+  built = false;
+  struct Entry {
+    std::weak_ptr<common::Filter> filter;
+    std::weak_ptr<const cudf::column> bitmap;
+  };
+  static std::mutex mutex;
+  static std::unordered_map<const common::Filter*, Entry> entries;
+
+  std::lock_guard<std::mutex> lock(mutex);
+  std::erase_if(
+      entries, [](const auto& entry) { return entry.second.bitmap.expired(); });
+  if (const auto it = entries.find(filter.get()); it != entries.end()) {
+    // The address of a freed filter can be taken by a new one.
+    if (auto bitmap = it->second.bitmap.lock();
+        bitmap != nullptr && it->second.filter.lock() == filter) {
+      return bitmap;
+    }
+  }
+
+  const auto span = static_cast<uint64_t>(upper) - static_cast<uint64_t>(lower);
+  std::vector<uint32_t> words(span / 32 + 1, 0);
+  for (const auto value : sortedFilterValues(*filter)) {
+    const auto index =
+        static_cast<uint64_t>(value) - static_cast<uint64_t>(lower);
+    words[index / 32] |= uint32_t{1} << (index % 32);
+  }
+  auto column = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::UINT32},
+      words.size(),
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      get_output_mr());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      column->mutable_view().data<uint32_t>(),
+      words.data(),
+      words.size() * sizeof(uint32_t),
+      cudaMemcpyHostToDevice,
+      stream.get()));
+  // 'words' has to outlive the copy, and the other data sources read the
+  // bitmap on their own streams.
+  stream.sync();
+  std::shared_ptr<const cudf::column> bitmap = std::move(column);
+  entries.insert_or_assign(filter.get(), Entry{filter, bitmap});
+  built = true;
+  return bitmap;
+}
+
 // Advisory filters stop filtering rows once they have kept more than this
 // share of at least 'kAdvisoryFilterMinRows' rows.
 constexpr double kAdvisoryFilterMaxKeptRatio{0.8};
@@ -1111,27 +1179,25 @@ CudfHiveDataSource::DynamicFilter CudfHiveDataSource::makeDynamicFilter(
           ? DynamicFilterEvaluation::kDeviceBitmap
           : DynamicFilterEvaluation::kRange;
       break;
-    case common::FilterKind::kBigintValuesUsingHashTable:
+    case common::FilterKind::kBigintValuesUsingHashTable: {
+      const auto& values =
+          static_cast<const common::BigintValuesUsingHashTable&>(*filter);
       dynamicFilter.evaluation = DynamicFilterEvaluation::kValues;
-      dynamicFilter.values =
-          static_cast<const common::BigintValuesUsingHashTable&>(*filter)
-              .values();
+      dynamicFilter.lower = values.min();
+      dynamicFilter.upper = values.max();
       break;
-    case common::FilterKind::kBigintValuesUsingBitmask:
+    }
+    case common::FilterKind::kBigintValuesUsingBitmask: {
+      const auto& values =
+          static_cast<const common::BigintValuesUsingBitmask&>(*filter);
       dynamicFilter.evaluation = DynamicFilterEvaluation::kValues;
-      dynamicFilter.values =
-          static_cast<const common::BigintValuesUsingBitmask&>(*filter)
-              .values();
+      dynamicFilter.lower = values.min();
+      dynamicFilter.upper = values.max();
       break;
+    }
     default:
       dynamicFilter.evaluation = DynamicFilterEvaluation::kHost;
       break;
-  }
-  if (dynamicFilter.evaluation == DynamicFilterEvaluation::kValues) {
-    std::sort(dynamicFilter.values.begin(), dynamicFilter.values.end());
-    if (dynamicFilter.values.empty()) {
-      dynamicFilter.evaluation = DynamicFilterEvaluation::kHost;
-    }
   }
   return dynamicFilter;
 }
@@ -1145,36 +1211,26 @@ void CudfHiveDataSource::skipCurrentSplit() {
 void CudfHiveDataSource::uploadDynamicFilterValues(
     DynamicFilter& dynamicFilter,
     const cudf::column_view& input,
-    cuda::stream_ref stream) const {
+    cuda::stream_ref stream) {
   dynamicFilter.hashSet.reset();
-  const auto& values = dynamicFilter.values;
-  const auto span = static_cast<uint64_t>(values.back()) -
-      static_cast<uint64_t>(values.front());
+  dynamicFilter.deviceValues.reset();
+  dynamicFilter.bitmap.reset();
+  const auto span = static_cast<uint64_t>(dynamicFilter.upper) -
+      static_cast<uint64_t>(dynamicFilter.lower);
   if (span / 32 < kMaxBitmapWords) {
-    std::vector<uint32_t> bitmap(span / 32 + 1, 0);
-    for (const auto value : values) {
-      const auto index =
-          static_cast<uint64_t>(value) - static_cast<uint64_t>(values.front());
-      bitmap[index / 32] |= uint32_t{1} << (index % 32);
-    }
-    dynamicFilter.bitmapMinimum = values.front();
-    dynamicFilter.deviceValues = cudf::make_fixed_width_column(
-        cudf::data_type{cudf::type_id::UINT32},
-        bitmap.size(),
-        cudf::mask_state::UNALLOCATED,
+    bool built;
+    dynamicFilter.bitmap = sharedValueBitmap(
+        dynamicFilter.filter,
+        dynamicFilter.lower,
+        dynamicFilter.upper,
         stream,
-        get_temp_mr());
-    CUDF_CUDA_TRY(cudaMemcpyAsync(
-        dynamicFilter.deviceValues->mutable_view().data<uint32_t>(),
-        bitmap.data(),
-        bitmap.size() * sizeof(uint32_t),
-        cudaMemcpyHostToDevice,
-        stream.get()));
-    // 'bitmap' has to outlive the copy.
-    stream.sync();
+        built);
+    numDynamicFilterValueUploads_ += built;
     return;
   }
+  ++numDynamicFilterValueUploads_;
 
+  const auto values = sortedFilterValues(*dynamicFilter.filter);
   dynamicFilter.deviceValues = cudf::type_dispatcher(
       input.type(), [&]<typename T>() -> std::unique_ptr<cudf::column> {
         if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
@@ -1243,8 +1299,8 @@ CudfHiveDataSource::dynamicFilterBounds() const {
       case DynamicFilterEvaluation::kValues:
         bounds.push_back(
             {index,
-             dynamicFilter.values.front(),
-             dynamicFilter.values.back(),
+             dynamicFilter.lower,
+             dynamicFilter.upper,
              dynamicFilter.filter->testNull()});
         break;
       default:
@@ -1382,7 +1438,8 @@ bool CudfHiveDataSource::intersectDynamicFilters(
       const auto input = integerColumn(index);
       // A hash set holds keys of one integer width; another file of the
       // scan may store the column in another.
-      if (dynamicFilter.deviceValues == nullptr ||
+      if ((dynamicFilter.bitmap == nullptr &&
+           dynamicFilter.hashSet == nullptr) ||
           (dynamicFilter.hashSet != nullptr &&
            dynamicFilter.hashSetType != input.type().id())) {
         uploadDynamicFilterValues(dynamicFilter, input, stream);
@@ -1397,8 +1454,8 @@ bool CudfHiveDataSource::intersectDynamicFilters(
       } else {
         applyIntegerBitmapToMask(
             input,
-            dynamicFilter.deviceValues->view(),
-            dynamicFilter.bitmapMinimum,
+            dynamicFilter.bitmap->view(),
+            dynamicFilter.lower,
             dynamicFilter.filter->testNull(),
             mask,
             stream,
@@ -1623,6 +1680,11 @@ CudfHiveDataSource::getRuntimeStats() {
   if (dynamicFilterDroppedRows_ > 0) {
     result.emplace(
         kDynamicFilterDroppedRows, RuntimeMetric(dynamicFilterDroppedRows_));
+  }
+  if (numDynamicFilterValueUploads_ > 0) {
+    result.emplace(
+        kDynamicFilterValueUploads,
+        RuntimeMetric(numDynamicFilterValueUploads_));
   }
   const auto& ioStats = ioStats_->stats();
   for (const auto& [key, value] : ioStats) {
