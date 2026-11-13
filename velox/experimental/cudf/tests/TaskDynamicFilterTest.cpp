@@ -220,6 +220,40 @@ TEST_F(TaskDynamicFilterTest, largeBuildWithFewKeys) {
   EXPECT_EQ(statSum(scanStats, TableScan::kDynamicFiltersTimedOut), 0);
 }
 
+TEST_F(TaskDynamicFilterTest, largeBuildWithDenseKeys) {
+  // More distinct keys than an exact set of values holds, and too dense for a
+  // bitmap to leave much out: every number below 150'000. Only the bounds of
+  // the keys are known, which the join does not send. The scan is released
+  // and reads everything.
+  constexpr int32_t kNumBuildRows = 150'000;
+  auto build = makeRowVector(
+      {"bk"},
+      {makeFlatVector<int64_t>(kNumBuildRows, [](auto row) { return row; })});
+  auto plan = makeJoinPlan(build);
+  const auto stats = run(plan, joinSql_);
+  const auto& scanStats = stats.at(plan.scanId);
+  EXPECT_EQ(scanStats.outputRows, kNumRows);
+  EXPECT_EQ(statSum(scanStats, DriverStats::kDynamicFiltersAccepted), 0);
+  EXPECT_EQ(statSum(scanStats, TableScan::kDynamicFiltersTimedOut), 0);
+}
+
+TEST_F(TaskDynamicFilterTest, largeBuildWithSparseKeys) {
+  // More distinct keys than an exact set of values holds: the even numbers
+  // below 300'000. The range of the keys covers the whole probe table. The
+  // bitmap of the keys that goes with it on the device leaves the odd keys
+  // out.
+  constexpr int32_t kNumBuildRows = 150'000;
+  auto build = makeRowVector(
+      {"bk"}, {makeFlatVector<int64_t>(kNumBuildRows, [](auto row) {
+        return 2 * row;
+      })});
+  auto plan = makeJoinPlan(build);
+  const auto stats = run(plan, joinSql_);
+  const auto& scanStats = stats.at(plan.scanId);
+  EXPECT_EQ(scanStats.outputRows, kNumRows / 2);
+  EXPECT_EQ(statSum(scanStats, TableScan::kDynamicFiltersTimedOut), 0);
+}
+
 TEST_F(TaskDynamicFilterTest, joinsWithoutFilter) {
   // The scan must not wait out its limit for a filter the join does not make.
   const folly::stop_watch<std::chrono::seconds> watch;

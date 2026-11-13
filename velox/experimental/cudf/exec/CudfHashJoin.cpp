@@ -344,15 +344,19 @@ void CudfHashJoinBuild::publishDynamicFilters(
                    << ": " << e.what();
       continue;
     }
-    // A large build side knows only the bounds of its keys, which rarely
-    // leave rows out, so it sends no filter.
-    if (keyFilter.filter == nullptr || !keyFilter.exact) {
+    // The bounds alone of the keys of a large build side rarely leave rows
+    // out, so they are not worth a filter on every batch of the scan.
+    if (keyFilter.filter == nullptr ||
+        (!keyFilter.exact && keyFilter.deviceBitmap == nullptr)) {
       continue;
     }
-    // The join still runs, so a scan may apply the filter in part.
+    // The join still runs, so a scan may apply the filter in part. A large
+    // build side sends the range of its keys with the bitmap of the keys,
+    // which stays on the device, for the cuDF scans of this task.
     task->publishDynamicFilter(
         source.filterId,
-        connector::hive::makeAdvisoryFilter(std::move(keyFilter.filter)));
+        connector::hive::makeAdvisoryFilter(
+            std::move(keyFilter.filter), std::move(keyFilter.deviceBitmap)));
     ++numPublished;
   }
   if (numPublished > 0) {
