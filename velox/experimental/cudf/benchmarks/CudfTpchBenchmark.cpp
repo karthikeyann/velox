@@ -76,6 +76,12 @@ DEFINE_bool(
     false,
     "Load column chunks while preloading cuDF Hive splits");
 
+DEFINE_uint64(
+    cudf_hive_fetch_ahead_bytes,
+    0,
+    "Device memory in bytes that column chunks fetched ahead of the drivers "
+    "may hold; 0 fetches nothing ahead");
+
 DEFINE_bool(
     cudf_hive_serialize_io_requests,
     false,
@@ -119,6 +125,9 @@ void CudfTpchBenchmark::initialize() {
     cudfHiveConfigurationValues
         [cudf_velox::connector::hive::CudfHiveConfig::kPreloadColumnChunks] =
             std::to_string(FLAGS_cudf_hive_preload_column_chunks);
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kFetchAheadBytes] =
+            std::to_string(FLAGS_cudf_hive_fetch_ahead_bytes);
     cudfHiveConfigurationValues
         [cudf_velox::connector::hive::CudfHiveConfig::kSerializeIoRequests] =
             std::to_string(FLAGS_cudf_hive_serialize_io_requests);
@@ -165,6 +174,9 @@ CudfTpchBenchmark::makeConnectorProperties() {
   cfg->set(
       CudfHiveCfg::kPreloadColumnChunks,
       std::to_string(FLAGS_cudf_hive_preload_column_chunks));
+  cfg->set(
+      CudfHiveCfg::kFetchAheadBytes,
+      std::to_string(FLAGS_cudf_hive_fetch_ahead_bytes));
   cfg->set(
       CudfHiveCfg::kSerializeIoRequests,
       std::to_string(FLAGS_cudf_hive_serialize_io_requests));

@@ -16,6 +16,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
+#include "velox/experimental/cudf/connectors/hive/FetchAheadBudget.h"
 
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/iceberg/IcebergConnector.h"
@@ -61,6 +62,9 @@ class CudfIcebergConnector final
 
  private:
   const std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
+  // The budget, start thread and streams that the connector's readers fetch
+  // ahead with. Null without a fetch-ahead budget.
+  const std::shared_ptr<FetchAheadContext> fetchAheadContext_;
   const std::shared_ptr<velox::connector::hive::iceberg::IcebergConfig>
       icebergConfig_;
 };

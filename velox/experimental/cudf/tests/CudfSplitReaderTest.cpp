@@ -106,6 +106,7 @@ TEST_F(CudfSplitReaderTest, setsPushdownFilterAfterReadingMetadata) {
       ioExecutor_.get(),
       connectorQueryCtx.get(),
       std::make_shared<CudfHiveConfig>(properties),
+      /*fetchAheadContext=*/nullptr,
       std::make_shared<io::IoStatistics>(),
       std::make_shared<IoStats>(),
       &logicalFilter);
@@ -182,6 +183,7 @@ TEST_F(CudfSplitReaderTest, timestampTypeFollowsSession) {
                 std::make_shared<config::ConfigBase>(
                     std::unordered_map<std::string, std::string>(
                         connectorConfig))),
+            /*fetchAheadContext=*/nullptr,
             std::make_shared<io::IoStatistics>(),
             std::make_shared<IoStats>(),
             nullptr);
@@ -255,6 +257,7 @@ TEST_F(CudfSplitReaderTest, tileDecodeFollowsSession) {
                 std::make_shared<config::ConfigBase>(
                     std::unordered_map<std::string, std::string>(
                         connectorConfig))),
+            /*fetchAheadContext=*/nullptr,
             std::make_shared<io::IoStatistics>(),
             std::make_shared<IoStats>(),
             nullptr);

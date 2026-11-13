@@ -153,6 +153,10 @@ bool CudfHiveConfig::preloadColumnChunksSession(
       config_->get<bool>(kPreloadColumnChunks, false));
 }
 
+uint64_t CudfHiveConfig::fetchAheadBytes() const {
+  return config_->get<uint64_t>(kFetchAheadBytes, 0);
+}
+
 bool CudfHiveConfig::serializeIoRequests() const {
   return config_->get<bool>(kSerializeIoRequests, false);
 }

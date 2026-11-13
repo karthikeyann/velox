@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
+#include "velox/experimental/cudf/connectors/hive/FetchAheadBudget.h"
 
 #include "velox/connectors/hive/HiveConnector.h"
 
@@ -51,11 +52,20 @@ class CudfHiveConnector final
     return true;
   }
 
+  /// Returns the fetch-ahead state of the connector's scans: null unless
+  /// cudf.hive.fetch-ahead-bytes is set.
+  const std::shared_ptr<FetchAheadContext>& fetchAheadContext() const {
+    return fetchAheadContext_;
+  }
+
   // TODO (dm): Re-add data sink
 
  protected:
   // TODO (dm): rename parquetconfig
   const std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
+  // The budget, start thread and streams that the connector's readers fetch
+  // ahead with. Null without a fetch-ahead budget.
+  const std::shared_ptr<FetchAheadContext> fetchAheadContext_;
 };
 
 class CudfHiveConnectorFactory

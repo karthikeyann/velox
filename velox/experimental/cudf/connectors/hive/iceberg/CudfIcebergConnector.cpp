@@ -51,6 +51,11 @@ CudfIcebergConnector::CudfIcebergConnector(
     folly::Executor* executor)
     : velox::connector::hive::HiveConnector(id, config, executor),
       cudfHiveConfig_(std::make_shared<CudfHiveConfig>(config)),
+      fetchAheadContext_(
+          cudfHiveConfig_->fetchAheadBytes() > 0
+              ? std::make_shared<FetchAheadContext>(
+                    cudfHiveConfig_->fetchAheadBytes())
+              : nullptr),
       icebergConfig_(
           std::make_shared<velox::connector::hive::iceberg::IcebergConfig>(
               connectorConfig())) {
@@ -73,6 +78,7 @@ std::unique_ptr<DataSource> CudfIcebergConnector::createDataSource(
         ioExecutor_,
         connectorQueryCtx,
         cudfHiveConfig_,
+        fetchAheadContext_,
         hiveConfig_);
   }
 
