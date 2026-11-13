@@ -47,11 +47,12 @@ struct BuildKeyFilter {
   /// possibly true, only if 'exact'.
   bool uniqueKeys{false};
 
-  /// For a 'filter' that is not exact, if
-  /// CudfConfig::dynamicFilterMaxBitmapBytes allows it: UINT32 words with bit
-  /// 'key - lower bound of filter' set for each build key. A cuDF scan tests
-  /// rows inside of the range with it when it comes attached to the filter
-  /// (connector::hive::makeAdvisoryFilter).
+  /// If CudfConfig::dynamicFilterMaxBitmapBytes allows it and 'filter' is not
+  /// a plain range of all its keys: UINT32 words with bit 'key - smallest
+  /// key' set for each build key. A cuDF scan tests rows with it when it
+  /// comes attached to the filter (connector::hive::makeAdvisoryFilter): it
+  /// narrows the range of a 'filter' that is not exact, and spares the scan
+  /// unpacking an exact one.
   std::shared_ptr<const cudf::column> deviceBitmap;
 };
 

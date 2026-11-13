@@ -30,9 +30,11 @@ namespace facebook::velox::cudf_velox::connector::hive {
 /// Shared copies stay advisory. A clone or a merge with another filter is not
 /// advisory, and a scan applies it to every row.
 ///
-/// 'deviceBitmap', if given, narrows an advisory BigintRange for a scan that
-/// filters rows on the device: UINT32 words with bit 'value - lower()' set for
-/// each value the producer has. Other readers of the filter see the range.
+/// 'deviceBitmap', if given, is what a scan that filters rows on the device
+/// tests instead of 'filter', a BigintRange or a set of integers: UINT32 words
+/// with bit 'value - smallest value the filter passes' set for each value the
+/// producer has. It narrows a range to the producer's values, and saves the
+/// scan from unpacking a set. Other readers of the filter see 'filter'.
 common::FilterPtr makeAdvisoryFilter(
     std::unique_ptr<common::Filter> filter,
     std::shared_ptr<const cudf::column> deviceBitmap = nullptr);

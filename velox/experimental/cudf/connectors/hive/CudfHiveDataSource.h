@@ -371,8 +371,8 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
     kRange,
     // A set of values of an integer column, tested on the device.
     kValues,
-    // A range of an integer column narrowed by the device bitmap its
-    // producer attached.
+    // A range or a set of values of an integer column, tested with the
+    // device bitmap its producer attached.
     kDeviceBitmap,
     // Any other filter, and any filter on a column that is not read as
     // integers, tested on the host over a copy of the column.
@@ -389,7 +389,8 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
 
     DynamicFilterEvaluation evaluation{DynamicFilterEvaluation::kHost};
 
-    // The smallest and largest value of a kValues filter.
+    // The smallest and largest value a kRange, kValues or kDeviceBitmap
+    // filter passes.
     int64_t lower{0};
     int64_t upper{0};
 

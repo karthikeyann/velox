@@ -219,12 +219,33 @@ BuildKeyFilter makeBuildKeyFilterOrThrow(
   } else if (numRows <= kMaxRowsPerDistinctValue * maxValues) {
     values = copyDistinctIntegersToHost(keys, maxValues, stream);
   }
+  const auto maxBitmapBits = 8 *
+      static_cast<uint64_t>(std::max<int64_t>(
+          0, CudfConfig::getInstance().dynamicFilterMaxBitmapBytes));
   if (values.has_value()) {
     std::sort(values->begin(), values->end());
     values->erase(std::unique(values->begin(), values->end()), values->end());
     result.filter = common::createBigintValues(*values, false);
     result.exact = true;
     result.uniqueKeys = values->size() == numValues;
+    // A cuDF scan would have to list the values of a set on the host again,
+    // which for a set kept as a bitmask means walking its whole range. The
+    // keys are on the device: give the scan their bitmap.
+    const auto span = static_cast<uint64_t>(values->back()) -
+        static_cast<uint64_t>(values->front());
+    if (result.filter->kind() != common::FilterKind::kBigintRange &&
+        span < maxBitmapBits) {
+      try {
+        result.deviceBitmap = connector::hive::makeIntegerBitmap(
+            keys, values->front(), values->back(), stream, get_output_mr());
+        // Scans read the bitmap on their own streams.
+        stream.sync();
+      } catch (const std::exception& e) {
+        LOG(WARNING) << "Failed to build the bitmap of a dynamic filter: "
+                     << e.what();
+        result.deviceBitmap = nullptr;
+      }
+    }
     return result;
   }
 
@@ -249,9 +270,6 @@ BuildKeyFilter makeBuildKeyFilterOrThrow(
   // pays if it fits and the keys leave a good share of the bounds out.
   const auto span = static_cast<uint64_t>(bounds->second) -
       static_cast<uint64_t>(bounds->first);
-  const auto maxBitmapBits = 8 *
-      static_cast<uint64_t>(std::max<int64_t>(
-          0, CudfConfig::getInstance().dynamicFilterMaxBitmapBytes));
   if (span < maxBitmapBits &&
       numValues < kMaxDynamicFilterBitmapDensity * span) {
     try {

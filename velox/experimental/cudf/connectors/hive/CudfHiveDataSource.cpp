@@ -624,8 +624,10 @@ common::FilterPtr makeAdvisoryFilter(
     std::shared_ptr<const cudf::column> deviceBitmap) {
   VELOX_CHECK(
       deviceBitmap == nullptr ||
-          filter->kind() == common::FilterKind::kBigintRange,
-      "Only a range carries a device bitmap");
+          filter->kind() == common::FilterKind::kBigintRange ||
+          filter->kind() == common::FilterKind::kBigintValuesUsingHashTable ||
+          filter->kind() == common::FilterKind::kBigintValuesUsingBitmask,
+      "Only a range or a set of integers carries a device bitmap");
   return {filter.release(), AdvisoryFilterDeleter{std::move(deviceBitmap)}};
 }
 
@@ -1174,11 +1176,13 @@ CudfHiveDataSource::DynamicFilter CudfHiveDataSource::makeDynamicFilter(
     return dynamicFilter;
   }
   switch (filter->kind()) {
-    case common::FilterKind::kBigintRange:
-      dynamicFilter.evaluation = advisoryFilterBitmap(filter) != nullptr
-          ? DynamicFilterEvaluation::kDeviceBitmap
-          : DynamicFilterEvaluation::kRange;
+    case common::FilterKind::kBigintRange: {
+      const auto& range = static_cast<const common::BigintRange&>(*filter);
+      dynamicFilter.evaluation = DynamicFilterEvaluation::kRange;
+      dynamicFilter.lower = range.lower();
+      dynamicFilter.upper = range.upper();
       break;
+    }
     case common::FilterKind::kBigintValuesUsingHashTable: {
       const auto& values =
           static_cast<const common::BigintValuesUsingHashTable&>(*filter);
@@ -1198,6 +1202,12 @@ CudfHiveDataSource::DynamicFilter CudfHiveDataSource::makeDynamicFilter(
     default:
       dynamicFilter.evaluation = DynamicFilterEvaluation::kHost;
       break;
+  }
+  // The producer's bitmap of the values the filter passes, based at the
+  // smallest of them, replaces the scan's own test.
+  if (dynamicFilter.evaluation != DynamicFilterEvaluation::kHost &&
+      advisoryFilterBitmap(filter) != nullptr) {
+    dynamicFilter.evaluation = DynamicFilterEvaluation::kDeviceBitmap;
   }
   return dynamicFilter;
 }
@@ -1289,13 +1299,7 @@ CudfHiveDataSource::dynamicFilterBounds() const {
   for (const auto& [index, dynamicFilter] : dynamicFilters_) {
     switch (dynamicFilter.evaluation) {
       case DynamicFilterEvaluation::kRange:
-      case DynamicFilterEvaluation::kDeviceBitmap: {
-        const auto& range =
-            static_cast<const common::BigintRange&>(*dynamicFilter.filter);
-        bounds.push_back(
-            {index, range.lower(), range.upper(), range.testNull()});
-        break;
-      }
+      case DynamicFilterEvaluation::kDeviceBitmap:
       case DynamicFilterEvaluation::kValues:
         bounds.push_back(
             {index,
@@ -1424,13 +1428,11 @@ bool CudfHiveDataSource::intersectDynamicFilters(
           get_temp_mr());
     } else if (
         dynamicFilter.evaluation == DynamicFilterEvaluation::kDeviceBitmap) {
-      const auto& range =
-          static_cast<const common::BigintRange&>(*dynamicFilter.filter);
       applyIntegerBitmapToMask(
           integerColumn(index),
           advisoryFilterBitmap(dynamicFilter.filter)->view(),
-          range.lower(),
-          range.testNull(),
+          dynamicFilter.lower,
+          dynamicFilter.filter->testNull(),
           mask,
           stream,
           get_temp_mr());

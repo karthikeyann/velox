@@ -3793,12 +3793,25 @@ TEST_F(TableScanTest, makeBuildKeyFilter) {
     ASSERT_NE(result.filter, nullptr);
     EXPECT_TRUE(result.exact);
     EXPECT_TRUE(result.uniqueKeys);
-    EXPECT_EQ(result.deviceBitmap, nullptr);
     EXPECT_TRUE(result.filter->testInt64(5));
     EXPECT_TRUE(result.filter->testInt64(9));
     EXPECT_TRUE(result.filter->testInt64(100'000));
     EXPECT_FALSE(result.filter->testInt64(6));
     EXPECT_FALSE(result.filter->testNull());
+    // The set comes with the bitmap of its keys, based at the smallest.
+    ASSERT_NE(result.deviceBitmap, nullptr);
+    EXPECT_THAT(
+        testBitmap(*result.deviceBitmap, 5, {5, 6, 9, 100'000, 100'001, 4}),
+        testing::ElementsAre(true, false, true, true, false, false));
+  }
+  {
+    SCOPED_TRACE("keys that are one range");
+    // A range needs no bitmap.
+    auto result = makeFilter({makeFlatVector<int64_t>({7, 5, 6})}, BIGINT());
+    ASSERT_NE(result.filter, nullptr);
+    EXPECT_TRUE(result.exact);
+    EXPECT_EQ(result.filter->kind(), common::FilterKind::kBigintRange);
+    EXPECT_EQ(result.deviceBitmap, nullptr);
   }
   {
     SCOPED_TRACE("a key in two rows");
@@ -4246,6 +4259,35 @@ TEST_F(TableScanTest, advisoryFilterWithDeviceBitmap) {
       {"c0"}, {makeFlatVector<int64_t>(100, [](auto row) { return row * 7; })});
   ::facebook::velox::exec::test::assertEqualResults(
       {expected}, readSplit(*source, rowType, pool_.get()));
+
+  // An exact set comes with a bitmap too: the scan tests rows with it and
+  // does not list the values of the set on the host.
+  config.dynamicFilterMaxValues = maxValues;
+  for (bool attachBitmap : {true, false}) {
+    SCOPED_TRACE(fmt::format("attachBitmap: {}", attachBitmap));
+    auto setFilter =
+        makeBuildKeyFilter({keys->get_column(0).view()}, BIGINT(), stream);
+    ASSERT_TRUE(setFilter.exact);
+    ASSERT_NE(setFilter.filter->kind(), common::FilterKind::kBigintRange);
+    ASSERT_NE(setFilter.deviceBitmap, nullptr);
+    auto setSource = connector->createDataSource(
+        rowType,
+        makeTableHandle("t", rowType),
+        HiveConnectorTestBase::allRegularColumns(rowType),
+        &ctx);
+    setSource->addDynamicFilter(
+        0,
+        attachBitmap ? makeAdvisoryFilter(
+                           std::move(setFilter.filter),
+                           std::move(setFilter.deviceBitmap))
+                     : makeAdvisoryFilter(std::move(setFilter.filter)));
+    setSource->addSplit(makeCudfHiveConnectorSplit(file->getPath()));
+    ::facebook::velox::exec::test::assertEqualResults(
+        {expected}, readSplit(*setSource, rowType, pool_.get()));
+    EXPECT_EQ(
+        setSource->getRuntimeStats().count("dynamicFilterValueUploads"),
+        attachBitmap ? 0 : 1);
+  }
 }
 
 TEST_F(TableScanTest, integerDynamicFilterPreservesKeyWidth) {
