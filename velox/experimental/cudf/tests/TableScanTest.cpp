@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
 #include "velox/experimental/cudf/connectors/hive/CudfIntegerMembership.h"
 #include "velox/experimental/cudf/connectors/hive/FetchAheadBudget.h"
+#include "velox/experimental/cudf/exec/CudfBuildKeyFilter.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -3576,6 +3577,46 @@ TEST_F(TableScanTest, dynamicFilterWithPreloadedSplits) {
         stats.at(joinId).customStats.count("replacedWithDynamicFilterRows"),
         returnBuildColumn ? 0 : 1);
   }
+
+  {
+    SCOPED_TRACE("left semi join");
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto buildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
+                         .values({build})
+                         .project({"c0 AS u_c0"})
+                         .planNode();
+    core::PlanNodeId scanId;
+    core::PlanNodeId joinId;
+    auto plan =
+        PlanBuilder(planNodeIdGenerator, pool_.get())
+            .startTableScan()
+            .connectorId(kCudfHiveConnectorId)
+            .outputType(rowType)
+            .dataColumns(rowType)
+            .assignments(HiveConnectorTestBase::allRegularColumns(rowType))
+            .endTableScan()
+            .capturePlanNodeId(scanId)
+            .hashJoin(
+                {"c0"},
+                {"u_c0"},
+                buildSide,
+                "",
+                {"c0", "c1"},
+                core::JoinType::kLeftSemiFilter)
+            .capturePlanNodeId(joinId)
+            .planNode();
+    auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                    .maxDrivers(4)
+                    .config(core::QueryConfig::kMaxSplitPreloadPerDriver, "2")
+                    .splits(scanId, makeCudfHiveConnectorSplits(files))
+                    .assertResults(
+                        "SELECT c0, c1 FROM t WHERE c0 IN (SELECT c0 FROM u)");
+    const auto stats = toPlanStats(task->taskStats());
+    EXPECT_EQ(stats.at(scanId).outputRows, kNumFiles * kKeysPerFile);
+    EXPECT_EQ(
+        stats.at(joinId).customStats.at("replacedWithDynamicFilterRows").sum,
+        kNumFiles * kKeysPerFile);
+  }
 }
 
 // One cuDF option switches the join's filters and the scan's acceptance off.
@@ -3678,6 +3719,528 @@ TEST_F(TableScanTest, dynamicFilterFromRepeatedBuildKeys) {
   EXPECT_EQ(
       stats.at(joinId).customStats.at("replacedWithDynamicFilterRows").sum,
       100);
+}
+
+// The filter a join builds from the key column of its build side.
+TEST_F(TableScanTest, makeBuildKeyFilter) {
+  using facebook::velox::cudf_velox::connector::hive::applyIntegerBitmapToMask;
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  auto& config = CudfConfig::getInstance();
+  const auto maxValues = config.dynamicFilterMaxValues;
+  const auto maxBitmapBytes = config.dynamicFilterMaxBitmapBytes;
+  SCOPE_EXIT {
+    config.dynamicFilterMaxValues = maxValues;
+    config.dynamicFilterMaxBitmapBytes = maxBitmapBytes;
+  };
+  // One vector per table of the build side.
+  const auto makeFilter = [&](const std::vector<VectorPtr>& keyVectors,
+                              const TypePtr& type) {
+    std::vector<std::unique_ptr<cudf::table>> tables;
+    std::vector<cudf::column_view> columns;
+    for (const auto& vector : keyVectors) {
+      tables.push_back(
+          with_arrow::toCudfTable(
+              makeRowVector({"k"}, {vector}), pool_.get(), stream, mr));
+      columns.push_back(tables.back()->get_column(0).view());
+    }
+    return makeBuildKeyFilter(columns, type, stream);
+  };
+  // Returns which of 'probe' the bitmap based at 'minimum' holds.
+  const auto testBitmap = [&](const cudf::column& bitmap,
+                              int64_t minimum,
+                              const std::vector<int64_t>& probe) {
+    auto table = with_arrow::toCudfTable(
+        makeRowVector({"p"}, {makeFlatVector<int64_t>(probe)}),
+        pool_.get(),
+        stream,
+        mr);
+    std::unique_ptr<cudf::column> mask;
+    applyIntegerBitmapToMask(
+        table->get_column(0).view(),
+        bitmap.view(),
+        minimum,
+        false,
+        mask,
+        stream,
+        mr);
+    auto rows = with_arrow::toVeloxColumn(
+        cudf::table_view{{mask->view()}},
+        pool_.get(),
+        ROW("mask", BOOLEAN()),
+        stream,
+        mr);
+    stream.sync();
+    std::vector<bool> values;
+    auto* flat = rows->childAt(0)->asFlatVector<bool>();
+    for (vector_size_t row = 0; row < flat->size(); ++row) {
+      values.push_back(flat->valueAt(row));
+    }
+    return values;
+  };
+
+  {
+    SCOPED_TRACE("few distinct keys in two tables");
+    auto result = makeFilter(
+        {makeNullableFlatVector<int64_t>({5, std::nullopt, 9}),
+         makeFlatVector<int64_t>({100'000})},
+        BIGINT());
+    ASSERT_NE(result.filter, nullptr);
+    EXPECT_TRUE(result.exact);
+    EXPECT_TRUE(result.uniqueKeys);
+    EXPECT_EQ(result.deviceBitmap, nullptr);
+    EXPECT_TRUE(result.filter->testInt64(5));
+    EXPECT_TRUE(result.filter->testInt64(9));
+    EXPECT_TRUE(result.filter->testInt64(100'000));
+    EXPECT_FALSE(result.filter->testInt64(6));
+    EXPECT_FALSE(result.filter->testNull());
+  }
+  {
+    SCOPED_TRACE("a key in two rows");
+    auto result = makeFilter({makeFlatVector<int32_t>({5, 5, 9})}, INTEGER());
+    ASSERT_NE(result.filter, nullptr);
+    EXPECT_TRUE(result.exact);
+    EXPECT_FALSE(result.uniqueKeys);
+    EXPECT_TRUE(result.filter->testInt64(9));
+    EXPECT_FALSE(result.filter->testInt64(7));
+  }
+  {
+    SCOPED_TRACE("only null keys");
+    auto result = makeFilter(
+        {makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt})},
+        BIGINT());
+    ASSERT_NE(result.filter, nullptr);
+    EXPECT_EQ(result.filter->kind(), common::FilterKind::kAlwaysFalse);
+    EXPECT_TRUE(result.exact);
+  }
+  {
+    SCOPED_TRACE("DATE keys");
+    auto result =
+        makeFilter({makeFlatVector<int32_t>({10, 20}, DATE())}, DATE());
+    ASSERT_NE(result.filter, nullptr);
+    EXPECT_TRUE(result.exact);
+    EXPECT_TRUE(result.filter->testInt64(10));
+    EXPECT_FALSE(result.filter->testInt64(15));
+  }
+  {
+    SCOPED_TRACE("keys the filter is not built for");
+    EXPECT_EQ(
+        makeFilter({makeFlatVector<std::string>({"a"})}, VARCHAR()).filter,
+        nullptr);
+    // The build side does not hold the key as the integer its type says.
+    EXPECT_EQ(
+        makeFilter({makeFlatVector<double>({1.0})}, BIGINT()).filter, nullptr);
+  }
+
+  config.dynamicFilterMaxValues = 4;
+  {
+    SCOPED_TRACE("many rows of few distinct keys");
+    auto result = makeFilter(
+        {makeFlatVector<int64_t>(100, [](auto row) { return row % 3 * 10; }),
+         makeFlatVector<int64_t>(100, [](auto row) { return row % 2 * 10; })},
+        BIGINT());
+    ASSERT_NE(result.filter, nullptr);
+    EXPECT_TRUE(result.exact);
+    EXPECT_FALSE(result.uniqueKeys);
+    EXPECT_TRUE(result.filter->testInt64(0));
+    EXPECT_TRUE(result.filter->testInt64(20));
+    EXPECT_FALSE(result.filter->testInt64(5));
+    EXPECT_FALSE(result.filter->testInt64(30));
+  }
+  // 1000 distinct keys: 0, 3, ..., 2997, with a null among them.
+  const auto manyKeys = makeFlatVector<int64_t>(
+      1'001,
+      [](auto row) { return row * 3; },
+      [](auto row) { return row == 1'000; });
+  {
+    SCOPED_TRACE("more distinct keys than the limit");
+    auto result = makeFilter({manyKeys}, BIGINT());
+    ASSERT_NE(result.filter, nullptr);
+    EXPECT_FALSE(result.exact);
+    ASSERT_EQ(result.filter->kind(), common::FilterKind::kBigintRange);
+    const auto& range = static_cast<const common::BigintRange&>(*result.filter);
+    EXPECT_EQ(range.lower(), 0);
+    EXPECT_EQ(range.upper(), 2'997);
+    EXPECT_FALSE(range.testNull());
+    ASSERT_NE(result.deviceBitmap, nullptr);
+    EXPECT_EQ(result.deviceBitmap->size(), 2'997 / 32 + 1);
+    EXPECT_THAT(
+        testBitmap(*result.deviceBitmap, 0, {0, 1, 3, 2'996, 2'997, 2'998, -3}),
+        testing::ElementsAre(true, false, true, false, true, false, false));
+  }
+  {
+    SCOPED_TRACE("keys that fill their range");
+    auto result =
+        makeFilter({makeFlatVector<int64_t>(1'000, folly::identity)}, BIGINT());
+    ASSERT_NE(result.filter, nullptr);
+    EXPECT_FALSE(result.exact);
+    EXPECT_EQ(result.deviceBitmap, nullptr);
+  }
+  {
+    SCOPED_TRACE("no bitmap allowed");
+    config.dynamicFilterMaxBitmapBytes = 0;
+    auto result = makeFilter({manyKeys}, BIGINT());
+    ASSERT_NE(result.filter, nullptr);
+    EXPECT_EQ(result.filter->kind(), common::FilterKind::kBigintRange);
+    EXPECT_EQ(result.deviceBitmap, nullptr);
+  }
+  {
+    SCOPED_TRACE("a bitmap that cannot be built");
+    // The limit lets a bitmap through that is wider than a cuDF column.
+    config.dynamicFilterMaxBitmapBytes = int64_t{1} << 60;
+    auto result = makeFilter(
+        {makeFlatVector<int64_t>(
+            1'000, [](auto row) { return row * (int64_t{1} << 40); })},
+        BIGINT());
+    ASSERT_NE(result.filter, nullptr);
+    ASSERT_EQ(result.filter->kind(), common::FilterKind::kBigintRange);
+    EXPECT_EQ(
+        static_cast<const common::BigintRange&>(*result.filter).upper(),
+        999 * (int64_t{1} << 40));
+    EXPECT_EQ(result.deviceBitmap, nullptr);
+  }
+}
+
+// Which joins send a filter to the scan of their probe side, and the rows
+// that scan then returns.
+TEST_F(TableScanTest, dynamicFilterJoinTypes) {
+  // c0 is the row number, null in every 100th row.
+  auto probe = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>(1'000, folly::identity, nullEvery(100)),
+       makeFlatVector<int64_t>(1'000, [](auto row) { return row % 5; })});
+  auto build = makeRowVector(
+      {"b", "v"},
+      {makeNullableFlatVector<int64_t>({10, 21, 21, 32, std::nullopt}),
+       makeFlatVector<int64_t>({1, 2, 3, 4, 5})});
+  auto file = TempFilePath::create();
+  writeToFile(file->getPath(), probe);
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+  auto rowType = asRowType(probe->type());
+
+  struct Join {
+    core::JoinType type;
+    std::vector<std::string> output;
+    std::string filter;
+    bool nullAsValue;
+    std::string sql;
+    // Probe rows the scan returns: 1000 if the join sends no filter.
+    int64_t scanRows;
+    bool replaced;
+  };
+  const std::vector<Join> joins = {
+      {core::JoinType::kInner,
+       {"c0", "v"},
+       "",
+       false,
+       "SELECT t.c0, u.v FROM t JOIN u ON t.c0 = u.b",
+       3,
+       false},
+      {core::JoinType::kInner,
+       {"c0", "v"},
+       "c1 < v",
+       false,
+       "SELECT t.c0, u.v FROM t JOIN u ON t.c0 = u.b AND t.c1 < u.v",
+       3,
+       false},
+      {core::JoinType::kLeftSemiFilter,
+       {"c0", "c1"},
+       "",
+       false,
+       "SELECT c0, c1 FROM t WHERE c0 IN (SELECT b FROM u)",
+       3,
+       true},
+      {core::JoinType::kLeftSemiFilter,
+       {"c0", "c1"},
+       "c1 < v",
+       false,
+       "SELECT c0, c1 FROM t WHERE EXISTS "
+       "(SELECT 1 FROM u WHERE t.c0 = u.b AND t.c1 < u.v)",
+       3,
+       false},
+      {core::JoinType::kRightSemiFilter,
+       {"b", "v"},
+       "",
+       false,
+       "SELECT b, v FROM u WHERE b IN (SELECT c0 FROM t)",
+       3,
+       false},
+      {core::JoinType::kRight,
+       {"c0", "v"},
+       "",
+       false,
+       "SELECT t.c0, u.v FROM t RIGHT JOIN u ON t.c0 = u.b",
+       3,
+       false},
+      // The joins below keep probe rows without a build key: no filter.
+      {core::JoinType::kLeft,
+       {"c0", "v"},
+       "",
+       false,
+       "SELECT t.c0, u.v FROM t LEFT JOIN u ON t.c0 = u.b",
+       1'000,
+       false},
+      {core::JoinType::kFull,
+       {"c0", "v"},
+       "",
+       false,
+       "SELECT t.c0, u.v FROM t FULL OUTER JOIN u ON t.c0 = u.b",
+       1'000,
+       false},
+      {core::JoinType::kAnti,
+       {"c0", "c1"},
+       "",
+       false,
+       "SELECT c0, c1 FROM t WHERE NOT EXISTS "
+       "(SELECT 1 FROM u WHERE t.c0 = u.b)",
+       1'000,
+       false},
+      {core::JoinType::kLeftSemiProject,
+       {"c0", "match"},
+       "",
+       false,
+       "SELECT c0, EXISTS (SELECT 1 FROM u WHERE t.c0 = u.b) FROM t",
+       1'000,
+       false},
+  };
+  for (const auto& join : joins) {
+    SCOPED_TRACE(join.sql);
+    auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+    auto buildPlan = PlanBuilder(ids, pool_.get()).values({build}).planNode();
+    core::PlanNodeId scanId;
+    core::PlanNodeId joinId;
+    auto plan =
+        PlanBuilder(ids, pool_.get())
+            .startTableScan()
+            .connectorId(kCudfHiveConnectorId)
+            .tableHandle(makeTableHandle("t", rowType))
+            .outputType(rowType)
+            .assignments(HiveConnectorTestBase::allRegularColumns(rowType))
+            .endTableScan()
+            .capturePlanNodeId(scanId)
+            .hashJoin(
+                {"c0"},
+                {"b"},
+                buildPlan,
+                join.filter,
+                join.output,
+                join.type,
+                /*nullAware=*/false,
+                join.nullAsValue)
+            .capturePlanNodeId(joinId)
+            .planNode();
+    auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                    .maxDrivers(1)
+                    .splits(scanId, makeCudfHiveConnectorSplits({file}))
+                    .assertResults(join.sql);
+    const auto stats = toPlanStats(task->taskStats());
+    const bool sends = join.scanRows < 1'000;
+    EXPECT_EQ(
+        stats.at(joinId).customStats.count("dynamicFiltersProduced"),
+        sends ? 1 : 0);
+    EXPECT_EQ(stats.at(scanId).outputRows, join.scanRows);
+    EXPECT_EQ(
+        stats.at(joinId).customStats.count("replacedWithDynamicFilterRows"),
+        join.replaced ? 1 : 0);
+
+    // The same join without dynamic filters.
+    AssertQueryBuilder(plan, duckDbQueryRunner_)
+        .config("hash_probe_dynamic_filter_pushdown_enabled", "false")
+        .maxDrivers(1)
+        .splits(scanId, makeCudfHiveConnectorSplits({file}))
+        .assertResults(join.sql);
+  }
+
+  {
+    SCOPED_TRACE("a build side with null keys only");
+    auto nullBuild = makeRowVector(
+        {"b"}, {makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt})});
+    auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+    auto buildPlan =
+        PlanBuilder(ids, pool_.get()).values({nullBuild}).planNode();
+    core::PlanNodeId scanId;
+    auto plan =
+        PlanBuilder(ids, pool_.get())
+            .startTableScan()
+            .connectorId(kCudfHiveConnectorId)
+            .tableHandle(makeTableHandle("t", rowType))
+            .outputType(rowType)
+            .assignments(HiveConnectorTestBase::allRegularColumns(rowType))
+            .endTableScan()
+            .capturePlanNodeId(scanId)
+            .hashJoin(
+                {"c0"}, {"b"}, buildPlan, "", {"c0"}, core::JoinType::kInner)
+            .planNode();
+    auto task = AssertQueryBuilder(plan)
+                    .maxDrivers(1)
+                    .splits(scanId, makeCudfHiveConnectorSplits({file}))
+                    .assertResults(
+                        makeRowVector({"c0"}, {makeFlatVector<int64_t>({})}));
+    const auto stats = toPlanStats(task->taskStats());
+    EXPECT_EQ(stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 1);
+    EXPECT_EQ(stats.at(scanId).outputRows, 0);
+  }
+}
+
+// A build side with more keys than a value set holds sends the bounds of its
+// keys and, when allowed, a bitmap of them.
+TEST_F(TableScanTest, dynamicFilterBoundsAndBitmap) {
+  auto probe =
+      makeRowVector({"c0"}, {makeFlatVector<int64_t>(3'000, folly::identity)});
+  // 1000 keys: 0, 3, ..., 2997.
+  auto build = makeRowVector(
+      {"b", "v"},
+      {makeFlatVector<int64_t>(1'000, [](auto row) { return row * 3; }),
+       makeFlatVector<int64_t>(1'000, folly::identity)});
+  auto file = TempFilePath::create();
+  writeToFile(file->getPath(), probe);
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+  auto rowType = asRowType(probe->type());
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto buildPlan = PlanBuilder(ids, pool_.get()).values({build}).planNode();
+  core::PlanNodeId scanId;
+  core::PlanNodeId joinId;
+  auto plan =
+      PlanBuilder(ids, pool_.get())
+          .startTableScan()
+          .connectorId(kCudfHiveConnectorId)
+          .tableHandle(makeTableHandle("t", rowType))
+          .outputType(rowType)
+          .assignments(HiveConnectorTestBase::allRegularColumns(rowType))
+          .endTableScan()
+          .capturePlanNodeId(scanId)
+          .hashJoin(
+              {"c0"}, {"b"}, buildPlan, "", {"c0", "v"}, core::JoinType::kInner)
+          .capturePlanNodeId(joinId)
+          .planNode();
+
+  auto& config = CudfConfig::getInstance();
+  const auto maxValues = config.dynamicFilterMaxValues;
+  const auto maxBitmapBytes = config.dynamicFilterMaxBitmapBytes;
+  SCOPE_EXIT {
+    config.dynamicFilterMaxValues = maxValues;
+    config.dynamicFilterMaxBitmapBytes = maxBitmapBytes;
+  };
+  config.dynamicFilterMaxValues = 10;
+  for (bool bitmap : {true, false}) {
+    SCOPED_TRACE(fmt::format("bitmap: {}", bitmap));
+    config.dynamicFilterMaxBitmapBytes = bitmap ? maxBitmapBytes : 0;
+    auto task =
+        AssertQueryBuilder(plan, duckDbQueryRunner_)
+            .maxDrivers(1)
+            .splits(scanId, makeCudfHiveConnectorSplits({file}))
+            .assertResults("SELECT t.c0, u.v FROM t JOIN u ON t.c0 = u.b");
+    const auto stats = toPlanStats(task->taskStats());
+    EXPECT_EQ(stats.at(joinId).customStats.at("dynamicFiltersProduced").sum, 1);
+    // The bitmap keeps the 1000 keys, the bounds 0 to 2997 keep 2998 rows.
+    EXPECT_EQ(stats.at(scanId).outputRows, bitmap ? 1'000 : 2'998);
+    EXPECT_EQ(
+        stats.at(joinId).customStats.count("replacedWithDynamicFilterRows"), 0);
+  }
+}
+
+// A join on a DATE key sends the days of its build side.
+TEST_F(TableScanTest, dynamicFilterOnDateKey) {
+  auto probe = makeRowVector(
+      {"d", "c1"},
+      {makeFlatVector<int32_t>(
+           1'000, [](auto row) { return 10'000 + row; }, nullEvery(50), DATE()),
+       makeFlatVector<int64_t>(1'000, folly::identity)});
+  auto build = makeRowVector(
+      {"b"}, {makeFlatVector<int32_t>({10'010, 10'020, 20'000}, DATE())});
+  auto file = TempFilePath::create();
+  writeToFile(file->getPath(), probe);
+  auto rowType = asRowType(probe->type());
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto buildPlan = PlanBuilder(ids, pool_.get()).values({build}).planNode();
+  core::PlanNodeId scanId;
+  core::PlanNodeId joinId;
+  auto plan =
+      PlanBuilder(ids, pool_.get())
+          .startTableScan()
+          .connectorId(kCudfHiveConnectorId)
+          .tableHandle(makeTableHandle("t", rowType))
+          .outputType(rowType)
+          .assignments(HiveConnectorTestBase::allRegularColumns(rowType))
+          .endTableScan()
+          .capturePlanNodeId(scanId)
+          .hashJoin({"d"}, {"b"}, buildPlan, "", {"c1"}, core::JoinType::kInner)
+          .capturePlanNodeId(joinId)
+          .planNode();
+  auto expected = makeRowVector({"c1"}, {makeFlatVector<int64_t>({10, 20})});
+  auto task = AssertQueryBuilder(plan)
+                  .maxDrivers(1)
+                  .splits(scanId, makeCudfHiveConnectorSplits({file}))
+                  .assertResults(expected);
+  const auto stats = toPlanStats(task->taskStats());
+  EXPECT_EQ(stats.at(joinId).customStats.at("dynamicFiltersProduced").sum, 1);
+  EXPECT_EQ(stats.at(scanId).outputRows, 2);
+  EXPECT_EQ(
+      stats.at(joinId).customStats.at("replacedWithDynamicFilterRows").sum, 2);
+}
+
+// A scan tests rows with the bitmap a producer attached to its bounds.
+TEST_F(TableScanTest, advisoryFilterWithDeviceBitmap) {
+  using cudf_velox::connector::hive::makeAdvisoryFilter;
+  auto rowType = ROW("c0", BIGINT());
+  auto input =
+      makeRowVector({"c0"}, {makeFlatVector<int64_t>(1'000, folly::identity)});
+  auto file = TempFilePath::create();
+  writeToFile(file->getPath(), input);
+
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  auto& config = CudfConfig::getInstance();
+  const auto maxValues = config.dynamicFilterMaxValues;
+  SCOPE_EXIT {
+    config.dynamicFilterMaxValues = maxValues;
+  };
+  config.dynamicFilterMaxValues = 1;
+  // 100 keys: 0, 7, ..., 693.
+  auto keys = with_arrow::toCudfTable(
+      makeRowVector(
+          {"k"},
+          {makeFlatVector<int64_t>(100, [](auto row) { return row * 7; })}),
+      pool_.get(),
+      stream,
+      mr);
+  auto keyFilter =
+      makeBuildKeyFilter({keys->get_column(0).view()}, BIGINT(), stream);
+  ASSERT_NE(keyFilter.deviceBitmap, nullptr);
+
+  auto properties = std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{});
+  ::facebook::velox::connector::ConnectorQueryCtx ctx(
+      pool_.get(),
+      pool_.get(),
+      properties.get(),
+      nullptr,
+      common::PrefixSortConfig{},
+      nullptr,
+      nullptr,
+      "query",
+      "task",
+      "scan",
+      0,
+      "");
+  auto connector = ::facebook::velox::connector::ConnectorRegistry::tryGet(
+      kCudfHiveConnectorId);
+  auto source = connector->createDataSource(
+      rowType,
+      makeTableHandle("t", rowType),
+      HiveConnectorTestBase::allRegularColumns(rowType),
+      &ctx);
+  source->addDynamicFilter(
+      0,
+      makeAdvisoryFilter(
+          std::move(keyFilter.filter), std::move(keyFilter.deviceBitmap)));
+  source->addSplit(makeCudfHiveConnectorSplit(file->getPath()));
+  auto expected = makeRowVector(
+      {"c0"}, {makeFlatVector<int64_t>(100, [](auto row) { return row * 7; })});
+  ::facebook::velox::exec::test::assertEqualResults(
+      {expected}, readSplit(*source, rowType, pool_.get()));
 }
 
 TEST_F(TableScanTest, integerDynamicFilterPreservesKeyWidth) {
@@ -4027,10 +4590,14 @@ TEST_F(TableScanTest, exactDynamicFilterUsesInputType) {
           // filters rows like the others, also next to a filter that is
           // evaluated on the host: it drops the first row, which the other
           // filters keep when they allow nulls.
+          // When nulls are not allowed the other filters keep one row,
+          // file row 3 or, with the late range, row 1: there the advisory
+          // filter rejects that row.
           source->addDynamicFilter(
               3,
               makeAdvisoryFilter(
-                  std::make_unique<common::BigintRange>(1, 6, false)));
+                  std::make_unique<common::BigintRange>(
+                      nullAllowed ? 1 : 4, 6, false)));
           if (lateRange) {
             // A prepared reader still owns the old, wider Range snapshot.
             source->addDynamicFilter(
@@ -4061,15 +4628,15 @@ TEST_F(TableScanTest, exactDynamicFilterUsesInputType) {
           auto expected = makeRowVector(
               {"c0", "c1", "c2", "c3"},
               {nullAllowed ? makeNullableFlatVector<T>({second, std::nullopt})
-                           : makeNullableFlatVector<T>({second}),
+                           : makeNullableFlatVector<T>({}),
                nullAllowed
                    ? makeFlatVector<T>({secondC1, static_cast<T>(lo + 50)})
-                   : makeFlatVector<T>({secondC1}),
+                   : makeFlatVector<T>({}),
                nullAllowed
                    ? makeNullableFlatVector<int64_t>({secondC2, std::nullopt})
-                   : makeNullableFlatVector<int64_t>({secondC2}),
+                   : makeNullableFlatVector<int64_t>({}),
                nullAllowed ? makeFlatVector<int64_t>({secondC3, 4})
-                           : makeFlatVector<int64_t>({secondC3})});
+                           : makeFlatVector<int64_t>({})});
           ::facebook::velox::exec::test::assertEqualResults({expected}, actual);
         }
       }
