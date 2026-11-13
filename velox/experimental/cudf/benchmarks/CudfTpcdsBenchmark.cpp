@@ -55,6 +55,16 @@ DEFINE_int32(
 
 DEFINE_bool(velox_cudf_table_scan, true, "Enable cuDF table scan");
 
+DEFINE_bool(
+    cudf_hive_use_buffered_input,
+    true,
+    "Use BufferedInputDataSource instead of KvikIO for cuDF Hive reads");
+
+DEFINE_bool(
+    cudf_hive_preload_column_chunks,
+    false,
+    "Load column chunks while preloading cuDF Hive splits");
+
 DEFINE_string(
     cudf_properties,
     "",
@@ -117,6 +127,12 @@ CudfTpcdsBenchmark::makeConnectorProperties() {
   cfg->set(
       CudfHiveCfg::kMaxPassReadLimit,
       std::to_string(FLAGS_cudf_pass_read_limit));
+  cfg->set(
+      CudfHiveCfg::kUseBufferedInput,
+      std::to_string(FLAGS_cudf_hive_use_buffered_input));
+  cfg->set(
+      CudfHiveCfg::kPreloadColumnChunks,
+      std::to_string(FLAGS_cudf_hive_preload_column_chunks));
   cfg->set(CudfHiveCfg::kAllowMismatchedCudfHiveSchemas, "true");
 
   return cfg;
