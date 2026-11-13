@@ -1704,6 +1704,11 @@ Reader options map to `libcudf parquet_reader_options <https://docs.rapids.ai/ap
      - bool
      - false
      - Whether background split preparation starts fetching the first column-chunk pass. Active splits always start fetching when activated. Enabling this can overlap I/O with the previous split, but retains one pass of device buffers per preloaded split.
+   * - cudf.hive.buffered-input-pinned-piece-bytes
+     -
+     - integer
+     - 0
+     - Size in bytes of the page-locked pieces through which a scan with ``cudf.hive.use-buffered-input`` copies a byte range to the device. The pieces come from cuDF's pinned memory resource, at most two per byte range being read, and a piece is read while the one before it is copied. 0 reads each byte range into one pageable buffer and copies from that.
    * - cudf.hive.fetch-ahead-bytes
      -
      - integer

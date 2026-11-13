@@ -77,6 +77,12 @@ DEFINE_bool(
     "Load column chunks while preloading cuDF Hive splits");
 
 DEFINE_uint64(
+    cudf_hive_buffered_input_pinned_piece_bytes,
+    0,
+    "Size in bytes of the page-locked pieces the BufferedInput data source "
+    "copies to the device through; 0 copies from one pageable buffer");
+
+DEFINE_uint64(
     cudf_hive_fetch_ahead_bytes,
     0,
     "Device memory in bytes that column chunks fetched ahead of the drivers "
@@ -125,6 +131,9 @@ void CudfTpchBenchmark::initialize() {
     cudfHiveConfigurationValues
         [cudf_velox::connector::hive::CudfHiveConfig::kPreloadColumnChunks] =
             std::to_string(FLAGS_cudf_hive_preload_column_chunks);
+    cudfHiveConfigurationValues[cudf_velox::connector::hive::CudfHiveConfig::
+                                    kBufferedInputPinnedPieceBytes] =
+        std::to_string(FLAGS_cudf_hive_buffered_input_pinned_piece_bytes);
     cudfHiveConfigurationValues
         [cudf_velox::connector::hive::CudfHiveConfig::kFetchAheadBytes] =
             std::to_string(FLAGS_cudf_hive_fetch_ahead_bytes);
@@ -174,6 +183,9 @@ CudfTpchBenchmark::makeConnectorProperties() {
   cfg->set(
       CudfHiveCfg::kPreloadColumnChunks,
       std::to_string(FLAGS_cudf_hive_preload_column_chunks));
+  cfg->set(
+      CudfHiveCfg::kBufferedInputPinnedPieceBytes,
+      std::to_string(FLAGS_cudf_hive_buffered_input_pinned_piece_bytes));
   cfg->set(
       CudfHiveCfg::kFetchAheadBytes,
       std::to_string(FLAGS_cudf_hive_fetch_ahead_bytes));

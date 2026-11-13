@@ -910,8 +910,9 @@ void CudfSplitReader::setupCudfDataSource() {
     makeKvikioDataSource();
     return;
   }
-  dataSource_ =
-      std::make_unique<BufferedInputDataSource>(std::move(bufferedInput));
+  dataSource_ = std::make_unique<BufferedInputDataSource>(
+      std::move(bufferedInput),
+      cudfHiveConfig_->bufferedInputPinnedPieceBytes());
 }
 
 void CudfSplitReader::setupReaderOptions() {

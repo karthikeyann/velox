@@ -34,8 +34,12 @@ namespace facebook::velox::cudf_velox::connector::hive {
 // contiguous buffers.
 class BufferedInputDataSource : public cudf::io::datasource {
  public:
-  explicit BufferedInputDataSource(
-      std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input);
+  /// @param pinnedPieceBytes Size of the page-locked pieces a device read
+  /// copies through, taken from cuDF's pinned memory resource: at most two per
+  /// read in progress. Zero reads each byte range into one pageable buffer.
+  BufferedInputDataSource(
+      std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input,
+      uint64_t pinnedPieceBytes);
 
   [[nodiscard]] size_t size() const override;
 
@@ -59,7 +63,8 @@ class BufferedInputDataSource : public cudf::io::datasource {
       cuda::stream_ref stream) override;
 
   /// Makes the device reads that have not begun return zero without reading
-  /// or copying anything, including those submitted later. For a consumer
+  /// or copying anything, including those submitted later, and a read that
+  /// copies through page-locked pieces stop at its next piece. For a consumer
   /// that gives up what it asked for: it still waits for the futures, and the
   /// wait is then only for the reads in progress.
   void abandonDeviceReads();
@@ -67,8 +72,18 @@ class BufferedInputDataSource : public cudf::io::datasource {
  private:
   void readContiguous(size_t offset, size_t size, uint8_t* dst);
 
+  // Reads up to 'size' bytes at 'offset' and copies them to 'dst' on 'stream'
+  // through page-locked pieces, reading a piece while the one before it is
+  // copied. Returns the number of bytes copied, after the last copy completed.
+  size_t readToDeviceInPieces(
+      size_t offset,
+      size_t size,
+      uint8_t* dst,
+      cuda::stream_ref stream);
+
   std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input_;
   const size_t fileSize_;
+  const uint64_t pinnedPieceBytes_;
   // Set by abandonDeviceReads().
   std::atomic_bool deviceReadsAbandoned_{false};
 };
