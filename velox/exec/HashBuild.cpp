@@ -298,6 +298,11 @@ void HashBuild::setupTable() {
     }
   }
   analyzeKeys_ = table_->hashMode() != BaseHashTable::HashMode::kHash;
+  checkDynamicFilterOptOut_ =
+      !operatorCtx_->task()->dynamicFilters().sources(planNodeId()).empty();
+  if (checkDynamicFilterOptOut_) {
+    optOutOfDynamicFiltersEarly();
+  }
   if (abandonHashBuildDedupMinPct_ == 0 && !joinNode_->isCountingJoin()) {
     // Building a HashTable without duplicates is disabled if
     // abandonBuildNoDupHashMinPct_ is 0. Counting joins always require dedup.
@@ -554,6 +559,9 @@ void HashBuild::addInput(RowVectorPtr input) {
 
   if (analyzeKeys_) {
     analyzeKeys_ = table_->analyzeKeys(activeRows_);
+  }
+  if (checkDynamicFilterOptOut_) {
+    optOutOfDynamicFiltersEarly();
   }
   auto rows = table_->rows();
   FlatVector<bool>* spillProbedFlagVector{nullptr};
@@ -841,7 +849,14 @@ bool HashBuild::finishHashBuild() {
     }
   };
 
+  SCOPE_EXIT {
+    // Scans may wait for the filters of this join, so every way out of the
+    // build resolves them. This has no effect on a filter published below.
+    publishDynamicFilters(nullptr);
+  };
+
   if (getHashTableFromCache()) {
+    publishDynamicFilters(cacheEntry_->table.get());
     return true;
   }
 
@@ -937,6 +952,12 @@ bool HashBuild::finishHashBuild() {
 
   addRuntimeStats();
 
+  // A table that holds a part of the build side, because the rest is spilled
+  // or belongs to other split groups, cannot filter the whole probe side.
+  const bool hasAllRows = spillPartitions.empty() && !isInputFromSpill() &&
+      operatorCtx_->driverCtx()->splitGroupId == kUngroupedGroupId;
+  publishDynamicFilters(hasAllRows ? table_.get() : nullptr);
+
   // Setup spill function for spilling hash table directly from hash join
   // bridge after transferring of table ownership.
   HashJoinTableSpillFunc tableSpillFunc;
@@ -971,6 +992,63 @@ bool HashBuild::finishHashBuild() {
     stateCleared_ = true;
   }
   return true;
+}
+
+void HashBuild::optOutOfDynamicFiltersEarly() {
+  auto* task = operatorCtx_->task().get();
+  const bool hasBloomFilter = operatorCtx_->driverCtx()
+                                  ->queryConfig()
+                                  .hashProbeBloomFilterPushdownMaxSize() > 0;
+  // A table of one split group holds a part of the build side.
+  const bool canMakeFilters =
+      TaskDynamicFilters::canFilterProbeSide(*joinNode_) &&
+      operatorCtx_->driverCtx()->splitGroupId == kUngroupedGroupId;
+  bool hasCandidate{false};
+  for (const auto& source : task->dynamicFilters().sources(planNodeId())) {
+    // The values of the other build drivers only add to the ones seen here,
+    // so what is too much for this driver's table is too much for the final
+    // one.
+    const auto& hasher = *table_->hashers()[source.keyIndex];
+    if (!canMakeFilters || !analyzeKeys_ ||
+        (!hasBloomFilter && hasher.supportsBloomFilter())) {
+      task->publishDynamicFilter(source.filterId, nullptr);
+    } else {
+      hasCandidate = true;
+    }
+  }
+  checkDynamicFilterOptOut_ = hasCandidate;
+}
+
+void HashBuild::publishDynamicFilters(const BaseHashTable* table) {
+  auto* task = operatorCtx_->task().get();
+  const auto& sources = task->dynamicFilters().sources(planNodeId());
+  if (sources.empty()) {
+    return;
+  }
+  const bool canFilterProbe =
+      TaskDynamicFilters::canFilterProbeSide(*joinNode_);
+  const bool stringEnabled = operatorCtx_->driverCtx()
+                                 ->queryConfig()
+                                 .hashProbeStringDynamicFilterPushdownEnabled();
+  int32_t numPublished{0};
+  for (const auto& source : sources) {
+    common::FilterPtr filter;
+    if (table != nullptr && canFilterProbe) {
+      if (table->numDistinct() == 0) {
+        filter = std::make_shared<common::AlwaysFalse>();
+      } else if (table->hashMode() != BaseHashTable::HashMode::kHash) {
+        filter =
+            table->hashers()[source.keyIndex]->getJoinKeyFilter(stringEnabled);
+      }
+    }
+    numPublished += filter != nullptr;
+    task->publishDynamicFilter(source.filterId, std::move(filter));
+  }
+  if (numPublished > 0) {
+    addRuntimeStat(
+        std::string(DriverStats::kDynamicFiltersProduced),
+        RuntimeCounter(numPublished));
+  }
 }
 
 void HashBuild::ensureTableFits(uint64_t numRows) {

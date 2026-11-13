@@ -277,6 +277,14 @@ class VectorHasher {
   // Returns null if distinctOverflow_ is true.
   std::unique_ptr<common::Filter> getFilter(bool nullAllowed) const;
 
+  /// Returns a filter that passes the non-null values added to this hasher,
+  /// for a hash join to send the build-side values of a key to the scans of
+  /// its probe side: the exact set of values or, when there are too many, the
+  /// bloom filter the join build has set. Returns nullptr if neither exists.
+  /// Also returns nullptr for a string key if 'stringEnabled' is false or the
+  /// type is a custom type.
+  common::FilterPtr getJoinKeyFilter(bool stringEnabled) const;
+
   bool supportsBloomFilter() const {
     if (typeProvidesCustomComparison_) {
       return false;

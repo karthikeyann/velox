@@ -293,6 +293,8 @@ class TaskCursorBase : public TaskCursor {
         params.numSplitGroups,
         params.groupedExecutionLeafNodeIds};
     planFragment_.taskUniqueId = params.taskUniqueId;
+    planFragment_.dynamicFilterSources = params.dynamicFilterSources;
+    planFragment_.dynamicFilterTargets = params.dynamicFilterTargets;
     beforeTaskStart_ = params.beforeTaskStart;
 
     if (!params.spillDirectory.empty()) {

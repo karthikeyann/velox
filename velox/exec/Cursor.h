@@ -84,6 +84,14 @@ struct CursorParameters {
   /// core::PlanFragment::taskUniqueId.
   std::optional<int32_t> taskUniqueId{};
 
+  /// Dynamic filters the hash joins of the plan make for table scans outside
+  /// of their pipelines. See core::PlanFragment::dynamicFilterSources.
+  std::vector<core::DynamicFilterSource> dynamicFilterSources{};
+
+  /// Dynamic filters the table scans of the plan wait for. See
+  /// core::PlanFragment::dynamicFilterTargets.
+  std::vector<core::DynamicFilterTarget> dynamicFilterTargets{};
+
   /// Hooks for a plan containing a FixedPointNode, passed to Task::create. The
   /// task copies them, so they need to outlive only the cursor's construction.
   const FixedPointOptions* fixedPointOptions{nullptr};

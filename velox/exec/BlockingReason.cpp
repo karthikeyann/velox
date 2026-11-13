@@ -40,6 +40,7 @@ const auto& blockingReasonNames() {
       {BlockingReason::kWaitForIndexSplits, "kWaitForIndexSplits"},
       {BlockingReason::kWaitForRPC, "kWaitForRPC"},
       {BlockingReason::kWaitForAggregationPeers, "kWaitForAggregationPeers"},
+      {BlockingReason::kWaitForDynamicFilter, "kWaitForDynamicFilter"},
   };
   return kNames;
 }

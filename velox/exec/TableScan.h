@@ -22,6 +22,7 @@
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/ScaledScanController.h"
+#include "velox/exec/TaskDynamicFilters.h"
 
 namespace facebook::velox::exec {
 
@@ -94,6 +95,16 @@ class TableScan : public SourceOperator {
   static constexpr std::string_view kDataSourceAddSplitWallNanos =
       "dataSourceAddSplitWallNanos";
 
+  /// Time the scan waited before reading for the dynamic filters that joins
+  /// outside of its pipeline make.
+  static constexpr std::string_view kDynamicFilterWaitWallNanos =
+      "dynamicFilterWaitWallNanos";
+
+  /// Number of dynamic filters from joins outside of the pipeline that had not
+  /// arrived when the scan stopped waiting and started to read.
+  static constexpr std::string_view kDynamicFiltersTimedOut =
+      "dynamicFiltersTimedOut";
+
   std::shared_ptr<ScaledScanController> testingScaledController() const {
     return scaledController_;
   }
@@ -128,6 +139,16 @@ class TableScan : public SourceOperator {
   // done, it will be made when needed.
   void preload(const std::shared_ptr<connector::ConnectorSplit>& split);
 
+  // Returns true if the scan has to wait, before it reads, for dynamic filters
+  // that joins outside of its pipeline make. Sets 'blockingFuture_' and
+  // 'blockingReason_' in that case. Applies the filters that have arrived.
+  bool waitForDynamicFilters();
+
+  // Applies the dynamic filters from outside of the pipeline that arrived
+  // since the last call. Returns the number of filters still to wait for and
+  // sets 'future' to complete when the next one is resolved.
+  int32_t applyTaskDynamicFilters(ContinueFuture* future);
+
   // Invoked by scan operator to check if it needs to stop to wait for scale up.
   bool shouldWaitForScaleUp();
 
@@ -152,6 +173,13 @@ class TableScan : public SourceOperator {
   const size_t getOutputTimeLimitMs_{0};
 
   const uint32_t outputBatchRowsOverride_;
+
+  // True if the plan fragment declares dynamic filters from outside of the
+  // pipeline for this scan and the connector can apply them.
+  const bool hasTaskDynamicFilters_;
+
+  // Longest time to wait for those filters before reading.
+  const std::chrono::milliseconds dynamicFilterMaxWait_;
 
   // If set, used for scan scale processing. It is shared by all the scan
   // operators instantiated from the same table scan node.
@@ -193,6 +221,20 @@ class TableScan : public SourceOperator {
 
   // String shown in ExceptionContext inside DataSource and LazyVector loading.
   std::string debugString_;
+
+  // False while the scan may still wait for dynamic filters before reading.
+  bool dynamicFilterWaitDone_{false};
+
+  // Measures the wait for dynamic filters. Set when the wait starts.
+  std::optional<folly::stop_watch<std::chrono::milliseconds>>
+      dynamicFilterWaitWatch_;
+
+  // The dynamic filters from outside of the pipeline that have arrived. Each
+  // data source of this scan gets them combined with the pipeline's filters.
+  std::vector<TaskDynamicFilters::ScanFilter> taskFilters_;
+
+  // Size of 'taskFilters_' as the cursor the task advances.
+  uint32_t numTaskDynamicFilters_{0};
 
   // The total number of raw input rows read up till the last finished split.
   // This is used to detect if a finished split is empty or not.
