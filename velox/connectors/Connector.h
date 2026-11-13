@@ -208,6 +208,13 @@ class ConnectorTableHandle : public ISerializable {
     return name();
   }
 
+  /// Returns true if the handle carries filters, so that a scan of the table
+  /// may return only a part of the rows. Used to tell whether the keys of a
+  /// join's build side are likely to be a part of the keys of its probe side.
+  virtual bool hasFilters() const {
+    return false;
+  }
+
   /// Returns true if this handle is of connector-specific type 'T'.
   template <typename T>
   bool is() const {

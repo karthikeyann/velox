@@ -32,6 +32,7 @@
 #include "velox/common/memory/CustomMemoryResourceRegistry.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/common/time/Timer.h"
+#include "velox/exec/DynamicFilterPlanner.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/ExchangeTransportRegistry.h"
 #include "velox/exec/FixedPointLoop.h"
@@ -458,6 +459,20 @@ std::shared_ptr<Task> Task::create(
         }
         return false;
       });
+
+  if (queryCtx->queryConfig().crossPipelineDynamicFilterEnabled() &&
+      planFragment.dynamicFilterSources.empty() &&
+      planFragment.dynamicFilterTargets.empty() &&
+      !planFragment.isGroupedExecution()) {
+    auto filters = DynamicFilterPlanner::plan(*planFragment.planNode, {});
+    for (const auto& target : filters.targets) {
+      VLOG(1) << "Task " << taskId << ": dynamic filter " << target.filterId
+              << " goes to column " << target.outputChannel << " of table scan "
+              << target.scanNodeId;
+    }
+    planFragment.dynamicFilterSources = std::move(filters.sources);
+    planFragment.dynamicFilterTargets = std::move(filters.targets);
+  }
 
   auto task = std::shared_ptr<Task>(new Task(
       taskId,

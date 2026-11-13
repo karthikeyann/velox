@@ -29,6 +29,7 @@ velox_add_library(
   DistinctAggregations.cpp
   Driver.cpp
   DynamicFilterCollector.cpp
+  DynamicFilterPlanner.cpp
   EnforceSingleRow.cpp
   Exchange.cpp
   InMemoryExchangeClient.cpp
@@ -144,6 +145,7 @@ velox_add_library(
   DistinctAggregations.h
   Driver.h
   DynamicFilterCollector.h
+  DynamicFilterPlanner.h
   DriverStats.h
   EnforceDistinct.h
   EnforceSingleRow.h

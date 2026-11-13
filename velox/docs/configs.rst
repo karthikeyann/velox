@@ -708,6 +708,17 @@ Table Scan
        increasing the number of running scan threads, and stop once exceeds this
        ratio. The value is in the range of [0, 1]. This only applies if
        'table_scan_scaled_processing_enabled' is true.
+   * - cross_pipeline_dynamic_filter_enabled
+     - bool
+     - false
+     - If true, a task whose plan fragment declares no dynamic filters derives
+       them from its plan: a hash join sends the build-side values of its keys
+       to the table scans of its probe side that are in the same task and not
+       in the join's pipeline, for example behind a local exchange or an
+       aggregation. The scans wait for the filters, see
+       'table_scan_dynamic_filter_max_wait_ms'. Filters are derived for integer
+       and date keys of joins whose build side has a filter, for scans that no
+       join of their own pipeline already filters.
    * - table_scan_dynamic_filter_max_wait_ms
      - integer
      - 10000
