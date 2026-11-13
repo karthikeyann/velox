@@ -273,12 +273,14 @@ class FetchScheduler {
   static bool prefersQueuedCopies(double copyToFillRatio);
 
   /// Returns the number of readers to start with, given 'copyToFillRatio' as
-  /// for prefersQueuedCopies(): ten divided by the ratio, between 4 and 24.
-  /// The ratio says how many fills the link takes at a time, and the numbers
-  /// are what three machines settled at when left to try: 5 to 8 readers at
-  /// a ratio of 1.1 to 1.9, 16 to 32 at 0.1 to 0.4. Starting there saves the
-  /// first scans the way from a number that suits another machine. Zero,
-  /// for a ratio that could not be measured, returns 16.
+  /// for prefersQueuedCopies(): ten divided by the ratio, between 4 and 16.
+  /// A link that is slow for the machine's memory is fed by few readers, and
+  /// more of them cost: at a ratio of 0.8 to 1.9 a PCIe 4 workstation
+  /// settles at 5 to 8, and a scan that starts with 16 has to come down
+  /// first. On fast links the scans climb from 16 by what they measure, to
+  /// 20 to 32 on the two machines tried; starting them higher made one of
+  /// them climb past the number that serves it. Zero, for a ratio that could
+  /// not be measured, returns 16.
   static size_t initialReadersFor(double copyToFillRatio);
 
   /// Returns where the controller stands after measuring 'window' in

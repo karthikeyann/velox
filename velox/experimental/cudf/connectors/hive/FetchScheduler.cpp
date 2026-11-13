@@ -278,10 +278,11 @@ bool FetchScheduler::prefersQueuedCopies(double copyToFillRatio) {
 
 // static
 size_t FetchScheduler::initialReadersFor(double copyToFillRatio) {
-  if (copyToFillRatio <= 0) {
+  // Also for a ratio that is not a number.
+  if (!(copyToFillRatio > 0)) {
     return 16;
   }
-  return static_cast<size_t>(std::clamp(10 / copyToFillRatio, 4.0, 24.0));
+  return static_cast<size_t>(std::clamp(10 / copyToFillRatio, 4.0, 16.0));
 }
 
 // static

@@ -36,6 +36,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -943,10 +944,23 @@ TEST_F(FetchSchedulerTest, prefersQueuedCopies) {
   // The number of readers to start with follows the same ratio.
   EXPECT_EQ(FetchScheduler::initialReadersFor(1.92), 5);
   EXPECT_EQ(FetchScheduler::initialReadersFor(1.14), 8);
-  EXPECT_EQ(FetchScheduler::initialReadersFor(0.4), 24);
-  EXPECT_EQ(FetchScheduler::initialReadersFor(0.13), 24);
+  EXPECT_EQ(FetchScheduler::initialReadersFor(0.83), 12);
+  EXPECT_EQ(FetchScheduler::initialReadersFor(0.4), 16);
+  EXPECT_EQ(FetchScheduler::initialReadersFor(0.13), 16);
   EXPECT_EQ(FetchScheduler::initialReadersFor(10), 4);
+  // Where the bounds take over.
+  EXPECT_EQ(FetchScheduler::initialReadersFor(2.5), 4);
+  EXPECT_EQ(FetchScheduler::initialReadersFor(0.625), 16);
+  // Not measured, or not a ratio.
   EXPECT_EQ(FetchScheduler::initialReadersFor(0), 16);
+  EXPECT_EQ(FetchScheduler::initialReadersFor(-1), 16);
+  EXPECT_EQ(
+      FetchScheduler::initialReadersFor(
+          std::numeric_limits<double>::quiet_NaN()),
+      16);
+  EXPECT_FALSE(
+      FetchScheduler::prefersQueuedCopies(
+          std::numeric_limits<double>::quiet_NaN()));
 
   // A scheduler that is not told starts the way its measurement says.
   const auto content = makeContent(kBufferSize);
