@@ -65,6 +65,20 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   static constexpr std::string_view kDynamicFilterValueUploads{
       "dynamicFilterValueUploads"};
 
+  /// Runtime statistics of a scan with 'parquet.reader.filter-first' on: row
+  /// group passes read filter columns first, and passes read with all columns
+  /// in one step because the split had no filter or could not be read that
+  /// way.
+  static constexpr std::string_view kFilterFirstPasses{"filterFirstPasses"};
+  static constexpr std::string_view kFilterFirstOneStepPasses{
+      "filterFirstOneStepPasses"};
+
+  /// Runtime statistics of a scan with 'parquet.reader.filter-first' on: rows
+  /// of the passes read filter columns first, and the rows of those the
+  /// filters kept, whose other columns were then read.
+  static constexpr std::string_view kFilterFirstRows{"filterFirstRows"};
+  static constexpr std::string_view kFilterFirstKeptRows{"filterFirstKeptRows"};
+
   /// Returns whether this data source can scan 'tableHandle' on the GPU:
   ///  - 'tableHandle' is a Hive table handle,
   ///  - no rows are sampled,
@@ -330,6 +344,12 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   common::SubfieldFilters subfieldFilters_;
 
   const PartitionKeySource partitionKeySource_;
+
+  // Whether splits with a filter are read filter columns first.
+  const bool filterFirst_;
+
+  // What the split readers of this data source read, by reading mode.
+  CudfSplitReader::ReadStats readStats_;
 
   // Table column name of each output column, in 'outputType_' order.
   std::vector<std::string> outputSourceNames_;

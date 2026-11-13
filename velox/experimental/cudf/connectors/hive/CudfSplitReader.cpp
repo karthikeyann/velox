@@ -37,7 +37,9 @@
 #include "velox/connectors/hive/storage_adapters/abfs/AbfsUtil.h"
 #endif
 
+#include <cudf/aggregation.hpp>
 #include <cudf/column/column.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>
 #include <cudf/io/parquet.hpp>
@@ -45,6 +47,9 @@
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/lists/lists_column_view.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
@@ -410,6 +415,17 @@ void CudfSplitReader::setPushdownFilter(const cudf::ast::expression* filter) {
   hasSplitSpecificPushdownFilter_ = true;
 }
 
+void CudfSplitReader::setFilterFirstFilter(
+    const cudf::ast::expression* filter,
+    std::vector<std::string> filterColumns) {
+  VELOX_CHECK_NOT_NULL(filter);
+  VELOX_CHECK(!filterColumns.empty(), "A filter must reference a column");
+  VELOX_CHECK_NULL(
+      splitReader_, "The filter of a prepared split cannot be replaced");
+  filterFirstFilter_ = filter;
+  filterFirstColumns_ = std::move(filterColumns);
+}
+
 void CudfSplitReader::prepareSplit(dwio::common::RuntimeStats& runtimeStats) {
   stream_ = cudfGlobalStreamPool().get_stream();
   fileMetaDatas();
@@ -434,8 +450,13 @@ void CudfSplitReader::prepareSplit(dwio::common::RuntimeStats& runtimeStats) {
 }
 
 std::optional<CudfSplitReader::TableChunk> CudfSplitReader::next(
-    uint64_t /*size*/) {
+    uint64_t /*size*/,
+    const RowFilter& rowFilter) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  rowFilter_ = rowFilter ? &rowFilter : nullptr;
+  SCOPE_EXIT {
+    rowFilter_ = nullptr;
+  };
 
   // Record start time before reading chunk
   auto startTimeUs = SteadyTime::now<std::chrono::microseconds>();
@@ -488,39 +509,43 @@ std::optional<CudfSplitReader::TableChunk> CudfSplitReader::readNextChunk() {
 
   auto outputMr = determineCudfMemoryResource();
 
-  if (passState_->currentPass >= passState_->passes.size()) {
-    return std::nullopt;
-  }
-
-  if (not passState_->isChunkingSetup) {
-    setupChunkingForCurrentPass(outputMr);
+  while (not passState_->isChunkingSetup) {
+    if (passState_->currentPass >= passState_->passes.size()) {
+      return std::nullopt;
+    }
+    if (not readsFilterColumnsFirst_) {
+      setupChunkingForCurrentPass(outputMr);
+      ++readStats_.numOneStepPasses;
+    } else if (not setupFilterFirstPass(outputMr)) {
+      // The filters keep no row of this pass.
+      finishCurrentPass();
+      continue;
+    }
     VELOX_CHECK(
         splitReader_->has_next_table_chunk(),
         "cuDF row group pass did not produce a table chunk");
   }
 
-  auto tableWithMetadata = splitReader_->materialize_all_columns_chunk();
+  auto chunk = readsFilterColumnsFirst_
+      ? readFilterFirstChunk(outputMr)
+      : std::move(splitReader_->materialize_all_columns_chunk().tbl);
+  const bool rowFilterApplied = passState_->rowFilterApplied;
 
   // This was the last chunk of the pass. Drop its fetch buffers and begin
   // I/O for the next pass, unless it was fetched ahead, while the caller
   // consumes this table.
   if (not splitReader_->has_next_table_chunk()) {
-    advancePass();
-    if (passState_->currentPass < passState_->passes.size()) {
-      startColumnChunkFetch();
-    } else {
-      passState_->passes.clear();
-    }
+    finishCurrentPass();
   }
 
   auto table = castDecimalColumnsToVeloxTypes(
-      std::move(tableWithMetadata.tbl),
+      std::move(chunk),
       readColumnTypes_,
       prependRowIndex_ ? 1 : 0,
       stream_,
       outputMr);
   const auto numRows = table->num_rows();
-  return TableChunk{std::move(table), numRows};
+  return TableChunk{std::move(table), numRows, rowFilterApplied};
 }
 
 void CudfSplitReader::startColumnChunkFetch() {
@@ -540,25 +565,18 @@ void CudfSplitReader::startColumnChunkFetch() {
     return;
   }
 
-  const auto& rowGroupIndices = passState_->passes[passState_->currentPass];
-
-  // Byte ranges are flattened across sources; the source index map is only
-  // needed once a reader spans multiple data sources.
-  const auto columnChunkByteRanges =
-      splitReader_
-          ->all_column_chunks_byte_ranges(rowGroupIndices, readerOptions_)
-          .first;
+  const auto& byteRanges = passState_->byteRanges[passState_->currentPass];
   startFetch(
       passState_->current,
-      columnChunkByteRanges,
-      numBytesOf(columnChunkByteRanges),
+      byteRanges,
+      numBytesOf(byteRanges.filter) + numBytesOf(byteRanges.other),
       /*isHeld=*/false,
       stream_);
 }
 
 void CudfSplitReader::startFetch(
     PassFetch& pass,
-    cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
+    const RowGroupPassState::ColumnChunkByteRanges& byteRanges,
     uint64_t numBytes,
     bool isHeld,
     cuda::stream_ref stream) {
@@ -566,12 +584,21 @@ void CudfSplitReader::startFetch(
   SCOPE_EXIT {
     nvtxRangePop();
   };
-  pass.fetch = fetchByteRangesAsync(
-      dataSource_,
-      byteRanges,
-      serializeIoRequests_,
-      stream,
-      {get_temp_mr(), get_temp_mr()});
+  const auto fetch =
+      [&](const std::vector<cudf::io::text::byte_range_info>& columnChunks) {
+        return fetchByteRangesAsync(
+            dataSource_,
+            columnChunks,
+            serializeIoRequests_,
+            stream,
+            {get_temp_mr(), get_temp_mr()});
+      };
+  if (readsFilterColumnsFirst_) {
+    // The filter column chunks are requested first, so the other column
+    // chunks keep arriving while the filter columns are decoded.
+    pass.filterFetch = fetch(byteRanges.filter);
+  }
+  pass.fetch = fetch(byteRanges.other);
   // Counted once the fetch exists: a fetch that fails to start holds nothing.
   if (fetchAheadBudget_ != nullptr) {
     if (!isHeld) {
@@ -608,13 +635,11 @@ void CudfSplitReader::offerPassFetch(
     PassFetch& target,
     cuda::stream_ref stream,
     FetchAheadBudget::Distance distance) {
-  // The byte ranges are worked out here, on the thread that uses the reader,
-  // so that the thread that starts the fetch does not.
-  auto byteRanges = splitReader_
-                        ->all_column_chunks_byte_ranges(
-                            passState_->passes[pass], readerOptions_)
-                        .first;
-  const auto numBytes = numBytesOf(byteRanges);
+  // A copy for the thread that starts the fetch, which does not use the
+  // reader.
+  auto byteRanges = passState_->byteRanges[pass];
+  const auto numBytes =
+      numBytesOf(byteRanges.filter) + numBytesOf(byteRanges.other);
   // The start allocates the device memory of the pass and submits its reads.
   // That is not work for the thread that gives the offer room, which only
   // released memory.
@@ -642,12 +667,39 @@ void CudfSplitReader::withdrawFetchOffer() {
   }
 }
 
-void CudfSplitReader::setupChunkingForCurrentPass(
-    rmm::device_async_resource_ref mr) {
+void CudfSplitReader::setColumnChunkByteRanges() {
+  // Byte ranges are flattened across sources; the source index map is only
+  // needed once a reader spans multiple data sources.
+  const auto& passes = passState_->passes;
+  auto& byteRanges = passState_->byteRanges;
+  byteRanges.resize(passes.size());
+  if (not readsFilterColumnsFirst_) {
+    for (size_t i = 0; i < passes.size(); ++i) {
+      byteRanges[i].other =
+          splitReader_->all_column_chunks_byte_ranges(passes[i], readerOptions_)
+              .first;
+    }
+    return;
+  }
+  for (size_t i = 0; i < passes.size(); ++i) {
+    byteRanges[i].filter =
+        splitReader_
+            ->filter_column_chunks_byte_ranges(passes[i], filterFirstOptions_)
+            .first;
+  }
+  for (size_t i = 0; i < passes.size(); ++i) {
+    byteRanges[i].other =
+        splitReader_
+            ->payload_column_chunks_byte_ranges(passes[i], filterFirstOptions_)
+            .first;
+  }
+}
+
+void CudfSplitReader::awaitCurrentPassFetch(ByteRangeFetch& fetch) {
   // No-op when the fetch was already started while preparing the split.
   startColumnChunkFetch();
 
-  // Wait for all reads of the pass to complete.
+  // Wait for the reads to complete.
   uint64_t waitNanos{0};
   {
     // The budget starts nothing ahead while this driver waits.
@@ -660,9 +712,9 @@ void CudfSplitReader::setupChunkingForCurrentPass(
       }
     };
     NanosecondWallTimer timer(&waitNanos);
-    passState_->current.fetch.wait();
+    fetch.wait();
   }
-  // The bytes of this pass are on the device and its decode begins: the
+  // Bytes of this pass are on the device and its decode begins: the
   // time to fetch the next pass, within the fetch-ahead budget. Offered
   // before the budget learns that the bytes arrived, which starts what is on
   // offer: the next pass goes before the splits prepared ahead.
@@ -689,6 +741,31 @@ void CudfSplitReader::setupChunkingForCurrentPass(
   if (passState_->current.isOnFetchAheadStream) {
     CUDF_CUDA_TRY(cudaStreamSynchronize(fetchAheadStream().get()));
   }
+}
+
+void CudfSplitReader::waitForFetch(ByteRangeFetch& fetch) {
+  {
+    // The budget starts nothing ahead while this driver waits.
+    if (fetchAheadBudget_ != nullptr) {
+      fetchAheadBudget_->waitBegin();
+    }
+    SCOPE_EXIT {
+      if (fetchAheadBudget_ != nullptr) {
+        fetchAheadBudget_->waitEnd();
+      }
+    };
+    fetch.wait();
+  }
+  // As in awaitCurrentPassFetch(): the copies a data source queued on the
+  // stream of the fetch must have run before the reader's stream decodes.
+  if (passState_->current.isOnFetchAheadStream) {
+    CUDF_CUDA_TRY(cudaStreamSynchronize(fetchAheadStream().get()));
+  }
+}
+
+void CudfSplitReader::setupChunkingForCurrentPass(
+    rmm::device_async_resource_ref mr) {
+  awaitCurrentPassFetch(passState_->current.fetch);
 
   splitReader_->setup_chunking_for_all_columns(
       chunkReadLimit_,
@@ -702,10 +779,180 @@ void CudfSplitReader::setupChunkingForCurrentPass(
   passState_->isChunkingSetup = true;
 }
 
+namespace {
+
+// Returns the number of true rows of the BOOL8 column 'mask', which has no
+// nulls.
+int64_t countTrueRows(const cudf::column_view& mask, cuda::stream_ref stream) {
+  const auto sum = cudf::reduce(
+      mask,
+      *cudf::make_sum_aggregation<cudf::reduce_aggregation>(),
+      cudf::data_type{cudf::type_id::INT64},
+      stream,
+      get_temp_mr());
+  return static_cast<const cudf::numeric_scalar<int64_t>&>(*sum).value(stream);
+}
+
+} // namespace
+
+bool CudfSplitReader::setupFilterFirstPass(rmm::device_async_resource_ref mr) {
+  namespace hybrid = cudf::io::parquet::experimental;
+  // The filter column chunks are enough to begin with.
+  awaitCurrentPassFetch(passState_->current.filterFetch);
+
+  const auto& rowGroupIndices = passState_->passes[passState_->currentPass];
+  const cudf::memory_resources temporary{get_temp_mr(), get_temp_mr()};
+  auto rowMask = splitReader_->build_all_true_row_mask(
+      rowGroupIndices, stream_, temporary);
+  ++readStats_.numFilterFirstPasses;
+  readStats_.numFilterFirstRows += rowMask->size();
+
+  auto rowMaskView = rowMask->mutable_view();
+  // Every row is a candidate, so no page of a filter column can be skipped.
+  auto filterTable = splitReader_->materialize_filter_columns(
+      rowGroupIndices,
+      passState_->current.filterFetch.data,
+      rowMaskView,
+      hybrid::use_data_page_mask::NO,
+      filterFirstOptions_,
+      stream_,
+      mr);
+  // The column chunks of the filter columns stay with the pass until it is
+  // released: the fetch-ahead budget counts the pass as one.
+
+  // The reader returns the columns its filter references, in its own order.
+  const auto& schema = filterTable.metadata.schema_info;
+  VELOX_CHECK_EQ(schema.size(), filterTable.tbl->num_columns());
+  const auto foldCase = [&](const std::string& name) {
+    return caseInsensitiveColumnNames_
+        ? ::facebook::velox::functions::stringImpl::utf8StrToLowerCopy(name)
+        : name;
+  };
+  auto& filterReadColumns = passState_->filterReadColumns;
+  filterReadColumns.clear();
+  for (const auto& column : schema) {
+    const auto it = std::find(
+        readColumnNames_.begin(),
+        readColumnNames_.end(),
+        foldCase(column.name));
+    VELOX_CHECK(
+        it != readColumnNames_.end(),
+        "Filter column is not a read column: {}",
+        column.name);
+    filterReadColumns.push_back(std::distance(readColumnNames_.begin(), it));
+  }
+
+  auto table = std::move(filterTable.tbl);
+  passState_->rowFilterApplied = false;
+  if (rowFilter_ != nullptr and table->num_rows() > 0) {
+    const auto keep = (*rowFilter_)(table->view(), filterReadColumns, stream_);
+    if (keep != nullptr) {
+      VELOX_CHECK_EQ(keep->size(), table->num_rows());
+      passState_->rowFilterApplied = true;
+      const auto numKeptRows = countTrueRows(keep->view(), stream_);
+      readStats_.numRowFilterRows += table->num_rows();
+      readStats_.numRowFilterKeptRows += numKeptRows;
+      // A filter that keeps every row leaves the mask and the table as they
+      // are.
+      if (numKeptRows < table->num_rows()) {
+        // The rows of 'table' are the true entries of the row mask, in order.
+        auto narrowed = cudf::boolean_mask_scatter(
+                            cudf::table_view{{keep->view()}},
+                            cudf::table_view{{rowMask->view()}},
+                            rowMask->view(),
+                            stream_,
+                            get_temp_mr())
+                            ->release();
+        rowMask = std::move(narrowed.front());
+        table = cudf::apply_retention_mask(
+            table->view(), keep->view(), stream_, mr);
+      }
+    }
+  }
+  readStats_.numFilterFirstKeptRows += table->num_rows();
+  if (table->num_rows() == 0) {
+    return false;
+  }
+
+  waitForFetch(passState_->current.fetch);
+  splitReader_->setup_chunking_for_payload_columns(
+      chunkReadLimit_,
+      passReadLimit_,
+      rowGroupIndices,
+      rowMask->view(),
+      hybrid::use_data_page_mask::YES,
+      passState_->current.fetch.data,
+      filterFirstOptions_,
+      stream_,
+      mr);
+
+  passState_->rowMask = std::move(rowMask);
+  passState_->filterTable = std::move(table);
+  passState_->numFilterRowsReturned = 0;
+  passState_->isChunkingSetup = true;
+  return true;
+}
+
+std::unique_ptr<cudf::table> CudfSplitReader::readFilterFirstChunk(
+    rmm::device_async_resource_ref mr) {
+  // The mask has to be the one the chunked read was set up with, unchanged:
+  // the reader chose the pages to decode from it.
+  auto payloadColumns =
+      splitReader_
+          ->materialize_payload_columns_chunk(passState_->rowMask->view())
+          .tbl->release();
+  const auto& filterReadColumns = passState_->filterReadColumns;
+  VELOX_CHECK_EQ(
+      payloadColumns.size() + filterReadColumns.size(),
+      readColumnNames_.size(),
+      "Filter-first read returned an unexpected number of columns");
+  VELOX_CHECK(
+      !payloadColumns.empty(),
+      "Filter-first read returned no column besides the filter columns");
+
+  // A chunk holds the next kept rows of the pass, as do the filter columns
+  // from the first row not returned yet.
+  const auto numRows = payloadColumns.front()->size();
+  const auto begin = passState_->numFilterRowsReturned;
+  auto& filterTable = passState_->filterTable;
+  VELOX_CHECK_LE(begin + numRows, filterTable->num_rows());
+  std::vector<std::unique_ptr<cudf::column>> filterColumns;
+  if (begin == 0 and not splitReader_->has_next_table_chunk()) {
+    // The only chunk of the pass takes the filter columns as they are.
+    VELOX_CHECK_EQ(numRows, filterTable->num_rows());
+    filterColumns = filterTable->release();
+  } else {
+    const auto rows =
+        cudf::slice(filterTable->view(), {begin, begin + numRows}, stream_)
+            .front();
+    filterColumns = cudf::table(rows, stream_, mr).release();
+  }
+  passState_->numFilterRowsReturned += numRows;
+
+  std::vector<std::unique_ptr<cudf::column>> columns(readColumnNames_.size());
+  for (size_t i = 0; i < filterReadColumns.size(); ++i) {
+    columns[filterReadColumns[i]] = std::move(filterColumns[i]);
+  }
+  // The other columns come in read column order.
+  auto payloadColumn = payloadColumns.begin();
+  for (auto& column : columns) {
+    if (column == nullptr) {
+      column = std::move(*payloadColumn++);
+    }
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 void CudfSplitReader::releasePassData(PassFetch& pass, bool isDecoded) {
   std::exception_ptr failure;
   try {
     // Queued or active reads can still write into the buffers being released.
+    // Both fetches are waited for before either failure is rethrown.
+    try {
+      pass.filterFetch.wait();
+    } catch (...) {
+      failure = std::current_exception();
+    }
     pass.fetch.wait();
     // Buffers of a fetch-ahead stream are freed on that stream, where the
     // next fetch reuses them. A data source may have queued copies there.
@@ -718,8 +965,9 @@ void CudfSplitReader::releasePassData(PassFetch& pass, bool isDecoded) {
       }
     }
   } catch (...) {
-    failure = std::current_exception();
+    failure = failure ? failure : std::current_exception();
   }
+  pass.filterFetch = {};
   pass.fetch = {};
   pass.isOnFetchAheadStream = false;
   if (pass.stage.has_value()) {
@@ -750,6 +998,9 @@ void CudfSplitReader::releaseCurrentPassData() {
                  << e.what();
     }
   };
+  passState_->rowMask.reset();
+  passState_->filterTable.reset();
+  passState_->rowFilterApplied = false;
   // Decode may have started on it and failed.
   releasePassData(passState_->current, /*isDecoded=*/true);
 }
@@ -758,11 +1009,23 @@ void CudfSplitReader::advancePass() {
   // The offer of the next pass, if it is still out, ends here: its start has
   // run, or is taken back and the caller starts the fetch itself.
   withdrawFetchOffer();
+  passState_->rowMask.reset();
+  passState_->filterTable.reset();
+  passState_->rowFilterApplied = false;
   releasePassData(passState_->current, /*isDecoded=*/true);
   passState_->isChunkingSetup = false;
   ++passState_->currentPass;
   passState_->current = std::move(passState_->next);
   passState_->next = {};
+}
+
+void CudfSplitReader::finishCurrentPass() {
+  advancePass();
+  if (passState_->currentPass < passState_->passes.size()) {
+    startColumnChunkFetch();
+  } else {
+    passState_->passes.clear();
+  }
 }
 
 void CudfSplitReader::resetSplit() {
@@ -780,6 +1043,9 @@ void CudfSplitReader::resetSplit() {
   numDynamicFilterSkippedRowGroups_ = 0;
   numSelectedRowGroups_ = 0;
   hasSplitSpecificPushdownFilter_ = false;
+  filterFirstFilter_ = nullptr;
+  filterFirstColumns_.clear();
+  readsFilterColumnsFirst_ = false;
   emptySplit_ = false;
   fileColumnNames_.clear();
   baseReadOffset_ = 0;
@@ -1000,6 +1266,26 @@ void CudfSplitReader::setupReaderOptions() {
   if (prependRowIndex_) {
     readerOptions_.enable_prepend_row_index_column(true);
   }
+
+  // A filter-first read needs a column to read after the filter columns, and
+  // filter columns that the file has and the reader returns as read columns.
+  const auto isFilterColumn = [&](const std::string& name) {
+    return std::ranges::find(filterFirstColumns_, name) !=
+        filterFirstColumns_.end();
+  };
+  readsFilterColumnsFirst_ = filterFirstFilter_ != nullptr and
+      supportsFilterFirst() and not prependRowIndex_ and
+      std::ranges::all_of(filterFirstColumns_,
+                          [&](const auto& name) {
+                            return fileColumnNames_.contains(name) and
+                                std::ranges::find(readColumnNames_, name) !=
+                                readColumnNames_.end();
+                          }) and
+      not std::ranges::all_of(readColumnNames_, isFilterColumn);
+  if (readsFilterColumnsFirst_) {
+    filterFirstOptions_ = readerOptions_;
+    filterFirstOptions_.set_filter(*filterFirstFilter_);
+  }
 }
 
 rmm::device_async_resource_ref CudfSplitReader::determineCudfMemoryResource()
@@ -1073,6 +1359,62 @@ bool testsIntegerRange(common::FilterKind kind) {
 
 } // namespace
 
+std::optional<size_t> CudfSplitReader::findIntegerColumn(
+    const std::string& name,
+    cudf::data_type type) const {
+  using ParquetType = cudf::io::parquet::Type;
+  const auto& schema = fileMetaDatas_.front().schema;
+  const auto& columns = schema.front().children_idx;
+  const auto fileName = [&](const std::string& name) {
+    return caseInsensitiveColumnNames_
+        ? ::facebook::velox::functions::stringImpl::utf8StrToLowerCopy(name)
+        : name;
+  };
+  // The column the reader decodes for 'name': the first one of that name.
+  const auto requestedName = fileName(name);
+  const auto column =
+      std::find_if(columns.begin(), columns.end(), [&](auto index) {
+        return fileName(schema[index].name) == requestedName;
+      });
+  if (column == columns.end()) {
+    return std::nullopt;
+  }
+  const auto& field = schema[*column];
+  if (field.max_repetition_level != 0 || !field.children_idx.empty()) {
+    return std::nullopt;
+  }
+  const auto stored = [&] {
+    if (type.id() == cudf::type_id::TIMESTAMP_DAYS) {
+      return field.type == ParquetType::INT32 &&
+          ((field.logical_type.has_value() &&
+            field.logical_type->type == cudf::io::parquet::LogicalType::DATE) ||
+           field.converted_type == cudf::io::parquet::ConvertedType::DATE);
+    }
+    if (!cudf::is_integral(type) || !cudf::is_signed(type)) {
+      return false;
+    }
+    const auto width = cudf::size_of(type) * 8;
+    if (field.logical_type.has_value()) {
+      return field.logical_type->type ==
+          cudf::io::parquet::LogicalType::INTEGER &&
+          field.logical_type->is_signed() &&
+          field.logical_type->bit_width() == width;
+    }
+    if (field.converted_type.has_value()) {
+      return false;
+    }
+    return (field.type == ParquetType::INT32 && width == 32) ||
+        (field.type == ParquetType::INT64 && width == 64);
+  }();
+  return stored ? std::optional<size_t>(*column) : std::nullopt;
+}
+
+bool CudfSplitReader::storesIntegersOfType(
+    const std::string& name,
+    cudf::data_type type) {
+  return !fileMetaDatas().empty() && findIntegerColumn(name, type).has_value();
+}
+
 void CudfSplitReader::filterDynamicRowGroups() {
   if (readerDynamicFilters_.empty()) {
     return;
@@ -1080,12 +1422,6 @@ void CudfSplitReader::filterDynamicRowGroups() {
   using ParquetType = cudf::io::parquet::Type;
   const auto& metadata = fileMetaDatas_.front();
   const auto& schema = metadata.schema;
-  const auto& columns = schema.front().children_idx;
-  const auto fileName = [&](const std::string& name) {
-    return caseInsensitiveColumnNames_
-        ? ::facebook::velox::functions::stringImpl::utf8StrToLowerCopy(name)
-        : name;
-  };
   dynamicRowGroups_.assign(metadata.row_groups.size(), true);
   std::vector<bool> allRowsMatch(metadata.row_groups.size(), true);
   for (const auto& [name, type, filter] : readerDynamicFilters_) {
@@ -1093,45 +1429,11 @@ void CudfSplitReader::filterDynamicRowGroups() {
       dynamicRowGroups_.assign(dynamicRowGroups_.size(), false);
       continue;
     }
-    // The column the reader decodes for 'name': the first one of that name.
-    const auto requestedName = fileName(name);
-    const auto column =
-        std::find_if(columns.begin(), columns.end(), [&](auto index) {
-          return fileName(schema[index].name) == requestedName;
-        });
     // The statistics are comparable with the filter's 64-bit integers only if
     // the file stores the column as the signed integer of the table's type.
-    const auto comparable = [&] {
-      if (column == columns.end() || !testsIntegerRange(filter->kind())) {
-        return false;
-      }
-      const auto& field = schema[*column];
-      if (field.max_repetition_level != 0 || !field.children_idx.empty()) {
-        return false;
-      }
-      if (type.id() == cudf::type_id::TIMESTAMP_DAYS) {
-        return field.type == ParquetType::INT32 &&
-            ((field.logical_type.has_value() &&
-              field.logical_type->type ==
-                  cudf::io::parquet::LogicalType::DATE) ||
-             field.converted_type == cudf::io::parquet::ConvertedType::DATE);
-      }
-      if (!cudf::is_integral(type) || !cudf::is_signed(type)) {
-        return false;
-      }
-      const auto width = cudf::size_of(type) * 8;
-      if (field.logical_type.has_value()) {
-        return field.logical_type->type ==
-            cudf::io::parquet::LogicalType::INTEGER &&
-            field.logical_type->is_signed() &&
-            field.logical_type->bit_width() == width;
-      }
-      if (field.converted_type.has_value()) {
-        return false;
-      }
-      return (field.type == ParquetType::INT32 && width == 32) ||
-          (field.type == ParquetType::INT64 && width == 64);
-    }();
+    const auto column = findIntegerColumn(name, type);
+    const bool comparable =
+        column.has_value() && testsIntegerRange(filter->kind());
     if (!comparable) {
       // Nothing is known about this filter: keep every row group and leave
       // the filter to the rows.
@@ -1248,6 +1550,17 @@ void CudfSplitReader::createCudfReader() {
 
   passState_ = std::make_unique<RowGroupPassState>();
   passState_->passes = selectRowGroupPasses();
+
+  // The rows of a pass read filter columns first are the rows of one column.
+  // The row groups the filter of such a read pruned above stay pruned: every
+  // row of them fails a filter the caller applies to the rows otherwise.
+  readsFilterColumnsFirst_ =
+      readsFilterColumnsFirst_ and
+      std::ranges::all_of(passState_->passes, [&](const auto& pass) {
+        return splitReader_->total_rows_in_row_groups(pass) <=
+            static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
+      });
+  setColumnChunkByteRanges();
 }
 
 void CudfSplitReader::setupPageIndexes() {
@@ -1275,10 +1588,13 @@ CudfSplitReader::RowGroupPasses CudfSplitReader::selectRowGroupPasses() {
         rowGroupIndices, readerOptions_);
   }
 
-  // Filter row groups using column chunk statistics
-  if (readerOptions_.get_filter().has_value()) {
+  // Filter row groups using column chunk statistics. The filter of a
+  // filter-first read rejects every row the pushdown filter rejects.
+  const auto& filterOptions =
+      readsFilterColumnsFirst_ ? filterFirstOptions_ : readerOptions_;
+  if (filterOptions.get_filter().has_value()) {
     rowGroupIndices = splitReader_->filter_row_groups_with_stats(
-        rowGroupIndices, readerOptions_, stream_);
+        rowGroupIndices, filterOptions, stream_);
   }
 
   if (!dynamicRowGroups_.empty()) {

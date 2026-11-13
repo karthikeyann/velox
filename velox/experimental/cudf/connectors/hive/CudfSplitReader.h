@@ -32,12 +32,15 @@
 #include "velox/type/Type.h"
 
 #include <cudf/ast/expressions.hpp>
+#include <cudf/column/column.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/types.hpp>
+#include <cudf/table/table.hpp>
 
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -103,9 +106,65 @@ class CudfSplitReader : public NvtxHelper {
   /// empty.
   const std::vector<cudf::io::parquet::FileMetaData>& fileMetaDatas();
 
+  /// Returns whether the file stores the top-level column 'name' as the
+  /// signed integers of 'type', or as dates when 'type' is TIMESTAMP_DAYS, so
+  /// that the reader decodes it in 'type'. False for a column the file does
+  /// not have and for a split without a file. Reads the footer if needed;
+  /// must be called before prepareSplit().
+  bool storesIntegersOfType(const std::string& name, cudf::data_type type);
+
   /// Sets the split-specific pushdown filter. The expression must remain alive
   /// while the split is being read.
   void setPushdownFilter(const cudf::ast::expression* filter);
+
+  /// Allows the split to be read filter columns first: the read columns
+  /// named by 'filterColumns', then the other columns for the rows 'filter'
+  /// keeps. 'filter' references exactly 'filterColumns', keeps no row the
+  /// pushdown filter rejects and takes its place in such a read. Must be
+  /// called before prepareSplit(). The expression must remain alive while the
+  /// split is being read.
+  void setFilterFirstFilter(
+      const cudf::ast::expression* filter,
+      std::vector<std::string> filterColumns);
+
+  /// Returns whether the prepared split is read filter columns first. It is
+  /// not if no such filter was set, if nothing is left to read after the
+  /// filter columns, if a filter column is not a column the file has and the
+  /// reader returns, if a row group pass has more rows than a column holds,
+  /// or if the reader has to change the rows or the columns it reads, as for
+  /// a row index or Iceberg deletes.
+  bool readsFilterColumnsFirst() const {
+    return readsFilterColumnsFirst_;
+  }
+
+  /// Narrows the rows a filter-first read keeps. Receives the filter columns
+  /// of the rows of a row group pass that the reader's filter kept, and the
+  /// index of each in the read columns. Returns a BOOL8 column without nulls
+  /// that is true for the rows to keep, or null if it tested no row.
+  using RowFilter = std::function<std::unique_ptr<cudf::column>(
+      const cudf::table_view& filterColumns,
+      std::span<const size_t> readColumns,
+      cuda::stream_ref stream)>;
+
+  /// What the reader has read of the split by reading mode.
+  struct ReadStats {
+    /// Row group passes read filter columns first.
+    int64_t numFilterFirstPasses{0};
+    /// Row group passes read with all columns in one step.
+    int64_t numOneStepPasses{0};
+    /// Rows of the passes read filter columns first.
+    int64_t numFilterFirstRows{0};
+    /// Rows of those the filters kept, whose other columns were then read.
+    int64_t numFilterFirstKeptRows{0};
+    /// Rows the row filter tested, and the rows of those it kept.
+    int64_t numRowFilterRows{0};
+    int64_t numRowFilterKeptRows{0};
+  };
+
+  /// Returns the statistics of what was read since the last call.
+  ReadStats takeReadStats() {
+    return std::exchange(readStats_, {});
+  }
 
   /// Opens the cuDF reader and sets up its options. Returns early without
   /// updating runtime statistics when the split is empty.
@@ -122,10 +181,18 @@ class CudfSplitReader : public NvtxHelper {
   struct TableChunk {
     std::unique_ptr<cudf::table> table;
     vector_size_t numRows{0};
+    /// Whether the row filter given to next() tested the rows of this chunk
+    /// before their other columns were read: in the call that started the
+    /// chunk's row group pass, which is this call or an earlier one.
+    bool rowFilterApplied{false};
   };
 
-  /// Read the next raw cudf table chunk. Returns nullopt when done.
-  virtual std::optional<TableChunk> next(uint64_t size);
+  /// Reads the next raw cudf table chunk. Returns nullopt when done.
+  /// 'rowFilter', if not empty, is called while a row group pass is read
+  /// filter columns first, during this call only.
+  virtual std::optional<TableChunk> next(
+      uint64_t size,
+      const RowFilter& rowFilter);
 
   /// Rebinds the query context of a reader prepared in the background to the
   /// context owned by the driver that reads it. Must be called before reading
@@ -182,6 +249,13 @@ class CudfSplitReader : public NvtxHelper {
 
   // Return the split-specific filter to push down to the cuDF reader.
   virtual cudf::ast::expression const* pushdownFilter() const;
+
+  // Returns whether the split can be read filter columns first with the
+  // filter set for that. A reader that pushes down another filter than the
+  // one it was given, or reads other columns from the file, returns false.
+  virtual bool supportsFilterFirst() const {
+    return true;
+  }
 
   // Determine the output memory resource for the cuDF reader.
   virtual rmm::device_async_resource_ref determineCudfMemoryResource() const;
@@ -273,8 +347,13 @@ class CudfSplitReader : public NvtxHelper {
 
   // The fetch of one row group pass.
   struct PassFetch {
-    // Owns the device data of the pass.
+    // Owns the device data of the pass: all column chunks, or the ones of the
+    // columns that are not filter columns when the split is read filter
+    // columns first.
     ByteRangeFetch fetch;
+    // Owns the device data of the filter column chunks of the pass when the
+    // split is read filter columns first.
+    ByteRangeFetch filterFetch;
     // Bytes of the fetch counted in the fetch-ahead budget.
     uint64_t heldBytes{0};
     // Where the fetch stands for the budget, while the budget counts it.
@@ -302,10 +381,47 @@ class CudfSplitReader : public NvtxHelper {
     PassFetch current;
     // The pass after it, when its fetch was started ahead.
     PassFetch next;
+
+    // Byte ranges of the column chunks of one pass.
+    struct ColumnChunkByteRanges {
+      // Filter column chunks. Empty unless the split is read filter columns
+      // first.
+      std::vector<cudf::io::text::byte_range_info> filter;
+      // The other column chunks: all of them unless the split is read filter
+      // columns first.
+      std::vector<cudf::io::text::byte_range_info> other;
+    };
+
+    // Byte ranges of each pass, known before any pass is read so that
+    // starting or offering a fetch does not disturb a read in progress.
+    std::vector<ColumnChunkByteRanges> byteRanges;
+
+    // One BOOL8 entry per row of the current pass, true for the rows its
+    // filters keep.
+    std::unique_ptr<cudf::column> rowMask;
+
+    // Filter columns of the kept rows of the current pass.
+    std::unique_ptr<cudf::table> filterTable;
+
+    // Index in the read columns of each column of 'filterTable'.
+    std::vector<size_t> filterReadColumns;
+
+    // Rows of 'filterTable' returned so far.
+    cudf::size_type numFilterRowsReturned{0};
+
+    // Whether the row filter tested the rows of the current pass.
+    bool rowFilterApplied{false};
   };
 
   // Setup the cuDF reader options
   void setupReaderOptions();
+
+  // Returns the index in the footer's schema of the top-level column 'name'
+  // if the file stores it as the signed integers of 'type', or as dates for
+  // TIMESTAMP_DAYS.
+  std::optional<size_t> findIntegerColumn(
+      const std::string& name,
+      cudf::data_type type) const;
 
   // Decides from the footer's integer statistics which row groups can hold a
   // row that passes the captured dynamic filters, and whether every row of
@@ -332,14 +448,24 @@ class CudfSplitReader : public NvtxHelper {
   void releasePassData(PassFetch& pass, bool isDecoded);
 
   // Start the reads of 'byteRanges', the column chunks of a pass, into
-  // 'pass'. 'isHeld' says whether the fetch-ahead budget already counts
-  // 'numBytes' for them.
+  // 'pass': the filter column chunks, if the split is read filter columns
+  // first, and then the others. 'isHeld' says whether the fetch-ahead budget
+  // already counts 'numBytes' for them.
   void startFetch(
       PassFetch& pass,
-      cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
+      const RowGroupPassState::ColumnChunkByteRanges& byteRanges,
       uint64_t numBytes,
       bool isHeld,
       cuda::stream_ref stream);
+
+  // Waits for 'fetch', which the first step of decoding the current pass
+  // needs, starting the fetches of the pass if they are not yet. Then offers
+  // the fetch of the next pass to the fetch-ahead budget.
+  void awaitCurrentPassFetch(ByteRangeFetch& fetch);
+
+  // Waits for 'fetch', a later fetch of the current pass, while the
+  // fetch-ahead budget starts nothing ahead.
+  void waitForFetch(ByteRangeFetch& fetch);
 
   // Offers the fetch of 'pass', which is the current pass or the one after
   // it, to the fetch-ahead budget.
@@ -359,6 +485,23 @@ class CudfSplitReader : public NvtxHelper {
 
   // Returns the stream that the reader's fetches are started ahead on.
   cuda::stream_ref fetchAheadStream();
+
+  // Makes the next pass the current one and starts its fetch unless it was
+  // started ahead.
+  void finishCurrentPass();
+
+  // Finds the byte ranges of the column chunks of every pass.
+  void setColumnChunkByteRanges();
+
+  // Reads the filter columns of the current pass, narrows the row mask of the
+  // pass with the reader's filter and the row filter, and sets up the chunked
+  // read of the other columns. Returns false if no row of the pass is kept.
+  bool setupFilterFirstPass(rmm::device_async_resource_ref mr);
+
+  // Reads the next chunk of the columns that are not filter columns and joins
+  // it with the filter columns of the same rows, in read column order.
+  std::unique_ptr<cudf::table> readFilterFirstChunk(
+      rmm::device_async_resource_ref mr);
 
   std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
   memory::MemoryPool* pool_;
@@ -386,6 +529,8 @@ class CudfSplitReader : public NvtxHelper {
   // cuDF split reader stuff.
   std::shared_ptr<cudf::io::datasource> dataSource_;
   cudf::io::parquet_reader_options readerOptions_;
+  // 'readerOptions_' with the filter of a filter-first read.
+  cudf::io::parquet_reader_options filterFirstOptions_;
   CudfParquetReaderPtr splitReader_;
 
   // Row group passes and byte fetch states.
@@ -410,6 +555,17 @@ class CudfSplitReader : public NvtxHelper {
   bool hasSplitSpecificPushdownFilter_{false};
   // Set when an ignored missing data file leaves nothing to read.
   bool emptySplit_{false};
+
+  // Filter of a filter-first read and the read columns it references. Null
+  // when the split is always read in one step.
+  const cudf::ast::expression* filterFirstFilter_{nullptr};
+  std::vector<std::string> filterFirstColumns_;
+  // Whether the prepared split is read filter columns first.
+  bool readsFilterColumnsFirst_{false};
+  // The row filter of the next() call in progress. Not owned.
+  const RowFilter* rowFilter_{nullptr};
+  // What was read since the last takeReadStats().
+  ReadStats readStats_;
 
   struct TotalScanTimeCallbackData {
     // SteadyTime reading in microseconds when the chunk read started.

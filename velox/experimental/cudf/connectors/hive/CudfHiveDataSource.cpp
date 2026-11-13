@@ -706,7 +706,9 @@ CudfHiveDataSource::CudfHiveDataSource(
       outputType_(outputType),
       pool_(connectorQueryCtx->memoryPool()),
       expressionEvaluator_(connectorQueryCtx->expressionEvaluator()),
-      partitionKeySource_(partitionKeySource) {
+      partitionKeySource_(partitionKeySource),
+      filterFirst_(cudfHiveConfig->isFilterFirstSession(
+          connectorQueryCtx->sessionProperties())) {
   tableHandle_ =
       std::dynamic_pointer_cast<const hive::HiveTableHandle>(tableHandle);
   VELOX_CHECK_NOT_NULL(
@@ -988,6 +990,7 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   }
 
   // An empty split has no footer to build the filter from.
+  const auto* pushdownFilter = subfieldFilterAst_;
   if (hasDecimalSubfieldFilter_ and
       not cudfSplitReader_->fileMetaDatas().empty()) {
     const auto& fileMetadatas = cudfSplitReader_->fileMetaDatas();
@@ -1009,6 +1012,16 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
         readerFilterType,
         &decimalTypes);
     cudfSplitReader_->setPushdownFilter(&filter);
+    pushdownFilter = &filter;
+  }
+  if (filterFirst_ and pushdownFilter != nullptr) {
+    std::vector<std::string> filterColumns;
+    filterColumns.reserve(subfieldFilters_.size());
+    for (const auto& [field, _] : subfieldFilters_) {
+      filterColumns.push_back(field.toString());
+    }
+    cudfSplitReader_->setFilterFirstFilter(
+        pushdownFilter, std::move(filterColumns));
   }
   cudfSplitReader_->prepareSplit(runtimeStats_);
 
@@ -1532,7 +1545,12 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     return nullptr;
   }
   ensureCudaContextForThread();
-  auto chunkOpt = cudfSplitReader_->next(size);
+  auto chunkOpt = cudfSplitReader_->next(size, {});
+  const auto readStats = cudfSplitReader_->takeReadStats();
+  readStats_.numFilterFirstPasses += readStats.numFilterFirstPasses;
+  readStats_.numOneStepPasses += readStats.numOneStepPasses;
+  readStats_.numFilterFirstRows += readStats.numFilterFirstRows;
+  readStats_.numFilterFirstKeptRows += readStats.numFilterFirstKeptRows;
   if (!chunkOpt.has_value()) {
     cudfSplitReader_->resetSplit();
     splitExhausted_ = true;
@@ -1685,6 +1703,20 @@ CudfHiveDataSource::getRuntimeStats() {
     result.emplace(
         kDynamicFilterValueUploads,
         RuntimeMetric(numDynamicFilterValueUploads_));
+  }
+  if (filterFirst_) {
+    // Reported also when zero, so that a scan that never read filter columns
+    // first shows it.
+    result.insert({
+        {std::string(kFilterFirstPasses),
+         RuntimeMetric(readStats_.numFilterFirstPasses)},
+        {std::string(kFilterFirstOneStepPasses),
+         RuntimeMetric(readStats_.numOneStepPasses)},
+        {std::string(kFilterFirstRows),
+         RuntimeMetric(readStats_.numFilterFirstRows)},
+        {std::string(kFilterFirstKeptRows),
+         RuntimeMetric(readStats_.numFilterFirstKeptRows)},
+    });
   }
   const auto& ioStats = ioStats_->stats();
   for (const auto& [key, value] : ioStats) {

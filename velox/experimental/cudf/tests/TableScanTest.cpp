@@ -2273,6 +2273,395 @@ TEST_F(TableScanTest, tileDecode) {
   }
 }
 
+// With 'parquet.reader.filter_first' a split with a pushed-down filter is read
+// in two steps, the filter columns and then the other columns of the rows the
+// filter keeps. The scan returns the rows of the one-step read, in its order.
+TEST_F(TableScanTest, filterFirst) {
+  using cudf_velox::connector::hive::CudfHiveConfig;
+  using cudf_velox::connector::hive::CudfHiveDataSource;
+  constexpr vector_size_t kRowsPerGroup{1'000};
+  constexpr int32_t kNumGroups{5};
+  constexpr int32_t kNumFiles{4};
+  const auto rowType = ROW({
+      {"c0", INTEGER()},
+      {"c1", BIGINT()},
+      {"c2", DOUBLE()},
+      {"c3", VARCHAR()},
+  });
+
+  // c0 is the row number in the file. c1, a filter column, and the payload
+  // columns c2 and c3 have nulls.
+  auto filePaths = makeFilePaths(kNumFiles);
+  std::vector<RowVectorPtr> allVectors;
+  for (int32_t file = 0; file < kNumFiles; ++file) {
+    std::vector<RowVectorPtr> groups;
+    for (int32_t group = 0; group < kNumGroups; ++group) {
+      const auto base = group * kRowsPerGroup;
+      std::vector<std::optional<std::string>> strings;
+      for (vector_size_t row = 0; row < kRowsPerGroup; ++row) {
+        strings.push_back(
+            row % 13 == 0
+                ? std::nullopt
+                : std::optional(fmt::format("{}-{}", file, base + row)));
+      }
+      groups.push_back(makeRowVector(
+          rowType->names(),
+          {
+              makeFlatVector<int32_t>(
+                  kRowsPerGroup, [&](auto row) { return base + row; }),
+              makeFlatVector<int64_t>(
+                  kRowsPerGroup,
+                  [&](auto row) { return (base + row) % 7; },
+                  nullEvery(11)),
+              makeFlatVector<double>(
+                  kRowsPerGroup,
+                  [&](auto row) { return (base + row) * 0.5 + file; },
+                  nullEvery(5)),
+              makeNullableFlatVector<std::string>(strings),
+          }));
+    }
+    writeToFile(filePaths[file]->getPath(), groups);
+    allVectors.insert(allVectors.end(), groups.begin(), groups.end());
+  }
+  createDuckDbTable(allVectors);
+
+  struct TestCase {
+    std::string name;
+    std::function<common::SubfieldFilters()> filters;
+    std::string sql;
+    // Rows per file of the row groups whose statistics pass the filter, and
+    // rows per file the filter keeps.
+    int64_t numFilterFirstRows;
+    int64_t numKeptRows;
+  };
+  const auto range = [](int64_t lower, int64_t upper, bool nullAllowed) {
+    return std::make_unique<common::BigintRange>(lower, upper, nullAllowed);
+  };
+  constexpr auto kMin = std::numeric_limits<int64_t>::min();
+  constexpr auto kMax = std::numeric_limits<int64_t>::max();
+  // Rows of a file with c0 in [lower, upper] and a c1 that is not null and at
+  // least 'minimum'.
+  const auto numMatches = [](int32_t lower, int32_t upper, int64_t minimum) {
+    int64_t count{0};
+    for (auto row = lower; row <= upper; ++row) {
+      count += (row % kRowsPerGroup) % 11 != 0 && row % 7 >= minimum;
+    }
+    return count;
+  };
+  const std::vector<TestCase> testCases{
+      {"two filter columns, nulls rejected, two of five row groups",
+       [&] {
+         return SubfieldFiltersBuilder()
+             .add("c0", range(1'500, 2'600, false))
+             .add("c1", range(3, kMax, false))
+             .build();
+       },
+       "c0 BETWEEN 1500 AND 2600 AND c1 >= 3",
+       2 * kRowsPerGroup,
+       numMatches(1'500, 2'600, 3)},
+      {"nulls of the filter column kept",
+       [&] {
+         return SubfieldFiltersBuilder()
+             .add("c1", range(kMin, 2, true))
+             .build();
+       },
+       "c1 <= 2 OR c1 IS NULL",
+       kNumGroups * kRowsPerGroup,
+       kNumGroups * kRowsPerGroup - numMatches(0, 4'999, 3)},
+      {"no row kept in a row group the statistics keep",
+       [&] {
+         return SubfieldFiltersBuilder()
+             .add("c0", range(1, 6, false))
+             .add("c1", range(0, 0, false))
+             .build();
+       },
+       "c0 BETWEEN 1 AND 6 AND c1 = 0",
+       kRowsPerGroup,
+       0},
+      {"every row kept",
+       [&] {
+         return SubfieldFiltersBuilder()
+             .add("c0", range(0, kMax, false))
+             .build();
+       },
+       "c0 >= 0",
+       kNumGroups * kRowsPerGroup,
+       kNumGroups * kRowsPerGroup},
+  };
+
+  // The filter column c1 is not projected; c0 is, between payload columns.
+  const auto outputType =
+      ROW({{"c3", VARCHAR()}, {"c0", INTEGER()}, {"c2", DOUBLE()}});
+  const auto assignments = HiveConnectorTestBase::allRegularColumns(rowType);
+  auto connector = ::facebook::velox::connector::ConnectorRegistry::tryGet(
+      kCudfHiveConnectorId);
+
+  struct Limits {
+    std::string chunkReadLimit;
+    std::string passReadLimit;
+  };
+  for (const auto& testCase : testCases) {
+    for (const auto& limits : {Limits{"0", "0"}, Limits{"4096", "32768"}}) {
+      SCOPED_TRACE(
+          fmt::format(
+              "{}, chunk read limit {}, pass read limit {}",
+              testCase.name,
+              limits.chunkReadLimit,
+              limits.passReadLimit));
+
+      // One data source reads the files in order, with the setting off and
+      // on.
+      struct Read {
+        std::vector<RowVectorPtr> rows;
+        std::unordered_map<std::string, RuntimeMetric> stats;
+      };
+      const auto read = [&](bool filterFirst) {
+        auto session = std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>{
+                {CudfHiveConfig::kFilterFirstSession,
+                 filterFirst ? "true" : "false"},
+                {CudfHiveConfig::kMaxChunkReadLimitSession,
+                 limits.chunkReadLimit},
+                {CudfHiveConfig::kMaxPassReadLimitSession,
+                 limits.passReadLimit},
+            });
+        ::facebook::velox::connector::ConnectorQueryCtx ctx(
+            pool_.get(),
+            pool_.get(),
+            session.get(),
+            nullptr,
+            common::PrefixSortConfig{},
+            nullptr,
+            nullptr,
+            "query",
+            "task",
+            "scan",
+            0,
+            "");
+        auto source = connector->createDataSource(
+            outputType,
+            makeTableHandle("t", rowType, testCase.filters(), nullptr),
+            assignments,
+            &ctx);
+        Read result;
+        for (const auto& filePath : filePaths) {
+          source->addSplit(makeCudfHiveConnectorSplit(filePath->getPath()));
+          for (auto& rows : readSplit(*source, outputType, pool_.get())) {
+            result.rows.push_back(std::move(rows));
+          }
+        }
+        result.stats = source->getRuntimeStats();
+        return result;
+      };
+      const auto oneStep = read(false);
+      const auto twoSteps = read(true);
+
+      const std::string filterFirstRows{CudfHiveDataSource::kFilterFirstRows};
+      const std::string keptRows{CudfHiveDataSource::kFilterFirstKeptRows};
+      EXPECT_FALSE(oneStep.stats.contains(filterFirstRows));
+      ASSERT_TRUE(twoSteps.stats.contains(filterFirstRows));
+      EXPECT_GT(
+          twoSteps.stats.at(std::string(CudfHiveDataSource::kFilterFirstPasses))
+              .sum,
+          0);
+      EXPECT_EQ(
+          twoSteps.stats
+              .at(std::string(CudfHiveDataSource::kFilterFirstOneStepPasses))
+              .sum,
+          0);
+      EXPECT_EQ(
+          twoSteps.stats.at(filterFirstRows).sum,
+          kNumFiles * testCase.numFilterFirstRows);
+      EXPECT_EQ(
+          twoSteps.stats.at(keptRows).sum, kNumFiles * testCase.numKeptRows);
+      EXPECT_EQ(numRows(twoSteps.rows), kNumFiles * testCase.numKeptRows);
+
+      // Same rows in the same order, whatever the chunk boundaries.
+      const auto flatten = [&](const std::vector<RowVectorPtr>& rows) {
+        auto all = BaseVector::create<RowVector>(outputType, 0, pool_.get());
+        for (const auto& vector : rows) {
+          all->append(vector.get());
+        }
+        return all;
+      };
+      facebook::velox::test::assertEqualVectors(
+          flatten(oneStep.rows), flatten(twoSteps.rows));
+
+      // Four drivers with splits prepared ahead.
+      auto plan = PlanBuilder()
+                      .startTableScan()
+                      .outputType(outputType)
+                      .tableHandle(makeTableHandle(
+                          "t", rowType, testCase.filters(), nullptr))
+                      .assignments(assignments)
+                      .endTableScan()
+                      .planNode();
+      auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                      .config(core::QueryConfig::kMaxSplitPreloadPerDriver, "2")
+                      .connectorSessionProperty(
+                          kCudfHiveConnectorId,
+                          CudfHiveConfig::kFilterFirstSession,
+                          "true")
+                      .connectorSessionProperty(
+                          kCudfHiveConnectorId,
+                          CudfHiveConfig::kMaxChunkReadLimitSession,
+                          limits.chunkReadLimit)
+                      .connectorSessionProperty(
+                          kCudfHiveConnectorId,
+                          CudfHiveConfig::kMaxPassReadLimitSession,
+                          limits.passReadLimit)
+                      .maxDrivers(4)
+                      .splits(makeCudfHiveConnectorSplits(
+                          {filePaths[0],
+                           filePaths[1],
+                           filePaths[2],
+                           filePaths[3],
+                           filePaths[0],
+                           filePaths[1],
+                           filePaths[2],
+                           filePaths[3]}))
+                      .assertResults(
+                          fmt::format(
+                              "SELECT c3, c0, c2 FROM tmp WHERE {0} UNION ALL "
+                              "SELECT c3, c0, c2 FROM tmp WHERE {0}",
+                              testCase.sql));
+      const auto planStats = toPlanStats(task->taskStats());
+      const auto& customStats = planStats.at(plan->id()).customStats;
+      ASSERT_TRUE(customStats.contains(keptRows));
+      EXPECT_EQ(
+          customStats.at(keptRows).sum, 2 * kNumFiles * testCase.numKeptRows);
+    }
+  }
+}
+
+// A scan that reads filter columns first can have its fetches started ahead:
+// the filter column chunks and the other column chunks of a pass count as one
+// fetch in the budget, which gets every byte back.
+TEST_F(TableScanTest, filterFirstWithFetchAhead) {
+  using cudf_velox::connector::hive::CudfHiveConfig;
+  using cudf_velox::connector::hive::CudfHiveDataSource;
+  constexpr vector_size_t kRowsPerGroup{1'000};
+  constexpr int32_t kNumGroups{6};
+  constexpr int32_t kNumFiles{8};
+  const auto rowType =
+      ROW({{"c0", BIGINT()}, {"c1", DOUBLE()}, {"c2", VARCHAR()}});
+  // c0 is the row number in the file.
+  auto filePaths = makeFilePaths(kNumFiles);
+  std::vector<RowVectorPtr> allVectors;
+  for (int32_t file = 0; file < kNumFiles; ++file) {
+    std::vector<RowVectorPtr> groups;
+    for (int32_t group = 0; group < kNumGroups; ++group) {
+      const auto base = group * kRowsPerGroup;
+      groups.push_back(makeRowVector(
+          rowType->names(),
+          {
+              makeFlatVector<int64_t>(
+                  kRowsPerGroup, [&](auto row) { return base + row; }),
+              makeFlatVector<double>(
+                  kRowsPerGroup,
+                  [&](auto row) { return (base + row) * 0.5 + file; },
+                  nullEvery(5)),
+              makeFlatVector<std::string>(
+                  kRowsPerGroup,
+                  [&](auto row) {
+                    return fmt::format("{}-{}", file, base + row);
+                  },
+                  nullEvery(13)),
+          }));
+    }
+    writeToFile(filePaths[file]->getPath(), groups);
+    allVectors.insert(allVectors.end(), groups.begin(), groups.end());
+  }
+  createDuckDbTable(allVectors);
+
+  // Rows 1'500 to 4'200: four of the six row groups of a file.
+  constexpr int64_t kNumKeptRows{2'701};
+  auto plan =
+      PlanBuilder()
+          .startTableScan()
+          .outputType(rowType)
+          .tableHandle(makeTableHandle(
+              "t",
+              rowType,
+              SubfieldFiltersBuilder()
+                  .add(
+                      "c0",
+                      std::make_unique<common::BigintRange>(
+                          1'500, 4'200, false))
+                  .build(),
+              nullptr))
+          .assignments(HiveConnectorTestBase::allRegularColumns(rowType))
+          .endTableScan()
+          .planNode();
+
+  struct Limits {
+    std::string chunkReadLimit;
+    std::string passReadLimit;
+  };
+  // With the limits of the second case a split is read in several passes, and
+  // the pass after the one being decoded is fetched ahead as well.
+  for (const auto& limits : {Limits{"0", "0"}, Limits{"4096", "16384"}}) {
+    for (const auto numDrivers : {1, 4}) {
+      SCOPED_TRACE(
+          fmt::format(
+              "chunk read limit {}, pass read limit {}, {} drivers",
+              limits.chunkReadLimit,
+              limits.passReadLimit,
+              numDrivers));
+      // Every scan has a connector, and so a budget, of its own.
+      resetCudfHiveConnector(
+          std::make_shared<config::ConfigBase>(
+              std::unordered_map<std::string, std::string>{
+                  {CudfHiveConfig::kFetchAheadBytes,
+                   std::to_string(1ULL << 30)},
+                  {CudfHiveConfig::kPreloadColumnChunks, "true"},
+                  {CudfHiveConfig::kUseBufferedInput, "false"},
+              }));
+      auto task =
+          AssertQueryBuilder(plan, duckDbQueryRunner_)
+              .config(core::QueryConfig::kMaxSplitPreloadPerDriver, "3")
+              .connectorSessionProperty(
+                  kCudfHiveConnectorId,
+                  CudfHiveConfig::kFilterFirstSession,
+                  "true")
+              .connectorSessionProperty(
+                  kCudfHiveConnectorId,
+                  CudfHiveConfig::kMaxChunkReadLimitSession,
+                  limits.chunkReadLimit)
+              .connectorSessionProperty(
+                  kCudfHiveConnectorId,
+                  CudfHiveConfig::kMaxPassReadLimitSession,
+                  limits.passReadLimit)
+              .maxDrivers(numDrivers)
+              .splits(makeCudfHiveConnectorSplits(filePaths))
+              .assertResults(
+                  "SELECT c0, c1, c2 FROM tmp WHERE c0 BETWEEN 1500 AND 4200");
+      const auto planStats = toPlanStats(task->taskStats());
+      const auto& customStats = planStats.at(plan->id()).customStats;
+      EXPECT_GE(
+          customStats.at(std::string(CudfHiveDataSource::kFilterFirstPasses))
+              .sum,
+          kNumFiles);
+      EXPECT_EQ(
+          customStats
+              .at(std::string(CudfHiveDataSource::kFilterFirstOneStepPasses))
+              .sum,
+          0);
+      EXPECT_EQ(
+          customStats.at(std::string(CudfHiveDataSource::kFilterFirstKeptRows))
+              .sum,
+          kNumFiles * kNumKeptRows);
+      task.reset();
+      waitForAllTasksToBeDeleted();
+      const auto fetchAhead = fetchAheadStats();
+      EXPECT_GT(fetchAhead.numOffered, 0);
+      EXPECT_EQ(fetchAhead.heldBytes, 0);
+      EXPECT_EQ(fetchAhead.numWaiting, 0);
+      EXPECT_EQ(fetchAhead.numAhead, 0);
+    }
+  }
+}
+
 // Presto pushes an equality on a column into the scan and re-creates the
 // column above it as a constant projection. When the scan reads no other
 // column, that projection sits over a zero-column input and still runs on the

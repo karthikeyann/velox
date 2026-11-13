@@ -80,6 +80,12 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   // Skip Parquet pushdown when the subfield filter must run after reading.
   cudf::ast::expression const* pushdownFilter() const override;
 
+  // Deletes, injected columns and deferred filters are applied to tables read
+  // in one step.
+  bool supportsFilterFirst() const override {
+    return false;
+  }
+
   // Override to determine the memory resource to construct cuDF reader.
   rmm::device_async_resource_ref determineCudfMemoryResource() const override;
 
