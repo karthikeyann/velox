@@ -26,6 +26,8 @@
 
 #include <cuco/static_set.cuh>
 #include <cuda/iterator>
+#include <thrust/fill.h>
+#include <thrust/for_each.h>
 #include <thrust/transform.h>
 
 #include <algorithm>
@@ -259,6 +261,69 @@ void CudfIntegerHashSet::apply(
       CUDF_FAIL("Integer hash membership requires a signed integer column");
     }
   });
+}
+
+namespace {
+template <typename T>
+struct SetBitmapBit {
+  const T* values;
+  const cudf::bitmask_type* nulls;
+  cudf::size_type offset;
+  int64_t minimum;
+  uint32_t* bitmap;
+
+  __device__ void operator()(cudf::size_type row) const {
+    if (nulls && !cudf::bit_is_set(nulls, row + offset)) {
+      return;
+    }
+    const auto index =
+        static_cast<uint64_t>(values[row]) - static_cast<uint64_t>(minimum);
+    atomicOr(bitmap + index / 32, uint32_t{1} << (index % 32));
+  }
+};
+} // namespace
+
+std::unique_ptr<cudf::column> makeIntegerBitmap(
+    const std::vector<cudf::column_view>& inputs,
+    int64_t minimum,
+    int64_t maximum,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  const auto span =
+      static_cast<uint64_t>(maximum) - static_cast<uint64_t>(minimum);
+  CUDF_EXPECTS(
+      span / 32 <
+          static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max()),
+      "Integer bitmap is too wide");
+  auto bitmap = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::UINT32},
+      static_cast<cudf::size_type>(span / 32 + 1),
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  auto* words = bitmap->mutable_view().data<uint32_t>();
+  thrust::fill_n(
+      rmm::exec_policy_nosync(stream, mr), words, bitmap->size(), uint32_t{0});
+  for (const auto& input : inputs) {
+    cudf::type_dispatcher(input.type(), [&]<typename T>() {
+      if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
+        auto rows = cuda::counting_iterator<cudf::size_type>{0};
+        thrust::for_each_n(
+            rmm::exec_policy_nosync(stream, mr),
+            rows,
+            input.size(),
+            SetBitmapBit<T>{
+                input.data<T>(),
+                input.null_mask(),
+                input.offset(),
+                minimum,
+                words});
+      } else {
+        CUDF_FAIL("Integer bitmap requires a signed integer column");
+      }
+    });
+  }
+  return bitmap;
 }
 
 void applyIntegerBitmapToMask(

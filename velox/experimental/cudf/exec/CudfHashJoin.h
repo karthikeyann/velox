@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/exec/CudfBuildKeyFilter.h"
 #include "velox/experimental/cudf/exec/CudfJoin.h"
 #include "velox/experimental/cudf/exec/CudfJoinBuild.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
@@ -35,6 +36,7 @@
 
 #include <cuda/stream>
 
+#include <atomic>
 #include <memory>
 #include <unordered_set>
 #include <vector>
@@ -80,6 +82,17 @@ class CudfHashJoinBridge : public exec::JoinBridge {
 
   std::shared_ptr<CudaEvent> getBuildReadyEvent();
 
+  /// Records that a probe sent the scan a dynamic filter that keeps exactly
+  /// the probe rows the join does.
+  void setReplacedByDynamicFilter() {
+    replacedByDynamicFilter_ = true;
+  }
+
+  /// Whether every probe of the join can pass its input through.
+  bool replacedByDynamicFilter() const {
+    return replacedByDynamicFilter_;
+  }
+
  private:
   /** @brief Hash tables and join objects transferred from build to probe
    * operators */
@@ -88,6 +101,9 @@ class CudfHashJoinBridge : public exec::JoinBridge {
   std::optional<cuda::stream_ref> buildStream_;
   /** @brief Event recorded after build-side CUDA work is ready for probes */
   std::shared_ptr<CudaEvent> buildReadyEvent_;
+  // Written by the one probe that produces the dynamic filters and read by
+  // the others after the Driver's pushdown lock.
+  std::atomic_bool replacedByDynamicFilter_{false};
 };
 
 /**
@@ -170,6 +186,11 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   void doNoMoreInput() override;
   void doClose() override;
 
+  /// Returns a filter that passes the build side's values of the join key
+  /// at 'keyIndex' in the join keys. Call after the build side has arrived
+  /// (isBlocked() returned kNotBlocked once).
+  BuildKeyFilter buildKeyFilter(column_index_t keyIndex);
+
  private:
   void waitForBuildReady(cuda::stream_ref stream);
 
@@ -190,18 +211,22 @@ class CudfHashJoinProbe : public CudfOperatorBase {
 
   struct ReadStream;
   ReadStream* findReadStream(cuda::stream_ref stream);
-  // Builds a supported integer dynamic filter from a build key.
-  std::shared_ptr<common::Filter> makeIntegerDynamicFilter(
-      column_index_t keyIndex);
+  // Returns the dynamic filter for the probe key at 'keyIndex' in the join
+  // keys, or null if the key type carries none. Tells 'bridge' if the filter
+  // replaces the join.
+  common::FilterPtr makeDynamicFilter(
+      column_index_t keyIndex,
+      CudfHashJoinBridge& bridge);
 
-  // Checks plan restrictions; the build keys must also be unique.
-  bool canReplaceJoinWithUniqueKeys() const;
+  // Whether a filter that keeps exactly the probe rows with a build key gives
+  // the output of the join.
+  bool canReplaceJoinWithDynamicFilter() const;
 
-  // Returns the matching probe operators in this pipeline.
-  std::vector<CudfHashJoinProbe*> findPeerOperators();
+  // Whether the join drops the probe rows that have no build key.
+  bool canPushdownDynamicFilters() const;
 
-  // Publishes build-side filters through the existing Driver protocol.
-  void pushdownDynamicFilters();
+  // Sends a filter per join key to the operators upstream that accept one.
+  void pushdownDynamicFilters(CudfHashJoinBridge& bridge);
 
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   /** @brief Hash tables and join objects received from build operator */
@@ -239,10 +264,8 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   // Preserves the join key order expected by Driver::pushdownFilters().
   std::vector<column_index_t> probeKeyChannels_;
 
-  // Learned while deduplicating a complete single-key build for an exact
-  // filter.
-  bool dynamicFilterHasUniqueKeys_{false};
-  // The exact pushed filter can replace an inner join with probe-only output.
+  // The scan upstream drops the probe rows the join would, so the join passes
+  // its input through.
   bool canReplaceWithDynamicFilter_{false};
   CudfJoinOutputLayout outputLayout_;
   bool finished_{false};

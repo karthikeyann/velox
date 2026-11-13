@@ -67,6 +67,10 @@ struct CudfConfig {
       "cudf.partitioned_output_batch_rows"};
   static constexpr const char* kCudfDynamicFilterEnabled{
       "cudf.dynamic_filter_enabled"};
+  static constexpr const char* kCudfDynamicFilterMaxValues{
+      "cudf.dynamic_filter_max_values"};
+  static constexpr const char* kCudfDynamicFilterMaxBitmapBytes{
+      "cudf.dynamic_filter_max_bitmap_bytes"};
   static constexpr const char* kCudfDynamicFilterRowFilterEnabled{
       "cudf.dynamic_filter_row_filter_enabled"};
   /// Query session configs for the cuDF Operators.
@@ -203,8 +207,22 @@ struct CudfConfig {
   // Query config key for the TopN batch size in the cuDF TopN operator.
   int32_t topNBatchSize{5};
 
-  /// Whether a cuDF Hive scan accepts dynamic filters.
+  /// Whether cuDF takes part in dynamic filtering: a cuDF hash join sends
+  /// dynamic filters and a cuDF Hive scan accepts them. Velox's
+  /// hash_probe_dynamic_filter_pushdown_enabled applies in addition.
   bool dynamicFilterEnabled{true};
+
+  /// Largest number of distinct build-side keys a cuDF hash join sends the
+  /// scan as an exact set of values, its dynamic filter. A build side with
+  /// more keys, or with more than 64 times as many key rows, sends only the
+  /// smallest and largest key. 0 sends bounds only.
+  int64_t dynamicFilterMaxValues{100'000};
+
+  /// Largest device bitmap, in bytes, a cuDF hash join with more build-side
+  /// key rows than dynamicFilterMaxValues builds for a cuDF scan to test rows
+  /// with. The bitmap has one bit per integer between the smallest and the
+  /// largest key. 0 sends such a join's key bounds only.
+  int64_t dynamicFilterMaxBitmapBytes{128 << 20};
 
   /// Whether a cuDF scan drops the rows that fail a dynamic filter whose join
   /// still checks every key. Such a filter always prunes row groups. A filter

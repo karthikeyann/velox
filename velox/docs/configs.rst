@@ -1672,7 +1672,15 @@ Note: These configurations are experimental and subject to change.
    * - cudf.dynamic_filter_enabled
      - bool
      - true
-     - If true, a cuDF Hive scan accepts dynamic filters, whoever sends them. If false, no dynamic filter reaches a cuDF Hive scan.
+     - If true, a cuDF hash join sends dynamic filters to the scans on its probe side and a cuDF Hive scan accepts dynamic filters, whoever sends them. If false, cuDF takes no part in dynamic filtering. ``hash_probe_dynamic_filter_pushdown_enabled`` must be true as well for a join to send filters.
+   * - cudf.dynamic_filter_max_values
+     - integer
+     - 100000
+     - Largest number of distinct build-side keys a cuDF hash join sends the probe-side scan as an exact set of values, its dynamic filter. A join with more keys, or with more than 64 times as many build-side key rows, sends the smallest and the largest key, and a bitmap of the keys if ``cudf.dynamic_filter_max_bitmap_bytes`` allows it. 0 never sends the set. Dynamic filters are produced only when ``hash_probe_dynamic_filter_pushdown_enabled`` is true.
+   * - cudf.dynamic_filter_max_bitmap_bytes
+     - integer
+     - 134217728
+     - Largest bitmap of join keys, in bytes, that a cuDF hash join with more build-side key rows than ``cudf.dynamic_filter_max_values`` builds on the device for a cuDF scan to filter rows with. The bitmap has one bit per integer between the smallest and the largest key. 0 sends such a join's smallest and largest key only.
    * - cudf.dynamic_filter_row_filter_enabled
      - bool
      - true

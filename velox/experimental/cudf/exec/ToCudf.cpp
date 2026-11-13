@@ -539,6 +539,14 @@ void CudfConfig::initialize(
   if (config.find(kCudfDynamicFilterEnabled) != config.end()) {
     dynamicFilterEnabled = folly::to<bool>(config[kCudfDynamicFilterEnabled]);
   }
+  if (config.find(kCudfDynamicFilterMaxValues) != config.end()) {
+    dynamicFilterMaxValues =
+        folly::to<int64_t>(config[kCudfDynamicFilterMaxValues]);
+  }
+  if (config.find(kCudfDynamicFilterMaxBitmapBytes) != config.end()) {
+    dynamicFilterMaxBitmapBytes =
+        folly::to<int64_t>(config[kCudfDynamicFilterMaxBitmapBytes]);
+  }
   if (config.find(kCudfDynamicFilterRowFilterEnabled) != config.end()) {
     dynamicFilterRowFilterEnabled =
         folly::to<bool>(config[kCudfDynamicFilterRowFilterEnabled]);

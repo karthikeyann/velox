@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfDynamicFilter.h"
+#include "velox/experimental/cudf/exec/CudfBuildKeyFilter.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -44,6 +45,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/reshape.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/search.hpp>
 #include <cudf/stream_compaction.hpp>
@@ -495,144 +497,78 @@ void CudfHashJoinProbe::waitForBuildReady(cuda::stream_ref stream) {
   }
 }
 
-std::shared_ptr<common::Filter> CudfHashJoinProbe::makeIntegerDynamicFilter(
-    column_index_t keyIndex) {
+BuildKeyFilter CudfHashJoinProbe::buildKeyFilter(column_index_t keyIndex) {
   VELOX_CHECK_LT(keyIndex, rightKeyIndices_.size());
   VELOX_CHECK(hashObject_.has_value());
-  common::testutil::TestValue::adjust(
-      "facebook::velox::cudf_velox::CudfHashJoinProbe::makeIntegerDynamicFilter",
-      this);
-
-  const auto& keyType = buildType_->childAt(rightKeyIndices_[keyIndex]);
-  if (keyType != TINYINT() && keyType != SMALLINT() && keyType != INTEGER() &&
-      keyType != BIGINT()) {
-    return nullptr;
-  }
-
   const auto& buildTables = hashObject_->first;
-  uint64_t numBuildValues{0};
+  std::vector<cudf::column_view> keys;
+  keys.reserve(buildTables.size());
   for (const auto& table : buildTables) {
-    const auto& keyColumn = table->get_column(rightKeyIndices_[keyIndex]);
-    const auto nullCount = keyColumn.null_count();
-    numBuildValues +=
-        nullCount >= 0 ? keyColumn.size() - nullCount : keyColumn.size();
+    keys.push_back(table->get_column(rightKeyIndices_[keyIndex]).view());
   }
-  // Bound the host copy and sorting work for an exact GPU join filter.
-  constexpr uint64_t kMaxBuildRows = 10'000;
-  if (numBuildValues == 0 || numBuildValues > kMaxBuildRows) {
-    return nullptr;
-  }
-
   auto stream =
       buildStream_ ? *buildStream_ : cudfGlobalStreamPool().get_stream();
   waitForBuildReady(stream);
-  return cudf::type_dispatcher(
-      buildTables.front()->get_column(rightKeyIndices_[keyIndex]).type(),
-      [&]<typename T>() -> common::FilterPtr {
-        if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
-          std::vector<T> hostValues;
-          std::vector<std::unique_ptr<cudf::table>> nonNullTables;
-          hostValues.reserve(numBuildValues);
-          nonNullTables.reserve(buildTables.size());
-          for (const auto& table : buildTables) {
-            auto input = table->get_column(rightKeyIndices_[keyIndex]).view();
-            if (input.null_count() != 0) {
-              nonNullTables.push_back(
-                  cudf::drop_nulls(
-                      cudf::table_view{{input}},
-                      std::vector<cudf::size_type>{0},
-                      stream,
-                      get_temp_mr()));
-              input = nonNullTables.back()->view().column(0);
-            }
-            if (input.size() == 0) {
-              continue;
-            }
-            const auto offset = hostValues.size();
-            hostValues.resize(offset + input.size());
-            CUDF_CUDA_TRY(cudaMemcpyAsync(
-                hostValues.data() + offset,
-                input.data<T>(),
-                input.size() * sizeof(T),
-                cudaMemcpyDeviceToHost,
-                stream.get()));
-          }
-          stream.sync();
-          if (hostValues.empty()) {
-            return nullptr;
-          }
-          if (!canReplaceJoinWithUniqueKeys()) {
-            const auto [lower, upper] =
-                std::minmax_element(hostValues.begin(), hostValues.end());
-            return connector::hive::makeAdvisoryFilter(
-                std::make_unique<common::BigintRange>(*lower, *upper, false));
-          }
-          const auto numNonNullValues = hostValues.size();
-          std::vector<int64_t> values;
-          if constexpr (std::is_same_v<T, int64_t>) {
-            values = std::move(hostValues);
-          } else {
-            values.assign(hostValues.begin(), hostValues.end());
-          }
-          std::sort(values.begin(), values.end());
-          values.erase(std::unique(values.begin(), values.end()), values.end());
-          dynamicFilterHasUniqueKeys_ = values.size() == numNonNullValues;
-          if (!dynamicFilterHasUniqueKeys_) {
-            // The retained join checks individual keys. Only prune row groups.
-            return connector::hive::makeAdvisoryFilter(
-                std::make_unique<common::BigintRange>(
-                    values.front(), values.back(), false));
-          }
-          return common::createBigintValues(values, false);
-        } else {
-          VELOX_UNSUPPORTED(
-              "Dynamic join filter requires a signed integer key");
-        }
-      });
+  return makeBuildKeyFilter(
+      keys, buildType_->childAt(rightKeyIndices_[keyIndex]), stream);
 }
 
-std::vector<CudfHashJoinProbe*> CudfHashJoinProbe::findPeerOperators() {
-  auto operators = operatorCtx_->task()->findPeerOperators(
-      operatorCtx_->driverCtx()->pipelineId, this);
-  std::vector<CudfHashJoinProbe*> peers;
-  peers.reserve(operators.size());
-  for (auto* op : operators) {
-    if (auto* peer = dynamic_cast<CudfHashJoinProbe*>(op)) {
-      peers.push_back(peer);
-    }
+common::FilterPtr CudfHashJoinProbe::makeDynamicFilter(
+    column_index_t keyIndex,
+    CudfHashJoinBridge& bridge) {
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::makeDynamicFilter",
+      this);
+  auto keyFilter = buildKeyFilter(keyIndex);
+  if (keyFilter.filter == nullptr) {
+    return nullptr;
   }
-  return peers;
+
+  // A semi join keeps a probe row once however many build rows match it, so
+  // only an inner join needs unique build keys to be replaced.
+  if (keyIndex == 0 && keyFilter.exact && canReplaceJoinWithDynamicFilter() &&
+      (keyFilter.uniqueKeys || joinNode_->isLeftSemiFilterJoin())) {
+    bridge.setReplacedByDynamicFilter();
+    return std::move(keyFilter.filter);
+  }
+  return connector::hive::makeAdvisoryFilter(
+      std::move(keyFilter.filter), std::move(keyFilter.deviceBitmap));
 }
 
-bool CudfHashJoinProbe::canReplaceJoinWithUniqueKeys() const {
+bool CudfHashJoinProbe::canReplaceJoinWithDynamicFilter() const {
   const auto& columns = outputLayout_.probeColumnIndices();
-  return probeKeyChannels_.size() == 1 &&
+  return (joinNode_->isInnerJoin() || joinNode_->isLeftSemiFilterJoin()) &&
+      probeKeyChannels_.size() == 1 &&
       outputLayout_.buildColumnIndices().empty() && !joinNode_->filter() &&
       std::unordered_set<cudf::size_type>(columns.begin(), columns.end())
           .size() == columns.size();
 }
 
-void CudfHashJoinProbe::pushdownDynamicFilters() {
+bool CudfHashJoinProbe::canPushdownDynamicFilters() const {
+  // A probe row without a matching build row does not reach the output of
+  // these joins, nor decide which build rows do.
+  return (joinNode_->isInnerJoin() || joinNode_->isLeftSemiFilterJoin() ||
+          joinNode_->isRightSemiFilterJoin() || joinNode_->isRightJoin()) &&
+      !joinNode_->isNullAsValue() &&
+      CudfConfig::getInstance().dynamicFilterEnabled &&
+      operatorCtx_->driverCtx()
+          ->queryConfig()
+          .hashProbeDynamicFilterPushdownEnabled();
+}
+
+void CudfHashJoinProbe::pushdownDynamicFilters(CudfHashJoinBridge& bridge) {
   auto* driver = operatorCtx_->driverCtx()->driver;
+  // The Driver asks one driver of the pipeline for each filter. The bridge
+  // tells the others whether that filter replaces the join.
   const auto numFilters = driver->pushdownFilters(
       this,
       probeKeyChannels_,
       [&](column_index_t keyIndex) -> common::FilterPtr {
-        auto filter = makeIntegerDynamicFilter(keyIndex);
-        if (filter != nullptr && dynamicFilterHasUniqueKeys_) {
-          // The Driver calls this for one driver of the pipeline only. The
-          // others learn here that the build keys are unique.
-          for (auto* peer : findPeerOperators()) {
-            peer->dynamicFilterHasUniqueKeys_ = true;
-          }
-        }
-        return filter;
+        return makeDynamicFilter(keyIndex, bridge);
       });
-  // An exact filter can replace a unique, single-key inner
-  // join whose output contains no build columns and has no residual filter.
   // Repeated output columns keep the normal gather path; the bypass moves them.
   canReplaceWithDynamicFilter_ = numFilters > 0 &&
-      dynamicFilterHasUniqueKeys_ && canReplaceJoinWithUniqueKeys();
+      bridge.replacedByDynamicFilter() && canReplaceJoinWithDynamicFilter();
 }
 
 void CudfHashJoinProbe::initialize() {
@@ -2567,13 +2503,8 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
         skipInput_ = true;
       }
     }
-  } else if (
-      joinNode_->isInnerJoin() && !joinNode_->isNullAsValue() &&
-      operatorCtx_->driverCtx()
-          ->queryConfig()
-          .hashProbeDynamicFilterPushdownEnabled()) {
-    // Driver resolves filter targets; the callback skips unsupported keys.
-    pushdownDynamicFilters();
+  } else if (canPushdownDynamicFilters()) {
+    pushdownDynamicFilters(*cudfJoinBridge);
   }
   if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin() ||
        joinNode_->isFullJoin()) &&

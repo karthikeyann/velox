@@ -3372,9 +3372,7 @@ TEST_F(TableScanTest, dynamicFilterPrunesReaderRowGroups) {
           expectedRowGroups * 1'000 - values.size());
     }
   };
-  // The join that returns its build key keeps a filter of key bounds, which
-  // the next commit replaces.
-  for (bool includeBuildKey : {false}) {
+  for (bool includeBuildKey : {false, true}) {
     runTest({12505}, common::FilterKind::kBigintRange, 1, includeBuildKey);
     runTest(
         {10005, 10015},
@@ -3468,7 +3466,7 @@ TEST_F(TableScanTest, integerDynamicFilterFromHashJoin) {
     }
   };
   common::testutil::ScopedTestValue filterBuildCounter(
-      "facebook::velox::cudf_velox::CudfHashJoinProbe::makeIntegerDynamicFilter",
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::makeDynamicFilter",
       std::function<void(void*)>([&](void*) { ++numFiltersBuilt; }));
   auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
                   .maxDrivers(4)
@@ -3531,9 +3529,7 @@ TEST_F(TableScanTest, dynamicFilterWithPreloadedSplits) {
   createDuckDbTable("u", {build});
   auto rowType = asRowType(vectors.front()->type());
 
-  // The join that returns a build column keeps a filter of key bounds, which
-  // the next commit replaces.
-  for (bool returnBuildColumn : {false}) {
+  for (bool returnBuildColumn : {false, true}) {
     SCOPED_TRACE(fmt::format("returnBuildColumn: {}", returnBuildColumn));
     auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
     auto buildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
@@ -3632,6 +3628,58 @@ TEST_F(TableScanTest, dynamicFilterDisabled) {
   }
 }
 
+// A build side with many rows and few distinct keys sends the exact set of
+// its keys, which replaces a semi join.
+TEST_F(TableScanTest, dynamicFilterFromRepeatedBuildKeys) {
+  constexpr vector_size_t kNumBuildRows{150'000};
+  ASSERT_GT(kNumBuildRows, CudfConfig::getInstance().dynamicFilterMaxValues);
+  auto probe =
+      makeRowVector({"c0"}, {makeFlatVector<int64_t>(1'000, folly::identity)});
+  // 100 distinct keys: 0, 10, ..., 990.
+  auto build = makeRowVector(
+      {"b"}, {makeFlatVector<int64_t>(kNumBuildRows, [](auto row) {
+        return (row % 100) * 10;
+      })});
+  auto file = TempFilePath::create();
+  writeToFile(file->getPath(), probe);
+  auto rowType = asRowType(probe->type());
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto buildPlan = PlanBuilder(ids, pool_.get()).values({build}).planNode();
+  core::PlanNodeId scanId;
+  core::PlanNodeId joinId;
+  auto plan =
+      PlanBuilder(ids, pool_.get())
+          .startTableScan()
+          .connectorId(kCudfHiveConnectorId)
+          .tableHandle(makeTableHandle("t", rowType))
+          .outputType(rowType)
+          .assignments(HiveConnectorTestBase::allRegularColumns(rowType))
+          .endTableScan()
+          .capturePlanNodeId(scanId)
+          .hashJoin(
+              {"c0"},
+              {"b"},
+              buildPlan,
+              "",
+              {"c0"},
+              core::JoinType::kLeftSemiFilter)
+          .capturePlanNodeId(joinId)
+          .planNode();
+  auto expected = makeRowVector(
+      {"c0"},
+      {makeFlatVector<int64_t>(100, [](auto row) { return row * 10; })});
+  auto task = AssertQueryBuilder(plan)
+                  .maxDrivers(1)
+                  .splits(scanId, makeCudfHiveConnectorSplits({file}))
+                  .assertResults(expected);
+  const auto stats = toPlanStats(task->taskStats());
+  // The bounds of the keys, 0 to 990, would keep 991 rows.
+  EXPECT_EQ(stats.at(scanId).outputRows, 100);
+  EXPECT_EQ(
+      stats.at(joinId).customStats.at("replacedWithDynamicFilterRows").sum,
+      100);
+}
+
 TEST_F(TableScanTest, integerDynamicFilterPreservesKeyWidth) {
   auto check = [&]<typename T>() {
     const T lo = std::numeric_limits<T>::min();
@@ -3680,8 +3728,9 @@ TEST_F(TableScanTest, integerDynamicFilterPreservesKeyWidth) {
         EXPECT_EQ(scanStats.customStats.at("dynamicFiltersAccepted").sum, 1);
         EXPECT_EQ(scanStats.outputRows, 2);
       } else {
-        EXPECT_EQ(scanStats.customStats.count("dynamicFiltersAccepted"), 0);
-        EXPECT_EQ(scanStats.outputRows, probe->size());
+        // Many build rows of two distinct keys: the set of the two.
+        EXPECT_EQ(scanStats.customStats.at("dynamicFiltersAccepted").sum, 1);
+        EXPECT_EQ(scanStats.outputRows, 2);
       }
     }
   };

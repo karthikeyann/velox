@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -51,6 +52,16 @@ class CudfIntegerHashSet {
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+/// Returns the UINT32 words of a bitmap with bit 'value - minimum' set for
+/// each non-null value of the signed integer 'inputs'. Every value must be in
+/// ['minimum', 'maximum'].
+std::unique_ptr<cudf::column> makeIntegerBitmap(
+    const std::vector<cudf::column_view>& inputs,
+    int64_t minimum,
+    int64_t maximum,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
 
 /// Intersects a non-nullable retention mask with an exact integer bitmap.
 /// UINT32 filter words are based at minimum. Creates the mask if absent.
