@@ -128,6 +128,14 @@ class CudfHashJoinBuild : public CudfJoinBuild {
   void buildAndPublish(std::vector<CudfVectorPtr> inputs) override;
 
  private:
+  // Publishes the dynamic filters the plan fragment declares for this join to
+  // the task, from the key columns 'keyIndices' of the build side 'tables'.
+  // Leaves a filter it cannot make to optOutOfDynamicFilters().
+  void publishDynamicFilters(
+      const std::vector<std::shared_ptr<cudf::table>>& tables,
+      const std::vector<cudf::size_type>& keyIndices,
+      cuda::stream_ref stream);
+
   // Opts out of the dynamic filters the plan fragment declares for this join
   // and that are not published yet. Table scans wait for them.
   void optOutOfDynamicFilters();

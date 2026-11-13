@@ -90,6 +90,10 @@ class CudfHiveTableHandle : public ConnectorTableHandle {
     return remainingFilter_;
   }
 
+  bool hasFilters() const override {
+    return subfieldFilterExpr_ != nullptr || remainingFilter_ != nullptr;
+  }
+
   // Schema of the table.  Need this for reading TEXTFILE.
   const RowTypePtr& dataColumns() const {
     return dataColumns_;
