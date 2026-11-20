@@ -18,6 +18,7 @@
 
 #include "velox/connectors/ConnectorRegistry.h"
 #include "velox/exec/OperatorType.h"
+#include "velox/exec/TableWriterStatNames.h"
 #include "velox/exec/Task.h"
 
 namespace facebook::velox::exec {
@@ -46,8 +47,7 @@ TableWriter::TableWriter(
           tableWriteNode->insertTableHandle()->connectorId())),
       insertTableHandle_(
           tableWriteNode->insertTableHandle()->connectorInsertTableHandle()),
-      commitStrategy_(tableWriteNode->commitStrategy()),
-      createTimeNs_(getCurrentTimeNano()) {
+      commitStrategy_(tableWriteNode->commitStrategy()) {
   setConnectorMemoryReclaimer();
   if (tableWriteNode->outputType()->size() == 1) {
     VELOX_USER_CHECK(!tableWriteNode->columnStatsSpec().has_value());
@@ -200,7 +200,7 @@ void TableWriter::addInput(RowVectorPtr input) {
       input->getNullCount());
 
   dataSink_->appendData(mappedInput);
-  numWrittenRows_ += input->size();
+  numWrittenRows_ += dataSink_->numChangedRows(*mappedInput);
   updateStats(dataSink_->stats());
 
   if (statsCollector_ != nullptr) {
@@ -322,8 +322,6 @@ std::string TableWriter::createTableCommitContext(bool lastOutput) {
 }
 
 void TableWriter::updateStats(const connector::DataSink::Stats& stats) {
-  const auto currentTimeNs = getCurrentTimeNano();
-  VELOX_CHECK_GE(currentTimeNs, createTimeNs_);
   {
     auto lockedStats = stats_.wlock();
     lockedStats->physicalWrittenBytes = stats.numWrittenBytes;
@@ -335,22 +333,23 @@ void TableWriter::updateStats(const connector::DataSink::Stats& stats) {
     }
     if (stats.numWrittenFiles != 0) {
       lockedStats->addRuntimeStat(
-          kNumWrittenFiles, RuntimeCounter(stats.numWrittenFiles));
+          TableWriterStatNames::kNumWrittenFiles,
+          RuntimeCounter(stats.numWrittenFiles));
     }
     if (stats.writeIOTimeUs != 0) {
       lockedStats->addRuntimeStat(
-          kWriteIOTime,
+          TableWriterStatNames::kWriteIOTime,
           RuntimeCounter(
               stats.writeIOTimeUs * 1000, RuntimeCounter::Unit::kNanos));
     }
     if (stats.recodeTimeNs != 0) {
       lockedStats->addRuntimeStat(
-          kWriteRecodeTime,
+          TableWriterStatNames::kWriteRecodeTime,
           RuntimeCounter(stats.recodeTimeNs, RuntimeCounter::Unit::kNanos));
     }
     if (stats.compressionTimeNs != 0) {
       lockedStats->addRuntimeStat(
-          kWriteCompressionTime,
+          TableWriterStatNames::kWriteCompressionTime,
           RuntimeCounter(
               stats.compressionTimeNs, RuntimeCounter::Unit::kNanos));
     }
@@ -368,9 +367,9 @@ void TableWriter::updateStats(const connector::DataSink::Stats& stats) {
               static_cast<uint64_t>(backgroundTimingStat->second.sum)});
     }
     lockedStats->addRuntimeStat(
-        kRunningWallNanos,
+        TableWriterStatNames::kRunningWallNanos,
         RuntimeCounter(
-            currentTimeNs - createTimeNs_, RuntimeCounter::Unit::kNanos));
+            creationWatch_.elapsed().count(), RuntimeCounter::Unit::kNanos));
   }
   if (!stats.spillStats.empty()) {
     *spillStats_ += stats.spillStats;
@@ -416,7 +415,7 @@ bool TableWriter::ConnectorReclaimer::reclaimableBytes(
     return false;
   }
   std::shared_ptr<Driver> driver = ensureDriver();
-  if (FOLLY_UNLIKELY(driver == nullptr)) {
+  if (driver == nullptr) [[unlikely]] {
     return false;
   }
   return memory::MemoryReclaimer::reclaimableBytes(pool, reclaimableBytes);
@@ -431,7 +430,7 @@ uint64_t TableWriter::ConnectorReclaimer::reclaim(
     return 0;
   }
   std::shared_ptr<Driver> driver = ensureDriver();
-  if (FOLLY_UNLIKELY(driver == nullptr)) {
+  if (driver == nullptr) [[unlikely]] {
     return 0;
   }
   VELOX_CHECK(

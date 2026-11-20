@@ -22,6 +22,7 @@
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/exec/tests/utils/QueryAssertions.h"
+#include "velox/exec/tests/utils/TaskMonitor.h"
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -235,7 +236,7 @@ class FakeSourceOperator : public SourceOperator {
   }
 
   void waitForOutput() {
-    if (FOLLY_UNLIKELY(memoryManager_ == nullptr)) {
+    if (memoryManager_ == nullptr) [[unlikely]] {
       memoryManager_ =
           operatorCtx_->driver()->task()->getLocalExchangeMemoryManager(
               operatorCtx_->driverCtx()->splitGroupId,
@@ -374,7 +375,7 @@ class FakeWriteOperator : public Operator {
   }
 
   void waitForConsume() {
-    if (FOLLY_UNLIKELY(memoryManager_ == nullptr)) {
+    if (memoryManager_ == nullptr) [[unlikely]] {
       memoryManager_ =
           operatorCtx_->driver()->task()->getLocalExchangeMemoryManager(
               operatorCtx_->driverCtx()->splitGroupId,
@@ -564,11 +565,10 @@ class ScaleWriterLocalPartitionTestParametrized
     const auto& params = GetParam();
     queryBuilder.config(
         core::QueryConfig::kMinLocalExchangePartitionCountToUsePartitionBuffer,
-        std::to_string(
-            params.minLocalExchangePartitionCountToUsePartitionBuffer));
+        params.minLocalExchangePartitionCountToUsePartitionBuffer);
     queryBuilder.config(
         core::QueryConfig::kMaxLocalExchangePartitionBufferSize,
-        std::to_string(params.maxLocalExchangePartitionBufferSize));
+        params.maxLocalExchangePartitionBufferSize);
   }
 };
 
@@ -633,9 +633,8 @@ TEST_F(ScaleWriterLocalPartitionTest, unpartitionBasic) {
     Operator::registerOperator(
         std::make_unique<FakeSourceNodeFactory>(testController));
 
-    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
     core::PlanNodeId exchnangeNodeId;
-    auto plan = PlanBuilder(planNodeIdGenerator)
+    auto plan = PlanBuilder()
                     .addNode([&](const core::PlanNodeId& id,
                                  const core::PlanNodePtr& input) {
                       return std::make_shared<FakeSourceNode>(id, rowType_);
@@ -660,11 +659,10 @@ TEST_F(ScaleWriterLocalPartitionTest, unpartitionBasic) {
             .maxQueryCapacity(queryCapacity)
             .config(
                 core::QueryConfig::kMaxLocalExchangeBufferSize,
-                std::to_string(maxExchanegBufferSize))
+                maxExchanegBufferSize)
             .config(
                 core::QueryConfig::kScaleWriterRebalanceMaxMemoryUsageRatio,
-                std::to_string(
-                    testData.scaleWriterRebalanceMaxMemoryUsageRatio))
+                testData.scaleWriterRebalanceMaxMemoryUsageRatio)
             .config(
                 core::QueryConfig::
                     kScaleWriterMinPartitionProcessedBytesRebalanceThreshold,
@@ -708,7 +706,7 @@ TEST_F(ScaleWriterLocalPartitionTest, unpartitionBasic) {
     task.reset();
 
     verifyResults(inputVectors, {result});
-    waitForAllTasksToBeDeleted();
+    TaskMonitor::waitForAllTasksDeleted();
   }
 }
 
@@ -736,9 +734,8 @@ TEST_P(ScaleWriterLocalPartitionTestParametrized, unpartitionFuzzer) {
     Operator::registerOperator(
         std::make_unique<FakeSourceNodeFactory>(testController));
 
-    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
     core::PlanNodeId exchnangeNodeId;
-    auto plan = PlanBuilder(planNodeIdGenerator)
+    auto plan = PlanBuilder()
                     .addNode([&](const core::PlanNodeId& id,
                                  const core::PlanNodePtr& input) {
                       return std::make_shared<FakeSourceNode>(id, rowType_);
@@ -764,7 +761,7 @@ TEST_P(ScaleWriterLocalPartitionTestParametrized, unpartitionFuzzer) {
             .maxQueryCapacity(queryCapacity)
             .config(
                 core::QueryConfig::kMaxLocalExchangeBufferSize,
-                std::to_string(maxExchanegBufferSize))
+                maxExchanegBufferSize)
             .config(
                 core::QueryConfig::kScaleWriterRebalanceMaxMemoryUsageRatio,
                 "1.0")
@@ -774,7 +771,7 @@ TEST_P(ScaleWriterLocalPartitionTestParametrized, unpartitionFuzzer) {
                 "256")
             .copyResults(pool_.get());
     verifyResults(inputVectors, {result});
-    waitForAllTasksToBeDeleted();
+    TaskMonitor::waitForAllTasksDeleted();
   }
 }
 
@@ -845,9 +842,8 @@ TEST_F(ScaleWriterLocalPartitionTest, partitionBasic) {
     Operator::registerOperator(
         std::make_unique<FakeSourceNodeFactory>(testController));
 
-    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
     core::PlanNodeId exchnangeNodeId;
-    auto plan = PlanBuilder(planNodeIdGenerator)
+    auto plan = PlanBuilder()
                     .addNode([&](const core::PlanNodeId& id,
                                  const core::PlanNodePtr& input) {
                       return std::make_shared<FakeSourceNode>(id, rowType_);
@@ -872,14 +868,13 @@ TEST_F(ScaleWriterLocalPartitionTest, partitionBasic) {
             .maxQueryCapacity(queryCapacity)
             .config(
                 core::QueryConfig::kMaxLocalExchangeBufferSize,
-                std::to_string(maxExchanegBufferSize))
+                maxExchanegBufferSize)
             .config(
                 core::QueryConfig::kScaleWriterMaxPartitionsPerWriter,
-                std::to_string(testData.numPartitionsPerWriter))
+                testData.numPartitionsPerWriter)
             .config(
                 core::QueryConfig::kScaleWriterRebalanceMaxMemoryUsageRatio,
-                std::to_string(
-                    testData.scaleWriterRebalanceMaxMemoryUsageRatio))
+                testData.scaleWriterRebalanceMaxMemoryUsageRatio)
             .config(
                 core::QueryConfig::
                     kScaleWriterMinProcessedBytesRebalanceThreshold,
@@ -949,7 +944,7 @@ TEST_F(ScaleWriterLocalPartitionTest, partitionBasic) {
     task.reset();
 
     verifyResults(inputVectors, {result});
-    waitForAllTasksToBeDeleted();
+    TaskMonitor::waitForAllTasksDeleted();
   }
 }
 
@@ -978,9 +973,8 @@ TEST_P(ScaleWriterLocalPartitionTestParametrized, partitionFuzzer) {
     Operator::registerOperator(
         std::make_unique<FakeSourceNodeFactory>(testController));
 
-    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
     core::PlanNodeId exchnangeNodeId;
-    auto plan = PlanBuilder(planNodeIdGenerator)
+    auto plan = PlanBuilder()
                     .addNode([&](const core::PlanNodeId& id,
                                  const core::PlanNodePtr& input) {
                       return std::make_shared<FakeSourceNode>(id, rowType_);
@@ -1006,7 +1000,7 @@ TEST_P(ScaleWriterLocalPartitionTestParametrized, partitionFuzzer) {
             .maxQueryCapacity(queryCapacity)
             .config(
                 core::QueryConfig::kMaxLocalExchangeBufferSize,
-                std::to_string(maxExchanegBufferSize))
+                maxExchanegBufferSize)
             .config(
                 core::QueryConfig::kScaleWriterRebalanceMaxMemoryUsageRatio,
                 "1.0")
@@ -1020,7 +1014,7 @@ TEST_P(ScaleWriterLocalPartitionTestParametrized, partitionFuzzer) {
                 "32")
             .copyResults(pool_.get());
     verifyResults(inputVectors, {result});
-    waitForAllTasksToBeDeleted();
+    TaskMonitor::waitForAllTasksDeleted();
   }
 }
 

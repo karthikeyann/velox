@@ -16,8 +16,10 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/tests/utils/CustomComparisonKeys.h"
 
 #include "velox/core/QueryConfig.h"
+#include "velox/exec/OperatorType.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -54,36 +56,36 @@ class LocalMergeTest : public OperatorTestBase {
         "NULLS LAST", "NULLS FIRST", "DESC NULLS FIRST", "DESC NULLS LAST"};
     for (const auto& sortOrderSql : sortOrderSqls) {
       const auto orderByClause = fmt::format("{} {}", key, sortOrderSql);
-      auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
-      auto plan = PlanBuilder(planNodeIdGenerator)
+      PlanBuilder builder;
+      auto plan = builder.newPlan()
                       .localMerge(
                           {orderByClause},
-                          {PlanBuilder(planNodeIdGenerator)
+                          {builder.newPlan()
                                .values(inputVectors)
                                .orderBy({orderByClause}, true)
                                .planNode()})
                       .planNode();
-      CursorParameters params;
-      params.planNode = plan;
-      params.maxDrivers = 1;
-      assertQueryOrdered(
-          params,
-          "SELECT * FROM (SELECT * FROM tmp) ORDER BY " + orderByClause,
-          {keyIndex});
+      AssertQueryBuilder(plan, duckDbQueryRunner_)
+          .maxDrivers(1)
+          .assertResults(
+              "SELECT * FROM (SELECT * FROM tmp) ORDER BY " + orderByClause,
+              std::vector<uint32_t>{keyIndex});
 
       std::vector<std::shared_ptr<const core::PlanNode>> sources;
       for (const auto& input : inputVectors) {
-        sources.push_back(PlanBuilder(planNodeIdGenerator)
-                              .values({input})
+        sources.push_back(builder.newPlan()
+                              .values(input)
                               .orderBy({orderByClause}, true)
                               .planNode());
       }
-      plan = PlanBuilder(planNodeIdGenerator)
+      plan = builder.newPlan()
                  .localMerge({orderByClause}, std::move(sources))
                  .planNode();
 
-      assertQueryOrdered(
-          plan, "SELECT * FROM tmp ORDER BY " + orderByClause, {keyIndex});
+      AssertQueryBuilder(plan, duckDbQueryRunner_)
+          .assertResults(
+              "SELECT * FROM tmp ORDER BY " + orderByClause,
+              std::vector<uint32_t>{keyIndex});
     }
   }
 
@@ -104,37 +106,33 @@ class LocalMergeTest : public OperatorTestBase {
             fmt::format("{} {}", key2, sortOrderSqls[j])};
         const auto orderBySql = fmt::format(
             "ORDER BY {}, {}", orderByClauses[0], orderByClauses[1]);
-        auto planNodeIdGenerator =
-            std::make_shared<core::PlanNodeIdGenerator>();
-        auto plan = PlanBuilder(planNodeIdGenerator)
+        PlanBuilder builder;
+        auto plan = builder.newPlan()
                         .localMerge(
                             orderByClauses,
-                            {PlanBuilder(planNodeIdGenerator)
+                            {builder.newPlan()
                                  .values(inputVectors)
                                  .orderBy(orderByClauses, true)
                                  .planNode()})
                         .planNode();
-        CursorParameters params;
-        params.planNode = plan;
-        params.maxDrivers = 1;
-        assertQueryOrdered(
-            params,
-            "SELECT * FROM (SELECT * FROM tmp) " + orderBySql,
-            sortingKeys);
+        AssertQueryBuilder(plan, duckDbQueryRunner_)
+            .maxDrivers(1)
+            .assertResults(
+                "SELECT * FROM (SELECT * FROM tmp) " + orderBySql, sortingKeys);
 
         std::vector<std::shared_ptr<const core::PlanNode>> sources;
         for (const auto& input : inputVectors) {
-          sources.push_back(PlanBuilder(planNodeIdGenerator)
-                                .values({input})
+          sources.push_back(builder.newPlan()
+                                .values(input)
                                 .orderBy(orderByClauses, true)
                                 .planNode());
         }
-        plan = PlanBuilder(planNodeIdGenerator)
+        plan = builder.newPlan()
                    .localMerge(orderByClauses, std::move(sources))
                    .planNode();
 
-        assertQueryOrdered(
-            plan, "SELECT * FROM tmp " + orderBySql, sortingKeys);
+        AssertQueryBuilder(plan, duckDbQueryRunner_)
+            .assertResults("SELECT * FROM tmp " + orderBySql, sortingKeys);
       }
     }
   }
@@ -166,6 +164,32 @@ TEST_F(LocalMergeTest, localMerge) {
   testTwoKeys(vectors, "c3", "c0");
 }
 
+// cuDF would merge the two zone encodings of one instant by zone key where
+// Velox merges them by 'id', so the merge must stay on the CPU.
+TEST_F(LocalMergeTest, customComparisonKeyFallsBackToCpu) {
+  cudf_velox::test_utils::CustomComparisonKeys keys(pool());
+  auto losAngeles =
+      keys.makeRowsInZone({"k", "id"}, "America/Los_Angeles", {1, 2}, {0, 2});
+  auto utc = keys.makeRowsInZone({"k", "id"}, "UTC", {1, 2}, {1, 3});
+
+  for (const auto& key : {"k ASC NULLS LAST", "k DESC NULLS FIRST"}) {
+    SCOPED_TRACE(key);
+    const std::vector<std::string> sortingKeys = {key, "id ASC NULLS LAST"};
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto sorted = [&](const RowVectorPtr& rows) {
+      return PlanBuilder(planNodeIdGenerator)
+          .values({rows})
+          .orderBy(sortingKeys, true)
+          .planNode();
+    };
+    keys.assertFallsBackToCpuInOrder(
+        PlanBuilder(planNodeIdGenerator)
+            .localMerge(sortingKeys, {sorted(losAngeles), sorted(utc)})
+            .planNode(),
+        exec::OperatorType::kLocalMerge);
+  }
+}
+
 TEST_F(LocalMergeTest, offByOne) {
   auto data1 = makeRowVector({
       makeFlatVector<int64_t>({0, 1, 10}),
@@ -175,24 +199,22 @@ TEST_F(LocalMergeTest, offByOne) {
       makeFlatVector<int64_t>({2, 3, 4, 5}),
   });
 
-  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  PlanBuilder builder;
 
-  auto plan =
-      PlanBuilder(planNodeIdGenerator)
-          .localMerge(
-              {"c0"},
-              {
-                  PlanBuilder(planNodeIdGenerator).values({data1}).planNode(),
-                  PlanBuilder(planNodeIdGenerator).values({data2}).planNode(),
-              })
-          .planNode();
+  auto plan = builder.newPlan()
+                  .localMerge(
+                      {"c0"},
+                      {
+                          builder.newPlan().values(data1).planNode(),
+                          builder.newPlan().values(data2).planNode(),
+                      })
+                  .planNode();
 
-  CursorParameters params;
-  params.planNode = plan;
-  params.queryCtx = core::QueryCtx::create(executor_.get());
-  params.queryCtx->testingOverrideConfigUnsafe(
-      {{core::QueryConfig::kPreferredOutputBatchRows, "6"}});
-  assertQueryOrdered(params, "VALUES (0), (1), (2), (3), (4), (5), (10)", {0});
+  AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .config(core::QueryConfig::kPreferredOutputBatchRows, "6")
+      .assertResults(
+          "VALUES (0), (1), (2), (3), (4), (5), (10)",
+          std::vector<uint32_t>{0});
 }
 
 } // namespace
