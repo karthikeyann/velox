@@ -315,6 +315,13 @@ class DataSink {
   /// TODO maybe at some point we want to make it async.
   virtual void appendData(RowVectorPtr input) = 0;
 
+  /// Returns the number of table rows that 'input' changes, which the table
+  /// writer reports as its row count. A sink whose input encodes one logical
+  /// change as several rows overrides this to count the change once.
+  virtual vector_size_t numChangedRows(const RowVector& input) const {
+    return input.size();
+  }
+
   /// Called after all data has been added via possibly multiple calls to
   /// appendData() This function finishes the data procesing like sort all the
   /// added data and write them to the file writer. The finish might take long
@@ -382,7 +389,9 @@ class DataSource {
     scanBatchCallback_ = std::move(callback);
   }
 
-  /// Called by TableScan after each non-empty batch with generic scan stats.
+  /// Called by TableScan after each read that scanned rows, with generic scan
+  /// stats. A read whose rows the filters removed, or whose output is dropped,
+  /// is reported too.
   /// Default is a no-op. Subclasses should override to create a
   /// connector-specific event (e.g., FileScanBatchEvent), enrich it with
   /// connector-specific fields, and call scanBatchCallback_.
@@ -814,7 +823,7 @@ class ConnectorQueryCtx {
   const std::unordered_map<std::string, memory::MemoryPool*> customPools_;
   bool selectiveNimbleReaderEnabled_{false};
   core::QueryConfig::RowSizeTrackingMode rowSizeTrackingEnabled_{
-      core::QueryConfig::RowSizeTrackingMode::ENABLED_FOR_ALL};
+      core::QueryConfig::RowSizeTrackingMode::kEnabledForAll};
 };
 
 class Connector;

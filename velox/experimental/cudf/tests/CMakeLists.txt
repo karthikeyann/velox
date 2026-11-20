@@ -33,7 +33,7 @@ set(CUDF_TESTS_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR})
 #     [TIMEOUT <seconds>]
 #   )
 #
-# gtest and gtest_main are always appended to LIBS.
+# gtest, gtest_main and gmock are always appended to LIBS.
 # Default timeout: 300 seconds
 function(velox_add_cudf_test)
   set(options "")
@@ -49,7 +49,7 @@ function(velox_add_cudf_test)
   set_target_properties(${ARG_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CUDF_TESTS_OUTPUT_DIR})
   add_test(NAME ${ARG_NAME} COMMAND ${ARG_NAME} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   set_tests_properties(${ARG_NAME} PROPERTIES LABELS cuda_driver TIMEOUT ${ARG_TIMEOUT})
-  target_link_libraries(${ARG_NAME} ${ARG_LIBS} gtest gtest_main)
+  target_link_libraries(${ARG_NAME} ${ARG_LIBS} gtest gtest_main gmock)
 endfunction()
 
 if(VELOX_ENABLE_ABFS)
@@ -66,6 +66,7 @@ if(VELOX_ENABLE_ABFS)
       velox_file
       velox_exec
       velox_exec_test_lib
+      velox_hive_storage_adapters_server_startup
       velox_test_util
   )
   target_compile_options(velox_cudf_abfs_read_test PRIVATE -Wno-deprecated-declarations)
@@ -129,7 +130,7 @@ velox_add_cudf_test(
 velox_add_cudf_test(
   NAME velox_cudf_vector_test
   SOURCES Main.cpp CudfVectorTest.cpp
-  LIBS velox_cudf_vector velox_vector_test_lib cudf::cudf
+  LIBS velox_cudf_vector velox_vector_test_lib cudf::cudf gmock
 )
 
 velox_add_cudf_test(
@@ -138,6 +139,15 @@ velox_add_cudf_test(
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib
   TIMEOUT 3000
 )
+
+# Decimal arithmetic on the device, compiled against the GPU shadows.
+velox_add_cudf_test(
+  NAME velox_cudf_decimal_arithmetic_device_test
+  SOURCES DecimalArithmeticDeviceTest.cu
+  LIBS cudf::cudf Folly::folly
+)
+set_target_properties(velox_cudf_decimal_arithmetic_device_test PROPERTIES CUDA_STANDARD 20)
+velox_cudf_use_gpu_shadows(velox_cudf_decimal_arithmetic_device_test)
 
 velox_add_cudf_test(
   NAME velox_cudf_enforce_single_row_test
@@ -178,7 +188,12 @@ velox_add_cudf_test(
 velox_add_cudf_test(
   NAME velox_cudf_hash_join_test
   SOURCES HashJoinTest.cpp Main.cpp
-  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_vector_fuzzer Folly::folly fmt::fmt
+  LIBS
+    ${CUDF_TEST_DEFAULT_LIBS}
+    velox_custom_types_for_testing
+    velox_vector_fuzzer
+    Folly::folly
+    fmt::fmt
 )
 
 velox_add_cudf_test(
@@ -221,7 +236,7 @@ velox_add_cudf_test(
 velox_add_cudf_test(
   NAME velox_cudf_nested_loop_join_test
   SOURCES Main.cpp NestedLoopJoinTest.cpp
-  LIBS ${CUDF_TEST_DEFAULT_LIBS}
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_custom_types_for_testing
 )
 
 velox_add_cudf_test(
@@ -236,6 +251,12 @@ velox_add_cudf_test(
   LIBS ${CUDF_TEST_DEFAULT_LIBS} fmt::fmt
 )
 
+velox_add_cudf_test(
+  NAME velox_cudf_presto_page_device_test
+  SOURCES Main.cpp PrestoPageDeviceTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_cudf_presto_serializer
+)
+
 if(VELOX_ENABLE_S3)
   velox_add_cudf_test(
     NAME velox_cudf_s3_read_test
@@ -245,8 +266,10 @@ if(VELOX_ENABLE_S3)
       velox_cudf_hive_connector
       velox_exec
       velox_exec_test_lib
+      velox_hive_storage_adapters_server_startup
       velox_file
       velox_s3fs
+      velox_stats_reporter_utils
       velox_test_util
   )
 endif()
@@ -266,7 +289,7 @@ velox_add_cudf_test(
 velox_add_cudf_test(
   NAME velox_cudf_subfield_filter_ast_test
   SOURCES Main.cpp SubfieldFilterAstTest.cpp
-  LIBS ${CUDF_TEST_DEFAULT_LIBS}
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_cudf_iceberg_connector
 )
 
 velox_add_cudf_test(
@@ -275,6 +298,7 @@ velox_add_cudf_test(
   LIBS
     velox_cudf_exec_test_lib
     velox_cudf_hive_connector
+    velox_dwio_parquet_reader
     velox_dwio_parquet_writer
     velox_exec
     velox_exec_test_lib
@@ -310,8 +334,18 @@ velox_add_cudf_test(
 velox_add_cudf_test(
   NAME velox_cudf_topnrownumber_test
   SOURCES Main.cpp TopNRowNumberTest.cpp
-  LIBS ${CUDF_TEST_DEFAULT_LIBS} fmt::fmt
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_window fmt::fmt
 )
+
+# Only built when VELOX_ENABLE_UCX_EXCHANGE is on; without it the ucx-exchange
+# library does not exist and ucxx was never fetched.
+if(VELOX_ENABLE_UCX_EXCHANGE)
+  velox_add_cudf_test(
+    NAME velox_cudf_ucx_transport_registration_test
+    SOURCES Main.cpp UcxTransportRegistrationTest.cpp
+    LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_ucx_exchange
+  )
+endif()
 
 velox_add_cudf_test(
   NAME velox_cudf_window_test
@@ -320,6 +354,30 @@ velox_add_cudf_test(
 )
 
 add_subdirectory(iceberg)
+
+# Host-only checks of the GpuExec type resolver, GpuTimestamp, and the BitUtil.h
+# shadow's countBits.
+velox_add_cudf_test(
+  NAME velox_cudf_gpu_types_test
+  SOURCES GpuTypesTest.cpp
+  LIBS Folly::folly fmt::fmt
+)
+
+# Compile-only test that each mechanism a Velox simple function needs on the
+# device, the gpu_shadows/ headers and the VELOX_GPU_COMPATIBLE annotations,
+# generates device code under nvcc with gpu_shadows/ ahead of the Velox source
+# root.
+add_library(velox_cudf_gpu_shadow_compile_test OBJECT GpuShadowCompileTest.cu)
+# Whole-program device compilation, so that a call to a __device__ function
+# declared but defined nowhere fails to compile. Separable compilation would
+# defer it to a device link, which an object library never gets.
+set_target_properties(
+  velox_cudf_gpu_shadow_compile_test
+  PROPERTIES CUDA_STANDARD 20 CUDA_SEPARABLE_COMPILATION OFF
+)
+velox_cudf_use_gpu_shadows(velox_cudf_gpu_shadow_compile_test)
+target_link_libraries(velox_cudf_gpu_shadow_compile_test PRIVATE Folly::folly fmt::fmt)
+
 add_subdirectory(utils)
 
 if(${VELOX_ENABLE_SPARK_FUNCTIONS})

@@ -13,7 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/exec/HashBuild.h"
+#include "velox/exec/HashProbe.h"
 #include "velox/exec/JoinBridge.h"
+#include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
@@ -97,9 +100,9 @@ class CustomJoinBuild : public Operator {
     // The last Driver to hit CustomJoinBuild::finish gathers the data from
     // all build Drivers and hands it over to the probe side. At this
     // point all build Drivers are continued and will free their
-    // state. allPeersFinished is true only for the last Driver of the
+    // state. allPeersArrived is true only for the last Driver of the
     // build pipeline.
-    if (!operatorCtx_->allPeersFinished(&future_, promises, peerOperators)) {
+    if (!operatorCtx_->allPeersArrived(&future_, promises, peerOperators)) {
       return;
     }
 
@@ -352,25 +355,25 @@ class OperatorReplacementTest : public OperatorTestBase {
       const std::string& referenceQuery) {
     createDuckDbTable("t", {leftBatch});
 
-    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    PlanBuilder builder;
 
-    CursorParameters params;
-    params.maxDrivers = numThreads;
-    params.planNode = PlanBuilder(planNodeIdGenerator)
-                          .values({leftBatch}, false)
-                          .hashJoin(
-                              {"c0"},
-                              {"u1"},
-                              PlanBuilder(planNodeIdGenerator)
-                                  .values(rightBatch, false)
-                                  .project({"c0 AS u1"})
-                                  .planNode(),
-                              "",
-                              {"c0"})
-                          .project({"c0"})
-                          .planNode();
+    auto plan = builder.newPlan()
+                    .values({leftBatch}, false)
+                    .hashJoin(
+                        {"c0"},
+                        {"u1"},
+                        builder.newPlan()
+                            .values(rightBatch, false)
+                            .project({"c0 AS u1"})
+                            .planNode(),
+                        "",
+                        {"c0"})
+                    .project({"c0"})
+                    .planNode();
 
-    OperatorTestBase::assertQuery(params, referenceQuery);
+    AssertQueryBuilder(plan, duckDbQueryRunner_)
+        .maxDrivers(numThreads)
+        .assertResults(referenceQuery);
   }
 };
 

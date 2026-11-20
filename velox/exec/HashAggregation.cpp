@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <optional>
 #include "velox/common/testutil/TestValue.h"
+#include "velox/exec/HashAggregationStatNames.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/PrefixSort.h"
 #include "velox/exec/Task.h"
@@ -75,7 +76,8 @@ void HashAggregation::initialize() {
   setupGroupingKeyChannelProjections(
       groupingKeyInputChannels, groupingKeyOutputChannels);
 
-  auto hashers = createVectorHashers(inputType, groupingKeyInputChannels);
+  auto hashers =
+      VectorHasher::createForKeys(inputType, groupingKeyInputChannels);
   const auto numHashers = hashers.size();
 
   std::vector<column_index_t> preGroupedChannels;
@@ -308,12 +310,12 @@ void HashAggregation::resetPartialOutputIfNeed() {
   {
     auto lockedStats = stats_.wlock();
     lockedStats->addRuntimeStat(
-        std::string(HashAggregation::kFlushRowCount),
+        std::string(HashAggregationStatNames::kFlushRowCount),
         RuntimeCounter(numOutputRows_));
     lockedStats->addRuntimeStat(
-        std::string(HashAggregation::kFlushTimes), RuntimeCounter(1));
+        std::string(HashAggregationStatNames::kFlushTimes), RuntimeCounter(1));
     lockedStats->addRuntimeStat(
-        std::string(HashAggregation::kPartialAggregationPct),
+        std::string(HashAggregationStatNames::kPartialAggregationPct),
         RuntimeCounter(saturateCast(aggregationPct)));
   }
   groupingSet_->resetTable(/*freeTable=*/false);
@@ -378,7 +380,7 @@ RowVectorPtr HashAggregation::getOutput() {
     prepareOutput(input_->size());
     groupingSet_->toIntermediate(input_, output_);
     addRuntimeStat(
-        std::string(HashAggregation::kAbandonedPartialAggregationRows),
+        std::string(HashAggregationStatNames::kAbandonedPartialAggregationRows),
         RuntimeCounter(input_->size()));
     numOutputRows_ += input_->size();
     input_ = nullptr;
@@ -509,7 +511,7 @@ bool HashAggregation::shouldEmitDefaultGlobalGroupingSetRows() {
 bool HashAggregation::electDefaultGlobalGroupingSetDriver() {
   std::vector<ContinuePromise> promises;
   std::vector<std::shared_ptr<Operator>> peerOperators;
-  if (!operatorCtx_->allPeersFinished(&future_, promises, peerOperators)) {
+  if (!operatorCtx_->allPeersArrived(&future_, promises, peerOperators)) {
     VELOX_CHECK(future_.valid());
     return false;
   }
@@ -521,7 +523,7 @@ bool HashAggregation::electDefaultGlobalGroupingSetDriver() {
     }
   };
 
-  // allPeersFinished returned true, so every peer has finished noMoreInput()
+  // allPeersArrived returned true, so every peer has finished noMoreInput()
   // and its input count is final.
   uint64_t totalInputRows = groupingSet_->numInputRows();
   for (const auto& peer : peerOperators) {
@@ -551,7 +553,7 @@ void HashAggregation::combineGlobalPartialAggregation() {
 
   std::vector<ContinuePromise> promises;
   std::vector<std::shared_ptr<Operator>> peerOperators;
-  if (!operatorCtx_->allPeersFinished(&future_, promises, peerOperators)) {
+  if (!operatorCtx_->allPeersArrived(&future_, promises, peerOperators)) {
     VELOX_CHECK(future_.valid());
     return;
   }
@@ -696,7 +698,7 @@ void HashAggregation::close() {
         groupingSet->numToIntermediateFastPathCalls();
     if (numToIntermediateFastPathCalls > 0) {
       addRuntimeStat(
-          std::string(kToIntermediateFastPathCalls),
+          std::string(HashAggregationStatNames::kToIntermediateFastPathCalls),
           RuntimeCounter(numToIntermediateFastPathCalls));
     }
   }

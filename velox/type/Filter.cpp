@@ -386,6 +386,10 @@ bool BigintValuesUsingBitmask::testingEquals(const Filter& other) const {
 }
 
 folly::dynamic BigintValuesUsingBloomFilter::serialize() const {
+  // A merged bloom filter exists only in a task's scan spec, which is built
+  // after the plan is deserialized. Nothing serializes it.
+  VELOX_CHECK_NULL(
+      exact_, "Serialization of a merged bloom filter is not supported");
   auto obj = Filter::serializeBase();
   folly::dynamic words = folly::dynamic::array;
   for (auto& block : blocks_) {
@@ -416,13 +420,30 @@ std::unique_ptr<Filter> BigintValuesUsingBloomFilter::create(
     }
   }
   return std::unique_ptr<BigintValuesUsingBloomFilter>(
-      new BigintValuesUsingBloomFilter(nullAllowed, std::move(blocks)));
+      new BigintValuesUsingBloomFilter(
+          nullAllowed, std::move(blocks), /*exact=*/nullptr));
+}
+
+std::unique_ptr<Filter> BigintValuesUsingBloomFilter::clone(
+    std::optional<bool> nullAllowed) const {
+  const bool newNullAllowed = nullAllowed.value_or(nullAllowed_);
+  return std::unique_ptr<BigintValuesUsingBloomFilter>(
+      new BigintValuesUsingBloomFilter(
+          newNullAllowed,
+          blocks_,
+          exact_ ? exact_->clone(newNullAllowed) : nullptr));
 }
 
 bool BigintValuesUsingBloomFilter::testingEquals(const Filter& other) const {
   auto* typedOther =
       Filter::testingBaseEquals<BigintValuesUsingBloomFilter>(other);
   if (!typedOther) {
+    return false;
+  }
+  if ((exact_ == nullptr) != (typedOther->exact_ == nullptr)) {
+    return false;
+  }
+  if (exact_ && !exact_->testingEquals(*typedOther->exact_)) {
     return false;
   }
   return blocks_.size() == typedOther->blocks_.size() &&
@@ -2154,6 +2175,35 @@ std::unique_ptr<Filter> HugeintValuesUsingHashTable::mergeWith(
   }
 }
 
+namespace {
+
+// Calls 'callback' for each value in the inclusive range [min, max]. Does
+// nothing if min > max.
+//
+// The obvious loop, 'for (v = min; v <= max; ++v)', is wrong when max is
+// INT64_MAX: 'v <= max' is always true, so after visiting INT64_MAX the loop
+// increments 'v' past it. Signed overflow is undefined behavior; in practice
+// 'v' wraps to INT64_MIN and the loop either runs forever or indexes out of
+// bounds.
+//
+// This comes up in real merges: 'x >= c' is a BigintRange with upper bound
+// INT64_MAX, and IN-lists may contain INT64_MAX itself.
+//
+// To avoid this, loop over the half-open range [min, max), where '++v' never
+// goes past max, then visit max separately.
+template <typename Callable>
+void safeForEachInt64(int64_t min, int64_t max, Callable&& callback) {
+  if (min > max) {
+    return;
+  }
+  for (auto value = min; value < max; ++value) {
+    callback(value);
+  }
+  callback(max);
+}
+
+} // namespace
+
 std::unique_ptr<Filter> BigintValuesUsingBitmask::mergeWith(
     const Filter* other) const {
   switch (other->kind()) {
@@ -2195,11 +2245,11 @@ std::unique_ptr<Filter> BigintValuesUsingBitmask::mergeWith(
       for (const auto& range : otherMultiRange->ranges()) {
         auto min = std::max(min_, range->lower());
         auto max = std::min(max_, range->upper());
-        for (auto i = min; i <= max; ++i) {
-          if (bitmask_[i - min_] && range->testInt64(i)) {
-            valuesToKeep.push_back(i);
+        safeForEachInt64(min, max, [&](int64_t value) {
+          if (bitmask_[value - min_] && range->testInt64(value)) {
+            valuesToKeep.push_back(value);
           }
-        }
+        });
       }
 
       bool bothNullAllowed = nullAllowed_ && other->testNull();
@@ -2222,11 +2272,11 @@ std::unique_ptr<Filter> BigintValuesUsingBitmask::mergeWith(
   bool bothNullAllowed = nullAllowed_ && other->testNull();
 
   std::vector<int64_t> valuesToKeep;
-  for (auto i = min; i <= max; ++i) {
-    if (bitmask_[i - min_] && other->testInt64(i)) {
-      valuesToKeep.push_back(i);
+  safeForEachInt64(min, max, [&](int64_t value) {
+    if (bitmask_[value - min_] && other->testInt64(value)) {
+      valuesToKeep.push_back(value);
     }
-  }
+  });
   return createBigintValues(valuesToKeep, bothNullAllowed);
 }
 
@@ -2397,21 +2447,25 @@ std::unique_ptr<Filter> BigintValuesUsingBloomFilter::mergeWith(
       return clone(false);
     case FilterKind::kBigintRange: {
       auto* filter = other->as<BigintRange>();
+      const bool bothNullAllowed = nullAllowed_ && other->testNull();
+      if (filter->lower() > filter->upper()) {
+        return nullOrFalse(bothNullAllowed);
+      }
       // If the hash table or bitmask generated is not small enough to fit in
       // cache, we would rather not merging it.
       int64_t range;
       if (__builtin_sub_overflow(filter->upper(), filter->lower(), &range) ||
           range > 100'000) {
-        return other->clone();
+        return mergeWithExact(*other);
       }
       std::vector<int64_t> values;
       values.reserve(range + 1);
-      for (int64_t i = filter->lower(); i <= filter->upper(); ++i) {
-        if (testInt64(i)) {
-          values.push_back(i);
+      safeForEachInt64(filter->lower(), filter->upper(), [&](int64_t value) {
+        if (testInt64(value)) {
+          values.push_back(value);
         }
-      }
-      return createBigintValues(values, nullAllowed_ && other->testNull());
+      });
+      return createBigintValues(values, bothNullAllowed);
     }
     case FilterKind::kBigintValuesUsingHashTable: {
       auto* filter = other->as<BigintValuesUsingHashTable>();
@@ -2429,25 +2483,40 @@ std::unique_ptr<Filter> BigintValuesUsingBloomFilter::mergeWith(
       auto* filter = other->as<BigintValuesUsingBitmask>();
       std::vector<int64_t> values;
       values.reserve(filter->max() - filter->min() + 1);
-      for (int64_t i = filter->min(); i <= filter->max(); ++i) {
-        if (filter->testInt64(i) && testInt64(i)) {
-          values.push_back(i);
+      safeForEachInt64(filter->min(), filter->max(), [&](int64_t value) {
+        if (filter->testInt64(value) && testInt64(value)) {
+          values.push_back(value);
         }
-      }
+      });
       return createBigintValues(values, nullAllowed_ && other->testNull());
     }
     case FilterKind::kNegatedBigintRange:
     case FilterKind::kNegatedBigintValuesUsingHashTable:
     case FilterKind::kNegatedBigintValuesUsingBitmask:
     case FilterKind::kBigintMultiRange:
-    case FilterKind::kBigintValuesUsingBloomFilter:
-      // Bloom filter allows false positive so dropping it will not affect
-      // correctness.  We can do so if we think merging will not improve
-      // performance.
-      return other->clone();
+      return mergeWithExact(*other);
+    case FilterKind::kBigintValuesUsingBloomFilter: {
+      // Bloom filters allow false positives, so the other bloom filter can be
+      // dropped. Its exact filter must still apply.
+      const auto* otherBloom = other->as<BigintValuesUsingBloomFilter>();
+      if (otherBloom->exact_) {
+        return mergeWithExact(*otherBloom->exact_);
+      }
+      return clone(nullAllowed_ && other->testNull());
+    }
     default:
       VELOX_FAIL("Cannot merge {} with {}", kindName(), other->kindName());
   }
+}
+
+std::unique_ptr<Filter> BigintValuesUsingBloomFilter::mergeWithExact(
+    const Filter& other) const {
+  const bool bothNullAllowed = nullAllowed_ && other.testNull();
+  std::shared_ptr<const Filter> exact =
+      exact_ ? exact_->mergeWith(&other) : other.clone(bothNullAllowed);
+  return std::unique_ptr<BigintValuesUsingBloomFilter>(
+      new BigintValuesUsingBloomFilter(
+          bothNullAllowed, blocks_, std::move(exact)));
 }
 
 namespace {
